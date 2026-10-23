@@ -24,6 +24,10 @@ how to write a proposal. Themes under Next are not releases and not in order; wh
 needs another first, it says so.
 
 ## Underway
+An item is underway when it has an open pull request, or someone said on its issue in the last
+week that they are working on it. Check here and the
+[open pull requests](https://github.com/opengeos/RustGIS/pulls) before starting; to take an item,
+comment on its issue and open a draft pull request early.
 - GPU map: vector tiles and labels on the GPU tile layer
   ([#635](https://github.com/opengeos/RustGIS/issues/635),
   [#596](https://github.com/opengeos/RustGIS/issues/596)).
@@ -37,6 +41,10 @@ needs another first, it says so.
 - Connection manager for databases and web services
   ([#699](https://github.com/opengeos/RustGIS/issues/699)).
 - Zonal statistics as a built-in tool ([#718](https://github.com/opengeos/RustGIS/pull/718)).
+- A "No fill" option for polygons ([#745](https://github.com/opengeos/RustGIS/pull/745), for
+  [#644](https://github.com/opengeos/RustGIS/issues/644)).
+- Editing PostGIS tables and saving the edits back
+  ([#671](https://github.com/opengeos/RustGIS/pull/671), draft).
 
 ## Next
 
@@ -49,9 +57,7 @@ The bugs users hit, the docs and a few quick wins: good first pull requests.
 - A pass over the user guide, the comparison pages and the README against what the app does
   today (vertex editing, spatial join and kriging are listed as missing or undocumented; some
   pages still say 16 languages).
-- Styling: a "No fill" button for polygons
-  ([#644](https://github.com/opengeos/RustGIS/issues/644); a transparent fill works today)
-  _(open)_; standard deviation, geometric interval and manual breaks _(open)_.
+- Styling: standard deviation, geometric interval and manual breaks _(open)_.
 - Selection by polygon and lasso, and a radius tool on the map (Neighborhood Explorer already
   selects by radius) _(open)_.
 
@@ -91,8 +97,8 @@ And alongside it:
 - A histogram for raster stretches; raster attribute tables.
 
 ### Data at the source
-- Write edits back to GeoPackage and PostGIS (edits stay in the project today). _Coordinate
-  first._
+- Write edits back to GeoPackage and PostGIS (edits stay in the project today; PostGIS is
+  underway in [#671](https://github.com/opengeos/RustGIS/pull/671)). _Coordinate first._
 - Editor tracking fields (created/edited by and at).
 - Attribute table columns: rename, hide and reorder _(open)_.
 - Persistent attribute joins and virtual fields. _Coordinate first_ (they change `Feature`).
