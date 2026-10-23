@@ -352,6 +352,37 @@ pub fn project(ds: &Dataset, crs: Crs) -> Result<Dataset> {
     Ok(out)
 }
 
+/// Defines the CRS of the dataset's native coordinates without changing those numeric values.
+/// Geometry stored in longitude/latitude is converted back through the previous CRS, then
+/// interpreted in the new one. Builds a copy so failed transformations leave the input intact.
+/// Source geometry discarded during import cannot be recovered this way.
+pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
+    if ds.crs_incomplete {
+        return Err(DataError::Format("geometry was lost during import; import the original file again with a crs override".into()));
+    }
+    let from = ds.crs.unwrap_or(Crs::LonLat);
+    let native = project(ds, from)?;
+    let to = crs.transformer().map_err(DataError::Format)?;
+    let mut out = native;
+    for f in &mut out.features {
+        if let Some(g) = f.geometry.take() {
+            let g = g.map_coords(&|c| to.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
+            let mut valid = true;
+            g.for_each_coord(|c| valid &= c.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0);
+            if !valid {
+                return Err(DataError::Format(format!(
+                    "feature {} can't be interpreted in {}; import the original file with a crs override",
+                    f.id,
+                    crs.label()
+                )));
+            }
+            f.geometry = Some(g);
+        }
+    }
+    out.crs = Some(crs);
+    Ok(out)
+}
+
 /// Refuses a system without an EPSG code for a GeoPackage or FlatGeobuf: their readers (RustGIS's
 /// among them) go by the code, and would read the file as longitude/latitude.
 fn check_projected(ext: &str, crs: Crs) -> Result<()> {
@@ -1308,12 +1339,24 @@ pub fn to_csv(ds: &Dataset) -> Result<String> {
 // ---------------------------------------------------------------------------------------------
 // Shapefile
 
+/// Reads a loose Shapefile using its sidecar CRS, retaining the default reader's behavior.
 fn read_shapefile(path: &Path, name: &str) -> Result<(Dataset, ReadReport)> {
+    read_shapefile_in(path, name, None)
+}
+
+/// Reads a Shapefile with an optional source CRS replacing its `.prj`, before any geometry is
+/// converted. This changes only interpretation; the files on disk are never modified.
+pub fn read_shapefile_in(path: &Path, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
+    check_size(path)?;
     let dbf = path.with_extension("dbf");
     if !dbf.is_file() {
         return Err(DataError::Format(format!("Shapefile: {} is missing", dbf.display())));
     }
+    check_size(&dbf)?;
     let shx = path.with_extension("shx");
+    if shx.is_file() {
+        check_size(&shx)?;
+    }
     let mut notes = Vec::new();
     let parts = ShapefileParts {
         shp: std::fs::read(path)?,
@@ -1322,7 +1365,7 @@ fn read_shapefile(path: &Path, name: &str) -> Result<(Dataset, ReadReport)> {
         prj: crate::raster::read_prj(path),
         cpg: crate::dbf::read_cpg(path, &mut notes),
     };
-    let (ds, mut report) = read_shapefile_parts(parts, name)?;
+    let (ds, mut report) = read_shapefile_parts(parts, name, crs)?;
     report.messages.extend(notes);
     Ok((ds, report))
 }
@@ -1398,6 +1441,18 @@ pub const MAX_ZIP_LAYERS: usize = 32;
 /// [`MAX_ZIP_LAYERS`]. Folders inside are fine; macOS
 /// resource forks (`__MACOSX/`, `._*`) are ignored.
 pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>> {
+    read_zip_in(file_name, bytes, None)
+}
+
+/// Reads a ZIP, optionally overriding the source CRS of every Shapefile in it. Other formats
+/// retain their own coordinate systems. The override is applied before reading any shapes.
+pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Vec<(Dataset, ReadReport)>> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(DataError::Format(format!("file is too large ({} bytes)", bytes.len())));
+    }
+    if let Some(c) = crs {
+        c.transformer().map_err(DataError::Format)?;
+    }
     let lower = |n: &str| n.to_ascii_lowercase();
     let is_fork = |n: &str| n.split('/').any(|part| part == "__MACOSX" || part.starts_with("._"));
     let ext_of = |n: &str| Path::new(n).extension().and_then(|e| e.to_str()).map(lower).unwrap_or_default();
@@ -1437,7 +1492,7 @@ pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadRepor
             skipped.push(format!("{n} (no .dbf beside it)"));
             continue;
         };
-        match read_shapefile_parts(ShapefileParts { shp, shx, dbf, prj, cpg }, &name) {
+        match read_shapefile_parts(ShapefileParts { shp, shx, dbf, prj, cpg }, &name, crs) {
             Ok(mut read) => {
                 read.0.source = Some(format!("{file_name}/{n}"));
                 out.push(read);
@@ -1505,7 +1560,9 @@ struct ShapefileParts {
     cpg: Option<Vec<u8>>,
 }
 
-fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, ReadReport)> {
+/// Decodes attributes and shapes together, tracking geometry lost during CRS conversion so
+/// a later projection definition cannot silently repair an incomplete layer.
+fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
     use shapefile::Shape;
     use shapefile::dbase::FieldValue;
     use std::io::Cursor;
@@ -1542,11 +1599,18 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, R
     let mut ds = Dataset::new(name, GeometryType::None, fields);
     let mut report = ReadReport::default();
     report.messages.extend(encoding_notes);
-    let to_lonlat = shapefile_crs(parts.prj.as_deref(), &mut report).map(|(crs, t)| {
-        ds.crs = Some(crs);
-        t
-    });
+    let to_lonlat = match crs {
+        Some(c) => {
+            ds.crs = Some(c);
+            Some(c.transformer().map_err(DataError::Format)?)
+        }
+        None => shapefile_crs(parts.prj.as_deref(), &mut report).map(|(crs, t)| {
+            ds.crs = Some(crs);
+            t
+        }),
+    };
     let (mut converted, mut unconverted) = (0usize, 0usize);
+    let mut source_kind = GeometryType::None;
     let pt = |x: f64, y: f64| Coord::new(x, y);
     for item in reader.iter_shapes_and_records() {
         let Ok((shape, record)) = item else {
@@ -1578,6 +1642,11 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, R
                 continue;
             }
         };
+        if source_kind == GeometryType::None
+            && let Some(g) = &geom
+        {
+            source_kind = g.kind();
+        }
         let geom = match (&to_lonlat, geom) {
             (Some(t), Some(g)) => {
                 let mut ok = true;
@@ -1608,6 +1677,11 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, R
         ds.push_next(geom, attrs);
     }
     ds.geometry_type = dominant_type(&ds);
+    // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
+    // conversion warning. Its shapes can be recovered by importing with an override.
+    if ds.geometry_type == GeometryType::None && unconverted > 0 {
+        ds.geometry_type = source_kind;
+    }
     integral_numeric_to_integer(&mut ds);
     let e = ds.extent();
     if !e.is_empty() && (e.min_x < -180.5 || e.max_x > 180.5 || e.min_y < -90.5 || e.max_y > 90.5) {
@@ -1616,6 +1690,7 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, R
     if report.skipped > 0 {
         report.messages.push(format!("{} shapes were unreadable or unsupported", report.skipped));
     }
+    ds.crs_incomplete = unconverted > 0;
     if unconverted > 0 && converted == 0 {
         report.messages.push("no shape could be converted to longitude/latitude: the .prj doesn't seem to match the coordinates".into());
     } else if unconverted > 0 {

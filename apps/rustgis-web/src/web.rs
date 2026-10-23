@@ -844,12 +844,15 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             let tool_exts = purpose.strip_prefix(rustgis_ui_egui::TOOL_FILE_PURPOSE);
             let mark = match (purpose, tool_exts) {
                 ("text", _) => rustgis_ui_egui::DELIMITED_PICK,
+                ("shapefile", _) => rustgis_ui_egui::SHAPEFILE_PICK,
                 (_, Some(_)) => rustgis_ui_egui::TOOL_FILE_PICK,
                 _ => "",
             };
             let dialog = if let Some(exts) = tool_exts {
                 let exts: Vec<&str> = exts.split(',').filter(|e| !e.is_empty()).collect();
                 if exts.is_empty() { rfd::AsyncFileDialog::new() } else { rfd::AsyncFileDialog::new().add_filter(exts.join(", "), &exts) }
+            } else if purpose == "shapefile" {
+                rfd::AsyncFileDialog::new().add_filter("Shapefile", &["shp", "dbf", "shx", "prj", "cpg", "zip"])
             } else if purpose == "project" {
                 rfd::AsyncFileDialog::new().add_filter("RustGIS project", &["rgis", "rgisx", "rgispkg"])
             } else if purpose == "item" {
@@ -884,7 +887,7 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 rfd::AsyncFileDialog::new().add_filter("Vector and raster data", DATA_EXTS)
             };
             // Data may come several files at once (photos gather in one layer).
-            let many = purpose == "data";
+            let many = matches!(purpose, "data" | "shapefile");
             wasm_bindgen_futures::spawn_local(async move {
                 let files: Vec<rfd::FileHandle> =
                     if many { dialog.pick_files().await.unwrap_or_default() } else { dialog.pick_file().await.into_iter().collect() };

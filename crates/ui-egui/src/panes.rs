@@ -1870,6 +1870,10 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let _ = app.run("ui.dialog", json!({"name": "renameLayer"}));
         ui.close();
     }
+    if !l.is_raster() && ui.button(tl!("Define Projection…")).clicked() {
+        let _ = app.run("ui.dialog", json!({"name": "defineProjection"}));
+        ui.close();
+    }
     // Layer groups (#413): a service's collections stay in their service group.
     if !service_child {
         let groups: Vec<(u32, String)> = app.session.map().groups.iter().map(|g| (g.id, g.name.clone())).collect();
@@ -4208,6 +4212,7 @@ fn save_history_script(app: &mut RustGisApp) {
     }
 }
 
+/// Shows the selected layer's source metadata alongside its internal longitude/latitude extent.
 fn details(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let Some(l) = app.session.active_layer.and_then(|id| app.session.map().layer(id)) else {
         ui.label(egui::RichText::new(tl!("Select a layer in the Layers pane.")).color(t.text_dim));
@@ -4227,6 +4232,7 @@ fn details(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             ("Selected", l.selection.len().to_string()),
             ("Symbology", tl!(l.renderer.kind_label()).to_string()),
             ("Source", l.dataset.source.clone().unwrap_or_else(|| tl!("In project").into())),
+            ("Source coordinate system", l.dataset.crs.map(|c| c.label()).unwrap_or_else(|| "EPSG:4326".into())),
             ("West", format!("{:.4}°", e.min_x)),
             ("East", format!("{:.4}°", e.max_x)),
             ("South", format!("{:.4}°", e.min_y)),

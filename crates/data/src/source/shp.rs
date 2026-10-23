@@ -72,6 +72,15 @@ const BUFFER: usize = 1 << 20;
 impl ShpSource {
     /// Opens `path` (the `.shp`) with the `.dbf` and optional `.prj` and `.cpg` beside it.
     pub fn open_path(path: &Path, name: &str) -> Result<ShpSource> {
+        Self::open_path_in(path, name, None)
+    }
+
+    /// Opens a Shapefile with an optional source CRS replacing its `.prj`. The spatial index
+    /// stays in native coordinates; requests and results use the chosen CRS for conversion.
+    pub fn open_path_in(path: &Path, name: &str, crs: Option<crate::raster::Crs>) -> Result<ShpSource> {
+        if let Some(c) = crs {
+            c.transformer().map_err(DataError::Format)?;
+        }
         let dbf = path.with_extension("dbf");
         if !dbf.is_file() {
             return Err(bad(format!("{} is missing", dbf.display())));
@@ -108,7 +117,10 @@ impl ShpSource {
         if table.rows != index.count {
             notes.push(format!("the .shp holds {} shapes and the .dbf {} rows; rows are matched by position", index.count, table.rows));
         }
-        let reproject = shp_reproject(crate::raster::read_prj(path).as_deref(), &mut notes);
+        let reproject = match crs {
+            Some(c) => Reproject::from_crs(c, &mut notes),
+            None => shp_reproject(crate::raster::read_prj(path).as_deref(), &mut notes),
+        };
         let extent = if native.is_empty() || !native.min_x.is_finite() { Extent::EMPTY } else { reproject.extent_to_lonlat(&native) };
         if reproject.is_lonlat()
             && !extent.is_empty()
@@ -129,7 +141,7 @@ impl ShpSource {
             fields,
             extent,
             count: Some(index.count),
-            crs: reproject.label(),
+            crs: crs.and_then(|c| c.custom_def()).map(|d| d.proj4.clone()).unwrap_or_else(|| reproject.label()),
             indexed: index.indexed(),
             notes,
         };

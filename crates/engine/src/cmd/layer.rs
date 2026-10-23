@@ -14,7 +14,7 @@ use crate::{CmdResult, CommandSpec as C, Session};
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addData", "Add Data", "Home › Add", add_data)
-            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for a CSV's coordinates, or a GDAL or DuckDB file that doesn't say", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
+            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, or a GDAL or DuckDB file that doesn't say", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
         C::new("layer.addPhotos", "Add Photos", "Home › Add", add_photos).params(
             r#"{"paths"?: [JPEG photo files], "folder"?: "a folder of photos (every JPEG in it)", "name"?: "the layer (default Photos; photos join it when it exists)"}"#,
         ),
@@ -33,6 +33,9 @@ pub fn commands() -> Vec<C> {
         C::new("info.databaseTables", "List Database Tables", "Home › Add › Add Data From Database", database_tables)
             .view()
             .params(r#"{"database": "as layer.addDatabase", "password"?: string}"#),
+        C::new("layer.defineProjection", "Define Projection", "Layers", define_projection)
+            .when(need_feature_layer)
+            .params(r#"{"layer"?: name|id, "crs": "EPSG:… or WKT; reinterpret native coordinates, without rewriting the source file"}"#),
         C::new("layer.loadAll", "Load All Features", "Layers", load_all).when(need_streamed).params(r#"{"layer"?: name|id}"#),
         C::new("layer.addUrl", "Add Data From URL", "Home › Add", add_url).params(
             r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true zooms to what was added; false keeps the view of a GeoParquet or FlatGeobuf read in place (zoomed to only when the map was empty)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on"}"#,
@@ -623,6 +626,8 @@ fn add_geodatabase(s: &mut Session, p: &Value, path: &str) -> CmdResult {
     Ok(out)
 }
 
+/// Opens a file through its format's reader. A Shapefile CRS override is applied before any
+/// conversion in both whole-file and streamed paths; the source file is never rewritten.
 fn add_data(s: &mut Session, p: &Value) -> CmdResult {
     let path = s_req(p, "path")?;
     let path = &*gdb_path(path);
@@ -674,6 +679,23 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
             Err(rustgis_data::DataError::Unsupported(_)) => {}
             Err(e) => return Err(format!("{path}: {e}")),
         }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if path.to_ascii_lowercase().ends_with(".shp")
+        && let Some(crs) = ps(p, "crs")
+    {
+        let crs = rustgis_data::raster::Crs::parse(crs)?;
+        let name = Path::new(path).file_stem().and_then(|n| n.to_str()).unwrap_or("layer");
+        let stream = b(p, "stream").unwrap_or_else(|| {
+            rustgis_data::source::shp::record_count(Path::new(path)).is_some_and(|n| n > rustgis_map::source::STREAM_ABOVE)
+        });
+        if stream {
+            let src = rustgis_data::source::shp::ShpSource::open_path_in(Path::new(path), name, Some(crs)).map_err(|e| e.to_string())?;
+            return add_source_with(s, p, Origin::Path(path), Some(Box::new(src)));
+        }
+        let mut read = rustgis_data::io::read_shapefile_in(Path::new(path), name, Some(crs)).map_err(|e| e.to_string())?;
+        read.0.source = Some(path.to_string());
+        return add_read(s, p, read);
     }
     // A large Shapefile is read in place, as a GeoPackage is; smaller ones are loaded whole.
     #[cfg(not(target_arch = "wasm32"))]
@@ -775,6 +797,14 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
     // A DXF drawing: its coordinate system (it never says) and one of its own layers.
     let dxf = rustgis_data::dxf::is_dxf_name(file_name);
     let mut reads = match crs.filter(|_| landxml) {
+        _ if lower.ends_with(".zip") && crs.is_some() => {
+            let crs = crs.map(rustgis_data::raster::Crs::parse).transpose()?;
+            rustgis_data::io::read_zip_in(file_name, bytes, crs)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(dataset, report)| rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() })
+                .collect()
+        }
         _ if dxf => {
             let opts = rustgis_data::dxf::Options {
                 crs: crs.map(rustgis_data::raster::Crs::parse).transpose()?,
@@ -1167,7 +1197,7 @@ fn add_source_with(
             _ => info.name.clone(),
         };
         if stream {
-            let layer = match &origin {
+            let mut layer = match &origin {
                 Origin::Path(path) => {
                     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
                     rustgis_map::source::SourceLayer::from_path(full, table.clone(), src)
@@ -1177,6 +1207,9 @@ fn add_source_with(
                 Origin::Mysql(o) => rustgis_map::source::SourceLayer::from_mysql((*o).clone(), src),
                 Origin::Sqlserver(o) => rustgis_map::source::SourceLayer::from_sqlserver((*o).clone(), src),
             };
+            if info.format == "Shapefile" {
+                layer.shapefile_crs = ps(p, "crs").map(rustgis_data::raster::Crs::parse).transpose()?;
+            }
             let unique = unique_name(s, &name);
             for n in &info.notes {
                 s.notify(format!("{unique}: {n}"), false);
@@ -1871,6 +1904,24 @@ fn need_streamed(s: &Session) -> Option<&'static str> {
         Some(_) => Some("this layer's features are already in memory"),
         None => Some("select a layer in the Layers pane first"),
     }
+}
+
+/// Reinterprets the layer's native coordinates in a replacement CRS. Validate the complete
+/// replacement before mutating the layer; undo then restores geometry, metadata and caches.
+fn define_projection(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    let crs = rustgis_data::raster::Crs::parse(s_req(p, "crs")?)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    if l.is_raster() || l.is_streamed() {
+        return Err(
+            "Define Projection needs a vector layer loaded into memory; import a Shapefile with a crs override for a streamed layer".into(),
+        );
+    }
+    let ds = rustgis_data::io::define_projection(&l.dataset, crs).map_err(|e| e.to_string())?;
+    let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+    l.dataset = ds;
+    l.touch_geometry();
+    Ok(json!({"layer": id, "crs": crs.label()}))
 }
 
 /// Loads a streamed layer's features into memory, so it can be edited like any other layer.

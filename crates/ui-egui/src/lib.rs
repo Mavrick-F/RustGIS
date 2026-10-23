@@ -93,6 +93,10 @@ pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 /// inbox, so the dialog's options go with that file and no other (a drop, another picker).
 pub const DELIMITED_PICK: &str = "\u{1}delimited:";
 
+/// Marks files returned by the source-CRS picker, so its override never applies to a drop or
+/// another picker. Several selected Shapefiles share the same import options.
+pub const SHAPEFILE_PICK: &str = "\u{1}shapefile:";
+
 /// The `open_async` purpose for a tool's file parameter, followed by the extensions it offers
 /// (`toolfile:nc,nc4`; none for any file).
 pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
@@ -204,7 +208,8 @@ pub fn parse_extent(text: &str) -> Option<[f64; 4]> {
 /// supplies an asynchronous file picker (results arrive in `inbox`) and browser downloads.
 #[derive(Default)]
 pub struct Services {
-    /// Opens a file picker for `"data"` or `"project"`; the chosen file lands in `inbox`.
+    /// Opens a file picker for `"data"`, `"project"`, or `"shapefile"`; results land in `inbox`.
+    /// Shapefile picks carry [`SHAPEFILE_PICK`] after sidecars are gathered into ZIPs.
     pub open_async: Option<Box<dyn Fn(&str)>>,
     /// Hands bytes to the user as a download named `file_name`.
     pub download: Option<Box<dyn Fn(&str, Vec<u8>)>>,
@@ -514,6 +519,8 @@ pub struct UiState {
     /// Add Delimited Text, for the file being picked (web): `null` opens its dialog for the file,
     /// a script's options are read with it.
     pub pending_csv: Option<Value>,
+    /// CRS override for the next Shapefile picked by Import Shapefile with Projection.
+    pub pending_shapefile: Option<Value>,
     /// Data downloading from web addresses (Add Data › From URL): the address, the parameters to
     /// add it with, and where the download lands.
     pub downloads: Vec<(u64, String, Value, Slot<Result<Vec<u8>, String>>)>,
@@ -668,6 +675,7 @@ impl Default for UiState {
             pending_open: None,
             web_file: None,
             pending_csv: None,
+            pending_shapefile: None,
             downloads: Vec::new(),
             project_download: None,
             sql: Default::default(),
@@ -1076,11 +1084,18 @@ impl RustGisApp {
 
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
-    /// ([`TOOL_FILE_PICK`]) goes to the Tools pane.
+    /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`].
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
         if let Some(name) = name.strip_prefix(TOOL_FILE_PICK) {
             panes::received_file(self, name, bytes);
             return Ok(Value::Null);
+        }
+        if let Some(name) = name.strip_prefix(SHAPEFILE_PICK) {
+            if !name.to_ascii_lowercase().ends_with(".zip") {
+                return Err(tl!("Choose a zipped Shapefile, or pick its .shp and .dbf together.").into());
+            }
+            let options = self.ui.pending_shapefile.clone().ok_or(tl!("Choose the source coordinate system before importing"))?;
+            return self.open_bytes_with(name, bytes, Some(options));
         }
         match name.strip_prefix(DELIMITED_PICK) {
             Some(name) => match self.ui.pending_csv.take() {
@@ -1091,6 +1106,7 @@ impl RustGisApp {
         }
     }
 
+    /// Opens file bytes with picker options, forwarding source CRS overrides before ZIP parsing.
     fn open_bytes_with(&mut self, name: &str, bytes: &[u8], csv: Option<Value>) -> Result<Value, String> {
         let lower = name.to_ascii_lowercase();
         // A plugin package: ask before installing it.
@@ -1175,8 +1191,9 @@ impl RustGisApp {
             use base64::Engine;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut p = json!({"fileName": name, "data": data});
-            // A spreadsheet picked for Add Delimited Text takes its options.
-            if let Some(Value::Object(opts)) = csv.filter(|_| rustgis_engine::data::sheets::is_sheet_name(name)) {
+            // A picked spreadsheet or Shapefile ZIP takes its import options.
+            if let Some(Value::Object(opts)) = csv.filter(|_| rustgis_engine::data::sheets::is_sheet_name(name) || lower.ends_with(".zip"))
+            {
                 for (k, v) in opts {
                     p[k] = v;
                 }
@@ -2192,6 +2209,20 @@ impl RustGisApp {
                     error: None,
                     failure: None,
                 });
+            }
+            "ui.importShapefile" => {
+                let text = p.get("crs").and_then(Value::as_str).ok_or(tl!("Source coordinate system is required"))?;
+                rustgis_engine::data::raster::Crs::parse(text)?;
+                if let Some(open) = &self.services.open_async {
+                    self.ui.pending_layout_picture = false;
+                    self.ui.pending_picture = None;
+                    self.ui.pending_open = None;
+                    self.ui.pending_csv = None;
+                    self.ui.pending_shapefile = Some(json!({"crs": text}));
+                    open("shapefile");
+                } else if let Some(path) = dialogs::pick_open(&["shp", "zip"], tl!("Shapefile")) {
+                    return self.run("layer.addData", json!({"path": path, "crs": text}));
+                }
             }
             "ui.addData" => {
                 if let Some(open) = &self.services.open_async {

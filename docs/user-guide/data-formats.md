@@ -293,6 +293,45 @@ need an EPSG code and otherwise default to WGS 84. A layer made in RustGIS defau
 another, such as `{"layer": "Parcels", "path": "parcels.gpkg", "crs": "EPSG:4647"}`. GeoJSON, KML,
 GPX, GeoParquet and CSV are always written in WGS 84.
 
+## Define Projection
+
+When a Shapefile's `.prj` is missing or incorrect, right-click its layer and choose
+**Define Projection…** (also in Command Search). Enter the **source** coordinate system, such
+as `EPSG:2263` or a WKT/PROJ definition, then Apply. This reinterprets the native coordinate
+numbers: it changes the layer's position, preserves attributes and selection, and can be undone
+in one step. Use **Zoom To Layer** to see its corrected position. It does not modify the original
+file. Saving the project keeps the definition. Shapefile exports use it by default;
+GeoPackage and FlatGeobuf exports do so when the definition has an EPSG code. Custom
+definitions without an EPSG code can be exported in their native coordinates as Shapefiles.
+
+This differs from changing the map's coordinate system, which only changes the display, or
+exporting to another CRS, which converts coordinate numbers while preserving locations.
+RustGIS stores geometry in longitude/latitude, so Define Projection first reconstructs native
+numbers through the previous CRS; small floating-point rounding differences are possible.
+Edits already made to the layer are reinterpreted too. If the wrong CRS already discarded or
+clamped coordinates, import the original file again to recover them accurately.
+
+If the incorrect `.prj` prevented geometry from being read, Define Projection cannot restore
+it. Choose **Import Original File…** in the dialog, or search for **Import Shapefile with
+Projection…**. Enter the correct CRS before choosing the file. In the browser, pick the `.shp`
+and `.dbf` together, with any sidecars, or choose a ZIP. The override replaces the `.prj` before
+any conversion and applies to every Shapefile in a ZIP; other formats keep their own CRS.
+This adds a new layer, so existing layer edits and styles are not transferred.
+
+A streamed layer cannot be changed by Define Projection. Use **Load All Features** first (up
+to the read limit), or import again with the override; streamed Shapefiles remember that
+override when the project reopens. Layers whose import lost geometry must be imported again.
+
+The same operations are available to scripts and the CLI:
+
+```json
+{"cmd":"layer.defineProjection","params":{"layer":"Parcels","crs":"EPSG:2263"}}
+{"cmd":"layer.addData","params":{"path":"parcels.shp","crs":"EPSG:2263"}}
+```
+
+`layer.addDataBytes`, `layer.addUrl` and `layer.addDownload` also accept `crs` for zipped
+Shapefiles. The source files and their `.prj` sidecars are never rewritten by either operation.
+
 ## RustGIS files
 
 | File | Extension | Notes |

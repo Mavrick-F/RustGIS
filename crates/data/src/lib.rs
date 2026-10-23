@@ -180,6 +180,10 @@ pub struct Dataset {
     /// always longitude/latitude; this is what an export writes by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crs: Option<raster::Crs>,
+    /// Import lost geometry while interpreting source coordinates. Defining a projection cannot
+    /// recover it; import the original file with a CRS override instead. Kept across project saves.
+    #[serde(default)]
+    pub crs_incomplete: bool,
     /// The features are a window onto a source read in place (the part of a large file in view),
     /// so they aren't saved: the source is read again instead.
     #[serde(skip)]
@@ -187,9 +191,10 @@ pub struct Dataset {
 }
 
 impl Serialize for Dataset {
+    /// Saves CRS recovery state with the dataset, but omits disposable streamed rows.
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("Dataset", 6)?;
+        let mut st = s.serialize_struct("Dataset", 7)?;
         st.serialize_field("name", &self.name)?;
         st.serialize_field("geometry_type", &self.geometry_type)?;
         st.serialize_field("fields", &self.fields)?;
@@ -200,6 +205,11 @@ impl Serialize for Dataset {
             st.serialize_field("crs", crs)?;
         } else {
             st.skip_field("crs")?;
+        }
+        if self.crs_incomplete {
+            st.serialize_field("crs_incomplete", &true)?;
+        } else {
+            st.skip_field("crs_incomplete")?;
         }
         st.end()
     }
@@ -213,8 +223,18 @@ pub struct ReadReport {
 }
 
 impl Dataset {
+    /// Creates an empty, complete dataset whose coordinates are assumed to be WGS 84.
     pub fn new(name: impl Into<String>, geometry_type: GeometryType, fields: Vec<Field>) -> Self {
-        Dataset { name: name.into(), geometry_type, fields, features: Features::default(), source: None, crs: None, windowed: false }
+        Dataset {
+            name: name.into(),
+            geometry_type,
+            fields,
+            features: Features::default(),
+            source: None,
+            crs: None,
+            crs_incomplete: false,
+            windowed: false,
+        }
     }
 
     /// Index of a field by case-insensitive name.

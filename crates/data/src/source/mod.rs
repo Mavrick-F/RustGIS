@@ -469,6 +469,9 @@ pub fn materialize(src: &dyn FeatureSource) -> Result<(Dataset, ReadReport)> {
     let batch = src.read(&Request::all())?;
     let mut ds = Dataset::new(info.name.clone(), info.geometry_type, info.fields.clone());
     ds.crs = info.coordinate_system();
+    // A streamed Shapefile skips unconvertible shapes rather than retaining empty geometry.
+    // Once materialized, it must still direct CRS repairs back to the original file.
+    ds.crs_incomplete = info.format == "Shapefile" && batch.skipped > 0;
     ds.features = batch.features.into();
     let mut report = ReadReport { skipped: batch.skipped, messages: info.notes.iter().map(|n| format!("{}: {n}", info.name)).collect() };
     if !batch.complete {

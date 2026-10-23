@@ -44,6 +44,9 @@ pub struct SourceLayer {
     /// The GeoPackage table.
     #[serde(default)]
     pub table: Option<String>,
+    /// A Shapefile's source CRS override, reapplied when its path is reopened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shapefile_crs: Option<rustgis_data::raster::Crs>,
     /// The original file, kept in the project when there is no path (a browser upload).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "crate::raster::b64")]
     pub embedded: Option<Arc<Vec<u8>>>,
@@ -397,7 +400,20 @@ impl SourceLayer {
             let name = self.file_name.as_deref().unwrap_or("layer.parquet");
             rustgis_data::source::open_shared(name, bytes.clone(), self.table.as_deref())
         } else if let Some(p) = &self.path {
-            let opened = rustgis_data::source::open_path(std::path::Path::new(p), self.table.as_deref());
+            #[cfg(not(target_arch = "wasm32"))]
+            let overridden = self.shapefile_crs.filter(|_| p.to_ascii_lowercase().ends_with(".shp"));
+            let opened = {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(crs) = overridden {
+                    let name = std::path::Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                    rustgis_data::source::shp::ShpSource::open_path_in(std::path::Path::new(p), name, Some(crs))
+                        .map(|src| Box::new(src) as Box<dyn FeatureSource>)
+                } else {
+                    rustgis_data::source::open_path(std::path::Path::new(p), self.table.as_deref())
+                }
+                #[cfg(target_arch = "wasm32")]
+                rustgis_data::source::open_path(std::path::Path::new(p), self.table.as_deref())
+            };
             match (opened, &self.gdal) {
                 // The converted copy is gone (a cleared cache, another machine): convert again.
                 #[cfg(not(target_arch = "wasm32"))]

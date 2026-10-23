@@ -181,6 +181,7 @@ fn layer_geojson(inputs: &dyn Inputs, name: &str) -> Result<Value, String> {
         features: sel.iter().filter_map(|&i| ds.features.get(i).cloned()).collect(),
         source: None,
         crs: None,
+        crs_incomplete: false,
         windowed: false,
     };
     Ok(rustgis_data::io::to_geojson(&sub))

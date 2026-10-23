@@ -642,6 +642,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.pane.bookmarks", "Bookmarks Pane", "Home › Navigate › Bookmarks"),
     ("ui.theme", "Toggle Dark Mode", "View"),
     ("ui.map.gpu", "Toggle GPU Rendering", "View"),
+    ("ui.importShapefile", "Import Shapefile with Projection…", "Home › Add"),
     ("ui.measurementUnits", "Toggle Imperial Measurements", "Home › Inspect › Measure"),
     ("ui.exportMap", "Export Map…", "Publish › Output"),
     ("ui.checkUpdate", "Check for Updates…", "Help › Help"),
@@ -658,6 +659,7 @@ enum SearchAction {
     Workflow(&'static str),
 }
 
+/// Routes commands requiring user input to their dialogs rather than executing empty params.
 fn search_action(id: &str) -> Option<SearchAction> {
     use crate::RightPane;
     use SearchAction::{Command, Dialog, OpenItem, Pane, SaveItem, Workflow};
@@ -695,6 +697,8 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "layer.addEncodedPolyline" => Dialog("addPolyline"),
         "layer.geocode" => Dialog("geocode"),
         "layer.rename" => Dialog("renameLayer"),
+        "layer.defineProjection" => Dialog("defineProjection"),
+        "ui.importShapefile" => Dialog("addShapefile"),
         "layer.definitionQuery" => Dialog("definitionQuery"),
         "layer.symbology" | "raster.symbology" | "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.ramp" => {
             Pane(RightPane::Symbology)

@@ -10,6 +10,10 @@ use crate::theme::{Tokens, semibold};
 
 #[derive(Default)]
 pub struct Dialogs {
+    /// The layer captured when Define Projection opens; changing selection must not retarget it.
+    pub projection_layer: Option<u32>,
+    /// Map-local layer IDs require the dialog to retain its original project and map as well.
+    pub projection_map: Option<(u64, usize, String)>,
     pub geometry: Option<crate::geometrycalc::Form>,
     pub open: Option<&'static str>,
     pub layer: String,
@@ -45,6 +49,7 @@ pub enum CsvSource {
 }
 
 impl Dialogs {
+    /// Opens a dialog on the current selection, capturing the target of CRS changes.
     pub fn open(&mut self, which: &str, s: &Session) -> Result<(), String> {
         let active = s.active_layer.and_then(|id| s.map().layer(id));
         let name: &'static str = match which {
@@ -60,6 +65,8 @@ impl Dialogs {
             "renameServiceGroup" => "renameServiceGroup",
             "renameGroup" => "renameGroup",
             "coordinateSystem" => "coordinateSystem",
+            "defineProjection" => "defineProjection",
+            "addShapefile" => "addShapefile",
             "camera" => "camera",
             "addTiles" => "addTiles",
             "basemap" => "basemap",
@@ -79,7 +86,9 @@ impl Dialogs {
             "saveProject" => "saveProject",
             other => return Err(format!("unknown dialog '{other}'")),
         };
-        if matches!(name, "addField" | "calculateField" | "definitionQuery" | "renameLayer" | "exportLayer") && active.is_none() {
+        if matches!(name, "addField" | "calculateField" | "definitionQuery" | "renameLayer" | "exportLayer" | "defineProjection")
+            && active.is_none()
+        {
             return Err("select a layer in the Layers pane first".into());
         }
         if name == "exportLayer" && active.is_some_and(|l| l.is_raster()) {
@@ -91,6 +100,14 @@ impl Dialogs {
         *self = Dialogs { open: Some(name), mode: "new", ..Dialogs::default() };
         self.layer = active.or_else(|| s.map().layers.first()).map(|l| l.name.clone()).unwrap_or_default();
         match name {
+            "defineProjection" => {
+                self.projection_layer = active.map(|l| l.id);
+                self.projection_map = Some((s.opened, s.project.active_map, s.map().name.clone()));
+                self.text = active
+                    .and_then(|l| l.dataset.crs)
+                    .map(|c| c.custom_def().map(|d| d.proj4.clone()).unwrap_or_else(|| c.label()))
+                    .unwrap_or_else(|| "EPSG:4326".into());
+            }
             "coordinateSystem" => {
                 self.text = s.map().projection.code();
                 // An EPSG code goes in the code box; presets are picked from the list.
@@ -129,6 +146,7 @@ impl Dialogs {
     }
 }
 
+/// Draws the active dialog and leaves it open on validation failure or a newly opened dialog.
 pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let Some(which) = app.dialogs.open else { return };
     if which == "calculateGeometry" {
@@ -143,6 +161,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "calculateField" => "Calculate Field",
         "definitionQuery" => "Definition Query",
         "coordinateSystem" => "Coordinate System",
+        "defineProjection" => "Define Projection",
+        "addShapefile" => "Import Shapefile with Projection",
         "camera" => "Camera",
         "addTiles" => "Add Tile Layer",
         "basemap" => "Basemap",
@@ -210,6 +230,37 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 });
             }
             "coordinateSystem" => close = coordinate_system(app, ui, &t),
+            "addShapefile" => {
+                ui.label(tl!("Choose the source coordinate system before importing. It replaces a missing or incorrect .prj without changing the original file."));
+                ui.label(tl!("Source coordinate system"));
+                let response = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:2263").desired_width(f32::INFINITY));
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, tl!("Source coordinate system")));
+                ui.label(tl!("In the browser, pick the .shp and .dbf together, with any sidecars, or pick a ZIP. The override applies to every Shapefile in the ZIP."));
+                close = buttons(app, ui, "Choose File…", |app| app.run("ui.importShapefile", json!({"crs": app.dialogs.text.trim()})).map(|_| ()));
+            }
+            "defineProjection" => {
+                ui.label(egui::RichText::new(&app.dialogs.layer).strong());
+                ui.label(tl!("Interpret the layer's native coordinates in this coordinate system. This changes where it draws; the source file is unchanged."));
+                ui.label(tl!("Source coordinate system"));
+                let label = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:2263").desired_width(f32::INFINITY));
+                label.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, tl!("Source coordinate system")));
+                ui.label(egui::RichText::new(tl!("Geometry lost during import cannot be recovered here. Use Import Original File to choose its coordinate system before reading it. Streamed layers must first be loaded into memory.")).weak());
+                if ui.button(tl!("Import Original File…")).clicked() {
+                    let crs = app.dialogs.text.clone();
+                    if app.dialogs.open("addShapefile", &app.session).is_ok() {
+                        app.dialogs.text = crs;
+                    }
+                }
+                close = buttons(app, ui, "Apply", |app| {
+                    if !app.dialogs.projection_map.as_ref().is_some_and(|(project, index, name)| {
+                        *project == app.session.opened && *index == app.session.project.active_map && *name == app.session.map().name
+                    }) {
+                        return Err(tl!("The active project or map changed; reopen Define Projection for the intended layer.").into());
+                    }
+                    let id = app.dialogs.projection_layer.ok_or(tl!("No layer selected"))?;
+                    app.run("layer.defineProjection", json!({"layer": id, "crs": app.dialogs.text.trim()})).map(|_| ())
+                });
+            }
             "basemap" | "body" | "addSample" | "layerTemplate" => {
                 // Menu items close their nearest closable parent. Keep that local to the
                 // gallery so picking an item doesn't persistently collapse the Window's body.
