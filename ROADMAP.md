@@ -14,6 +14,8 @@ issues; feature-by-feature comparison with GeoLibre is tracked in
   it: depth in these beats a long list of first versions.
 - **Foundations before features.** Build the shared piece once (an expression engine, a secret
   store, Z coordinates) and let several features stand on it.
+- **Free and self-contained.** Pure Rust with nothing else to install; GDAL and DuckDB are
+  optional extras that add formats, not requirements.
 - **One program everywhere.** Desktop, browser, CLI, Python and AI agents share the same commands;
   nothing below `apps/` breaks the WebAssembly build.
 
