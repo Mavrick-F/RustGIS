@@ -20,8 +20,8 @@ issues; feature-by-feature comparison with GeoLibre is tracked in
 ## Contributing
 Most items below have no issue yet: propose one and open a pull request. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for which items to pick freely, which to coordinate first, and
-how to write a proposal. Releases below are focuses, not dates; an item moves when it lands,
-whatever its release.
+how to write a proposal. Themes under Next are not releases and not in order; where an item
+needs another first, it says so.
 
 ## Underway
 - GPU map: vector tiles and labels on the GPU tile layer
@@ -40,9 +40,8 @@ whatever its release.
 
 ## Next
 
-### 0.4: An update soon
-The bugs users hit, the docs and a few quick wins, plus whatever from Underway lands in time;
-released soon, not held for the rest.
+### Fixes and quick wins
+The bugs users hit, the docs and a few quick wins: good first pull requests.
 - Robustness: the Windows 11 start-up failure
   ([#375](https://github.com/opengeos/RustGIS/issues/375)), Control-click menus on macOS
   ([#707](https://github.com/opengeos/RustGIS/issues/707)), Load Off-Map Data
@@ -56,8 +55,8 @@ released soon, not held for the rest.
 - Selection by polygon and lasso, and a radius tool on the map (Neighborhood Explorer already
   selects by radius) _(open)_.
 
-### 0.5: Solid ground
-Correct, robust and recoverable, with the foundations later releases stand on.
+### Solid ground
+Correct, robust and recoverable, with the foundations other themes stand on.
 - Correct coordinates: grid datum shifts (NTv2 and GeoTIFF grids) for NAD27, NAD83(HARN),
   GDA94↔GDA2020 and OSGB36, and a notice whenever a layer is read without its shift; GDA94
   ([#730](https://github.com/opengeos/RustGIS/issues/730)) is one case. _Coordinate first._
@@ -71,7 +70,7 @@ Correct, robust and recoverable, with the foundations later releases stand on.
   layers), extract vertices, points along lines, check and fix geometry _(open)_.
 - Batch runs: one tool over many layers or a folder of files.
 
-### 0.6: Expressions and cartography
+### Expressions and cartography
 One expression engine, a superset of today's SQL where clause so existing definition queries,
 label-class queries and display filters keep working. It replaces the three parsers of today
 (where clauses, Calculate Field, attribute rules) and serves Calculate Field, attribute rules,
@@ -91,7 +90,7 @@ And alongside it:
 - Style import: QGIS QML and SLD styles applied to layers.
 - A histogram for raster stretches; raster attribute tables.
 
-### 0.7: Data at the source
+### Data at the source
 - Write edits back to GeoPackage and PostGIS (edits stay in the project today). _Coordinate
   first._
 - Editor tracking fields (created/edited by and at).
@@ -100,9 +99,9 @@ And alongside it:
 - Attribute forms: widgets, constraints and conditional visibility, on top of domains and
   subtypes.
 - Layer metadata, exported as STAC items.
-- ArcGIS sign-in (OAuth) and a Portal browser, on the 0.5 secret store.
+- ArcGIS sign-in (OAuth) and a Portal browser, once the secret store (Solid ground) exists.
 
-### 0.8: Analysis
+### Analysis
 - Routing: isochrones, service areas and an origin–destination matrix (today shortest path over
   a line layer).
 - Hot-spot statistics (Getis-Ord Gi\*), and emerging hot spots on the time slider.
@@ -110,7 +109,7 @@ And alongside it:
 - Reverse geocoding; a DEM downloader so viewshed works without a loaded elevation raster
   _(open)_.
 
-### 0.9: 3D scenes, first steps
+### 3D scenes, first steps
 - Phases 1–2 of [#726](https://github.com/opengeos/RustGIS/issues/726): Z coordinates kept from
   the data and written back; a scene with a free camera and each layer's elevation mode (on the
   ground, relative, absolute).
