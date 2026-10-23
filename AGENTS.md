@@ -4,6 +4,9 @@ RustGIS is a fast, free and open-source GIS in pure Rust for mapping, analyzing 
 geospatial data, on the desktop and in the browser. Its architecture: layered crates, everything
 is a command, a thin egui front end, headless screenshots for UI work.
 
+Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
+[CONTRIBUTING.md](CONTRIBUTING.md) (what to coordinate first).
+
 ## Never crash
 - No `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!` in non-test code; no `unsafe`
   (`unsafe_code = "forbid"`). Crate roots carry the `#![deny(clippy::unwrap_used, …)]` block.
