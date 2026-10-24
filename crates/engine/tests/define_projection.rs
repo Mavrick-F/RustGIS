@@ -187,3 +187,27 @@ fn zip_override_applies_to_each_shapefile_and_keeps_geojson_coordinates() {
     paris(&read[1].0);
     assert_eq!(point(&read[2].0), Coord::new(10.0, 20.0));
 }
+
+#[test]
+fn blank_shapefile_crs_keeps_prj_for_whole_and_streamed_imports() {
+    let dir = std::env::temp_dir().join(format!("rustgis-m1-blank-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (ext, bytes) in io::shapefile_parts_in(&native(), Crs::parse("EPSG:32631").unwrap()).unwrap().0 {
+        std::fs::write(dir.join(format!("parcels.{ext}")), bytes).unwrap();
+    }
+    for crs in ["", " \t ", " EPSG:32631 "] {
+        for stream in [false, true] {
+            let mut s = Session::new(Project::default());
+            let result = s.run("layer.addData", &json!({"path": dir.join("parcels.shp"), "crs": crs, "stream": stream})).unwrap();
+            let id = result["layer"].as_u64().unwrap() as u32;
+            paris(&s.map().layer(id).unwrap().load_all().unwrap());
+            let saved = s.project.saved_text().unwrap().0;
+            let restored = Session::new(Project::from_json(&saved).unwrap());
+            paris(&restored.map().layer(id).unwrap().load_all().unwrap());
+        }
+    }
+    let mut s = Session::new(Project::default());
+    assert!(s.run("layer.addData", &json!({"path": dir.join("parcels.shp"), "crs": "not a CRS"})).is_err());
+    assert!(s.map().layers.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}

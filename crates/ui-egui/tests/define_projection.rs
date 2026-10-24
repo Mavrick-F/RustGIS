@@ -136,3 +136,64 @@ fn dialog_rejects_a_replacement_project_with_the_same_map_and_layer() {
     let current = &h.state().session.map().layer(id).unwrap().dataset;
     assert_eq!(current.features[0].geometry.as_ref().unwrap().label_point().unwrap().x, 451_219.33);
 }
+
+#[test]
+fn shapefile_picker_validation_errors_are_visible_after_inbox_processing() {
+    use std::sync::{Arc, Mutex};
+    for (name, pending, message) in [
+        ("orphan.prj", Some(json!({"crs": "EPSG:32631"})), "pick its .shp and .dbf together"),
+        ("parcels.zip", None, "Choose the source coordinate system before importing"),
+    ] {
+        let mut h = harness();
+        let before = h.state().session.map().layers.len();
+        h.state_mut().session.notices.clear();
+        h.state_mut().ui.pending_shapefile = pending;
+        h.state_mut().services.inbox = Some(Arc::new(Mutex::new(vec![(format!("{}{name}", rustgis_ui_egui::SHAPEFILE_PICK), vec![])])));
+        h.step();
+        assert!(h.state().session.notices.iter().any(|n| n.error && n.text.contains(message)), "{:?}", h.state().session.notices);
+        assert_eq!(h.state().session.map().layers.len(), before);
+    }
+}
+
+#[test]
+fn downloaded_shapefile_keeps_the_requested_source_crs() {
+    use std::io::{Read, Write};
+    let mut h = harness();
+    h.state_mut().dialogs.open = None;
+    let ds = h.state().session.map().layer_by_name("Parcels").unwrap().dataset.clone();
+    let entries = rustgis_engine::data::io::shapefile_parts_in(&ds, rustgis_engine::data::raster::Crs::LonLat)
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|(ext, bytes)| (format!("parcels.{ext}"), bytes))
+        .collect::<Vec<_>>();
+    let bytes = rustgis_engine::data::zip::write(&entries).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+    });
+    h.state_mut()
+        .run(
+            "ui.addUrl",
+            json!({"url": format!("http://{address}/parcels.zip"), "crs": "EPSG:32631", "name": "Downloaded", "layer": "parcels"}),
+        )
+        .unwrap();
+    for _ in 0..100 {
+        h.step();
+        if h.state().session.map().layer_by_name("Downloaded").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let layer = h.state().session.map().layer_by_name("Downloaded").unwrap();
+    let point = layer.dataset.features[0].geometry.as_ref().unwrap().label_point().unwrap();
+    assert!((point.x - 2.335).abs() < 1e-6 && (point.y - 48.855).abs() < 1e-6, "{point:?}");
+    assert_eq!(layer.dataset.crs, Some(rustgis_engine::data::raster::Crs::parse("EPSG:32631").unwrap()));
+}

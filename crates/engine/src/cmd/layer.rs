@@ -682,7 +682,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     if path.to_ascii_lowercase().ends_with(".shp")
-        && let Some(crs) = ps(p, "crs")
+        && let Some(crs) = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty())
     {
         let crs = rustgis_data::raster::Crs::parse(crs)?;
         let name = Path::new(path).file_stem().and_then(|n| n.to_str()).unwrap_or("layer");
@@ -1208,7 +1208,8 @@ fn add_source_with(
                 Origin::Sqlserver(o) => rustgis_map::source::SourceLayer::from_sqlserver((*o).clone(), src),
             };
             if info.format == "Shapefile" {
-                layer.shapefile_crs = ps(p, "crs").map(rustgis_data::raster::Crs::parse).transpose()?;
+                layer.shapefile_crs =
+                    ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()).map(rustgis_data::raster::Crs::parse).transpose()?;
             }
             let unique = unique_name(s, &name);
             for n in &info.notes {

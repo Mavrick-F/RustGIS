@@ -1092,9 +1092,15 @@ impl RustGisApp {
         }
         if let Some(name) = name.strip_prefix(SHAPEFILE_PICK) {
             if !name.to_ascii_lowercase().ends_with(".zip") {
-                return Err(tl!("Choose a zipped Shapefile, or pick its .shp and .dbf together.").into());
+                let error = tl!("Choose a zipped Shapefile, or pick its .shp and .dbf together.").to_string();
+                self.session.notify(error.clone(), true);
+                return Err(error);
             }
-            let options = self.ui.pending_shapefile.clone().ok_or(tl!("Choose the source coordinate system before importing"))?;
+            let Some(options) = self.ui.pending_shapefile.clone() else {
+                let error = tl!("Choose the source coordinate system before importing").to_string();
+                self.session.notify(error.clone(), true);
+                return Err(error);
+            };
             return self.open_bytes_with(name, bytes, Some(options));
         }
         match name.strip_prefix(DELIMITED_PICK) {
@@ -2125,7 +2131,7 @@ impl RustGisApp {
                     Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
                 );
                 let mut q = json!({});
-                for k in ["name", "layer"] {
+                for k in ["name", "layer", "crs"] {
                     if let Some(v) = p.get(k).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
                         q[k] = v.clone();
                     }
