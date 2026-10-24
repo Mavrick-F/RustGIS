@@ -15,27 +15,25 @@ fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Waits for worker results, downloaded tiles and the GPU callbacks that upload their pictures.
+/// UI steps alone do not run paced uploads; every candidate settled frame must be painted.
 fn wait_for_frame(h: &mut egui_kittest::Harness<'_, RustGisApp>) {
     use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache;
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    // Tiles still arriving would draw the map again: until none arrived since the last frames.
     loop {
-        assert!(std::time::Instant::now() < end, "tiles kept arriving");
+        assert!(std::time::Instant::now() < end, "frame workers, tiles or GPU uploads did not settle");
         let tiles = cache::generation();
         for _ in 0..40 {
             h.step();
         }
-        while h.state().map.drawing() || cache::in_flight() > 0 {
-            assert!(std::time::Instant::now() < end, "frame worker did not finish");
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            h.step();
-        }
-        // Uploading a finished scene changes whether tile generations participate in its key.
-        // Let an idle frame adopt that live-tile key before the test starts moving the camera.
+        h.render().expect("paint frame and advance tile uploads");
+        // Painting can discover another upload backlog. Let the next UI frame adopt it
+        // before treating drawing=false as proof that the displayed scene is complete.
         h.step();
         if !h.state().map.drawing() && cache::in_flight() == 0 && cache::generation() == tiles {
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -321,4 +319,47 @@ fn raster_tiles_move_with_the_camera_on_the_gpu() {
     }
     assert!(h.state().map.moves_on_gpu());
     assert_gpu_picture_matches_cpu(&mut h);
+}
+
+/// Waiting for a live scene must include paints: tile uploads are paced in the GPU callback,
+/// so CPU composition and finished downloads alone do not make the displayed frame complete.
+#[test]
+fn waiting_for_live_tiles_paints_until_the_top_layer_is_uploaded() {
+    use rustgis_ui_egui::rustgis_engine::{
+        map::{TileKind, TileLayer},
+        render::rustgis_tiles,
+    };
+    let _serial = one_at_a_time();
+    let png = |color| {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(256, 256, image::Rgba(color)).write_to(&mut out, image::ImageFormat::Png).expect("tile");
+        out.into_inner()
+    };
+    let bottom = png([180, 40, 40, 255]);
+    let top = png([30, 40, 200, 255]);
+    rustgis_tiles::cache::set_fetcher(move |url, done| done(Ok(if url.contains("upload-top") { top.clone() } else { bottom.clone() })));
+    let Some(mut h) = harness() else { return };
+    h.state_mut().run("map.body", json!({"name": "moon", "basemap": false})).expect("Moon");
+    h.state_mut().run("map.projection", json!({"type": "mercator"})).expect("projection");
+    h.state_mut().run("map.setScale", json!({"scale": 10_000_000.0})).expect("tile scale");
+    let m = h.state_mut().session.map_mut();
+    m.layers.clear();
+    m.graticule = false;
+    // More independent pictures than one upload frame accepts, even on a fast adapter.
+    for n in 0..31 {
+        m.tiles.push(TileLayer::new(
+            format!("Bottom {n}"),
+            TileKind::Raster,
+            format!("https://upload-bottom-{n}.test/{{z}}/{{x}}/{{y}}.png"),
+        ));
+    }
+    m.tiles.insert(0, TileLayer::new("Top", TileKind::Raster, "https://upload-top.test/{z}/{x}/{y}.png"));
+    h.state_mut().map.invalidate();
+    wait_for_frame(&mut h);
+    let image = h.render().expect("settled tiles");
+    let center = h.state().map.view_rect.expect("map").0.center();
+    let p = image.get_pixel(center.x.round() as u32, center.y.round() as u32);
+    assert!(u16::from(p[2]) > u16::from(p[0]) * 2, "the waiter returned before the top live layer was uploaded: {p:?}");
+    h.step();
+    assert!(!h.state().map.drawing(), "painting the settled frame must not reveal an upload backlog");
 }
