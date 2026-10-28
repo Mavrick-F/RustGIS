@@ -146,6 +146,9 @@ pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
 /// Marks a returned shortcut picker file; cancellation leaves no pending routing state.
 pub const SHORTCUT_PICK: &str = "\u{1}shortcuts:";
 
+/// Maximum portable shortcut document size: saved overrides plus room for version metadata.
+pub const SHORTCUT_FILE_MAX_BYTES: usize = keymap::MAX_PREF_BYTES + 100;
+
 /// Starts the name of a file the web shell's tool file picker put in the inbox: it goes to the
 /// Tools pane's file parameter, not onto the map.
 pub const TOOL_FILE_PICK: &str = "\u{1}toolfile:";

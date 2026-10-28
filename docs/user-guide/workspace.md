@@ -228,8 +228,10 @@ from the current defaults. `Mod` means Ctrl, or ⌘ on macOS, so the same file w
 Import merges with your current shortcuts: review the counts of bindings, conflicts and unknown
 commands, then choose **Import** or **Cancel**. The file wins on conflicting keys; unrelated
 bindings stay unchanged. Unknown command ids are retained and become usable when their plugin is
-installed. Invalid files are rejected without changing shortcuts. Files are limited to 100,000
-bytes and 1,000 records, and the merged preferences must fit those limits too. If saved preferences
+installed. Import only files you trust: pressing an imported key runs its command with the supplied
+parameters, which can include file writes or preference changes. Inspect shared JSON before importing.
+Invalid files are rejected without changing shortcuts. Files are limited to 100,100
+bytes (including version metadata) and 1,000 records. Merged preference data must fit 100,000 bytes. If saved preferences
 are unreadable, use **Reset All** before importing so they are not silently overwritten.
 
 The version 1 file format is:
@@ -246,6 +248,7 @@ The version 1 file format is:
 ```
 
 Conflicts count distinct keys whose final imported assignment replaces a different current binding.
+Unknown-command counts cover retained imported assignments, excluding removals and overwritten records.
 Records apply in file order; the last assignment to a key wins. A removal removes only the named
 command and parameters at that key, so a different user binding is preserved.
 

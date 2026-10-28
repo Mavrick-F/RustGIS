@@ -471,6 +471,14 @@ async fn read_together(files: Vec<web_sys::File>, mark: &str, inbox: &Inbox, not
     let mut read = Vec::new();
     for file in files {
         let name = file.name();
+        let shortcut = mark == rustgis_ui_egui::SHORTCUT_PICK || (mark.is_empty() && name.to_ascii_lowercase().ends_with(".rgisshortcuts"));
+        if shortcut && file.size() > rustgis_ui_egui::SHORTCUT_FILE_MAX_BYTES as f64 {
+            notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((rustgis_ui_egui::tl!("Shortcut file exceeds the size limit.").into(), true));
+            continue;
+        }
         if let Some(bytes) = crate::parts::read_file(file, notes.clone()).await {
             read.push((name, bytes));
         }

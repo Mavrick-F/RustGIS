@@ -129,7 +129,7 @@ fn command_search_context_menu_opens_matching_editor_row() {
 #[test]
 fn unreadable_preferences_survive_edits_until_an_explicit_reset() {
     let too_many = serde_json::to_string(&vec![serde_json::json!({"keys":"D","command":"select.clear"}); 1_001]).unwrap();
-    for original in ["not json".to_string(), " ".repeat(100_001), too_many] {
+    for original in ["not json".to_string(), " ".repeat(rustgis_ui_egui::SHORTCUT_FILE_MAX_BYTES + 1), too_many] {
         let prefs = Arc::new(Mutex::new(HashMap::from([("shortcut_changes".into(), original.clone())])));
         let mut h = harness(prefs.clone());
         h.state_mut().run("ui.customizeShortcuts", Value::Null).unwrap();
@@ -205,7 +205,7 @@ fn invalid_imports_are_atomic_and_shortcut_commands_reset_defaults() {
         json!({"rustgis_shortcuts":1,"bindings":[{"keys":"D","command":"select.clear"},{"keys":"Mod+C","command":"ui.theme"}]}).to_string(),
         json!({"rustgis_shortcuts":1,"bindings":[{"keys":"D","command":"select.clear"},{"keys":42}]}).to_string(),
         json!({"rustgis_shortcuts":1,"bindings":vec![json!({"keys":"D","command":"select.clear"});1001]}).to_string(),
-        " ".repeat(100_001),
+        " ".repeat(rustgis_ui_egui::SHORTCUT_FILE_MAX_BYTES + 1),
     ] {
         assert!(h.state_mut().run("ui.shortcuts.import", json!({"text":text,"confirm":true})).is_err());
         assert_eq!(h.state().ui.keymap, before);
@@ -231,6 +231,8 @@ fn browser_picker_payload_and_download_use_the_portable_document() {
         download.lock().unwrap().push((name.to_owned(), bytes));
         Ok(())
     }));
+    // A cancelled item picker leaves legacy routing state; the next picker must supersede it.
+    h.state_mut().run("ui.openItem", serde_json::json!({"kind":"styles"})).unwrap();
     h.state_mut().run("ui.shortcuts.import", Value::Null).unwrap();
     assert_eq!(*picked.lock().unwrap(), "shortcuts");
     // Cancelling returns no payload. An unrelated drop must still use normal data routing.
@@ -259,11 +261,16 @@ fn import_counts_final_conflicting_keys_and_recognizes_help() {
         {"keys":"Mod+T","command":"select.clear"},
         {"keys":"Mod+T","command":"ui.shortcuts"},
         {"keys":"F8","command":"ui.theme"},
-        {"keys":"F8","command":"select.clear"}
+        {"keys":"F8","command":"select.clear"},
+        {"keys":"F9","command":"ui.about"},
+        {"keys":"F10","command":"ui.pane.contents"},
+        {"keys":"F11","command":"plugin:absent/h","remove":true},
+        {"keys":"F12","command":"plugin:overwritten/h"},
+        {"keys":"F12","command":"ui.theme"}
     ]})
     .to_string();
     let summary = app.run("ui.shortcuts.import", json!({"text":text})).unwrap();
-    assert_eq!(summary, json!({"bindings":4,"conflicts":1,"unknown_commands":0}));
+    assert_eq!(summary, json!({"bindings":9,"conflicts":1,"unknown_commands":0}));
 }
 
 #[test]
@@ -309,8 +316,65 @@ fn preference_extra_fields_load_but_import_extra_fields_are_rejected() {
     assert!(h.state().ui.keymap.bindings.iter().any(|b| b.chord.key == egui::Key::D && b.command == "select.clear"));
     h.state_mut().run("ui.shortcuts.set", json!({"keys":"F8","command":"ui.theme"})).unwrap();
     assert!(prefs.lock().unwrap()["shortcut_changes"].contains("F8"), "extra fields must not block subsequent saves");
+    let reloaded = harness(prefs.clone());
+    assert!(reloaded.state().ui.keymap.bindings.iter().any(|b| b.chord.key == egui::Key::D && b.command == "select.clear"));
     let before = h.state().ui.keymap.clone();
     let text = json!({"rustgis_shortcuts":1,"bindings":[{"keys":"D","command":"ui.theme","parms":{}}]}).to_string();
     assert!(h.state_mut().run("ui.shortcuts.import", json!({"text":text,"confirm":true})).is_err());
     assert_eq!(h.state().ui.keymap, before);
+}
+
+/// Export/import must work even when valid saved preferences reach the exact payload limit.
+#[test]
+fn full_size_saved_preferences_export_compactly_and_import_again() {
+    use serde_json::json;
+    let prefs = Arc::new(Mutex::new(HashMap::new()));
+    let mut h = harness(prefs.clone());
+    h.state_mut().run("ui.shortcuts.set", json!({"keys":"F8","command":"ui.theme","params":{"value":""}})).unwrap();
+    let overhead = prefs.lock().unwrap()["shortcut_changes"].len();
+    let value = "x".repeat(100_000 - overhead);
+    h.state_mut().run("ui.shortcuts.set", json!({"keys":"F8","command":"ui.theme","params":{"value":value}})).unwrap();
+    assert_eq!(prefs.lock().unwrap()["shortcut_changes"].len(), 100_000);
+    let exported = h.state_mut().run("ui.shortcuts.export", json!({"text":true})).unwrap();
+    let text = exported["text"].as_str().unwrap();
+    assert!(text.len() > 100_000, "the document envelope needs its own allowance");
+    assert!(text.len() <= rustgis_ui_egui::SHORTCUT_FILE_MAX_BYTES);
+    let mut other = harness(Arc::new(Mutex::new(HashMap::new())));
+    other.state_mut().run("ui.shortcuts.import", json!({"text":text,"confirm":true})).unwrap();
+    assert_eq!(other.state().ui.keymap, h.state().ui.keymap);
+}
+
+/// A script changing keys while a preview is open must invalidate the displayed conflict count.
+#[test]
+fn shortcut_commands_invalidate_an_open_import_preview() {
+    use serde_json::json;
+    let mut h = harness(Arc::new(Mutex::new(HashMap::new())));
+    let text = json!({"rustgis_shortcuts":1,"bindings":[{"keys":"F8","command":"ui.theme"}]}).to_string();
+    for (id, params) in [
+        ("ui.shortcuts.set", json!({"keys":"F8","command":"select.clear"})),
+        ("ui.shortcuts.reset", json!({"keys":"F8"})),
+        ("ui.shortcuts.reset", Value::Null),
+    ] {
+        h.state_mut().run("ui.shortcuts.import", json!({"text":text})).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("Import Keyboard Shortcuts").is_some());
+        h.state_mut().run(id, params).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("Import Keyboard Shortcuts").is_none(), "{id} left a stale preview");
+    }
+}
+
+/// Browser inbox callers discard returned errors, so picker failures must also notify the user.
+#[test]
+fn browser_shortcut_errors_are_visible_and_future_versions_are_identified() {
+    use serde_json::json;
+    let mut h = harness(Arc::new(Mutex::new(HashMap::new())));
+    for bytes in [b"invalid".as_slice(), &[255], &vec![b' '; rustgis_ui_egui::SHORTCUT_FILE_MAX_BYTES + 1]] {
+        let before = h.state().session.notices.len();
+        assert!(h.state_mut().open_picked(&format!("{}bad.json", rustgis_ui_egui::SHORTCUT_PICK), bytes).is_err());
+        assert!(h.state().session.notices.len() > before);
+    }
+    let text = json!({"rustgis_shortcuts":2,"bindings":[{"new_field":true}]}).to_string();
+    let error = h.state_mut().run("ui.shortcuts.import", json!({"text":text})).unwrap_err();
+    assert_eq!(error, "Unsupported shortcut file version.");
 }

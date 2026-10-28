@@ -1,7 +1,7 @@
 //! Portable shortcut overrides and atomic, previewed merges into device preferences.
 use crate::{
-    RustGisApp, dialogs,
-    keymap::{Change, Chord, Keymap, MAX_PREF_BYTES},
+    RustGisApp, SHORTCUT_FILE_MAX_BYTES as MAX_FILE_BYTES, dialogs,
+    keymap::{Change, Chord, Keymap},
     shortcutui,
 };
 use serde::{Deserialize, Serialize};
@@ -39,23 +39,28 @@ pub(crate) struct Preview {
 
 /// Route picker and dropped shortcut bytes without allocating a base64 copy of oversized input.
 pub(crate) fn picked(app: &mut RustGisApp, bytes: &[u8]) -> Result<Value, String> {
-    if bytes.len() > MAX_PREF_BYTES {
+    picked_bytes(app, bytes).inspect_err(|error| app.session.notify(error.clone(), true))
+}
+
+/// Validate raw picker bytes before constructing command parameters.
+fn picked_bytes(app: &mut RustGisApp, bytes: &[u8]) -> Result<Value, String> {
+    if bytes.len() > MAX_FILE_BYTES {
         return Err(tl!("Shortcut file exceeds the size limit.").into());
     }
     let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
     run(app, "ui.shortcuts.import", &json!({"text":text}))
 }
 
-/// Read at most the preference limit, including native files and browser picker payloads.
+/// Read at most the portable file limit, including native files and browser picker payloads.
 fn input(p: &Value) -> Result<String, String> {
     let bytes = if let Some(text) = p.get("text").and_then(Value::as_str) {
-        if text.len() > MAX_PREF_BYTES {
+        if text.len() > MAX_FILE_BYTES {
             return Err(tl!("Shortcut file exceeds the size limit.").into());
         }
         return Ok(text.to_owned());
     } else if let Some(data) = p.get("data").and_then(Value::as_str) {
         use base64::Engine;
-        if data.len() > MAX_PREF_BYTES.div_ceil(3) * 4 {
+        if data.len() > MAX_FILE_BYTES.div_ceil(3) * 4 {
             return Err(tl!("Shortcut file exceeds the size limit.").into());
         }
         base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?
@@ -65,7 +70,7 @@ fn input(p: &Value) -> Result<String, String> {
             use std::io::Read;
             let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
             let mut bytes = Vec::new();
-            file.take((MAX_PREF_BYTES + 1) as u64).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            file.take((MAX_FILE_BYTES + 1) as u64).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
             bytes
         }
         #[cfg(target_arch = "wasm32")]
@@ -76,7 +81,7 @@ fn input(p: &Value) -> Result<String, String> {
     } else {
         return Err(tl!("Provide shortcut file text, data or a path.").into());
     };
-    if bytes.len() > MAX_PREF_BYTES {
+    if bytes.len() > MAX_FILE_BYTES {
         return Err(tl!("Shortcut file exceeds the size limit.").into());
     }
     String::from_utf8(bytes).map_err(|e| e.to_string())
@@ -84,10 +89,14 @@ fn input(p: &Value) -> Result<String, String> {
 
 /// Validate every record before exposing a preview or changing the live map.
 fn merge(app: &RustGisApp, text: &str) -> Result<(Keymap, Value), String> {
-    if text.len() > MAX_PREF_BYTES {
+    if text.len() > MAX_FILE_BYTES {
         return Err(tl!("Shortcut file exceeds the size limit.").into());
     }
-    let doc: Document = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if value.get("rustgis_shortcuts").and_then(Value::as_u64).is_some_and(|version| version != 1) {
+        return Err(tl!("Unsupported shortcut file version.").into());
+    }
+    let doc: Document = serde_json::from_value(value).map_err(|e| e.to_string())?;
     if doc.rustgis_shortcuts != 1 {
         return Err(tl!("Unsupported shortcut file version.").into());
     }
@@ -100,16 +109,19 @@ fn merge(app: &RustGisApp, text: &str) -> Result<(Keymap, Value), String> {
         return Err(tl!("Too many shortcut changes to save.").into());
     }
     let mut assigned = std::collections::HashSet::new();
-    let mut unknown = std::collections::HashSet::new();
     for change in &doc.bindings {
         let chord = Chord::parse(&change.keys).ok_or(tl!("Invalid shortcut key."))?;
         if !change.remove {
             assigned.insert(chord);
         }
-        if !known(app, &change.command) {
-            unknown.insert(&change.command);
-        }
     }
+    let unknown = assigned
+        .iter()
+        .filter_map(|&chord| merged.command_for(chord))
+        .filter(|binding| !known(app, &binding.command))
+        .map(|binding| &binding.command)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let conflicts = assigned
         .into_iter()
         .filter(|&chord| {
@@ -118,7 +130,7 @@ fn merge(app: &RustGisApp, text: &str) -> Result<(Keymap, Value), String> {
                 .is_some_and(|new| app.ui.keymap.command_for(chord).is_some_and(|old| !old.runs(&new.command, &new.params)))
         })
         .count();
-    Ok((merged, json!({"bindings":doc.bindings.len(), "conflicts":conflicts, "unknown_commands":unknown.len()})))
+    Ok((merged, json!({"bindings":doc.bindings.len(), "conflicts":conflicts, "unknown_commands":unknown})))
 }
 
 /// Include UI actions outside Command Search when recognizing portable command ids.
@@ -137,6 +149,8 @@ fn known(app: &RustGisApp, id: &str) -> bool {
                 | "ui.identify"
                 | "ui.shortcuts.set"
                 | "ui.shortcuts.reset"
+                | "ui.about"
+                | "ui.pane.contents"
         )
 }
 
@@ -144,9 +158,9 @@ fn known(app: &RustGisApp, id: &str) -> bool {
 fn document(app: &RustGisApp) -> Result<String, String> {
     let changes = app.ui.keymap.preferences(&Keymap::new(&app.session.registry)).ok_or(tl!("Too many shortcut changes to save."))?;
     let bindings = serde_json::from_str(&changes).map_err(|e| e.to_string())?;
-    let text = serde_json::to_string_pretty(&Document { rustgis_shortcuts: 1, bindings }).map_err(|e| e.to_string())?;
-    // The envelope and pretty printing count toward the same import limit.
-    if text.len() > MAX_PREF_BYTES {
+    let text = serde_json::to_string(&Document { rustgis_shortcuts: 1, bindings }).map_err(|e| e.to_string())?;
+    // Compact output and the metadata allowance let every valid saved configuration export.
+    if text.len() > MAX_FILE_BYTES {
         return Err(tl!("Shortcut file exceeds the size limit.").into());
     }
     Ok(text)
@@ -158,6 +172,7 @@ pub fn run(app: &mut RustGisApp, id: &str, p: &Value) -> Result<Value, String> {
         "ui.shortcuts.import" => {
             if p.is_null() || p.as_object().is_some_and(|o| o.is_empty()) {
                 if let Some(open) = &app.services.open_async {
+                    app.ui.pending_open = None;
                     open("shortcuts");
                     return Ok(Value::Null);
                 }
@@ -235,6 +250,7 @@ pub fn run(app: &mut RustGisApp, id: &str, p: &Value) -> Result<Value, String> {
             }
             app.ui.keymap = next;
             shortcutui::save(app);
+            app.ui.shortcut_editor.import = None;
             Ok(Value::Null)
         }
         _ => Err(tl!("Unknown shortcut command.").into()),
