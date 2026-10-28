@@ -647,6 +647,8 @@ pub(crate) fn command_available(id: &str, web: bool) -> bool {
 
 /// The `ui.*` commands Command Search lists: (id, label, ribbon location).
 pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
+    ("ui.shortcuts.import", "Import Keyboard Shortcuts…", "Settings › Customize › Keyboard Shortcuts"),
+    ("ui.shortcuts.export", "Export Keyboard Shortcuts…", "Settings › Customize › Keyboard Shortcuts"),
     ("ui.customizeShortcuts", "Keyboard Shortcuts", "Settings › Customize"),
     ("ui.addData", "Add Data…", "Home › Add"),
     ("ui.addDelimited", "Add Delimited Text…", "Home › Add › Add Data"),

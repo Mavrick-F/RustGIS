@@ -39,7 +39,6 @@ comment on its issue or pull request and open a draft pull request early.
 - Georeferencer: side-by-side window, transform picker, more formats
   ([#609](https://github.com/opengeos/RustGIS/issues/609)).
 
-- Rebindable keyboard shortcuts ([#562](https://github.com/opengeos/RustGIS/issues/562)).
 
 ## Next
 
@@ -166,6 +165,7 @@ Open questions rather than plans; discuss before building.
 - An in-app Python console; an R package.
 
 ## Done
+- Customizable keyboard shortcuts with portable JSON import/export ([#562](https://github.com/opengeos/RustGIS/issues/562)).
 - Save edits back to existing GeoPackage and PostGIS tables on desktop, with atomic saves,
   conflict detection and discard/reload ([#1041](https://github.com/opengeos/RustGIS/issues/1041)).
 - Projects that survive a move: local data paths relative to the project and undoable Repair

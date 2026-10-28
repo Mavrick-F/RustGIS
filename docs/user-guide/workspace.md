@@ -222,6 +222,42 @@ to open it in the editor. If saved preferences are unreadable or exceed the supp
 original value is preserved and edits apply only to the current session. **Reset All** explicitly
 replaces the saved shortcuts with the defaults.
 
+Use **Import…** and **Export…** in the editor to back up shortcuts or share them between desktop,
+macOS and browser sessions. Export writes `rustgis-shortcuts.json`, containing only differences
+from the current defaults. `Mod` means Ctrl, or ⌘ on macOS, so the same file works across platforms.
+Import merges with your current shortcuts: review the counts of bindings, conflicts and unknown
+commands, then choose **Import** or **Cancel**. The file wins on conflicting keys; unrelated
+bindings stay unchanged. Unknown command ids are retained and become usable when their plugin is
+installed. Invalid files are rejected without changing shortcuts. Files are limited to 100,000
+bytes and 1,000 records, and the merged preferences must fit those limits too. If saved preferences
+are unreadable, use **Reset All** before importing so they are not silently overwritten.
+
+The version 1 file format is:
+
+```json
+{
+  "rustgis_shortcuts": 1,
+  "bindings": [
+    { "keys": "D", "command": "tool.set", "params": { "tool": "select" } },
+    { "keys": "T", "command": "select.zoomTo" },
+    { "keys": "Mod+T", "command": "table.open", "remove": true }
+  ]
+}
+```
+
+Conflicts count distinct keys whose final imported assignment replaces a different current binding.
+Records apply in file order; the last assignment to a key wins. A removal removes only the named
+command and parameters at that key, so a different user binding is preserved.
+
+Scripts and UI automation can use these UI-layer commands (the AI Assistant still refuses `ui.*`):
+
+| Command | Parameters and result |
+| --- | --- |
+| `ui.shortcuts.set` | `keys`, `command`, optional `params`; replaces the key's binding. With `remove: true`, removes only that command and parameters at the key. |
+| `ui.shortcuts.reset` | `keys` restores that key's default; no parameters resets all shortcuts. |
+| `ui.shortcuts.export` | No parameters opens Save/download; `path` writes a desktop file; `text: true` returns the document as `text` without a file dialog. |
+| `ui.shortcuts.import` | No parameters opens a file picker. `text`, base64 `data`, or desktop `path` validates and opens the preview, returning `bindings`, `conflicts`, `unknown_commands`. Pass the same document with `confirm: true` to merge and save it. |
+
 See the [keyboard shortcut reference](index.md#keyboard-shortcuts) for project, map and editing
 shortcuts, macOS bindings and text-field undo behavior. **Help › Shortcuts** lists the active
 bindings in the app. Feature editing is described in [Editing](editing.md); layout deletion,

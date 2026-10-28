@@ -71,6 +71,7 @@ mod scriptcolor;
 mod scriptcomplete;
 mod searchbox;
 mod serviceui;
+mod shortcutfile;
 mod shortcutui;
 mod showme;
 mod sourcespane;
@@ -1302,6 +1303,7 @@ impl RustGisApp {
             (".rgistemplate", "project.fromTemplate"),
             (".rgistask", "task.import"),
             (".rgisbookmarks", "bookmark.import"),
+            (".rgisshortcuts", "ui.shortcuts.import"),
             (".rgisreport", "report.open"),
             (".rgisrpttemplate", "report.open"),
             (".rgispres", "presentation.import"),
@@ -2256,6 +2258,9 @@ impl RustGisApp {
                 } else {
                     self.map.popup = None;
                 }
+            }
+            "ui.shortcuts.set" | "ui.shortcuts.reset" | "ui.shortcuts.export" | "ui.shortcuts.import" => {
+                return shortcutfile::run(self, id, p);
             }
             "ui.shortcuts" => self.ui.shortcuts = true,
             "ui.customizeShortcuts" => self.ui.shortcut_editor.open = true,
