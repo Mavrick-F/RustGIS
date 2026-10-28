@@ -143,6 +143,9 @@ pub const SHAPEFILE_PICK: &str = "\u{1}shapefile:";
 /// (`toolfile:nc,nc4`; none for any file).
 pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
 
+/// Marks a returned shortcut picker file; cancellation leaves no pending routing state.
+pub const SHORTCUT_PICK: &str = "\u{1}shortcuts:";
+
 /// Starts the name of a file the web shell's tool file picker put in the inbox: it goes to the
 /// Tools pane's file parameter, not onto the map.
 pub const TOOL_FILE_PICK: &str = "\u{1}toolfile:";
@@ -1254,8 +1257,12 @@ impl RustGisApp {
 
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
-    /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`].
+    /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`];
+    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview.
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
+        if name.starts_with(SHORTCUT_PICK) {
+            return shortcutfile::picked(self, bytes);
+        }
         if let Some(name) = name.strip_prefix(TOOL_FILE_PICK) {
             panes::received_file(self, name, bytes);
             return Ok(Value::Null);
@@ -1322,6 +1329,9 @@ impl RustGisApp {
             return self.run(cmd, json!({"image": base64::engine::general_purpose::STANDARD.encode(bytes)}));
         }
         if let Some(cmd) = self.ui.pending_open.take().or(item) {
+            if cmd == "ui.shortcuts.import" {
+                return shortcutfile::picked(self, bytes);
+            }
             use base64::Engine;
             let mut p = json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes)});
             // A colour ramp file's name tells its format and names its ramp.

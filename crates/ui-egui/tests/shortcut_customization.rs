@@ -221,28 +221,30 @@ fn invalid_imports_are_atomic_and_shortcut_commands_reset_defaults() {
 
 #[test]
 fn browser_picker_payload_and_download_use_the_portable_document() {
-    use base64::Engine;
-    use serde_json::json;
     let picked = Arc::new(Mutex::new(String::new()));
     let downloaded = Arc::new(Mutex::new(Vec::new()));
     let pick = picked.clone();
     let download = downloaded.clone();
-    let mut app = RustGisApp::new(Session::new(Project::default())).with_services(Services {
-        open_async: Some(Box::new(move |purpose| *pick.lock().unwrap() = purpose.to_string())),
-        download: Some(Box::new(move |name, bytes| {
-            download.lock().unwrap().push((name.to_owned(), bytes));
-            Ok(())
-        })),
-        ..Services::default()
-    });
-    app.run("ui.shortcuts.import", Value::Null).unwrap();
+    let mut h = harness(Arc::new(Mutex::new(HashMap::new())));
+    h.state_mut().services.open_async = Some(Box::new(move |purpose| *pick.lock().unwrap() = purpose.to_string()));
+    h.state_mut().services.download = Some(Box::new(move |name, bytes| {
+        download.lock().unwrap().push((name.to_owned(), bytes));
+        Ok(())
+    }));
+    h.state_mut().run("ui.shortcuts.import", Value::Null).unwrap();
     assert_eq!(*picked.lock().unwrap(), "shortcuts");
+    // Cancelling returns no payload. An unrelated drop must still use normal data routing.
+    h.state_mut().open_bytes("drop.geojson", br#"{"type":"FeatureCollection","features":[]}"#).unwrap();
     let text = r#"{"rustgis_shortcuts":1,"bindings":[{"keys":"D","command":"select.clear"}]}"#;
-    // open_bytes is the shared browser inbox/drop entry point, with pending_open set by the picker.
-    app.open_bytes("class.json", text.as_bytes()).unwrap();
-    assert!(!app.ui.keymap.bindings.iter().any(|b| b.chord.key == egui::Key::D && !b.chord.command));
-    app.run("ui.shortcuts.import", json!({"data":base64::engine::general_purpose::STANDARD.encode(text),"confirm":true})).unwrap();
-    app.run("ui.shortcuts.export", Value::Null).unwrap();
+    let marked = format!("{}class.json", rustgis_ui_egui::SHORTCUT_PICK);
+    h.state_mut().open_picked(&marked, text.as_bytes()).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("Bindings: 1 · Conflicts: 0 · Unknown commands: 0").is_some());
+    assert!(!h.state().ui.keymap.bindings.iter().any(|b| b.chord.key == egui::Key::D && !b.chord.command));
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Import").click();
+    h.run_steps(3);
+    assert!(h.state().ui.keymap.bindings.iter().any(|b| b.chord.key == egui::Key::D && b.command == "select.clear"));
+    h.state_mut().run("ui.shortcuts.export", Value::Null).unwrap();
     let files = downloaded.lock().unwrap();
     assert_eq!(files[0].0, "rustgis-shortcuts.json");
     let document: Value = serde_json::from_slice(&files[0].1).unwrap();
@@ -293,4 +295,22 @@ fn imported_unknown_plugin_binding_runs_after_plugin_load() {
     // Only real keyboard dispatch through the newly loaded plugin emits this notification.
     assert!(h.state().session.notices.iter().any(|n| n.text.contains("imported shortcut ran")));
     assert!(rp::unload("shortcut-late"));
+}
+
+/// Saved preferences remain forward tolerant, while imported typos are rejected atomically.
+#[test]
+fn preference_extra_fields_load_but_import_extra_fields_are_rejected() {
+    use serde_json::json;
+    let prefs = Arc::new(Mutex::new(HashMap::from([(
+        "shortcut_changes".into(),
+        r#"[{"keys":"D","command":"select.clear","future":true}]"#.into(),
+    )])));
+    let mut h = harness(prefs.clone());
+    assert!(h.state().ui.keymap.bindings.iter().any(|b| b.chord.key == egui::Key::D && b.command == "select.clear"));
+    h.state_mut().run("ui.shortcuts.set", json!({"keys":"F8","command":"ui.theme"})).unwrap();
+    assert!(prefs.lock().unwrap()["shortcut_changes"].contains("F8"), "extra fields must not block subsequent saves");
+    let before = h.state().ui.keymap.clone();
+    let text = json!({"rustgis_shortcuts":1,"bindings":[{"keys":"D","command":"ui.theme","parms":{}}]}).to_string();
+    assert!(h.state_mut().run("ui.shortcuts.import", json!({"text":text,"confirm":true})).is_err());
+    assert_eq!(h.state().ui.keymap, before);
 }

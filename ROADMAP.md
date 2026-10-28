@@ -39,7 +39,6 @@ comment on its issue or pull request and open a draft pull request early.
 - Georeferencer: side-by-side window, transform picker, more formats
   ([#609](https://github.com/opengeos/RustGIS/issues/609)).
 
-
 ## Next
 
 ### Fixes and quick wins

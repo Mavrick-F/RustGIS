@@ -11,13 +11,39 @@ use serde_json::{Value, json};
 #[serde(deny_unknown_fields)]
 struct Document {
     rustgis_shortcuts: u32,
+    #[serde(deserialize_with = "import_bindings")]
     bindings: Vec<Change>,
+}
+
+/// Reject misspelled fields in portable files without changing tolerant preference loading.
+fn import_bindings<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Change>, D::Error> {
+    use serde::de::Error;
+    Vec::<Value>::deserialize(deserializer)?
+        .into_iter()
+        .map(|record| {
+            if let Some(fields) = record.as_object()
+                && fields.keys().any(|key| !matches!(key.as_str(), "keys" | "command" | "params" | "remove"))
+            {
+                return Err(D::Error::custom(tl!("Unknown shortcut binding field.")));
+            }
+            serde_json::from_value(record).map_err(D::Error::custom)
+        })
+        .collect()
 }
 
 /// A validated document awaiting confirmation; the merge is recomputed against current bindings.
 pub(crate) struct Preview {
     pub text: String,
     pub summary: Value,
+}
+
+/// Route picker and dropped shortcut bytes without allocating a base64 copy of oversized input.
+pub(crate) fn picked(app: &mut RustGisApp, bytes: &[u8]) -> Result<Value, String> {
+    if bytes.len() > MAX_PREF_BYTES {
+        return Err(tl!("Shortcut file exceeds the size limit.").into());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+    run(app, "ui.shortcuts.import", &json!({"text":text}))
 }
 
 /// Read at most the preference limit, including native files and browser picker payloads.
@@ -132,7 +158,6 @@ pub fn run(app: &mut RustGisApp, id: &str, p: &Value) -> Result<Value, String> {
         "ui.shortcuts.import" => {
             if p.is_null() || p.as_object().is_some_and(|o| o.is_empty()) {
                 if let Some(open) = &app.services.open_async {
-                    app.ui.pending_open = Some("ui.shortcuts.import");
                     open("shortcuts");
                     return Ok(Value::Null);
                 }

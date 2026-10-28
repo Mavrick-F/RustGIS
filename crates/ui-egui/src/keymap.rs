@@ -181,7 +181,6 @@ impl Binding {
 
 /// One user change to the defaults, stored in preferences.
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Change {
     pub(crate) keys: String,
     pub(crate) command: String,

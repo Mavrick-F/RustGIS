@@ -936,6 +936,7 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             // So does a file picked for a tool's file parameter, which goes to the Tools pane.
             let tool_exts = purpose.strip_prefix(rustgis_ui_egui::TOOL_FILE_PURPOSE);
             let mark = match (purpose, tool_exts) {
+                ("shortcuts", _) => rustgis_ui_egui::SHORTCUT_PICK,
                 ("text", _) => rustgis_ui_egui::DELIMITED_PICK,
                 ("shapefile", _) => rustgis_ui_egui::SHAPEFILE_PICK,
                 (_, Some(_)) => rustgis_ui_egui::TOOL_FILE_PICK,
