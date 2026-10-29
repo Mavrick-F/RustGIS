@@ -67,8 +67,8 @@ Whoever opens a pull request is responsible for it, however it was written:
 RustGIS is licensed under Apache-2.0, so everything in it must be your own work or come from a
 source whose licence allows that.
 
-- Don't copy code from GPL, LGPL, AGPL or other copyleft projects (such as GRASS, QGIS or GEOS), and don't ask an AI
-  tool to translate it into Rust: a translation is still a copy.
+- Don't copy code from GPL, LGPL, AGPL or other copyleft projects (such as GRASS, QGIS or GEOS),
+  and don't ask an AI tool to translate it into Rust: a translation is still a copy.
 - Implementing an algorithm from a paper, a standard or a specification is fine. Cite it in a
   code comment or the pull request.
 - If you followed another project's code while writing yours, name it in the pull request so a

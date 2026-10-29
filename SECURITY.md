@@ -8,7 +8,7 @@ not in a public issue, pull request or discussion. Include what you did, what ha
 RustGIS version and platform (desktop, browser, command line or Python), and a file, plugin or
 script that shows it if you have one.
 
-A maintainer will reply on the report. We fix confirmed problems in the next release and
+A maintainer will reply on the report. We aim to fix confirmed problems in the next release and
 publish a GitHub security advisory with it, crediting you unless you'd rather we didn't. Please
 give us a chance to release a fix before you disclose the problem publicly.
 
@@ -33,7 +33,8 @@ around one of them is a security problem:
   or exports, or stored outside the OS keychain where the docs say they're kept there.
 - **Files and links**: opening a data file, project, style, package or URL that runs code,
   writes or reads files the user didn't choose, or sends local data somewhere.
-- **The web app**: script injection or reading another site's data at `web.rustgis.app` or the other `rustgis.app` sites.
+- **The web app**: script injection or reading another site's data at `web.rustgis.app` or the
+  other `rustgis.app` sites.
 - **Releases**: anything that could put untrusted code into a published build or package.
 
 ## What doesn't
@@ -42,9 +43,9 @@ Report these as ordinary [issues](https://github.com/opengeos/RustGIS/issues):
 
 - A crash, hang or memory blow-up from a malformed file or parameters, unless it leads to more
   than that. These are bugs we fix, and the regression tests keep them fixed.
-- Anything a plugin marked *Not sandboxed* (a process plugin: a Python script or a native program) does: it runs with your rights, and
-  the install prompt says so.
-- Anything done with the MCP token, after the user approves it, or with approval turned off
+- Anything a plugin marked *Not sandboxed* (a process plugin: a Python script or a native
+  program) does: it runs with your rights, and the install prompt says so.
+- Anything a holder of the MCP token does, after the user approves it, or with approval turned off
   (**Approve agents' actions without asking**, or the MCP server's `--yes`): whoever holds the
   token or approves the action can do what an agent can.
 - Data sent to a service you configured (an AI provider, a geocoder, a tile or database server),

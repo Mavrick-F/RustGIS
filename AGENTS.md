@@ -71,9 +71,9 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
 ## Assets
 - No third-party vendor icons, images, styles, fonts, help text or code. Icons are drawn in
   code (`icons.rs`). Every asset file has a row in `ATTRIBUTION.md`.
-- Never copy or translate code from GPL, LGPL or other copyleft projects (such as GRASS, QGIS or GEOS) into
-  RustGIS, by hand or with an AI tool. Implementing a published algorithm is fine: cite the paper
-  or standard. Name in the pull request any project whose code you followed (see
+- Never copy or translate code from GPL, LGPL or other copyleft projects (such as GRASS, QGIS or
+  GEOS) into RustGIS, by hand or with an AI tool. Implementing a published algorithm is fine: cite
+  the paper or standard. Name in the pull request any project whose code you followed (see
   [CONTRIBUTING.md](CONTRIBUTING.md#where-code-comes-from)).
 - Screenshots and other images are not committed here: they live in
   [opengeos/rustgis-assets](https://github.com/opengeos/rustgis-assets) (WebP, served at

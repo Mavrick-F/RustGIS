@@ -55,8 +55,9 @@ commands are skipped.
 When a reader, writer, tool or command can't represent something, approximates it or drops it, it
 says so in a notice: what was lost, how much and where. Notices go through `Session::notify`,
 which the app shows, the CLI prints and Python returns from `take_notices`. Commands pass on the
-notes readers return, and geoprocessing tools report theirs in `ToolResult::messages`. A result that would be unusable is an error instead.
-Older code doesn't yet report every loss; each one found is treated as a bug.
+notes readers return, and geoprocessing tools report theirs in `ToolResult::messages`. A result
+that would be unusable is an error instead. Older code doesn't yet report every loss; each one
+found is treated as a bug.
 
 ## Pure Rust
 
@@ -64,8 +65,8 @@ RustGIS's engine and apps are written in Rust, and need no GDAL, PROJ or other G
 installed. Some dependencies do compile C code into the build: the Zstandard decoder (`zstd-sys`,
 desktop and browser), SQLite (`libsqlite3-sys` through `rusqlite`, desktop), the TLS cryptography
 libraries (`aws-lc-sys` and `ring`, desktop) and GeographicLib's geodesic routines for the
-azimuthal equidistant projection (`proj4rs-geodesic`, desktop). Building them needs a C compiler; building the web
-app needs clang for Zstandard.
+azimuthal equidistant projection (`proj4rs-geodesic`, desktop). Building them needs a C
+compiler; building the web app needs clang for Zstandard.
 
 ## Secrets
 
