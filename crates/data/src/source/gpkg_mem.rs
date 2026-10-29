@@ -284,18 +284,77 @@ impl FeatureSource for GpkgMemSource {
                 if !in_request(&geometry, req) || (!known && !sample.wants()) {
                     return ControlFlow::Continue(());
                 }
-                let attrs = self
-                    .info
-                    .fields
-                    .iter()
-                    .zip(&self.field_cols)
-                    .map(|(f, &c)| r.get(c).map(|v| value(v, f.ty)).unwrap_or(Value::Null))
-                    .collect();
                 // Integer keys, negative ones too, map to distinct ids.
-                sample.keep(Feature { id: rowid as u64, geometry: Some(geometry), attrs });
+                sample.keep(Feature { id: rowid as u64, geometry: Some(geometry), attrs: self.attrs(r) });
                 ControlFlow::Continue(())
             })
             .map_err(err)?;
         Ok(Batch { matched: sample.seen(), complete: sample.complete(), features: sample.items, skipped })
+    }
+
+    /// The upload is held in memory already, so every table can be visited.
+    fn visits_chunks(&self) -> bool {
+        true
+    }
+
+    /// A scan in table order, keeping and skipping the rows a whole read does.
+    fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
+        let req = Request { extent, limit: usize::MAX };
+        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let mut out = Batch { complete: true, ..Batch::default() };
+        // The visitor's error, which stops the scan.
+        let mut failed = None;
+        self.db
+            .rows(&self.table, |rowid, r| {
+                let blob = match r.get(self.geom_col) {
+                    Some(Val::Blob(b)) => b,
+                    Some(Val::Null) | None => return ControlFlow::Continue(()),
+                    Some(_) => {
+                        out.skipped += 1;
+                        return ControlFlow::Continue(());
+                    }
+                };
+                if super::gpkg_blob::is_empty_blob(blob) {
+                    return ControlFlow::Continue(());
+                }
+                let Some((envelope, body)) = super::gpkg_blob::split_blob(blob) else {
+                    out.skipped += 1;
+                    return ControlFlow::Continue(());
+                };
+                if let (Some(q), Some(e)) = (&native, envelope)
+                    && !e.intersects(q)
+                {
+                    return ControlFlow::Continue(());
+                }
+                let Some(geometry) = wkb::decode(body).and_then(|g| self.reproject.geometry(g)) else {
+                    out.skipped += 1;
+                    return ControlFlow::Continue(());
+                };
+                if !in_request(&geometry, &req) {
+                    return ControlFlow::Continue(());
+                }
+                out.matched += 1;
+                match chunks.push(Feature { id: rowid as u64, geometry: Some(geometry), attrs: self.attrs(r) }) {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(e) => {
+                        failed = Some(e);
+                        ControlFlow::Break(())
+                    }
+                }
+            })
+            .map_err(err)?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        chunks.flush()?;
+        Ok(out)
+    }
+}
+
+impl GpkgMemSource {
+    /// A row's field values, in `info.fields` order.
+    fn attrs(&self, r: &[Val]) -> Vec<Value> {
+        self.info.fields.iter().zip(&self.field_cols).map(|(f, &c)| r.get(c).map(|v| value(v, f.ty)).unwrap_or(Value::Null)).collect()
     }
 }

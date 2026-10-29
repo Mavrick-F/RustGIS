@@ -220,20 +220,16 @@ impl FeatureSource for ShpSource {
     }
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let encoding = self.encoding.decoder();
-        if bytes == 0 {
-            return Err(bad("the render memory budget is zero"));
-        }
+        let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         let extent = extent.map(|e| self.reproject.extent_from_lonlat(&e));
         if extent.is_some_and(|e| e.is_empty()) {
             return Ok(Batch { complete: true, ..Batch::default() });
         }
         let bounds = extent.map(|e| [e.min_x as f32, e.min_y as f32, e.max_x as f32, e.max_y as f32]);
-        let mut used = 0usize;
         let mut shp = Cursor::open(&self.shp)?;
         let mut dbf = Cursor::open(&self.dbf)?;
         let mut buf = Vec::new();
         let mut row = vec![0u8; self.table.row_len];
-        let mut features = Vec::new();
         let mut skipped = 0;
         // The same directory, ordering, extent rules and read-only scan fallback as sampled
         // reads, with no interaction row cap. The index visits records without materializing
@@ -278,27 +274,9 @@ impl FeatureSource for ShpSource {
             } else {
                 vec![Value::Null; self.table.columns.len()]
             };
-            let feature = Feature { id: u64::from(i) + 1, geometry, attrs };
-            let size = super::chunk_memory::feature_bytes(&feature).saturating_add(std::mem::size_of::<Feature>());
-            if !features.is_empty() && used.saturating_add(size) > bytes {
-                features.shrink_to_fit();
-                visit(std::mem::take(&mut features))?;
-                used = 0;
-            }
-            // A geometry is indivisible. Preserve a valid detailed row instead of dropping it
-            // or failing the entire layer when it alone exceeds the chunk target.
-            if size > bytes {
-                visit(vec![feature])?;
-                return Ok(());
-            }
-            used = used.saturating_add(size);
-            features.push(feature);
-            Ok(())
+            chunks.push(Feature { id: u64::from(i) + 1, geometry, attrs })
         })?;
-        if !features.is_empty() {
-            features.shrink_to_fit();
-            visit(features)?;
-        }
+        chunks.flush()?;
         Ok(Batch { features: Vec::new(), matched, complete, skipped })
     }
 }

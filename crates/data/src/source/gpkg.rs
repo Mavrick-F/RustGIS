@@ -368,6 +368,43 @@ impl FeatureSource for GpkgSource {
         }
         Ok(out)
     }
+
+    /// Every table on disk is scanned in full, whatever its index.
+    fn visits_chunks(&self) -> bool {
+        true
+    }
+
+    /// A scan in table order: the envelope in each geometry's header tests the extent before
+    /// decoding, as a read without the spatial index does. It runs on a connection of its own,
+    /// so the map's reads of the layer don't wait for it, and nothing is locked while the
+    /// visitor runs.
+    fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
+        let path = {
+            let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
+            let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
+            conn.path().filter(|p| !p.is_empty()).map(PathBuf::from).ok_or_else(|| DataError::Format("GeoPackage has no file".into()))?
+        };
+        let conn = open_db(&path)?;
+        let req = Request { extent, limit: usize::MAX };
+        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let sql = format!("SELECT {} FROM {}", self.select_list(), quote(&self.table));
+        let mut st = conn.prepare(&sql).map_err(err)?;
+        let mut rows = st.query([]).map_err(err)?;
+        let (mut matched, mut skipped) = (0u64, 0usize);
+        while let Some(r) = rows.next().map_err(err)? {
+            match self.feature(r, native.as_ref(), &req).map_err(err)? {
+                Row::Feature(f) => {
+                    matched += 1;
+                    chunks.push(f)?;
+                }
+                Row::Skip => {}
+                Row::Bad => skipped += 1,
+            }
+        }
+        chunks.flush()?;
+        Ok(Batch { features: Vec::new(), matched, complete: true, skipped })
+    }
 }
 
 /// WGS 84 as OGC WKT, the coordinate system GeoPackages are written in.

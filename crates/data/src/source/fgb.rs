@@ -175,6 +175,59 @@ impl FgbSource {
         Ok(out)
     }
 
+    /// Visits the features a complete [`FgbSource::read_with`] of `extent` gives, in the same
+    /// order and with the same ids, a chunk at a time. An extent read through the index holds
+    /// the feature numbers it finds (8 bytes each) for the ids, as a read does.
+    fn visit_with<R: Read + Seek>(
+        &self,
+        open: &impl Fn() -> Result<R>,
+        extent: Option<Extent>,
+        chunks: &mut super::chunk_memory::Chunker<'_>,
+    ) -> Result<Batch> {
+        let req = Request { extent, limit: usize::MAX };
+        let reader = open_reader(open()?)?;
+        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let indexed = native.filter(|_| self.info.indexed);
+        let mut numbers: Option<Vec<u64>> = match indexed {
+            Some(e) => Some(self.search(open()?, &e)?),
+            None => None,
+        };
+        let mut iter = match indexed {
+            Some(e) => reader.select_bbox(e.min_x, e.min_y, e.max_x, e.max_y).map_err(err)?,
+            None => reader.select_all().map_err(err)?,
+        };
+        // As in a read: an index walk that disagrees with the selection is not trusted for ids.
+        if let Some(nums) = &numbers
+            && iter.features_count() != Some(nums.len())
+        {
+            numbers = None;
+            iter = open_reader(open()?)?.select_all().map_err(err)?;
+        }
+        let mut out = Batch { complete: true, ..Batch::default() };
+        let mut n = 0u64;
+        while let Some(f) = iter.next().map_err(err)? {
+            n += 1;
+            let id = numbers.as_ref().and_then(|v| v.get(usize::try_from(n - 1).unwrap_or(usize::MAX)).copied()).unwrap_or(n);
+            let geometry = f.to_wkb(CoordDimensions::xy()).ok().as_deref().and_then(wkb::decode).and_then(|g| self.reproject.geometry(g));
+            let Some(geometry) = geometry else {
+                out.skipped += 1;
+                continue;
+            };
+            if !in_request(&geometry, &req) {
+                continue;
+            }
+            let mut props = Props { fields: &self.info.fields, values: vec![Value::Null; self.info.fields.len()] };
+            if f.process_properties(&mut props).is_err() {
+                out.skipped += 1;
+                continue;
+            }
+            out.matched += 1;
+            chunks.push(Feature { id, geometry: Some(geometry), attrs: props.values })?;
+        }
+        chunks.flush()?;
+        Ok(out)
+    }
+
     /// The geometry type of a file that declares none (mixed output), from its first features: a
     /// read that stops there, not a pass over the file.
     fn peek_kind(&self) -> GeometryType {
@@ -478,6 +531,22 @@ impl FeatureSource for FgbSource {
         match &self.input {
             Input::Remote(f) => Some(f.clone()),
             _ => None,
+        }
+    }
+
+    /// A file or an upload; a file by its web address is read a view at a time, not in full.
+    fn visits_chunks(&self) -> bool {
+        !matches!(self.input, Input::Remote(_))
+    }
+
+    /// In file order, or the index's order for an extent, as a read; one feature decoded at a
+    /// time from the file or upload.
+    fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
+        match &self.input {
+            Input::Path(p) => self.visit_with(&|| Ok(BufReader::new(std::fs::File::open(p)?)), extent, &mut chunks),
+            Input::Bytes(b) => self.visit_with(&|| Ok(Cursor::new(b.clone())), extent, &mut chunks),
+            Input::Remote(_) => Err(DataError::Unsupported("a whole FlatGeobuf by its web address read a chunk at a time".into())),
         }
     }
 }

@@ -202,15 +202,27 @@ pub struct Batch {
 
 /// A vector data source read in place.
 pub trait FeatureSource: Send + Sync {
-    /// Whether complete, ordered traversal is available without an interaction row limit.
+    /// Whether the map draws the source by complete traversal ([`FeatureSource::visit_chunks`])
+    /// on every render rather than from a sampled view window. Implies
+    /// [`FeatureSource::visits_chunks`].
     fn streams_chunks(&self) -> bool {
         false
     }
-    /// Visits every matching feature in source painter order. Release each chunk before the
-    /// next callback. `bytes` targets owned feature storage; an indivisible larger row is emitted alone.
-    /// Callback errors stop traversal. Success returns an empty, complete summary batch.
+    /// Whether [`FeatureSource::visit_chunks`] is available, for a pass over the whole source
+    /// (an export) that holds one chunk at a time. Unlike [`FeatureSource::streams_chunks`], it
+    /// leaves drawing alone.
+    fn visits_chunks(&self) -> bool {
+        self.streams_chunks()
+    }
+    /// Visits every matching feature in source painter order: the features and ids a complete
+    /// [`FeatureSource::read`] of the same extent gives, in the same order and with the same
+    /// skipped count when there is no extent (an extent read through an index may order and skip
+    /// differently). Release each chunk before the next callback. `bytes` targets owned feature
+    /// storage; an indivisible larger row is emitted alone, and a provider may hold its own unit
+    /// of the file (a GeoParquet row group) besides. Callback errors stop traversal. Success
+    /// returns an empty, complete summary batch, whose `matched` counts the features visited.
     fn visit_chunks(&self, _extent: Option<Extent>, _bytes: usize, _visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
-        Err(DataError::Format("this provider does not support chunk traversal".into()))
+        Err(DataError::Unsupported("a source that can't be read a chunk at a time".into()))
     }
     fn info(&self) -> &SourceInfo;
     /// Whether features were left out of every read because the coordinate system the source
