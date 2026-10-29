@@ -1167,17 +1167,6 @@ fn buffer(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     result(out, format!("Buffer: {n} features at {d} {}", if s(p, "units").is_empty() { "Kilometers" } else { s(p, "units") }))
 }
 
-/// Union of a polygon layer's (selected) features.
-fn union_of(inp: &dyn Inputs, p: &Json, k: &str) -> Result<MultiPolygon<f64>, String> {
-    let ds = input(inp, p, k)?;
-    if ds.geometry_type != GeometryType::Polygon {
-        return Err(format!("'{}' is not a polygon layer", ds.name));
-    }
-    let polys: Vec<MultiPolygon<f64>> =
-        rows(inp, p, k, ds).iter().filter_map(|r| ds.features.get(*r)?.geometry.as_ref()).filter_map(to_multipolygon).collect();
-    Ok(union_all(polys.iter().flat_map(|m| m.0.iter())))
-}
-
 /// A feature as the overlay can take it: a feature of several polygons, which may overlap, unioned
 /// into one; any other as it is, so a single polygon's edges stay exactly where they are.
 fn dissolved(g: &Geometry) -> std::borrow::Cow<'_, Geometry> {
@@ -1225,13 +1214,58 @@ fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry
     }
 }
 
+/// Clip each input feature to the union of only the selected clip polygons whose projected
+/// extents meet it. Union candidates together so overlapping masks never duplicate output.
 fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
-    let mask = union_of(inp, p, "clip")?;
+    let clip_ds = input(inp, p, "clip")?;
+    if clip_ds.geometry_type != GeometryType::Polygon {
+        return Err(format!("'{}' is not a polygon layer", clip_ds.name));
+    }
+    let masks: Vec<_> = rows(inp, p, "clip", clip_ds)
+        .into_iter()
+        .filter_map(|r| clip_ds.features.get(r)?.geometry.as_ref().and_then(to_multipolygon))
+        .map(|m| {
+            let ext = merc_extent(&m);
+            // Union even one polygon: collapsed rings have no filled area. Keep the original
+            // bounds too: rounding an edge must not hide a line the boolean overlay clips to it.
+            let mask = union_all(m.0.iter());
+            let ext = ext.union(&merc_extent(&mask));
+            (mask, ext)
+        })
+        .filter(|(m, _)| !m.0.is_empty())
+        .collect();
+    let index = ExtentIndex::new(masks.iter().map(|(_, ext)| *ext));
+    // Each mask is normalized once. Reuse it directly for one candidate; for several, retain
+    // only the most recent union, avoiding repeated work without an unbounded mask cache.
+    let mut last_candidates = Vec::new();
+    let mut cached_mask = MultiPolygon(Vec::new());
     let mut out = copy_schema(ds, out_name(p, format!("{}_Clip", ds.name)), ds.geometry_type);
     for r in rows(inp, p, "input", ds) {
         let Some(f) = ds.features.get(r) else { continue };
-        if let Some(c) = f.geometry.as_ref().and_then(|g| part(&dissolved(g), &mask, true)) {
+        let Some(g) = f.geometry.as_ref() else { continue };
+        let ext = merc_extent(&to_geo(g));
+        // i_overlay uses 29 integer bits about the domain centre. Allow several grid steps
+        // for normalization and clipping: a line just outside an edge can snap onto it.
+        // This widens only the candidate search; the boolean overlay still decides the result.
+        let domain = index.total.union(&ext);
+        let margin = domain.width().max(domain.height()) / f64::from(1_u32 << 27);
+        let ext = ext.padded(0.0, margin);
+        let near: Vec<_> = index.candidates(&ext).into_iter().filter(|i| masks.get(*i).is_some_and(|(_, e)| e.intersects(&ext))).collect();
+        if near.is_empty() {
+            continue;
+        }
+        let mask = if let [i] = near.as_slice() {
+            let Some((m, _)) = masks.get(*i) else { continue };
+            m
+        } else {
+            if near != last_candidates {
+                cached_mask = union_all(near.iter().filter_map(|i| masks.get(*i)).flat_map(|(m, _)| m.0.iter()));
+                last_candidates = near;
+            }
+            &cached_mask
+        };
+        if let Some(c) = part(&dissolved(g), mask, true) {
             out.push(Some(c), f.attrs.clone());
         }
     }
@@ -2122,6 +2156,8 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     result(out, format!("Simplify: {before} → {after} vertices"))
 }
 
+/// Select against nearby selectors, indexed in the projection used by the predicate and after
+/// any distance buffer. Inversion and input row order keep the exhaustive selection's semantics.
 fn select_by_location(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let sel_ds = input(inp, p, "select")?;
@@ -2129,14 +2165,17 @@ fn select_by_location(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     if dist > 5_000_000.0 {
         return Err("Distance is too large (limit 5000 km)".into());
     }
-    let selectors: Vec<geo::Geometry<f64>> = rows(inp, p, "select", sel_ds)
+    let selectors: Vec<(geo::Geometry<f64>, Extent)> = rows(inp, p, "select", sel_ds)
         .iter()
         .filter_map(|r| sel_ds.features.get(*r)?.geometry.as_ref())
         .map(|g| {
             let b = if dist > 0.0 { geodesic_buffer(g, dist) } else { None };
-            to_geo(b.as_ref().unwrap_or(g))
+            let gg = to_geo(b.as_ref().unwrap_or(g));
+            let ext = merc_extent(&gg);
+            (gg, ext)
         })
         .collect();
+    let index = ExtentIndex::new(selectors.iter().map(|(_, ext)| *ext));
     let invert = s(p, "invert") == "Yes";
     let hits: Vec<usize> = (0..ds.features.len())
         .filter(|r| {
@@ -2144,7 +2183,9 @@ fn select_by_location(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 return false;
             };
             let gg = to_geo(g);
-            let hit = selectors.iter().any(|s| s.intersects(&gg));
+            let ext = merc_extent(&gg);
+            let hit =
+                index.candidates(&ext).into_iter().filter_map(|i| selectors.get(i)).any(|(s, e)| e.intersects(&ext) && s.intersects(&gg));
             hit != invert
         })
         .collect();
@@ -5762,6 +5803,253 @@ mod tests {
             .collect();
         assert_eq!(counts, expected);
         assert!(expected.iter().filter(|n| **n > 0).count() > 200, "most polygons hold some points: {expected:?}");
+    }
+
+    /// Deterministic random masks and mixed inputs exercise an actual grid, overlapping masks,
+    /// holes, multipart features, empty geometry, boundary contacts and projected coordinates.
+    fn indexed_overlay_inputs() -> Map {
+        let mut seed = 0x1142_9e37_79b9u64;
+        let mut rand = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut masks = Dataset::new("masks", GeometryType::Polygon, vec![]);
+        for i in 0..80 {
+            let (x, y, size) = (rand() * 12.0, rand() * 12.0, 0.2 + rand() * 2.0);
+            let mut g = sq(x, y, size);
+            if let Geometry::Polygon(polys) = &mut g {
+                if i % 3 == 0 {
+                    let Geometry::Polygon(hole) = sq(x + size * 0.25, y + size * 0.25, size * 0.5) else {
+                        panic!("square fixture must be a polygon")
+                    };
+                    polys[0].push(hole[0][0].clone());
+                } else if i % 3 == 1 {
+                    let Geometry::Polygon(extra) = sq(x + size * 0.5, y, size) else { panic!("square fixture must be a polygon") };
+                    polys.extend(extra);
+                }
+            }
+            masks.push(Some(g), vec![]);
+        }
+        masks.push(Some(sq(40.0, 80.0, 6.0)), vec![]);
+        masks.push(Some(sq(190.0, 0.0, 2.0)), vec![]);
+        masks.push(Some(sq(0.0, 0.0, 1.0)), vec![]);
+        masks.push(None, vec![]);
+        let mut features = Dataset::new("features", GeometryType::Polygon, vec![Field::new("row", FieldType::Integer)]);
+        for i in 0..180 {
+            let (x, y, size) = (rand() * 16.0 - 2.0, rand() * 16.0 - 2.0, rand() * 2.0 + 0.1);
+            let g = match i % 4 {
+                0 => sq(x, y, size),
+                1 => Geometry::Line(vec![vec![Coord::new(x, y), Coord::new(x + size, y + size)]]),
+                2 => Geometry::Point(Coord::new(x, y)),
+                _ => Geometry::MultiPoint(vec![Coord::new(x, y), Coord::new(x + size, y)]),
+            };
+            features.push(Some(g), vec![Value::Int(i)]);
+        }
+        for g in [
+            Some(Geometry::Point(Coord::new(42.0, 89.0))),
+            Some(Geometry::Point(Coord::new(-169.0, 1.0))),
+            Some(Geometry::Point(Coord::new(0.0, 0.0))),
+            Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0)]])),
+            Some(sq(0.0, 0.0, 1.0)),
+            Some(sq(-3.0, -3.0, 22.0)),
+            Some(Geometry::Polygon(vec![])),
+            None,
+        ] {
+            features.push(g, vec![Value::Int(features.features.len() as i64)]);
+        }
+        Map(HashMap::from([("masks".into(), masks), ("features".into(), features)]))
+    }
+
+    /// Compare polygon coverage rather than vertex order or the overlay's rounding; other
+    /// geometries must have the same parts. The fixture spans nearly the whole projected world:
+    /// its whole-mask integer overlay rounds to centimetres, so allow a 10 cm boundary band
+    /// for symmetric-difference area and 10 cm between line vertices. Points never move.
+    fn assert_same_clip_geometry(got: &Geometry, want: &Geometry) {
+        use geo::{Area, Euclidean, Length};
+        if let (Some(a), Some(b)) = (to_multipolygon(got), to_multipolygon(want)) {
+            let perimeter: f64 = [&a, &b]
+                .into_iter()
+                .flat_map(|m| m.0.iter())
+                .flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
+                .map(|ring| Euclidean.length(ring))
+                .sum();
+            let error = a.xor(&b).unsigned_area();
+            assert!(error <= perimeter * 0.1, "area error {error}: {got:?} vs {want:?}");
+        } else {
+            match (got, want) {
+                (Geometry::Point(_), Geometry::Point(_)) | (Geometry::MultiPoint(_), Geometry::MultiPoint(_)) => {
+                    assert_eq!(got, want);
+                    return;
+                }
+                (Geometry::Line(a), Geometry::Line(b)) => {
+                    assert_eq!(a.len(), b.len(), "line parts differ");
+                    for (a, b) in a.iter().zip(b) {
+                        assert_eq!(a.len(), b.len(), "line vertices differ");
+                    }
+                }
+                _ => panic!("geometry variants differ: {got:?} vs {want:?}"),
+            }
+            let a = to_geo(got);
+            let b = to_geo(want);
+            use geo::CoordsIter;
+            let a: Vec<_> = a.coords_iter().collect();
+            let b: Vec<_> = b.coords_iter().collect();
+            assert_eq!(a.len(), b.len(), "{got:?} vs {want:?}");
+            for (a, b) in a.iter().zip(&b) {
+                assert!((a.x - b.x).abs() < 0.1 && (a.y - b.y).abs() < 0.1, "{got:?} vs {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_clip_matches_the_whole_mask() {
+        let m = indexed_overlay_inputs();
+        let masks = &m.0["masks"];
+        assert!(
+            ExtentIndex::new(masks.features.iter().filter_map(|f| f.geometry.as_ref().and_then(to_multipolygon)).map(|m| merc_extent(&m)))
+                .cell_size()
+                .is_some()
+        );
+        for selection in [None, Some((0..80).filter(|i| i % 3 != 0).collect()), Some(vec![82]), Some(vec![83])] {
+            let mut selected = HashMap::new();
+            if let Some(s) = selection {
+                selected.insert("masks".into(), s);
+                selected.insert("features".into(), (0..188).filter(|i| i % 5 != 0).collect());
+            }
+            let inp = Selected(indexed_overlay_inputs(), selected);
+            let p = serde_json::json!({"input":"features", "clip":"masks"});
+            let masks = &inp.0.0["masks"];
+            let polys: Vec<_> = rows(&inp, &p, "clip", masks)
+                .iter()
+                .filter_map(|r| masks.features[*r].geometry.as_ref().and_then(to_multipolygon))
+                .collect();
+            let whole = union_all(polys.iter().flat_map(|m| m.0.iter()));
+            let features = &inp.0.0["features"];
+            let expected: Vec<_> = rows(&inp, &p, "input", features)
+                .into_iter()
+                .filter_map(|r| {
+                    let f = &features.features[r];
+                    let g = part(&dissolved(f.geometry.as_ref()?), &whole, true)?;
+                    Some((f.attrs.clone(), g))
+                })
+                .collect();
+            let out = layer(crate::run("clip", &inp, &p).unwrap());
+            assert_eq!(out.fields, features.fields);
+            assert_eq!(
+                out.features.iter().map(|f| &f.attrs).collect::<Vec<_>>(),
+                expected.iter().map(|(attrs, _)| attrs).collect::<Vec<_>>()
+            );
+            for (f, (attrs, g)) in out.features.iter().zip(&expected) {
+                assert_eq!(&f.attrs, attrs);
+                assert_same_clip_geometry(f.geometry.as_ref().unwrap(), g);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_clip_handles_repeated_and_changing_neighbourhoods() {
+        let mut masks = Dataset::new("masks", GeometryType::Polygon, vec![]);
+        for i in 0..20 {
+            masks.push(Some(sq(f64::from(i) * 2.0, 0.0, 1.0)), vec![]);
+        }
+        masks.push(Some(sq(0.2, 0.0, 1.0)), vec![]);
+        masks.push(Some(sq(4.2, 0.0, 1.0)), vec![]);
+        // Repeated multi-mask hits, a different multi-mask set, a singleton, a miss, and the
+        // earlier sets again: neither cached unions nor single masks may leak across inputs.
+        let xs = [-100.0, 0.5, 0.6, 4.5, 8.5, 100.0, 0.7, 4.7, 4.8];
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![Field::new("x", FieldType::Double)]);
+        for x in xs {
+            pts.push(Some(Geometry::Point(Coord::new(x, 0.5))), vec![Value::Float(x)]);
+        }
+        let m = Map(HashMap::from([("masks".into(), masks), ("pts".into(), pts)]));
+        let out = layer(crate::run("clip", &m, &serde_json::json!({"input":"pts", "clip":"masks"})).unwrap());
+        let kept: Vec<_> = out.features.iter().map(|f| f.attrs[0].as_f64().unwrap()).collect();
+        assert_eq!(kept, [0.5, 0.6, 4.5, 8.5, 0.7, 4.7, 4.8]);
+        for f in &out.features {
+            assert_eq!(f.geometry, Some(Geometry::Point(Coord::new(f.attrs[0].as_f64().unwrap(), 0.5))));
+        }
+    }
+
+    #[test]
+    fn indexed_clip_discards_masks_with_no_filled_area() {
+        let mut masks = Dataset::new("masks", GeometryType::Polygon, vec![]);
+        masks.push(
+            Some(Geometry::Polygon(vec![vec![vec![
+                Coord::new(0.0, 0.0),
+                Coord::new(1.0, 0.0),
+                Coord::new(2.0, 0.0),
+                Coord::new(0.0, 0.0),
+            ]]])),
+            vec![],
+        );
+        masks.push(Some(sq(10.0, 0.0, 1.0)), vec![]);
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        pts.push(Some(Geometry::Point(Coord::new(0.5, 0.0))), vec![]);
+        pts.push(Some(Geometry::Line(vec![vec![Coord::new(0.5, 0.0), Coord::new(1.5, 0.0)]])), vec![]);
+        pts.push(Some(Geometry::MultiPoint(vec![Coord::new(0.5, 0.0), Coord::new(10.5, 0.5)])), vec![]);
+        let m = Map(HashMap::from([("masks".into(), masks), ("pts".into(), pts)]));
+        let out = layer(crate::run("clip", &m, &serde_json::json!({"input":"pts", "clip":"masks"})).unwrap());
+        assert_eq!(out.features.len(), 1);
+        assert_eq!(out.features[0].geometry, Some(Geometry::Point(Coord::new(10.5, 0.5))));
+    }
+
+    #[test]
+    fn indexed_clip_keeps_lines_that_snap_to_mask_edges() {
+        let mut masks = Dataset::new("masks", GeometryType::Polygon, vec![]);
+        masks.push(Some(sq(0.0, 0.0, 1.0)), vec![]);
+        let mut lines = Dataset::new("lines", GeometryType::Polyline, vec![]);
+        for y in [-1e-12, -0.01] {
+            lines.push(Some(Geometry::Line(vec![vec![Coord::new(0.1, y), Coord::new(0.9, y)]])), vec![]);
+        }
+        let whole = union_all(to_multipolygon(masks.features[0].geometry.as_ref().unwrap()).unwrap().0.iter());
+        let expected: Vec<_> = lines.features.iter().filter_map(|f| part(f.geometry.as_ref().unwrap(), &whole, true)).collect();
+        // The integer overlay snaps the near line onto the edge, but leaves the far line out.
+        assert_eq!(expected.len(), 1);
+        let m = Map(HashMap::from([("masks".into(), masks), ("lines".into(), lines)]));
+        let out = layer(crate::run("clip", &m, &serde_json::json!({"input":"lines", "clip":"masks"})).unwrap());
+        assert_eq!(out.features.iter().filter_map(|f| f.geometry.clone()).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn indexed_selection_matches_every_selector_including_buffers() {
+        for selection in [None, Some((0..80).filter(|i| i % 3 != 0).collect()), Some(vec![83])] {
+            let mut selected = HashMap::new();
+            if let Some(s) = selection {
+                selected.insert("masks".into(), s);
+                // Input selection must not restrict a new location selection.
+                selected.insert("features".into(), vec![0]);
+            }
+            let inp = Selected(indexed_overlay_inputs(), selected);
+            for distance in [0.0, 20_000.0] {
+                for invert in [false, true] {
+                    let p = serde_json::json!({"input":"features", "select":"masks", "distance": distance, "units":"Meters", "invert": if invert { "Yes" } else { "No" }});
+                    let masks = &inp.0.0["masks"];
+                    let selectors: Vec<_> = rows(&inp, &p, "select", masks)
+                        .iter()
+                        .filter_map(|r| masks.features[*r].geometry.as_ref())
+                        .map(|g| {
+                            let b = if distance > 0.0 { geodesic_buffer(g, distance) } else { None };
+                            to_geo(b.as_ref().unwrap_or(g))
+                        })
+                        .collect();
+                    let expected: Vec<_> = inp.0.0["features"]
+                        .features
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(r, f)| {
+                            let gg = to_geo(f.geometry.as_ref()?);
+                            (selectors.iter().any(|s| s.intersects(&gg)) != invert).then_some(r)
+                        })
+                        .collect();
+                    let Output::Selection { rows, .. } = crate::run("selectByLocation", &inp, &p).unwrap().output else {
+                        panic!("expected selection")
+                    };
+                    assert_eq!(rows, expected, "distance={distance}, invert={invert}");
+                }
+            }
+        }
     }
 
     #[test]
