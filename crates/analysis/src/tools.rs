@@ -1236,15 +1236,15 @@ fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         .filter(|(m, _)| !m.0.is_empty())
         .collect();
     let index = ExtentIndex::new(masks.iter().map(|(_, ext)| *ext));
-    // Each mask is normalized once. Reuse it directly for one candidate; for several, retain
-    // only the most recent union, avoiding repeated work without an unbounded mask cache.
-    let mut last_candidates = Vec::new();
-    let mut cached_mask = MultiPolygon(Vec::new());
+    // Single candidates reuse their normalized mask. Retain eight recent multi-mask unions
+    // so alternating neighbourhoods can reuse work too; evict the least recently used.
+    const MAX_CACHED_MASKS: usize = 8;
+    let mut cached_masks: std::collections::VecDeque<(Vec<usize>, MultiPolygon<f64>)> = std::collections::VecDeque::new();
     let mut out = copy_schema(ds, out_name(p, format!("{}_Clip", ds.name)), ds.geometry_type);
     for r in rows(inp, p, "input", ds) {
         let Some(f) = ds.features.get(r) else { continue };
         let Some(g) = f.geometry.as_ref() else { continue };
-        let ext = merc_extent(&to_geo(g));
+        let ext = projected_extent(g);
         // i_overlay uses 29 integer bits about the domain centre. Allow several grid steps
         // for normalization and clipping: a line just outside an edge can snap onto it.
         // This widens only the candidate search; the boolean overlay still decides the result.
@@ -1259,11 +1259,19 @@ fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             let Some((m, _)) = masks.get(*i) else { continue };
             m
         } else {
-            if near != last_candidates {
-                cached_mask = union_all(near.iter().filter_map(|i| masks.get(*i)).flat_map(|(m, _)| m.0.iter()));
-                last_candidates = near;
+            if let Some(pos) = cached_masks.iter().position(|(ids, _)| *ids == near) {
+                if let Some(entry) = cached_masks.remove(pos) {
+                    cached_masks.push_back(entry);
+                }
+            } else {
+                if cached_masks.len() == MAX_CACHED_MASKS {
+                    cached_masks.pop_front();
+                }
+                let mask = union_all(near.iter().filter_map(|i| masks.get(*i)).flat_map(|(m, _)| m.0.iter()));
+                cached_masks.push_back((near, mask));
             }
-            &cached_mask
+            let Some((_, mask)) = cached_masks.back() else { continue };
+            mask
         };
         if let Some(c) = part(&dissolved(g), mask, true) {
             out.push(Some(c), f.attrs.clone());
@@ -2184,8 +2192,7 @@ fn select_by_location(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             };
             let gg = to_geo(g);
             let ext = merc_extent(&gg);
-            let hit =
-                index.candidates(&ext).into_iter().filter_map(|i| selectors.get(i)).any(|(s, e)| e.intersects(&ext) && s.intersects(&gg));
+            let hit = index.any_candidate(&ext, |i| selectors.get(i).is_some_and(|(s, e)| e.intersects(&ext) && s.intersects(&gg)));
             hit != invert
         })
         .collect();
@@ -2609,6 +2616,14 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         output: Output::Layers(vec![OutputLayer::Raster { file_name: format!("{name}.tif"), name, bytes }]),
         messages: vec![msg],
     })
+}
+
+/// Project coordinates directly into an extent, without allocating the full geometry. Use the
+/// same transform and non-finite-coordinate filtering as [`to_geo`] followed by [`merc_extent`].
+fn projected_extent(g: &Geometry) -> Extent {
+    let mut ext = Extent::EMPTY;
+    g.for_each_coord(|c| ext.expand(rustgis_geom::lonlat_to_merc(c)));
+    ext
 }
 
 /// The extent of a geometry in Web Mercator, as [`to_geo`] gives it, leaving out non-finite
@@ -3214,18 +3229,41 @@ impl ExtentIndex {
         self.grid.as_ref().map(|_| self.cell_w.max(self.cell_h))
     }
 
+    /// The cell bounds of the query's overlap with the grid, excluding empty or disjoint queries.
+    fn query_cells(&self, ext: &Extent) -> Option<((i64, i64), (i64, i64))> {
+        if !ext.intersects(&self.total) {
+            return None;
+        }
+        // Clamp to the grid's own bounds, even for a query far larger than the layer.
+        let t = &self.total;
+        Some((self.key(ext.min_x.max(t.min_x), ext.min_y.max(t.min_y)), self.key(ext.max_x.min(t.max_x), ext.max_y.min(t.max_y))))
+    }
+
+    /// Whether any candidate passes `test`, stopping immediately at the first match. Test each
+    /// candidate at most once even when it spans several cells; candidate order is unspecified.
+    fn any_candidate(&self, ext: &Extent, mut test: impl FnMut(usize) -> bool) -> bool {
+        let Some(grid) = &self.grid else { return (0..self.len).any(test) };
+        let Some(((x0, y0), (x1, y1))) = self.query_cells(ext) else { return false };
+        let mut seen = std::collections::HashSet::new();
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                if let Some(indices) = grid.get(&(x, y)) {
+                    for &i in indices {
+                        if seen.insert(i) && test(i) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// The features whose extents may meet `ext`, in order and once each: every feature without a
     /// grid. Each still needs its own test.
     fn candidates(&self, ext: &Extent) -> Vec<usize> {
         let Some(grid) = &self.grid else { return (0..self.len).collect() };
-        if !ext.intersects(&self.total) {
-            return Vec::new();
-        }
-        // Only the part of `ext` over the grid: a feature far larger than the indexed layer would
-        // otherwise reach cells up to the clamp, past the grid's own.
-        let t = &self.total;
-        let (min_x, min_y, max_x, max_y) = (ext.min_x.max(t.min_x), ext.min_y.max(t.min_y), ext.max_x.min(t.max_x), ext.max_y.min(t.max_y));
-        let ((x0, y0), (x1, y1)) = (self.key(min_x, min_y), self.key(max_x, max_y));
+        let Some(((x0, y0), (x1, y1))) = self.query_cells(ext) else { return Vec::new() };
         let mut found = Vec::new();
         for x in x0..=x1 {
             for y in y0..=y1 {
@@ -5973,6 +6011,49 @@ mod tests {
     }
 
     #[test]
+    fn indexed_clip_handles_alternating_neighbourhoods_and_cache_eviction() {
+        let mut masks = Dataset::new("masks", GeometryType::Polygon, vec![]);
+        for i in 0..12 {
+            let x = f64::from(i) * 2.0;
+            masks.push(Some(sq(x, 0.0, 1.0)), vec![]);
+            masks.push(Some(sq(x + 0.2, 0.0, 1.0)), vec![]);
+        }
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![Field::new("x", FieldType::Double)]);
+        // Revisit alternating sets, then overflow the eight-entry cache and revisit evicted sets.
+        for i in [0, 1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 11, 0] {
+            let x = f64::from(i) * 2.0 + 0.5;
+            pts.push(Some(Geometry::Point(Coord::new(x, 0.5))), vec![Value::Float(x)]);
+        }
+        let expected = pts.features.clone();
+        let m = Map(HashMap::from([("masks".into(), masks), ("pts".into(), pts)]));
+        let out = layer(crate::run("clip", &m, &serde_json::json!({"input":"pts", "clip":"masks"})).unwrap());
+        assert_eq!(out.features.len(), expected.len());
+        for (got, want) in out.features.iter().zip(expected) {
+            assert_eq!(got.geometry, want.geometry);
+            assert_eq!(got.attrs, want.attrs);
+        }
+    }
+
+    #[test]
+    fn projected_extent_matches_full_geometry_projection() {
+        let m = indexed_overlay_inputs();
+        for ds in m.0.values() {
+            for g in ds.features.iter().filter_map(|f| f.geometry.as_ref()) {
+                assert_eq!(projected_extent(g), merc_extent(&to_geo(g)), "{g:?}");
+            }
+        }
+        for g in [
+            Geometry::MultiPoint(vec![]),
+            Geometry::Line(vec![vec![]]),
+            Geometry::Polygon(vec![]),
+            Geometry::MultiPoint(vec![Coord::new(f64::NAN, 10.0), Coord::new(200.0, 90.0), Coord::new(-220.0, -90.0)]),
+            Geometry::Point(Coord::new(f64::INFINITY, f64::NEG_INFINITY)),
+        ] {
+            assert_eq!(projected_extent(&g), merc_extent(&to_geo(&g)), "{g:?}");
+        }
+    }
+
+    #[test]
     fn indexed_clip_discards_masks_with_no_filled_area() {
         let mut masks = Dataset::new("masks", GeometryType::Polygon, vec![]);
         masks.push(
@@ -6050,6 +6131,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn extent_index_any_candidate_short_circuits_and_deduplicates() {
+        // Every extent spans many cells. A hit must not collect the rest of the grid first;
+        // on a miss, repeated references to the same selector must not repeat its predicate.
+        for n in [8, 40] {
+            let index = ExtentIndex::new((0..n).map(|_| Extent::new(0.0, 0.0, 10.0, 10.0)));
+            let query = Extent::new(-100.0, -100.0, 100.0, 100.0);
+            let mut calls = 0;
+            assert!(index.any_candidate(&query, |_| {
+                calls += 1;
+                true
+            }));
+            assert_eq!(calls, 1);
+            let mut seen = std::collections::HashSet::new();
+            assert!(!index.any_candidate(&query, |i| {
+                assert!(seen.insert(i));
+                false
+            }));
+            assert_eq!(seen.len(), n);
+        }
+        let index = ExtentIndex::new((0..40).map(|i| Extent::new(f64::from(i), 0.0, f64::from(i) + 0.1, 0.1)));
+        let mut calls = 0;
+        assert!(!index.any_candidate(&Extent::new(0.0, 0.0, 0.1, 0.1), |_| {
+            calls += 1;
+            false
+        }));
+        assert!(calls > 0 && calls < 40, "visited {calls} candidates");
+        assert!(!index.any_candidate(&Extent::new(50.0, 50.0, 51.0, 51.0), |_| panic!("disjoint query visited a candidate")));
+        assert!(!index.any_candidate(&Extent::EMPTY, |_| panic!("empty query visited a candidate")));
     }
 
     #[test]
