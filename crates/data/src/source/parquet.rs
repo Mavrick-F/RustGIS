@@ -47,6 +47,8 @@ pub struct ParquetSource {
     remote: Option<Arc<Remote>>,
     /// Every row group meeting a read's extent is read (a catalog's index), never a sample of them.
     exact: bool,
+    /// The most rows read from one row group: `MAX_GROUP_ROWS`, lowered by tests.
+    group_rows: usize,
 }
 
 impl ParquetSource {
@@ -212,7 +214,8 @@ impl ParquetSource {
             indexed: covering.is_some(),
             notes,
         };
-        let mut src = ParquetSource { info, reader, geom_col, field_cols, covering, reproject, remote, exact: false };
+        let mut src =
+            ParquetSource { info, reader, geom_col, field_cols, covering, reproject, remote, exact: false, group_rows: MAX_GROUP_ROWS };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = super::peek_kind(&src);
         }
@@ -221,13 +224,20 @@ impl ParquetSource {
 }
 
 impl ParquetSource {
+    /// A source that reads at most `rows` of a row group, for tests of the cap.
+    #[cfg(test)]
+    pub(crate) fn with_group_rows(mut self, rows: usize) -> Self {
+        self.group_rows = rows;
+        self
+    }
+
     /// The rows of row group `g` read. Row counts come from the file: bounded by what the
     /// geometry column chunk holds, and by a cap, so a crafted count can't size a huge allocation.
     fn rows_in(&self, md: &ParquetMetaData, g: usize) -> usize {
         let rg = md.row_group(g);
         let rows = usize::try_from(rg.num_rows()).unwrap_or(0);
         let values = rg.columns().get(self.geom_col).and_then(|c| usize::try_from(c.num_values()).ok()).unwrap_or(0);
-        rows.min(values).min(MAX_GROUP_ROWS)
+        rows.min(values).min(self.group_rows)
     }
 
     /// Which rows of row group `g` have a bounding box meeting the native extent `e`, read from
@@ -406,6 +416,16 @@ impl FeatureSource for ParquetSource {
                 },
                 _ => vec![true; self.rows_in(md, g)],
             };
+            // A read takes at most `MAX_GROUP_ROWS` of a row group, and no more than its geometry
+            // column holds. A traversal promises every row, so a group it can't read whole is an
+            // error, not a quietly shorter export.
+            let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
+            if declared > take.len() as u64 {
+                return Err(DataError::Format(format!(
+                    "GeoParquet: row group {g} has {declared} rows, more than the {} read from one",
+                    take.len()
+                )));
+            }
             if !take.iter().any(|&t| t) {
                 continue;
             }

@@ -17,6 +17,8 @@ pub mod edit;
 
 /// Rows fetched by id per query.
 const CHUNK: usize = 500;
+/// The most rows one page of a complete traversal reads under the connection's lock.
+const PAGE_ROWS: usize = 4096;
 
 /// A feature table in a GeoPackage.
 pub struct GpkgSource {
@@ -375,35 +377,64 @@ impl FeatureSource for GpkgSource {
     }
 
     /// A scan in table order: the envelope in each geometry's header tests the extent before
-    /// decoding, as a read without the spatial index does. It runs on a connection of its own,
-    /// so the map's reads of the layer don't wait for it, and nothing is locked while the
-    /// visitor runs.
+    /// decoding, as a read without the spatial index does. The rows come in pages by rowid,
+    /// each read under the connection's lock and handed over after it is released, so the
+    /// map's reads of the layer go on and nothing is locked while the visitor runs. A page
+    /// stops at `bytes` of decoded rows.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
-        let path = {
-            let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
-            let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
-            conn.path().filter(|p| !p.is_empty()).map(PathBuf::from).ok_or_else(|| DataError::Format("GeoPackage has no file".into()))?
-        };
-        let conn = open_db(&path)?;
         let req = Request { extent, limit: usize::MAX };
         let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
-        let sql = format!("SELECT {} FROM {}", self.select_list(), quote(&self.table));
-        let mut st = conn.prepare(&sql).map_err(err)?;
-        let mut rows = st.query([]).map_err(err)?;
-        let (mut matched, mut skipped) = (0u64, 0usize);
-        while let Some(r) = rows.next().map_err(err)? {
-            match self.feature(r, native.as_ref(), &req).map_err(err)? {
-                Row::Feature(f) => {
-                    matched += 1;
-                    chunks.push(f)?;
+        // The rowid follows the selected columns; a scan without an order walks rowids in order.
+        let page = |first: bool| {
+            format!(
+                "SELECT {}, rowid FROM {} WHERE rowid {} ?1 ORDER BY rowid LIMIT {PAGE_ROWS}",
+                self.select_list(),
+                quote(&self.table),
+                if first { ">=" } else { ">" }
+            )
+        };
+        let rowid = self.info.fields.len() + 2;
+        let mut out = Batch { complete: true, ..Batch::default() };
+        let mut after = (i64::MIN, true);
+        loop {
+            let mut rows_read = 0usize;
+            let mut last = None;
+            let mut used = 0usize;
+            let mut kept = Vec::new();
+            {
+                let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
+                let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
+                let mut st = conn.prepare_cached(&page(after.1)).map_err(err)?;
+                let mut rows = st.query([after.0]).map_err(err)?;
+                while let Some(r) = rows.next().map_err(err)? {
+                    rows_read += 1;
+                    last = Some(r.get::<_, i64>(rowid).map_err(err)?);
+                    match self.feature(r, native.as_ref(), &req).map_err(err)? {
+                        Row::Feature(f) => {
+                            used = used.saturating_add(super::chunk_memory::feature_bytes(&f));
+                            kept.push(f);
+                        }
+                        Row::Skip => {}
+                        Row::Bad => out.skipped += 1,
+                    }
+                    if used >= bytes {
+                        break;
+                    }
                 }
-                Row::Skip => {}
-                Row::Bad => skipped += 1,
+            }
+            out.matched += kept.len() as u64;
+            for f in kept {
+                chunks.push(f)?;
+            }
+            match last {
+                // A full page, or one cut short by its bytes: more may follow.
+                Some(k) if rows_read == PAGE_ROWS || used >= bytes => after = (k, false),
+                _ => break,
             }
         }
         chunks.flush()?;
-        Ok(Batch { features: Vec::new(), matched, complete: true, skipped })
+        Ok(out)
     }
 }
 
