@@ -637,7 +637,9 @@ pub fn write_in(ds: &crate::Dataset, crs: Crs) -> Result<Vec<u8>> {
 /// Writes FlatGeobuf with a spatial index to `out`, in `crs`'s coordinates: the features `feed`
 /// hands to the function it is given, a run at a time, their attributes named by `fields`.
 /// Returns how many were left out for having no geometry. The writer keeps each feature in a
-/// temporary file and only its index entry in memory, so a whole layer needn't be held.
+/// temporary file and only its index entry in memory, so a whole layer needn't be held. The
+/// writer needs that file whether or not it writes an index, and the web app has no files, so
+/// there a FlatGeobuf is refused rather than written.
 pub(crate) fn write_features(
     name: &str,
     geometry_type: GeometryType,
@@ -648,6 +650,11 @@ pub(crate) fn write_features(
 ) -> Result<usize> {
     use flatgeobuf::geozero::wkb::Wkb;
     use flatgeobuf::{FgbCrs, FgbWriter, FgbWriterOptions, GeometryType as G};
+    // The writer's temporary file would reach `std::env::temp_dir`, which aborts the web app.
+    // (`cfg!` rather than `#[cfg]`: the rest of the function stays reachable code there.)
+    if cfg!(target_arch = "wasm32") {
+        return Err(DataError::Unsupported("FlatGeobuf in the browser".into()));
+    }
     let ty = match geometry_type {
         GeometryType::Point => G::Unknown,
         GeometryType::Polyline => G::MultiLineString,

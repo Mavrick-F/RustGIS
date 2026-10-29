@@ -420,7 +420,7 @@ impl FeatureSource for ParquetSource {
             }
             // A read takes at most `MAX_GROUP_ROWS` of a row group, and no more than its geometry
             // column holds. A traversal promises every row, so a group it can't read whole is an
-            // error, not a quietly shorter export; it is refused before anything is read.
+            // error, not a quietly shorter export; it is refused before this group is read.
             let readable = self.rows_in(md, g);
             if declared > self.group_rows as u64 {
                 return Err(DataError::Format(format!(

@@ -42,8 +42,8 @@ struct Runs {
     info: SourceInfo,
     features: Vec<Feature>,
     per: usize,
-    /// Fails the traversal after this many runs (of the traversal counted from 0 that the second
-    /// says, or every one).
+    /// Fails the traversal on its run numbered `fail_after` (counted from 0), on the traversal
+    /// numbered `fail_pass` if set, or on every traversal.
     fail_after: Option<usize>,
     fail_pass: Option<usize>,
     passes: std::sync::atomic::AtomicUsize,

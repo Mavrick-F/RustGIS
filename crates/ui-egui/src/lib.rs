@@ -3157,7 +3157,8 @@ impl RustGisApp {
                     .active_layer
                     .and_then(|id| self.session.map().layer(id))
                     .ok_or("select a layer in the Layers pane first")?;
-                // Any format but GeoPackage, which needs SQLite.
+                // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
+                // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 // A streamed layer exports its whole source, not the features read for the view.
                 let whole = if l.is_streamed() { Some(l.load_all()?) } else { None };
