@@ -16,21 +16,11 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
   command/tool with junk parameters. Keep them green; every crash fix gets a regression test.
 
 ## Never silent
-- A wrong result that looks right costs more than a crash. When a reader, writer, tool or command
-  can't represent something, approximates it or drops it, it says what was lost, how much, and in
-  which layer or file: Z values or GeometryCollection members dropped, field names or text cut to
-  fit a format, columns a format can't hold, a coordinate system assumed or a datum shift skipped,
-  invalid features skipped, a cap on how many features are read or drawn.
-- Say it where people and scripts see it: `Session::notify` (a notice the app shows, the CLI
-  prints and Python's `take_notices` returns), directly or by passing on a reader's notes; a tool
-  reports through `ToolResult::messages`, which reach `notify`.
-  `eprintln!`, a log line or a code comment alone doesn't count. When the result would be
-  unusable, return an error instead.
-- One notice per kind of loss per operation, with a count ("Rivers: Z values dropped from 412
-  features"), not one per feature.
-- A test feeds the lossy input and checks for the notice, and checks that an input losing nothing
-  gives none. A silent loss found in existing code is a bug: fix it with a regression test, or
-  open an issue.
+- A reader, writer, tool or command that drops, truncates or approximates data says what, how
+  much and where: Z values dropped, field names cut, a CRS assumed, features skipped.
+- Report through `Session::notify` (app, CLI, Python `take_notices`) or `ToolResult::messages`,
+  one notice per kind with a count; `eprintln!` alone doesn't count. Unusable results are errors.
+- Test both ways: lossy input gives the notice, clean input none. Existing silent losses are bugs.
 
 ## Architecture
 | Layer | Crate | Job |
