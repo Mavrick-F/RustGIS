@@ -15,6 +15,23 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
 - `crates/engine/src/tests.rs::hostile_params_never_panic` and the analysis equivalent run every
   command/tool with junk parameters. Keep them green; every crash fix gets a regression test.
 
+## Never silent
+- A wrong result that looks right costs more than a crash. When a reader, writer, tool or command
+  can't represent something, approximates it or drops it, it says what was lost, how much, and in
+  which layer or file: Z values or GeometryCollection members dropped, field names or text cut to
+  fit a format, columns a format can't hold, a coordinate system assumed or a datum shift skipped,
+  invalid features skipped, a cap on how many features are read or drawn.
+- Say it where people and scripts see it: `Session::notify` (a notice the app shows, the CLI
+  prints and Python's `take_notices` returns), directly or by passing on a reader's notes; a tool
+  reports through `ToolResult::messages`, which reach `notify`.
+  `eprintln!`, a log line or a code comment alone doesn't count. When the result would be
+  unusable, return an error instead.
+- One notice per kind of loss per operation, with a count ("Rivers: Z values dropped from 412
+  features"), not one per feature.
+- A test feeds the lossy input and checks for the notice, and checks that an input losing nothing
+  gives none. A silent loss found in existing code is a bug: fix it with a regression test, or
+  open an issue.
+
 ## Architecture
 | Layer | Crate | Job |
 |---|---|---|
@@ -54,6 +71,10 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
 ## Assets
 - No third-party vendor icons, images, styles, fonts, help text or code. Icons are drawn in
   code (`icons.rs`). Every asset file has a row in `ATTRIBUTION.md`.
+- Never copy or translate code from GPL, LGPL or other copyleft projects (such as GRASS, QGIS or GEOS) into
+  RustGIS, by hand or with an AI tool. Implementing a published algorithm is fine: cite the paper
+  or standard. Name in the pull request any project whose code you followed (see
+  [CONTRIBUTING.md](CONTRIBUTING.md#where-code-comes-from)).
 - Screenshots and other images are not committed here: they live in
   [opengeos/rustgis-assets](https://github.com/opengeos/rustgis-assets) (WebP, served at
   `https://assets.rustgis.app/images/…`) and docs link to them by URL.
