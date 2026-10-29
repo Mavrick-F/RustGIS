@@ -634,6 +634,16 @@ pub fn write_in(ds: &crate::Dataset, crs: Crs) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Refuses to write FlatGeobuf in the browser, before the writer is made: its temporary file
+/// would reach `std::env::temp_dir`, which aborts the web app. (A flag rather than `#[cfg]`, so
+/// both cases are tested natively.)
+fn writable(browser: bool) -> Result<()> {
+    if browser {
+        return Err(DataError::Unsupported("FlatGeobuf in the browser".into()));
+    }
+    Ok(())
+}
+
 /// Writes FlatGeobuf with a spatial index to `out`, in `crs`'s coordinates: the features `feed`
 /// hands to the function it is given, a run at a time, their attributes named by `fields`.
 /// Returns how many were left out for having no geometry. The writer keeps each feature in a
@@ -650,11 +660,7 @@ pub(crate) fn write_features(
 ) -> Result<usize> {
     use flatgeobuf::geozero::wkb::Wkb;
     use flatgeobuf::{FgbCrs, FgbWriter, FgbWriterOptions, GeometryType as G};
-    // The writer's temporary file would reach `std::env::temp_dir`, which aborts the web app.
-    // (`cfg!` rather than `#[cfg]`: the rest of the function stays reachable code there.)
-    if cfg!(target_arch = "wasm32") {
-        return Err(DataError::Unsupported("FlatGeobuf in the browser".into()));
-    }
+    writable(cfg!(target_arch = "wasm32"))?;
     let ty = match geometry_type {
         GeometryType::Point => G::Unknown,
         GeometryType::Polyline => G::MultiLineString,
@@ -709,4 +715,17 @@ pub(crate) fn write_features(
     })?;
     w.write(out).map_err(err)?;
     Ok(left_out)
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    /// The browser refuses FlatGeobuf before the writer, whose temporary file aborted the web
+    /// app, is made; the desktop writes it.
+    #[test]
+    fn flatgeobuf_is_refused_in_the_browser_and_written_on_the_desktop() {
+        assert!(matches!(writable(true), Err(DataError::Unsupported(m)) if m.contains("browser")));
+        assert!(writable(false).is_ok());
+    }
 }

@@ -601,22 +601,29 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub(crate) fn write_atomic_with<T>(path: &Path, write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<T>) -> Result<T> {
     use std::io::Write;
     let tmp = temp_beside(path)?;
-    // Opened before the cleanup below, so a name already taken is never removed.
+    // Opened before the guard, so a name already taken is never removed.
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-    let result = (|| -> Result<T> {
-        let mut out = std::io::BufWriter::new(file);
-        let value = write(&mut out)?;
-        out.flush()?;
-        out.get_ref().sync_all()?;
-        // Closed before the rename, including on Windows.
-        drop(out);
-        std::fs::rename(&tmp, path)?;
-        Ok(value)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    // Removes the file on an error and on a panic in `write` alike, unless it was moved into place.
+    let staged = Staged(&tmp);
+    let mut out = std::io::BufWriter::new(file);
+    let value = write(&mut out)?;
+    out.flush()?;
+    out.get_ref().sync_all()?;
+    // Closed before the rename, including on Windows.
+    drop(out);
+    std::fs::rename(&tmp, path)?;
+    std::mem::forget(staged);
+    Ok(value)
+}
+
+/// A file being written beside its destination: removed when dropped, as an export that
+/// failed or panicked leaves it. A finished export forgets it once the file is renamed.
+struct Staged<'a>(&'a Path);
+
+impl Drop for Staged<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
     }
-    result
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1094,8 +1101,8 @@ fn feature_to_geojson(fields: &[Field], f: &crate::Feature) -> Json {
 }
 
 /// Writes a GeoJSON FeatureCollection a run of features at a time, for exports that never hold
-/// the whole layer: the collection [`to_geojson`] gives for the same features, its members in
-/// the order `type`, `name`, `features`.
+/// the whole layer: the same collection as [`to_geojson`] for the same features, its members
+/// written in the order `type`, `name`, `features` (a serialized [`to_geojson`] sorts them).
 pub(crate) struct GeoJsonWriter<W: std::io::Write> {
     out: W,
     fields: Vec<Field>,

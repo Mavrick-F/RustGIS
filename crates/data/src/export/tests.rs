@@ -240,3 +240,13 @@ fn streamed_exports_refuse_what_they_cant_write() {
     assert!(write_source_in(&whole_only, &layer, &d.join("out.csv"), Crs::LonLat).is_err());
     assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
 }
+
+/// A writer that panics leaves no temporary file behind either.
+#[test]
+fn a_panicking_writer_leaves_nothing_behind() {
+    let d = folder("panic");
+    let path = d.join("out.csv");
+    let r = std::panic::catch_unwind(|| crate::io::write_atomic_with(&path, |_| -> Result<()> { panic!("the writer failed") }));
+    assert!(r.is_err());
+    assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+}
