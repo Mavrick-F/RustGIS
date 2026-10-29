@@ -6,7 +6,8 @@ Report security problems privately through
 [GitHub's private vulnerability reporting](https://github.com/opengeos/RustGIS/security/advisories/new),
 not in a public issue, pull request or discussion. Include what you did, what happened, the
 RustGIS version and platform (desktop, browser, command line or Python), and a file, plugin or
-script that shows it if you have one.
+script that shows it if you have one. Leave out real passwords, keys and private data; a
+made-up example is enough.
 
 A maintainer will reply to the report. We aim to fix confirmed problems in the next release and
 publish a GitHub security advisory with it, crediting you unless you'd rather we didn't. Please
