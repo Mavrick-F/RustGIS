@@ -629,9 +629,26 @@ pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
 /// Writes a dataset whose geometry is in `crs`'s coordinates as FlatGeobuf, with a spatial index,
 /// the file saying `crs`.
 pub fn write_in(ds: &crate::Dataset, crs: Crs) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_features(&ds.name, ds.geometry_type, &ds.fields, crs, &mut out, &mut |add| add(&ds.features))?;
+    Ok(out)
+}
+
+/// Writes FlatGeobuf with a spatial index to `out`, in `crs`'s coordinates: the features `feed`
+/// hands to the function it is given, a run at a time, their attributes named by `fields`.
+/// Returns how many were left out for having no geometry. The writer keeps each feature in a
+/// temporary file and only its index entry in memory, so a whole layer needn't be held.
+pub(crate) fn write_features(
+    name: &str,
+    geometry_type: GeometryType,
+    fields: &[Field],
+    crs: Crs,
+    out: &mut dyn std::io::Write,
+    feed: &mut dyn FnMut(&mut dyn FnMut(&[Feature]) -> Result<()>) -> Result<()>,
+) -> Result<usize> {
     use flatgeobuf::geozero::wkb::Wkb;
     use flatgeobuf::{FgbCrs, FgbWriter, FgbWriterOptions, GeometryType as G};
-    let ty = match ds.geometry_type {
+    let ty = match geometry_type {
         GeometryType::Point => G::Unknown,
         GeometryType::Polyline => G::MultiLineString,
         GeometryType::Polygon => G::MultiPolygon,
@@ -643,8 +660,8 @@ pub fn write_in(ds: &crate::Dataset, crs: Crs) -> Result<Vec<u8>> {
         crs: FgbCrs { org: (code > 0).then_some("EPSG"), code, wkt: wkt.as_deref(), ..Default::default() },
         ..Default::default()
     };
-    let mut w = FgbWriter::create_with_options(&ds.name, ty, options).map_err(err)?;
-    for f in &ds.fields {
+    let mut w = FgbWriter::create_with_options(name, ty, options).map_err(err)?;
+    for f in fields {
         let t = match f.ty {
             FieldType::Integer => ColumnType::Long,
             FieldType::Double => ColumnType::Double,
@@ -653,30 +670,36 @@ pub fn write_in(ds: &crate::Dataset, crs: Crs) -> Result<Vec<u8>> {
         };
         w.add_column(&f.name, t, |_, c| c.nullable = true);
     }
-    for feat in &ds.features {
-        let Some(g) = &feat.geometry else { continue };
-        let mut failed = None;
-        w.add_feature_geom(Wkb(wkb::encode(g)), |out| {
-            use flatgeobuf::geozero::PropertyProcessor;
-            for (i, (f, v)) in ds.fields.iter().zip(&feat.attrs).enumerate() {
-                let r = match v {
-                    Value::Null => continue,
-                    Value::Int(x) => out.property(i, &f.name, &ColumnValue::Long(*x)),
-                    Value::Float(x) => out.property(i, &f.name, &ColumnValue::Double(*x)),
-                    Value::Bool(x) => out.property(i, &f.name, &ColumnValue::Bool(*x)),
-                    Value::Text(x) => out.property(i, &f.name, &ColumnValue::String(x)),
-                };
-                if let Err(e) = r {
-                    failed = Some(e.to_string());
+    let mut left_out = 0;
+    feed(&mut |features| {
+        for feat in features {
+            let Some(g) = &feat.geometry else {
+                left_out += 1;
+                continue;
+            };
+            let mut failed = None;
+            w.add_feature_geom(Wkb(wkb::encode(g)), |out| {
+                use flatgeobuf::geozero::PropertyProcessor;
+                for (i, (f, v)) in fields.iter().zip(&feat.attrs).enumerate() {
+                    let r = match v {
+                        Value::Null => continue,
+                        Value::Int(x) => out.property(i, &f.name, &ColumnValue::Long(*x)),
+                        Value::Float(x) => out.property(i, &f.name, &ColumnValue::Double(*x)),
+                        Value::Bool(x) => out.property(i, &f.name, &ColumnValue::Bool(*x)),
+                        Value::Text(x) => out.property(i, &f.name, &ColumnValue::String(x)),
+                    };
+                    if let Err(e) = r {
+                        failed = Some(e.to_string());
+                    }
                 }
+            })
+            .map_err(|e| DataError::Format(format!("FlatGeobuf: {e}")))?;
+            if let Some(e) = failed {
+                return Err(DataError::Format(format!("FlatGeobuf: {e}")));
             }
-        })
-        .map_err(|e| DataError::Format(format!("FlatGeobuf: {e}")))?;
-        if let Some(e) = failed {
-            return Err(DataError::Format(format!("FlatGeobuf: {e}")));
         }
-    }
-    let mut out = Vec::new();
-    w.write(&mut out).map_err(err)?;
-    Ok(out)
+        Ok(())
+    })?;
+    w.write(out).map_err(err)?;
+    Ok(left_out)
 }

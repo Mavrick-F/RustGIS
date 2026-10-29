@@ -518,7 +518,39 @@ impl Layer {
     /// Every feature of a streamed layer's source (up to the read limit), for tools and for
     /// loading the layer into memory.
     pub fn load_all(&self) -> Result<Dataset, String> {
-        let Some(src) = &self.source else { return Ok(self.dataset.clone()) };
+        let Some(copy) = self.open_source()? else { return Ok(self.dataset.clone()) };
+        let (mut ds, _) = copy.read_all()?;
+        ds.name = self.dataset.name.clone();
+        // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
+        if !self.dataset.fields.is_empty() {
+            ds.fields = self.dataset.fields.clone();
+        }
+        ds.source = self.dataset.source.clone();
+        Ok(ds)
+    }
+
+    /// A streamed layer's source, to export whole a chunk at a time, with a dataset of no
+    /// features naming them as [`Layer::load_all`] would. `None` for a layer not
+    /// read in place, or whose source can't be read so (one by its web address).
+    pub fn chunk_export(&self) -> Result<Option<(std::sync::Arc<dyn rustgis_data::source::FeatureSource>, Dataset)>, String> {
+        let Some(copy) = self.open_source()? else { return Ok(None) };
+        let Some(src) = copy.visit_source() else { return Ok(None) };
+        let info = src.info();
+        let mut ds = Dataset::new(self.dataset.name.clone(), info.geometry_type, info.fields.clone());
+        ds.crs = info.coordinate_system();
+        if !self.dataset.fields.is_empty() {
+            ds.fields = self.dataset.fields.clone();
+        }
+        // (A source declaring no geometry type takes its first geometry's when exported, as a
+        // whole read does.)
+        ds.source = self.dataset.source.clone();
+        Ok(Some((src, ds)))
+    }
+
+    /// A copy of a streamed layer's source, opened (waiting for one still opening, as an export
+    /// does); `None` for a layer not read in place.
+    fn open_source(&self) -> Result<Option<source::SourceLayer>, String> {
+        let Some(src) = &self.source else { return Ok(None) };
         let mut copy = src.clone();
         if !copy.is_open() {
             copy.open()?;
@@ -532,14 +564,7 @@ impl Layer {
                     .unwrap_or_else(|| "the layer's source is still opening: try again once it has opened".into()));
             }
         }
-        let (mut ds, _) = copy.read_all()?;
-        ds.name = self.dataset.name.clone();
-        // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
-        if !self.dataset.fields.is_empty() {
-            ds.fields = self.dataset.fields.clone();
-        }
-        ds.source = self.dataset.source.clone();
-        Ok(ds)
+        Ok(Some(copy))
     }
 
     /// The symbol a row draws with.

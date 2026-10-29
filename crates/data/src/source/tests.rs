@@ -1874,6 +1874,10 @@ fn geopackage_flatgeobuf_and_geoparquet_visit_what_a_whole_read_gives() {
         let error = src.visit_chunks(None, 4096, &mut |_| Ok(())).unwrap_err().to_string();
         assert!(error.contains("replaced"), "{error}");
         assert_eq!(src.read(&Request::all()).unwrap().features.len(), 600);
+        // A file removed is missing, not replaced.
+        std::fs::remove_file(&gpkg).unwrap();
+        let error = src.visit_chunks(None, 4096, &mut |_| Ok(())).unwrap_err().to_string();
+        assert!(!error.contains("replaced"), "{error}");
     }
     // An unreadable geometry is skipped and counted, and a row without one left out, as a read does.
     drop(sources);

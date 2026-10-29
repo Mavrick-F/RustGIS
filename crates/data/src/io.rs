@@ -338,7 +338,14 @@ pub fn project(ds: &Dataset, crs: Crs) -> Result<Dataset> {
     }
     let mut out = ds.clone();
     let t = crs.transformer().map_err(DataError::Format)?;
-    for f in &mut out.features {
+    project_features(&mut out.features, &t, crs)?;
+    Ok(out)
+}
+
+/// Converts features' longitude/latitude geometry in place to the coordinates of `crs`, through
+/// its transformer `t`. Fails on a coordinate the system can't hold, naming its feature.
+pub(crate) fn project_features(features: &mut [crate::Feature], t: &crate::raster::Transformer, crs: Crs) -> Result<()> {
+    for f in features {
         if let Some(g) = f.geometry.take() {
             let mut ok = true;
             let p = g.map_coords(&|c| t.from_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
@@ -349,7 +356,7 @@ pub fn project(ds: &Dataset, crs: Crs) -> Result<Dataset> {
             f.geometry = Some(p);
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Defines the CRS of the dataset's native coordinates without changing those numeric values.
@@ -385,7 +392,7 @@ pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
 
 /// Refuses a system without an EPSG code for a GeoPackage or FlatGeobuf: their readers (RustGIS's
 /// among them) go by the code, and would read the file as longitude/latitude.
-fn check_projected(ext: &str, crs: Crs) -> Result<()> {
+pub(crate) fn check_projected(ext: &str, crs: Crs) -> Result<()> {
     if crs.epsg() == 0 && matches!(ext, "gpkg" | "fgb") {
         return Err(DataError::Unsupported(format!(".{ext} in {}: give the system as an EPSG code", crs.label())));
     }
@@ -408,9 +415,12 @@ pub fn write_bytes_in(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usi
 
 /// [`write_bytes_in`] for a dataset already in `crs`'s coordinates.
 fn projected_bytes(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usize)> {
-    let fmt = |e: serde_json::Error| DataError::Format(e.to_string());
     Ok(match ext {
-        "geojson" | "json" => (serde_json::to_vec(&to_geojson(ds)).map_err(fmt)?, 0),
+        "geojson" | "json" => {
+            let mut w = GeoJsonWriter::new(Vec::new(), &ds.name, &ds.fields)?;
+            w.write(&ds.features)?;
+            (w.finish()?, 0)
+        }
         "csv" => (to_csv(ds)?.into_bytes(), 0),
         "fgb" => (crate::source::fgb::write_in(ds, crs)?, without_geometry(ds)),
         "parquet" | "geoparquet" => (crate::source::parquet::write(ds)?, 0),
@@ -584,6 +594,28 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// As [`write_atomic`], the file written through `write` as it goes rather than from bytes held
+/// whole: for exports that write a layer a chunk at a time. Returns what `write` returns.
+pub(crate) fn write_atomic_with<T>(path: &Path, write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<T>) -> Result<T> {
+    use std::io::Write;
+    let tmp = temp_beside(path)?;
+    let result = (|| -> Result<T> {
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut out = std::io::BufWriter::new(file);
+        let value = write(&mut out)?;
+        out.flush()?;
+        out.get_ref().sync_all()?;
+        // Closed before the rename, including on Windows.
+        drop(out);
+        std::fs::rename(&tmp, path)?;
+        Ok(value)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1045,19 +1077,55 @@ pub(crate) fn dominant_type(ds: &Dataset) -> GeometryType {
     }
 }
 
+/// A dataset as a GeoJSON FeatureCollection value, in longitude/latitude.
 pub fn to_geojson(ds: &Dataset) -> Json {
-    let features: Vec<Json> = ds
-        .features
-        .iter()
-        .map(|f| {
-            let mut props = Map::new();
-            for (field, v) in ds.fields.iter().zip(&f.attrs) {
-                props.insert(field.name.clone(), v.to_json());
-            }
-            json!({"type": "Feature", "id": f.id, "properties": props, "geometry": f.geometry.as_ref().map(geometry_to_geojson)})
-        })
-        .collect();
+    let features: Vec<Json> = ds.features.iter().map(|f| feature_to_geojson(&ds.fields, f)).collect();
     json!({"type": "FeatureCollection", "name": ds.name, "features": features})
+}
+
+/// A feature as a GeoJSON Feature, its attributes named by `fields`.
+fn feature_to_geojson(fields: &[Field], f: &crate::Feature) -> Json {
+    let mut props = Map::new();
+    for (field, v) in fields.iter().zip(&f.attrs) {
+        props.insert(field.name.clone(), v.to_json());
+    }
+    json!({"type": "Feature", "id": f.id, "properties": props, "geometry": f.geometry.as_ref().map(geometry_to_geojson)})
+}
+
+/// Writes a GeoJSON FeatureCollection a run of features at a time, for exports that never hold
+/// the whole layer: the collection [`to_geojson`] gives for the same features, its members in
+/// the order `type`, `name`, `features`.
+pub(crate) struct GeoJsonWriter<W: std::io::Write> {
+    out: W,
+    fields: Vec<Field>,
+    first: bool,
+}
+
+impl<W: std::io::Write> GeoJsonWriter<W> {
+    /// Starts the collection named `name`, its features' attributes named by `fields`.
+    pub(crate) fn new(mut out: W, name: &str, fields: &[Field]) -> Result<Self> {
+        out.write_all(br#"{"type":"FeatureCollection","name":"#)?;
+        serde_json::to_writer(&mut out, name).map_err(|e| DataError::Format(e.to_string()))?;
+        out.write_all(br#","features":["#)?;
+        Ok(GeoJsonWriter { out, fields: fields.to_vec(), first: true })
+    }
+
+    /// Writes the next features.
+    pub(crate) fn write(&mut self, features: &[crate::Feature]) -> Result<()> {
+        for f in features {
+            if !std::mem::take(&mut self.first) {
+                self.out.write_all(b",")?;
+            }
+            serde_json::to_writer(&mut self.out, &feature_to_geojson(&self.fields, f)).map_err(|e| DataError::Format(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Closes the collection and gives the writer back.
+    pub(crate) fn finish(mut self) -> Result<W> {
+        self.out.write_all(b"]}")?;
+        Ok(self.out)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1439,34 +1507,60 @@ fn csv_cell(v: &Value) -> String {
     }
 }
 
+/// A dataset as CSV text: its fields, and a point layer's longitude and latitude ([`CsvWriter`]).
 pub fn to_csv(ds: &Dataset) -> Result<String> {
-    let mut w = csv::Writer::from_writer(Vec::new());
-    let point = ds.geometry_type == GeometryType::Point;
-    let mut head: Vec<String> = ds.fields.iter().map(|f| f.name.clone()).collect();
-    if point {
-        // Coordinate columns get names that don't collide with existing fields.
-        for base in ["longitude", "latitude"] {
-            let mut name = base.to_string();
-            let mut i = 1;
-            while head.iter().any(|h| h.eq_ignore_ascii_case(&name)) {
-                name = format!("{base}_{i}");
-                i += 1;
-            }
-            head.push(name);
-        }
-    }
-    w.write_record(&head).map_err(|e| DataError::Format(e.to_string()))?;
-    for f in &ds.features {
-        let mut row: Vec<String> = f.attrs.iter().map(csv_cell).collect();
+    let mut w = CsvWriter::new(Vec::new(), &ds.fields, ds.geometry_type)?;
+    w.write(&ds.features)?;
+    String::from_utf8(w.finish()?).map_err(|e| DataError::Format(e.to_string()))
+}
+
+/// Writes CSV a run of features at a time: a header of the fields, and for a point layer
+/// longitude and latitude columns after them.
+pub(crate) struct CsvWriter<W: std::io::Write> {
+    w: csv::Writer<W>,
+    point: bool,
+}
+
+impl<W: std::io::Write> CsvWriter<W> {
+    /// Writes the header for `fields`, with coordinate columns for a point layer.
+    pub(crate) fn new(out: W, fields: &[Field], geometry_type: GeometryType) -> Result<Self> {
+        let mut w = csv::Writer::from_writer(out);
+        let point = geometry_type == GeometryType::Point;
+        let mut head: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
         if point {
-            let c = f.geometry.as_ref().and_then(|g| g.label_point());
-            row.push(c.map(|c| c.x.to_string()).unwrap_or_default());
-            row.push(c.map(|c| c.y.to_string()).unwrap_or_default());
+            // Coordinate columns get names that don't collide with existing fields.
+            for base in ["longitude", "latitude"] {
+                let mut name = base.to_string();
+                let mut i = 1;
+                while head.iter().any(|h| h.eq_ignore_ascii_case(&name)) {
+                    name = format!("{base}_{i}");
+                    i += 1;
+                }
+                head.push(name);
+            }
         }
-        w.write_record(&row).map_err(|e| DataError::Format(e.to_string()))?;
+        w.write_record(&head).map_err(|e| DataError::Format(e.to_string()))?;
+        Ok(CsvWriter { w, point })
     }
-    let bytes = w.into_inner().map_err(|e| DataError::Format(e.to_string()))?;
-    String::from_utf8(bytes).map_err(|e| DataError::Format(e.to_string()))
+
+    /// Writes the next features, a row each.
+    pub(crate) fn write(&mut self, features: &[crate::Feature]) -> Result<()> {
+        for f in features {
+            let mut row: Vec<String> = f.attrs.iter().map(csv_cell).collect();
+            if self.point {
+                let c = f.geometry.as_ref().and_then(|g| g.label_point());
+                row.push(c.map(|c| c.x.to_string()).unwrap_or_default());
+                row.push(c.map(|c| c.y.to_string()).unwrap_or_default());
+            }
+            self.w.write_record(&row).map_err(|e| DataError::Format(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Flushes the rows and gives the writer back.
+    pub(crate) fn finish(self) -> Result<W> {
+        self.w.into_inner().map_err(|e| DataError::Format(e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -967,6 +967,20 @@ fn wkb_type_name(g: &crate::Geometry) -> &'static str {
 /// `bbox` covering column so readers can skip rows and row groups by extent. A table without
 /// geometry is written as plain Parquet.
 pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
+    write_features(ds.geometry_type, &ds.fields, Vec::new(), &mut |add| add(&ds.features))
+}
+
+/// Writes GeoParquet to `out`: the features `feed` hands to the function it is given, a run at
+/// a time, their attributes named by `fields`. Each run is written as row groups of at most
+/// `WRITE_GROUP_ROWS` rows, so only one run is held (a run's last group can be smaller, and a
+/// streamed export's groups end with its chunks); the geometry types and bounding box the `geo`
+/// metadata gives are gathered as the rows go and written with the footer.
+pub(crate) fn write_features<W: std::io::Write + Send>(
+    geometry_type: GeometryType,
+    fields: &[Field],
+    out: W,
+    feed: &mut dyn FnMut(&mut dyn FnMut(&[Feature]) -> Result<()>) -> Result<()>,
+) -> Result<W> {
     use parquet::basic::{Compression, Repetition};
     use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int64Type};
     use parquet::file::metadata::KeyValue;
@@ -974,9 +988,9 @@ pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::types::Type;
 
-    let has_geom = ds.geometry_type != GeometryType::None;
-    let geom_name = free_name(&ds.fields, "geometry");
-    let bbox_name = free_name(&ds.fields, "bbox");
+    let has_geom = geometry_type != GeometryType::None;
+    let geom_name = free_name(fields, "geometry");
+    let bbox_name = free_name(fields, "bbox");
     let prim = |name: &str, t: Physical, rep: Repetition, logical: Option<LogicalType>| {
         Type::primitive_type_builder(name, t).with_repetition(rep).with_logical_type(logical).build().map(Arc::new).map_err(err)
     };
@@ -991,7 +1005,7 @@ pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
             Type::group_type_builder(&bbox_name).with_repetition(Repetition::OPTIONAL).with_fields(corners).build().map_err(err)?,
         ));
     }
-    for f in &ds.fields {
+    for f in fields {
         cols.push(match f.ty {
             FieldType::Integer => prim(&f.name, Physical::INT64, Repetition::OPTIONAL, None)?,
             FieldType::Double => prim(&f.name, Physical::DOUBLE, Repetition::OPTIONAL, None)?,
@@ -1001,12 +1015,102 @@ pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
     }
     let schema = Arc::new(Type::group_type_builder("schema").with_fields(cols).build().map_err(err)?);
 
-    let mut metadata = Vec::new();
+    let props = WriterProperties::builder().set_compression(Compression::SNAPPY).set_created_by("RustGIS".to_string()).build();
+    let mut w = SerializedFileWriter::new(out, schema, Arc::new(props)).map_err(err)?;
+
+    /// The row group's next column writer; an error should the schema end first.
+    fn next_column<'a, W: std::io::Write + Send>(
+        rg: &'a mut parquet::file::writer::SerializedRowGroupWriter<'_, W>,
+    ) -> Result<parquet::file::writer::SerializedColumnWriter<'a>> {
+        rg.next_column().map_err(err)?.ok_or_else(|| DataError::Format("GeoParquet: the schema ended early".into()))
+    }
+    /// The present values of an optional column and its definition levels.
+    fn levels<T>(values: impl Iterator<Item = Option<T>>) -> (Vec<T>, Vec<i16>) {
+        let (mut vals, mut defs) = (Vec::new(), Vec::new());
+        for v in values {
+            defs.push(i16::from(v.is_some()));
+            vals.extend(v);
+        }
+        (vals, defs)
+    }
+    let mut types: Vec<&'static str> = Vec::new();
+    let mut extent = Extent::EMPTY;
+    feed(&mut |features| {
+        for rows in features.chunks(WRITE_GROUP_ROWS) {
+            for g in rows.iter().filter_map(|f| f.geometry.as_ref()) {
+                let t = wkb_type_name(g);
+                if !types.contains(&t) {
+                    types.push(t);
+                }
+                extent = extent.union(&g.extent());
+            }
+            let mut rg = w.next_row_group().map_err(err)?;
+            if has_geom {
+                let (vals, defs) = levels(rows.iter().map(|f| f.geometry.as_ref().map(|g| ByteArray::from(wkb::encode(g)))));
+                let mut c = next_column(&mut rg)?;
+                c.typed::<ByteArrayType>().write_batch(&vals, Some(&defs), None).map_err(err)?;
+                c.close().map_err(err)?;
+                // A feature's bounding box, `None` without geometry (or with an empty one).
+                let boxes: Vec<Option<Extent>> =
+                    rows.iter().map(|f| f.geometry.as_ref().map(|g| g.extent()).filter(|e| !e.is_empty())).collect();
+                for corner in 0..4 {
+                    let (vals, defs) = levels(boxes.iter().map(|b| {
+                        b.map(|e| match corner {
+                            0 => e.min_x,
+                            1 => e.min_y,
+                            2 => e.max_x,
+                            _ => e.max_y,
+                        })
+                    }));
+                    let mut c = next_column(&mut rg)?;
+                    c.typed::<DoubleType>().write_batch(&vals, Some(&defs), None).map_err(err)?;
+                    c.close().map_err(err)?;
+                }
+            }
+            for (i, f) in fields.iter().enumerate() {
+                let attr = |r: &Feature| r.attrs.get(i).cloned().unwrap_or(Value::Null);
+                let mut c = next_column(&mut rg)?;
+                match f.ty {
+                    FieldType::Integer => {
+                        let (v, d) = levels(rows.iter().map(|r| match attr(r) {
+                            Value::Int(x) => Some(x),
+                            Value::Bool(b) => Some(i64::from(b)),
+                            // A whole float fits; anything else would lose its value.
+                            Value::Float(x) if x.fract() == 0.0 && x.abs() < 9.0e18 => Some(x as i64),
+                            Value::Text(s) => s.trim().parse().ok(),
+                            _ => None,
+                        }));
+                        c.typed::<Int64Type>().write_batch(&v, Some(&d), None).map_err(err)?;
+                    }
+                    FieldType::Double => {
+                        let (v, d) = levels(rows.iter().map(|r| attr(r).as_f64()));
+                        c.typed::<DoubleType>().write_batch(&v, Some(&d), None).map_err(err)?;
+                    }
+                    FieldType::Boolean => {
+                        let (v, d) = levels(rows.iter().map(|r| match attr(r) {
+                            Value::Bool(b) => Some(b),
+                            Value::Int(x) => Some(x != 0),
+                            _ => None,
+                        }));
+                        c.typed::<BoolType>().write_batch(&v, Some(&d), None).map_err(err)?;
+                    }
+                    FieldType::Text => {
+                        let (v, d) = levels(rows.iter().map(|r| match attr(r) {
+                            Value::Null => None,
+                            v => Some(ByteArray::from(v.to_string().into_bytes())),
+                        }));
+                        c.typed::<ByteArrayType>().write_batch(&v, Some(&d), None).map_err(err)?;
+                    }
+                }
+                c.close().map_err(err)?;
+            }
+            rg.close().map_err(err)?;
+        }
+        Ok(())
+    })?;
     if has_geom {
-        let mut types: Vec<&str> = ds.features.iter().filter_map(|f| f.geometry.as_ref()).map(wkb_type_name).collect();
         types.sort_unstable();
-        types.dedup();
-        let e = ds.extent();
+        let e = extent;
         let mut col = serde_json::json!({
             "encoding": "WKB",
             "geometry_types": types,
@@ -1019,91 +1123,7 @@ pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
             col["bbox"] = serde_json::json!([e.min_x, e.min_y, e.max_x, e.max_y]);
         }
         let geo = serde_json::json!({"version": "1.1.0", "primary_column": geom_name, "columns": {geom_name.clone(): col}});
-        metadata.push(KeyValue::new("geo".to_string(), geo.to_string()));
-    }
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_created_by("RustGIS".to_string())
-        .set_key_value_metadata(Some(metadata))
-        .build();
-    let mut w = SerializedFileWriter::new(Vec::new(), schema, Arc::new(props)).map_err(err)?;
-
-    fn next_column<'a>(
-        rg: &'a mut parquet::file::writer::SerializedRowGroupWriter<'_, Vec<u8>>,
-    ) -> Result<parquet::file::writer::SerializedColumnWriter<'a>> {
-        rg.next_column().map_err(err)?.ok_or_else(|| DataError::Format("GeoParquet: the schema ended early".into()))
-    }
-    // The present values of an optional column and its definition levels.
-    fn levels<T>(values: impl Iterator<Item = Option<T>>) -> (Vec<T>, Vec<i16>) {
-        let (mut vals, mut defs) = (Vec::new(), Vec::new());
-        for v in values {
-            defs.push(i16::from(v.is_some()));
-            vals.extend(v);
-        }
-        (vals, defs)
-    }
-    for rows in ds.features.chunks(WRITE_GROUP_ROWS) {
-        let mut rg = w.next_row_group().map_err(err)?;
-        if has_geom {
-            let (vals, defs) = levels(rows.iter().map(|f| f.geometry.as_ref().map(|g| ByteArray::from(wkb::encode(g)))));
-            let mut c = next_column(&mut rg)?;
-            c.typed::<ByteArrayType>().write_batch(&vals, Some(&defs), None).map_err(err)?;
-            c.close().map_err(err)?;
-            // A feature's bounding box, `None` without geometry (or with an empty one).
-            let boxes: Vec<Option<Extent>> =
-                rows.iter().map(|f| f.geometry.as_ref().map(|g| g.extent()).filter(|e| !e.is_empty())).collect();
-            for corner in 0..4 {
-                let (vals, defs) = levels(boxes.iter().map(|b| {
-                    b.map(|e| match corner {
-                        0 => e.min_x,
-                        1 => e.min_y,
-                        2 => e.max_x,
-                        _ => e.max_y,
-                    })
-                }));
-                let mut c = next_column(&mut rg)?;
-                c.typed::<DoubleType>().write_batch(&vals, Some(&defs), None).map_err(err)?;
-                c.close().map_err(err)?;
-            }
-        }
-        for (i, f) in ds.fields.iter().enumerate() {
-            let attr = |r: &Feature| r.attrs.get(i).cloned().unwrap_or(Value::Null);
-            let mut c = next_column(&mut rg)?;
-            match f.ty {
-                FieldType::Integer => {
-                    let (v, d) = levels(rows.iter().map(|r| match attr(r) {
-                        Value::Int(x) => Some(x),
-                        Value::Bool(b) => Some(i64::from(b)),
-                        // A whole float fits; anything else would lose its value.
-                        Value::Float(x) if x.fract() == 0.0 && x.abs() < 9.0e18 => Some(x as i64),
-                        Value::Text(s) => s.trim().parse().ok(),
-                        _ => None,
-                    }));
-                    c.typed::<Int64Type>().write_batch(&v, Some(&d), None).map_err(err)?;
-                }
-                FieldType::Double => {
-                    let (v, d) = levels(rows.iter().map(|r| attr(r).as_f64()));
-                    c.typed::<DoubleType>().write_batch(&v, Some(&d), None).map_err(err)?;
-                }
-                FieldType::Boolean => {
-                    let (v, d) = levels(rows.iter().map(|r| match attr(r) {
-                        Value::Bool(b) => Some(b),
-                        Value::Int(x) => Some(x != 0),
-                        _ => None,
-                    }));
-                    c.typed::<BoolType>().write_batch(&v, Some(&d), None).map_err(err)?;
-                }
-                FieldType::Text => {
-                    let (v, d) = levels(rows.iter().map(|r| match attr(r) {
-                        Value::Null => None,
-                        v => Some(ByteArray::from(v.to_string().into_bytes())),
-                    }));
-                    c.typed::<ByteArrayType>().write_batch(&v, Some(&d), None).map_err(err)?;
-                }
-            }
-            c.close().map_err(err)?;
-        }
-        rg.close().map_err(err)?;
+        w.append_key_value_metadata(KeyValue::new("geo".to_string(), geo.to_string()));
     }
     w.into_inner().map_err(err)
 }

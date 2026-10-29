@@ -785,7 +785,13 @@ file over 256 MB through a buffer, so it is never held whole), and each view par
 features it shows. A single feature, a bare geometry or TopoJSON is loaded whole.
 
 A streamed layer works like any other for symbology, labels, pop-ups, selection and the
-attribute table (which lists the features read for the view). Geoprocessing tools, exports and
+attribute table (which lists the features read for the view). On the desktop, **Export Features**
+(`share.exportLayer`) of a GeoPackage, FlatGeobuf, GeoParquet or Shapefile read in place to
+GeoJSON, CSV, FlatGeobuf, GeoPackage or GeoParquet reads the source a chunk at a time, putting
+each chunk in the output's coordinate system and writing it before reading the next: the layer
+is never held whole, so its size isn't limited by memory (a FlatGeobuf still keeps a small index
+entry for each feature). A source read by its web address is exported whole, as below.
+Geoprocessing tools, other exports and
 **Load All Features** read the whole source, up to 2 million features (500,000 in the web app;
 a source that doesn't report its feature count must have fewer than that, since a read that
 reaches the limit is refused); a larger source is refused rather than processed as a sample. A

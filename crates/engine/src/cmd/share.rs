@@ -74,22 +74,34 @@ fn export_map(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"path": path, "bytes": png.len()}))
 }
 
+/// `share.exportLayer`: writes a layer to a file by its extension. A streamed layer exports its
+/// whole source, a chunk at a time where the source and format allow (see `data::export`).
 fn export_layer(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let path = ps(p, "path").ok_or("path is required")?.to_string();
     let l = s.map().layer(id).ok_or("no layer")?;
-    // A streamed layer exports its whole source, not the features read for the view.
-    let whole = if l.is_streamed() { Some(l.load_all()?) } else { None };
-    let ds = whole.as_ref().unwrap_or(&l.dataset);
+    let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    // A streamed layer exports its whole source, not the features read for the view: a chunk at
+    // a time where the source and format allow, so its size isn't limited by memory.
+    let chunks = if l.is_streamed() && rustgis_data::export::streams(&ext) { l.chunk_export()? } else { None };
+    let whole = if l.is_streamed() && chunks.is_none() { Some(l.load_all()?) } else { None };
+    let ds = chunks.as_ref().map(|(_, layer)| layer).or(whole.as_ref()).unwrap_or(&l.dataset);
     // GeoJSON, KML and GPX are longitude/latitude; the others keep the layer's own system unless
     // told another.
-    let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let crs = match ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()) {
         Some(text) => Crs::parse(text)?,
         None => rustgis_data::io::default_export_crs(ds, &ext),
     };
-    let left_out = rustgis_data::io::write_path_in(ds, Path::new(&path), crs).map_err(|e| e.to_string())?;
-    let written = ds.features.len().saturating_sub(left_out);
+    let (written, left_out) = match &chunks {
+        Some((src, layer)) => {
+            let e = rustgis_data::export::write_source_in(src.as_ref(), layer, Path::new(&path), crs).map_err(|e| e.to_string())?;
+            (e.written, e.left_out)
+        }
+        None => {
+            let left_out = rustgis_data::io::write_path_in(ds, Path::new(&path), crs).map_err(|e| e.to_string())?;
+            (ds.features.len().saturating_sub(left_out), left_out)
+        }
+    };
     // FlatGeobuf, KML, GPX and Shapefile hold features with geometry only (a Shapefile, only
     // geometry it can draw).
     if left_out > 0 {

@@ -7,6 +7,7 @@
 mod dbf;
 pub mod dirs;
 pub mod dxf;
+pub mod export;
 pub mod filegdb;
 pub mod geometry;
 pub mod georss;
