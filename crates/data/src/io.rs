@@ -601,8 +601,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub(crate) fn write_atomic_with<T>(path: &Path, write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<T>) -> Result<T> {
     use std::io::Write;
     let tmp = temp_beside(path)?;
+    // Opened before the cleanup below, so a name already taken is never removed.
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
     let result = (|| -> Result<T> {
-        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         let mut out = std::io::BufWriter::new(file);
         let value = write(&mut out)?;
         out.flush()?;

@@ -613,8 +613,11 @@ fn build(conn: &Connection, ds: &crate::Dataset, crs: Crs) -> Result<()> {
     // Feature ids are kept when they are unique and fit; otherwise SQLite numbers the rows.
     let mut seen = std::collections::HashSet::new();
     let keep_ids = ds.features.iter().all(|f| i64::try_from(f.id).is_ok() && seen.insert(f.id));
-    // The table is made for the whole layer, so nothing needs doing again.
-    insert(conn, &layout, &ds.features, keep_ids)?;
+    // The table is made for the whole layer, so nothing should need doing again; should a
+    // feature not fit after all, the export fails rather than leave it out.
+    if insert(conn, &layout, &ds.features, keep_ids)?.is_some() {
+        return Err(DataError::Format("GeoPackage: a feature doesn't fit the table chosen for the layer".into()));
+    }
     finish(conn, &layout, ds.extent())
 }
 

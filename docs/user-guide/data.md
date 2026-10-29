@@ -789,8 +789,10 @@ attribute table (which lists the features read for the view). On the desktop, **
 (`share.exportLayer`) of a GeoPackage, FlatGeobuf, GeoParquet or Shapefile read in place to
 GeoJSON, CSV, FlatGeobuf, GeoPackage or GeoParquet reads the source a chunk at a time, putting
 each chunk in the output's coordinate system and writing it before reading the next: the layer
-is never held whole, so its size isn't limited by memory (a FlatGeobuf still keeps a small index
-entry for each feature). A source read by its web address is exported whole, as below.
+is never held whole. What stays in memory is a chunk and what the source and the output keep: a
+GeoParquet source one row group at a time (memory grows with its largest row group), a FlatGeobuf
+output a small index entry for each feature. A source read by its web address is exported whole,
+as below.
 Geoprocessing tools, other exports and
 **Load All Features** read the whole source, up to 2 million features (500,000 in the web app;
 a source that doesn't report its feature count must have fewer than that, since a read that
