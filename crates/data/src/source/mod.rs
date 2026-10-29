@@ -219,10 +219,11 @@ pub trait FeatureSource: Send + Sync {
     /// skipped count when there is no extent (an extent read through an index may order and skip
     /// differently). Release each chunk before the next callback. `bytes` targets owned feature
     /// storage; an indivisible larger row is emitted alone, and a provider may hold its own unit
-    /// of the file (a GeoParquet row group) besides. Callback errors stop traversal. Success
-    /// returns an empty, complete summary batch. Its `matched` is the provider's count of
-    /// matches: the features visited for GeoPackage, FlatGeobuf and GeoParquet, the records the
-    /// index matched for Shapefile (which may include rows skipped or deleted).
+    /// of the file (a GeoParquet row group) or an index's list of matches (FlatGeobuf, for an
+    /// extent) besides. Callback errors stop traversal. Success returns an empty, complete
+    /// summary batch. Its `matched` is the provider's count of matches: the features visited for
+    /// GeoPackage, FlatGeobuf and GeoParquet, the records the index matched for Shapefile (which
+    /// may include rows skipped or deleted).
     fn visit_chunks(&self, _extent: Option<Extent>, _bytes: usize, _visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         Err(DataError::Unsupported("a source that can't be read a chunk at a time".into()))
     }

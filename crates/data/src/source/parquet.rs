@@ -407,25 +407,30 @@ impl FeatureSource for ParquetSource {
         for g in 0..md.num_row_groups() {
             // From the declared row counts, as a read numbers them.
             let start = base;
-            base = base.saturating_add(u64::try_from(md.row_group(g).num_rows()).unwrap_or(0));
-            let take = match (native, self.covering) {
-                (Some(e), Some(c)) => match group_extent(md, g, c) {
-                    Some(ge) if !ge.intersects(&e) => continue,
-                    Some(ge) if contains(&e, &ge) => vec![true; self.rows_in(md, g)],
-                    _ => self.covered_rows(md, g, &e, c)?,
-                },
-                _ => vec![true; self.rows_in(md, g)],
+            let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
+            base = base.saturating_add(declared);
+            let area = match (native, self.covering) {
+                (Some(e), Some(c)) => Some((e, c, group_extent(md, g, c))),
+                _ => None,
             };
+            if let Some((e, _, Some(ge))) = area
+                && !ge.intersects(&e)
+            {
+                continue;
+            }
             // A read takes at most `MAX_GROUP_ROWS` of a row group, and no more than its geometry
             // column holds. A traversal promises every row, so a group it can't read whole is an
-            // error, not a quietly shorter export.
-            let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
-            if declared > take.len() as u64 {
+            // error, not a quietly shorter export; it is refused before anything is read.
+            let readable = self.rows_in(md, g);
+            if declared > readable as u64 {
                 return Err(DataError::Format(format!(
-                    "GeoParquet: row group {g} has {declared} rows, more than the {} read from one",
-                    take.len()
+                    "GeoParquet: row group {g} has {declared} rows, more than the {readable} read from one"
                 )));
             }
+            let take = match area {
+                Some((e, c, ge)) if !ge.is_some_and(|ge| contains(&e, &ge)) => self.covered_rows(md, g, &e, c)?,
+                _ => vec![true; readable],
+            };
             if !take.iter().any(|&t| t) {
                 continue;
             }
@@ -437,7 +442,7 @@ impl FeatureSource for ParquetSource {
                 return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
             }
             for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
-                let geometry = geoms.get(k).and_then(|b| b.as_deref()).and_then(wkb::decode).and_then(|g| self.reproject.geometry(g));
+                let geometry = geoms.get(k).and_then(|b| b.as_deref()).and_then(wkb::decode).and_then(|geom| self.reproject.geometry(geom));
                 let Some(geometry) = geometry else {
                     out.skipped += 1;
                     continue;

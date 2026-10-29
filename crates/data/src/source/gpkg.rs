@@ -17,8 +17,6 @@ pub mod edit;
 
 /// Rows fetched by id per query.
 const CHUNK: usize = 500;
-/// The most rows one page of a complete traversal reads under the connection's lock.
-const PAGE_ROWS: usize = 4096;
 
 /// A feature table in a GeoPackage.
 pub struct GpkgSource {
@@ -32,6 +30,9 @@ pub struct GpkgSource {
     reproject: Reproject,
     /// A copy written for a file opened from memory, removed when the source is dropped.
     temp: Option<PathBuf>,
+    /// The database file and its identity when opened ([`file_identity`]), for a traversal on a
+    /// connection of its own to check it reads the same file.
+    file: Option<(PathBuf, Option<(u64, u64)>)>,
 }
 
 impl Drop for GpkgSource {
@@ -214,7 +215,11 @@ impl GpkgSource {
             indexed: rtree.is_some(),
             notes,
         };
-        let mut src = GpkgSource { info, conn: Mutex::new(Some(conn)), table, geom, pk, rtree, reproject, temp };
+        let file = conn.path().filter(|p| !p.is_empty()).map(PathBuf::from).map(|p| {
+            let id = file_identity(&p);
+            (p, id)
+        });
+        let mut src = GpkgSource { info, conn: Mutex::new(Some(conn)), table, geom, pk, rtree, reproject, temp, file };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = src.peek_kind();
         }
@@ -377,64 +382,54 @@ impl FeatureSource for GpkgSource {
     }
 
     /// A scan in table order: the envelope in each geometry's header tests the extent before
-    /// decoding, as a read without the spatial index does. The rows come in pages by rowid,
-    /// each read under the connection's lock and handed over after it is released, so the
-    /// map's reads of the layer go on and nothing is locked while the visitor runs. A page
-    /// stops at `bytes` of decoded rows.
+    /// decoding, as a read without the spatial index does, with the same statement. It runs on a
+    /// read-only connection of its own, one statement and so one snapshot of the database, so
+    /// the map's reads of the layer go on and nothing is locked while the visitor runs. A file
+    /// put in place of the one opened is refused (where the system says files' identities).
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
+        let Some((path, id)) = &self.file else { return Err(DataError::Format("GeoPackage: no file to read".into())) };
+        let replaced = || DataError::Format(format!("{}: the file was replaced since it was added; add it again", path.display()));
+        if id.is_some() && file_identity(path) != *id {
+            return Err(replaced());
+        }
+        let conn = open_db(path)?;
+        if id.is_some() && file_identity(path) != *id {
+            return Err(replaced());
+        }
         let req = Request { extent, limit: usize::MAX };
         let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
-        // The rowid follows the selected columns; a scan without an order walks rowids in order.
-        let page = |first: bool| {
-            format!(
-                "SELECT {}, rowid FROM {} WHERE rowid {} ?1 ORDER BY rowid LIMIT {PAGE_ROWS}",
-                self.select_list(),
-                quote(&self.table),
-                if first { ">=" } else { ">" }
-            )
-        };
-        let rowid = self.info.fields.len() + 2;
+        let sql = format!("SELECT {} FROM {}", self.select_list(), quote(&self.table));
+        let mut st = conn.prepare(&sql).map_err(err)?;
+        let mut rows = st.query([]).map_err(err)?;
         let mut out = Batch { complete: true, ..Batch::default() };
-        let mut after = (i64::MIN, true);
-        loop {
-            let mut rows_read = 0usize;
-            let mut last = None;
-            let mut used = 0usize;
-            let mut kept = Vec::new();
-            {
-                let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
-                let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
-                let mut st = conn.prepare_cached(&page(after.1)).map_err(err)?;
-                let mut rows = st.query([after.0]).map_err(err)?;
-                while let Some(r) = rows.next().map_err(err)? {
-                    rows_read += 1;
-                    last = Some(r.get::<_, i64>(rowid).map_err(err)?);
-                    match self.feature(r, native.as_ref(), &req).map_err(err)? {
-                        Row::Feature(f) => {
-                            used = used.saturating_add(super::chunk_memory::feature_bytes(&f));
-                            kept.push(f);
-                        }
-                        Row::Skip => {}
-                        Row::Bad => out.skipped += 1,
-                    }
-                    if used >= bytes {
-                        break;
-                    }
+        while let Some(r) = rows.next().map_err(err)? {
+            match self.feature(r, native.as_ref(), &req).map_err(err)? {
+                Row::Feature(f) => {
+                    out.matched += 1;
+                    chunks.push(f)?;
                 }
-            }
-            out.matched += kept.len() as u64;
-            for f in kept {
-                chunks.push(f)?;
-            }
-            match last {
-                // A full page, or one cut short by its bytes: more may follow.
-                Some(k) if rows_read == PAGE_ROWS || used >= bytes => after = (k, false),
-                _ => break,
+                Row::Skip => {}
+                Row::Bad => out.skipped += 1,
             }
         }
         chunks.flush()?;
         Ok(out)
+    }
+}
+
+/// A file's device and inode, which tell it from another file put at its path since; `None`
+/// where the system doesn't say them.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 

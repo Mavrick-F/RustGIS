@@ -1831,7 +1831,11 @@ fn geopackage_flatgeobuf_and_geoparquet_visit_what_a_whole_read_gives() {
         assert!(part.complete && part.features.len() == in_box(&extent), "{format}");
         let (rows, summary, _) = visit_all(src.as_ref(), Some(extent), 1024);
         assert!(summary.complete && summary.features.is_empty() && summary.matched == rows.len() as u64, "{format}");
-        assert_eq!(by_id(rows), by_id(part.features), "{format}");
+        if src.info().indexed {
+            assert_eq!(by_id(rows), by_id(part.features), "{format}");
+        } else {
+            assert_eq!(rows, part.features, "{format}");
+        }
         assert!(visit_all(src.as_ref(), Some(Extent::new(1.0, 1.0, 2.0, 2.0)), 1024).0.is_empty(), "{format}");
         // A visitor's error stops the traversal; a zero budget is refused before any row.
         let mut calls = 0;
@@ -1853,6 +1857,17 @@ fn geopackage_flatgeobuf_and_geoparquet_visit_what_a_whole_read_gives() {
     let capped = parquet::ParquetSource::open_path(&pq_plain, "plain").unwrap().with_group_rows(40);
     let error = capped.visit_chunks(None, 4096, &mut |_| Ok(())).unwrap_err().to_string();
     assert!(error.contains("row group 0 has 50 rows, more than the 40"), "{error}");
+    // A GeoPackage put in place of the one added is refused, not read as the layer.
+    #[cfg(unix)]
+    {
+        let src = open_path(&gpkg, None).unwrap();
+        let other = d.join("other.gpkg");
+        write_gpkg(&other, false);
+        std::fs::rename(&other, &gpkg).unwrap();
+        let error = src.visit_chunks(None, 4096, &mut |_| Ok(())).unwrap_err().to_string();
+        assert!(error.contains("replaced"), "{error}");
+        assert_eq!(src.read(&Request::all()).unwrap().features.len(), 600);
+    }
     // An unreadable geometry is skipped and counted, and a row without one left out, as a read does.
     drop(sources);
     let c = rusqlite::Connection::open(&gpkg_scan).unwrap();
