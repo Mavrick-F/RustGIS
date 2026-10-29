@@ -1843,22 +1843,56 @@ fn kriging_auto_cell(extent: &Extent, n: usize, neighbours: usize) -> f64 {
     cell
 }
 
+/// The extent of a geometry in Web Mercator, as [`to_geo`] gives it, leaving out non-finite
+/// coordinates as [`Extent::expand`] does: one NaN doesn't hide the rest.
+fn merc_extent(g: &impl geo::CoordsIter<Scalar = f64>) -> Extent {
+    g.coords_iter().fold(Extent::EMPTY, |mut e, c| {
+        e.expand(Coord::new(c.x, c.y));
+        e
+    })
+}
+
+/// Summarize Within: each polygon's count of the (selected) point features that meet it, inside it
+/// or on its edge; a feature of several points counts once in each polygon it meets. Each point is
+/// tested only against the polygons whose extents hold it, through an [`ExtentIndex`]. The extents
+/// are in Web Mercator, where the test runs, so a point beyond the map's latitude limit still
+/// meets a polygon reaching that limit.
 fn count_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let polys = input(inp, p, "polygons")?;
     let pts = input(inp, p, "points")?;
-    let point_geoms: Vec<geo::Geometry<f64>> =
-        rows(inp, p, "points", pts).iter().filter_map(|r| pts.features.get(*r)?.geometry.as_ref()).map(to_geo).collect();
     let mut out = polys.clone();
     out.name = out_name(p, format!("{}_Summarize", polys.name));
     out.source = None;
     let fi = out.ensure_field("point_count", FieldType::Integer);
-    let mut total = 0i64;
-    for f in &mut out.features {
-        let n = match f.geometry.as_ref().and_then(to_multipolygon) {
-            Some(mp) => point_geoms.iter().filter(|g| mp.intersects(*g)).count() as i64,
-            None => 0,
-        };
-        total += n;
+    // Each polygon's row, shape and extent; a feature without polygons meets no point.
+    let zones: Vec<(usize, MultiPolygon<f64>, Extent)> = out
+        .features
+        .iter()
+        .enumerate()
+        .filter_map(|(row, f)| {
+            let mp = f.geometry.as_ref().and_then(to_multipolygon)?;
+            let ext = merc_extent(&mp);
+            Some((row, mp, ext))
+        })
+        .collect();
+    let index = ExtentIndex::new(zones.iter().map(|(_, _, ext)| *ext));
+    let mut counts = vec![0i64; out.features.len()];
+    for r in rows(inp, p, "points", pts) {
+        let Some(g) = pts.features.get(r).and_then(|f| f.geometry.as_ref()) else { continue };
+        let pg = to_geo(g);
+        let ext = merc_extent(&pg);
+        for zi in index.candidates(&ext) {
+            let Some((row, mp, z_ext)) = zones.get(zi) else { continue };
+            if z_ext.intersects(&ext)
+                && mp.intersects(&pg)
+                && let Some(c) = counts.get_mut(*row)
+            {
+                *c += 1;
+            }
+        }
+    }
+    let total: i64 = counts.iter().sum();
+    for (f, n) in out.features.iter_mut().zip(counts) {
         if let Some(v) = f.attrs.get_mut(fi) {
             *v = Value::Int(n);
         }
@@ -4319,6 +4353,96 @@ mod tests {
             .map(|f| (f.attrs[0].as_f64().unwrap(), if let Value::Text(t) = &f.attrs[1] { t.as_str() } else { "" }))
             .collect();
         assert_eq!(rows, [(1.0, "a"), (2.0, "a"), (2.0, "a")]);
+    }
+
+    /// Summarize Within, through its index, counts what testing every point against every polygon
+    /// counts: random triangles and squares with holes, overlapping and of very different sizes
+    /// (one covering them all), a polygon feature without geometry, points on vertices (the edge
+    /// counts), several-point features, points outside every polygon, past the latitude limit or
+    /// with non-finite coordinates, and a selection of points.
+    #[test]
+    fn count_points_matches_testing_every_point_against_every_polygon() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let c = Coord::new;
+        let mut polys = Dataset::new("polys", GeometryType::Polygon, vec![]);
+        let mut vertices = Vec::new();
+        for i in 0..300 {
+            let (x, y, size) = (rand() * 40.0 - 20.0, rand() * 40.0 - 20.0, 0.1 + rand() * 3.0);
+            let g = if i % 3 == 0 {
+                let hole = vec![
+                    c(x + size * 0.25, y + size * 0.25),
+                    c(x + size * 0.25, y + size * 0.75),
+                    c(x + size * 0.75, y + size * 0.75),
+                    c(x + size * 0.25, y + size * 0.25),
+                ];
+                let outer = vec![c(x, y), c(x + size, y), c(x + size, y + size), c(x, y + size), c(x, y)];
+                Geometry::Polygon(vec![vec![outer, hole]])
+            } else {
+                let (a, b) = (c(x + size * rand(), y), c(x + size, y + size * rand()));
+                Geometry::Polygon(vec![vec![vec![c(x, y + size), a, b, c(x, y + size)]]])
+            };
+            if i % 7 == 0 {
+                vertices.extend(match &g {
+                    Geometry::Polygon(p) => p.iter().flatten().flatten().copied().collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                });
+            }
+            polys.push(Some(g), vec![]);
+        }
+        polys.push(Some(sq(-30.0, -30.0, 60.0)), vec![]);
+        // Reaching past the map's latitude limit, where every latitude beyond it is the same.
+        polys.push(Some(sq(40.0, 80.0, 6.0)), vec![]);
+        polys.push(None, vec![]);
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        for _ in 0..3000 {
+            pts.push(Some(Geometry::Point(c(rand() * 50.0 - 25.0, rand() * 50.0 - 25.0))), vec![]);
+        }
+        for v in vertices {
+            pts.push(Some(Geometry::Point(v)), vec![]);
+        }
+        for _ in 0..100 {
+            let (x, y) = (rand() * 40.0 - 20.0, rand() * 40.0 - 20.0);
+            pts.push(Some(Geometry::MultiPoint(vec![c(x, y), c(x + 2.0, y + 1.0), c(x - 1.0, y + 3.0)])), vec![]);
+        }
+        // Beyond the latitude limit, and features with non-finite coordinates.
+        pts.push(Some(Geometry::Point(c(42.0, 89.0))), vec![]);
+        pts.push(Some(Geometry::MultiPoint(vec![c(f64::NAN, 1.0), c(41.0, 81.0)])), vec![]);
+        pts.push(Some(Geometry::MultiPoint(vec![c(f64::INFINITY, f64::NAN), c(-29.0, -29.0)])), vec![]);
+        pts.push(Some(Geometry::Point(c(f64::NAN, f64::NAN))), vec![]);
+        pts.push(None, vec![]);
+        let selected: Vec<usize> = (0..pts.features.len()).filter(|r| r % 5 != 0).collect();
+        // Enough polygons for the index to build its grid, not fall back to testing them all.
+        let extents = polys.features.iter().filter_map(|f| f.geometry.as_ref().and_then(to_multipolygon)).map(|mp| merc_extent(&mp));
+        assert!(ExtentIndex::new(extents).cell_size().is_some());
+        // Every selected point against every polygon.
+        let expected: Vec<i64> = polys
+            .features
+            .iter()
+            .map(|f| {
+                let Some(mp) = f.geometry.as_ref().and_then(to_multipolygon) else { return 0 };
+                selected.iter().filter_map(|r| pts.features.get(*r)?.geometry.as_ref()).filter(|g| mp.intersects(&to_geo(g))).count() as i64
+            })
+            .collect();
+        let m = Selected(
+            Map(HashMap::from([("polys".to_string(), polys), ("pts".to_string(), pts)])),
+            HashMap::from([("pts".to_string(), selected)]),
+        );
+        let out = layer(crate::run("countPoints", &m, &serde_json::json!({"polygons": "polys", "points": "pts"})).unwrap());
+        let fi = out.field_index("point_count").unwrap();
+        let counts: Vec<i64> = (0..out.features.len())
+            .map(|r| match out.value(r, fi) {
+                Value::Int(n) => *n,
+                v => panic!("{v:?}"),
+            })
+            .collect();
+        assert_eq!(counts, expected);
+        assert!(expected.iter().filter(|n| **n > 0).count() > 200, "most polygons hold some points: {expected:?}");
     }
 
     #[test]
