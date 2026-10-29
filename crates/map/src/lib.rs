@@ -2171,7 +2171,7 @@ impl Map {
                 src.full_read = block;
                 if changed || mode_changed || budget_changed {
                     let selected = std::mem::take(&mut src.saved_selection);
-                    src.reset();
+                    src.reset_window();
                     src.saved_selection = selected;
                 }
                 if changed || (!block && layer.view_cache_bytes() > bytes) {
@@ -2181,7 +2181,7 @@ impl Map {
                         layer.selection.iter().filter_map(|r| layer.dataset.features.get(*r)).map(|f| f.id).collect();
                     if let Some(src) = &mut layer.source {
                         selected.append(&mut src.saved_selection);
-                        src.reset();
+                        src.reset_window();
                     }
                     layer.install(Vec::new());
                     if let Some(src) = &mut layer.source {

@@ -3002,26 +3002,33 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
             && layer.geometry_type() != GeometryType::Point
             && let (Some(source), Some(level)) = (&source, rustgis_map::lod::level(thin_tol))
         {
-            let (mut eligible, mut all, mut kept) = (0usize, 0usize, 0usize);
-            let result = visit_complete(source.as_ref(), &mut |features| {
-                for feature in features {
-                    if let Some(g) = feature.geometry {
-                        let g = flat.project(&g);
-                        eligible = eligible.saturating_add(rustgis_map::lod::thinnable(&g));
-                        all = all.saturating_add(rustgis_map::lod::vertices(&g));
-                        kept = kept
-                            .saturating_add(rustgis_map::lod::vertices(&rustgis_map::lod::thin(&g, rustgis_map::lod::tolerance(level))));
+            let result = layer.source.as_ref()?.cached_thinning(&key, level, || {
+                let (mut eligible, mut all, mut kept) = (0usize, 0usize, 0usize);
+                visit_complete(source.as_ref(), &mut |features| {
+                    for feature in features {
+                        if let Some(g) = feature.geometry {
+                            let g = flat.project(&g);
+                            eligible = eligible.saturating_add(rustgis_map::lod::thinnable(&g));
+                            all = all.saturating_add(rustgis_map::lod::vertices(&g));
+                            kept = kept.saturating_add(rustgis_map::lod::vertices(&rustgis_map::lod::thin(
+                                &g,
+                                rustgis_map::lod::tolerance(level),
+                            )));
+                        }
                     }
-                }
-                Ok(())
+                    Ok(())
+                })?;
+                Ok(eligible > rustgis_map::lod::THIN_ABOVE && kept as f64 <= all as f64 * (1.0 - rustgis_map::lod::MIN_SAVING))
             });
-            if let Err(e) = result {
-                if let Some(s) = &mut layer.source {
-                    s.error = Some(e.to_string());
+            match result {
+                Ok(decision) => thin_complete = decision,
+                Err(e) => {
+                    if let Some(s) = &mut layer.source {
+                        s.error = Some(e.to_string());
+                    }
+                    return None;
                 }
-                return None;
             }
-            thin_complete = eligible > rustgis_map::lod::THIN_ABOVE && kept as f64 <= all as f64 * (1.0 - rustgis_map::lod::MIN_SAVING);
         }
 
         let mut target = if offscreen { Pixmap::new(w, h)? } else { Pixmap::new(1, 1)? };

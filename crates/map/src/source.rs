@@ -18,6 +18,7 @@ use rustgis_data::source::{Batch, FeatureSource, Request, SourceInfo};
 use rustgis_geom::Extent;
 use serde::{Deserialize, Serialize};
 
+mod render_lod;
 mod window;
 
 /// Retained streamed rows and geometry caches per map; excludes scratch and render/export copies.
@@ -54,6 +55,9 @@ pub struct SourceLayer {
     handle: Option<Arc<dyn FeatureSource>>,
     #[serde(skip)]
     window: Option<Window>,
+    /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
+    #[serde(skip)]
+    render_lod: Arc<Mutex<render_lod::Decisions>>,
     #[serde(skip)]
     pending: Option<Arc<Pending>>,
     /// Projection used for this disposable window's geometry cache.
@@ -618,6 +622,23 @@ impl SourceLayer {
         self.handle.as_ref().filter(|h| h.streams_chunks()).cloned()
     }
 
+    /// Reuses a complete source's thinning decision for a projection and LOD level. Both
+    /// outcomes are retained across render snapshots; failed calculations are retried. The
+    /// bounded cache follows the open handle, and explicit source resets discard it.
+    pub fn cached_thinning(
+        &self,
+        projection: &str,
+        level: i32,
+        calculate: impl FnOnce() -> rustgis_data::Result<bool>,
+    ) -> rustgis_data::Result<bool> {
+        let Some(handle) = &self.handle else { return calculate() };
+        match self.render_lod.lock() {
+            Ok(mut cache) => cache.get_or_try_insert(handle, projection, level, calculate),
+            // A failed optional cache must not make the source permanently undrawable.
+            Err(_) => calculate(),
+        }
+    }
+
     /// Retained interaction bytes assigned by the map, or the standalone default.
     pub fn budget(&self) -> usize {
         if self.byte_budget == 0 { VIEW_BYTES } else { self.byte_budget }
@@ -892,6 +913,12 @@ impl SourceLayer {
 
     /// Forgets the window, so the next view reads again (after the source changes).
     pub fn reset(&mut self) {
+        self.render_lod = Default::default();
+        self.reset_window();
+    }
+
+    /// Drops disposable view rows while retaining decisions about the unchanged full source.
+    pub(crate) fn reset_window(&mut self) {
         self.window = None;
         self.pending = None;
         self.ready_cache = None;
