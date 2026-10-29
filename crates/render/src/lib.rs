@@ -3000,9 +3000,9 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
         let mut thin_complete = false;
         if globe.is_none()
             && layer.geometry_type() != GeometryType::Point
-            && let (Some(source), Some(level)) = (&source, rustgis_map::lod::level(thin_tol))
+            && let (Some(owner), Some(source), Some(level)) = (&layer.source, &source, rustgis_map::lod::level(thin_tol))
         {
-            let result = layer.source.as_ref()?.cached_thinning(&key, level, || {
+            let result = owner.cached_thinning(&key, level, || {
                 let (mut eligible, mut all, mut kept) = (0usize, 0usize, 0usize);
                 visit_complete(source.as_ref(), &mut |features| {
                     for feature in features {

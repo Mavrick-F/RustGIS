@@ -1231,6 +1231,7 @@ fn counted_lod(layer: &Layer, size: usize) -> (Layer, std::sync::Arc<std::sync::
     (layer, calls)
 }
 
+/// Independent worker snapshots share both useful and ineffective thinning decisions while panning.
 #[test]
 fn streamed_lod_reuses_decisions_across_render_snapshots_and_pans() {
     use std::sync::atomic::Ordering;
@@ -1257,6 +1258,7 @@ fn streamed_lod_reuses_decisions_across_render_snapshots_and_pans() {
     }
 }
 
+/// Density and projection changes select separate decisions; refresh and replacement invalidate them.
 #[test]
 fn streamed_lod_separates_levels_projections_and_source_resets() {
     use std::sync::atomic::Ordering;
@@ -1301,6 +1303,7 @@ fn streamed_lod_separates_levels_projections_and_source_resets() {
     assert_eq!(replacement_calls.load(Ordering::Relaxed), 2);
 }
 
+/// Failed fills stay retryable, negative results are cached, and LRU hits refresh recency.
 #[test]
 fn streamed_lod_retries_failed_decisions_and_bounds_retained_levels() {
     let mut ds = Dataset::new("cache", GeometryType::Polyline, vec![]);
@@ -1321,4 +1324,18 @@ fn streamed_lod_retries_failed_decisions_and_bounds_retained_levels() {
     assert!(source.cached_thinning("mercator", 2, || panic!("recent level should remain")).unwrap());
     assert!(source.cached_thinning("mercator", 4, || Ok(true)).unwrap());
     assert!(source.cached_thinning("mercator", 2, || panic!("hit must refresh recency")).unwrap());
+}
+
+/// A source panic must not disable caching for later successful frames in the same session.
+#[test]
+fn streamed_lod_recovers_caching_after_an_escaped_source_panic() {
+    let ds = Dataset::new("panic recovery", GeometryType::Polyline, vec![]);
+    let (layer, _) = counted_lod(&Layer::new(1, ds), 1);
+    let source = layer.source.as_ref().unwrap();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.cached_thinning("mercator", 0, || panic!("injected source panic"))
+    }));
+    assert!(failed.is_err());
+    assert!(source.cached_thinning("mercator", 0, || Ok(true)).unwrap());
+    assert!(source.cached_thinning("mercator", 0, || panic!("recovered decision must be cached")).unwrap());
 }

@@ -11,7 +11,8 @@ pub(super) struct Decisions {
 
 impl Decisions {
     /// Computes only missing decisions, retaining successes for this exact open source.
-    /// The caller holds the source's shared lock so concurrent snapshots do not repeat work.
+    /// The caller holds the source's `render_lod` mutex throughout calculation, so concurrent
+    /// render snapshots wait for a fill instead of repeating the same traversal.
     pub(super) fn get_or_try_insert(
         &mut self,
         source: &Arc<dyn FeatureSource>,

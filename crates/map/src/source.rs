@@ -632,11 +632,10 @@ impl SourceLayer {
         calculate: impl FnOnce() -> rustgis_data::Result<bool>,
     ) -> rustgis_data::Result<bool> {
         let Some(handle) = &self.handle else { return calculate() };
-        match self.render_lod.lock() {
-            Ok(mut cache) => cache.get_or_try_insert(handle, projection, level, calculate),
-            // A failed optional cache must not make the source permanently undrawable.
-            Err(_) => calculate(),
-        }
+        // Calculations insert only on success, so an escaped source panic leaves a valid
+        // cache. Recover the guard so later frames can cache successful decisions again.
+        let mut cache = self.render_lod.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.get_or_try_insert(handle, projection, level, calculate)
     }
 
     /// Retained interaction bytes assigned by the map, or the standalone default.
@@ -1114,6 +1113,22 @@ pub fn generation() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// Reopening this same layer must invalidate populated decisions even without `reset`.
+    #[test]
+    fn reopening_a_populated_thinning_cache_uses_the_new_handle() {
+        let mut ds = rustgis_data::Dataset::new("source", rustgis_data::GeometryType::Point, vec![]);
+        ds.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![]);
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&ds).unwrap());
+        let handle = rustgis_data::source::open_shared("source.fgb", bytes.clone(), None).unwrap();
+        let mut source = super::SourceLayer::from_bytes("source.fgb", bytes, None, handle);
+        assert!(!source.cached_thinning("mercator", 0, || Ok(false)).unwrap());
+        let old_handle = source.handle.clone().unwrap();
+        source.open().unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&old_handle, source.handle.as_ref().unwrap()));
+        assert!(source.cached_thinning("mercator", 0, || Ok(true)).unwrap());
+        assert!(source.cached_thinning("mercator", 0, || panic!("new handle's decision must be cached")).unwrap());
+    }
+
     #[test]
     fn postgis_edits_keep_their_row_versions() {
         let edit = super::PostgisEdit {
