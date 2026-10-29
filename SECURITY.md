@@ -8,7 +8,7 @@ not in a public issue, pull request or discussion. Include what you did, what ha
 RustGIS version and platform (desktop, browser, command line or Python), and a file, plugin or
 script that shows it if you have one.
 
-A maintainer will reply on the report. We aim to fix confirmed problems in the next release and
+A maintainer will reply to the report. We aim to fix confirmed problems in the next release and
 publish a GitHub security advisory with it, crediting you unless you'd rather we didn't. Please
 give us a chance to release a fix before you disclose the problem publicly.
 
