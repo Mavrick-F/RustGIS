@@ -1776,7 +1776,11 @@ fn visit_all(src: &dyn FeatureSource, extent: Option<Extent>, budget: usize) -> 
     let summary = src
         .visit_chunks(extent, budget, &mut |chunk| {
             calls += 1;
-            assert!(chunk.len() == 1 || chunk_memory::features_bytes(&chunk) <= budget, "{}", src.info().format);
+            // Only a row that alone exceeds the budget comes over it, by itself.
+            let alone_too_big = |c: &Vec<Feature>| {
+                c.len() == 1 && c.iter().all(|f| chunk_memory::feature_bytes(f) + std::mem::size_of::<Feature>() > budget)
+            };
+            assert!(chunk_memory::features_bytes(&chunk) <= budget || alone_too_big(&chunk), "{}", src.info().format);
             rows.extend(chunk);
             Ok(())
         })
@@ -1857,6 +1861,9 @@ fn geopackage_flatgeobuf_and_geoparquet_visit_what_a_whole_read_gives() {
     let capped = parquet::ParquetSource::open_path(&pq_plain, "plain").unwrap().with_group_rows(40);
     let error = capped.visit_chunks(None, 4096, &mut |_| Ok(())).unwrap_err().to_string();
     assert!(error.contains("row group 0 has 50 rows, more than the 40"), "{error}");
+    // A capped row group outside the extent is passed over, not refused.
+    let capped = parquet::ParquetSource::open_path(&pq, "grid").unwrap().with_group_rows(40);
+    assert!(visit_all(&capped, Some(Extent::new(178.0, 0.0, 179.0, 1.0)), 4096).0.is_empty());
     // A GeoPackage put in place of the one added is refused, not read as the layer.
     #[cfg(unix)]
     {
@@ -1877,5 +1884,11 @@ fn geopackage_flatgeobuf_and_geoparquet_visit_what_a_whole_read_gives() {
     let whole = src.read(&Request::all()).unwrap();
     assert_eq!((whole.features.len(), whole.skipped), (600, 1));
     let (rows, summary, _) = visit_all(src.as_ref(), None, 4096);
+    assert_eq!((rows, summary.skipped), (whole.features, 1));
+    // The browser's reader of the same file skips and leaves out the same rows.
+    let mem = gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(std::fs::read(&gpkg_scan).unwrap())), None).unwrap();
+    let whole = mem.read(&Request::all()).unwrap();
+    assert_eq!((whole.features.len(), whole.skipped), (600, 1));
+    let (rows, summary, _) = visit_all(&mem, None, 4096);
     assert_eq!((rows, summary.skipped), (whole.features, 1));
 }

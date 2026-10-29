@@ -422,10 +422,14 @@ impl FeatureSource for ParquetSource {
             // column holds. A traversal promises every row, so a group it can't read whole is an
             // error, not a quietly shorter export; it is refused before anything is read.
             let readable = self.rows_in(md, g);
-            if declared > readable as u64 {
+            if declared > self.group_rows as u64 {
                 return Err(DataError::Format(format!(
-                    "GeoParquet: row group {g} has {declared} rows, more than the {readable} read from one"
+                    "GeoParquet: row group {g} has {declared} rows, more than the {} read from one",
+                    self.group_rows
                 )));
+            }
+            if declared > readable as u64 {
+                return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
             }
             let take = match area {
                 Some((e, c, ge)) if !ge.is_some_and(|ge| contains(&e, &ge)) => self.covered_rows(md, g, &e, c)?,

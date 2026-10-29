@@ -72,7 +72,10 @@ fn feature_tables(conn: &Connection) -> Result<Vec<String>> {
 
 impl GpkgSource {
     pub fn open(path: &Path, layer: Option<&str>) -> Result<Self> {
-        Self::open_conn(open_db(path)?, layer, None)
+        // The identity is taken before the database is opened: a file put in its place after
+        // this leaves it describing the file opened, which a traversal then refuses to swap.
+        let id = file_identity(path);
+        Self::open_conn(open_db(path)?, layer, None, id)
     }
 
     /// Opens a GeoPackage held in memory, through a temporary copy (SQLite reads files). The copy
@@ -103,7 +106,8 @@ impl GpkgSource {
             return Err(e.into());
         }
         drop(f);
-        match open_db(&p).and_then(|c| Self::open_conn(c, layer, Some(p.clone()))) {
+        let id = file_identity(&p);
+        match open_db(&p).and_then(|c| Self::open_conn(c, layer, Some(p.clone()), id)) {
             Ok(s) => Ok(s),
             Err(e) => {
                 let _ = std::fs::remove_file(&p);
@@ -112,7 +116,8 @@ impl GpkgSource {
         }
     }
 
-    fn open_conn(conn: Connection, layer: Option<&str>, temp: Option<PathBuf>) -> Result<Self> {
+    /// A source on an open database; `id` is the file's identity taken before it was opened.
+    fn open_conn(conn: Connection, layer: Option<&str>, temp: Option<PathBuf>, id: Option<(u64, u64)>) -> Result<Self> {
         let tables = feature_tables(&conn)?;
         let table = match layer {
             Some(l) => tables
@@ -215,10 +220,7 @@ impl GpkgSource {
             indexed: rtree.is_some(),
             notes,
         };
-        let file = conn.path().filter(|p| !p.is_empty()).map(PathBuf::from).map(|p| {
-            let id = file_identity(&p);
-            (p, id)
-        });
+        let file = conn.path().filter(|p| !p.is_empty()).map(|p| (PathBuf::from(p), id));
         let mut src = GpkgSource { info, conn: Mutex::new(Some(conn)), table, geom, pk, rtree, reproject, temp, file };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = src.peek_kind();
@@ -376,9 +378,9 @@ impl FeatureSource for GpkgSource {
         Ok(out)
     }
 
-    /// Every table on disk is scanned in full, whatever its index.
+    /// Every table in a file is scanned in full, whatever its index.
     fn visits_chunks(&self) -> bool {
-        true
+        self.file.is_some()
     }
 
     /// A scan in table order: the envelope in each geometry's header tests the extent before
@@ -389,14 +391,15 @@ impl FeatureSource for GpkgSource {
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         let Some((path, id)) = &self.file else { return Err(DataError::Format("GeoPackage: no file to read".into())) };
-        let replaced = || DataError::Format(format!("{}: the file was replaced since it was added; add it again", path.display()));
-        if id.is_some() && file_identity(path) != *id {
-            return Err(replaced());
-        }
+        let same_file = || {
+            if id.is_some() && file_identity(path) != *id {
+                return Err(DataError::Format(format!("{}: the file was replaced since it was added; add it again", path.display())));
+            }
+            Ok(())
+        };
+        same_file()?;
         let conn = open_db(path)?;
-        if id.is_some() && file_identity(path) != *id {
-            return Err(replaced());
-        }
+        same_file()?;
         let req = Request { extent, limit: usize::MAX };
         let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
         let sql = format!("SELECT {} FROM {}", self.select_list(), quote(&self.table));
