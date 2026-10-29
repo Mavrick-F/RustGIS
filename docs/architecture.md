@@ -64,7 +64,8 @@ found is treated as a bug.
 RustGIS's engine and apps are written in Rust and run without GDAL, PROJ or any other GIS
 library installed. GDAL, DuckDB and the `geolibre` program are optional extras: on the desktop,
 when they are installed, RustGIS calls them to read [more formats](user-guide/data-formats.md#formats-read-through-gdal),
-run DuckDB queries and run the [GeoLibre tools](user-guide/analysis.md#geolibre-tools). Some
+run DuckDB queries and run the [GeoLibre tools](user-guide/analysis.md#geolibre-tools). In the web
+app the GeoLibre tools run in the browser instead, through geolibre-rust's WASI runner. Some
 dependencies do compile C code into the build: the Zstandard decoder (`zstd-sys`,
 desktop and browser), SQLite (`libsqlite3-sys` through `rusqlite`, desktop), the TLS cryptography
 libraries (`aws-lc-sys` and `ring`, desktop) and GeographicLib's geodesic routines for the

@@ -29,7 +29,7 @@ around one of them is a security problem:
   registry blocklist or a hash mismatch. See [Plugins › Safety](docs/plugins.md#safety).
 - **Agents**: anything reaching the MCP relay or MCP over HTTP without its token, or from another
   host or a web page; the AI Assistant running a file, network or plugin command without the
-  user's approval. See [MCP](docs/mcp.md).
+  user's approval. See [MCP](docs/mcp.md) and the [AI Assistant](docs/user-guide/assistant.md).
 - **Credentials**: passwords, keys or tokens written to the audit log, other logs, project files
   or exports, or stored outside the OS keychain where the docs say they're kept there.
 - **Files and links**: opening a data file, project, style, package or URL that runs code,
