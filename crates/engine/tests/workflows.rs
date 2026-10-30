@@ -138,13 +138,14 @@ fn layer<'a>(s: &'a Session, name: &str) -> &'a Dataset {
 }
 
 /// Checks the zone totals against the closed-form areas: R1 is three rows of 2.5 parcels, C2 two
-/// rows of 1.5 (the north-east parcels are in no zone).
+/// rows of 1.5 (the north-east parcel and the east half of its neighbour are in no zone).
 fn check_totals(stats: &Dataset) {
     let want = [
         ("R1", 9, quadrangle_km2(WEST, SOUTH, SPLIT, SOUTH + 3.0 * STEP)),
         ("C2", 4, quadrangle_km2(SPLIT, SOUTH, WEST + 4.0 * STEP, SOUTH + 2.0 * STEP)),
     ];
     let got = rows(stats, "zone");
+    assert_eq!(stats.features.len(), 2, "one row per zone");
     assert_eq!(got.len(), 2, "one row per zone: {got:?}");
     for (zone, pieces, km2) in want {
         let row: std::collections::HashMap<_, _> = got[zone].iter().cloned().collect();
@@ -154,6 +155,22 @@ fn check_totals(stats: &Dataset) {
         // The figure an analyst reports, to the acre.
         assert_eq!((sum * ACRES_PER_KM2).round(), (km2 * ACRES_PER_KM2).round(), "{zone}: acres");
     }
+}
+
+/// The value the assessment table gives a parcel: none for the last, which has no row.
+fn assessment(parcel: &str) -> Field {
+    let k = parcel.parse::<i64>().unwrap_or_else(|_| panic!("{parcel}")) - 101;
+    if k < 11 { Field::Int(100_000 + k * 1_000) } else { Field::Null }
+}
+
+/// Checks that every feature carries its parcel's assessed value; the number checked.
+fn check_values(ds: &Dataset) -> usize {
+    let (id, value) = (ds.field_index("parcel_id").unwrap(), ds.field_index("value_usd").unwrap());
+    for r in 0..ds.features.len() {
+        let parcel = ds.value(r, id).to_string();
+        assert_eq!(ds.value(r, value), &assessment(&parcel), "{}: {parcel}", ds.name);
+    }
+    ds.features.len()
 }
 
 /// Join a spreadsheet to parcels, keeping leading zeros in their ids; overlay zoning; total the
@@ -171,21 +188,18 @@ fn join_overlay_summarise_map_save_reopen_and_share() {
 
     // The join matched every parcel by its text id; "101" matched none, and the parcel with no
     // assessment kept its row with no value.
-    let assessed = rows(layer(&s, "assessed"), "parcel_id");
-    assert_eq!(assessed.len(), 12);
-    for (k, (id, fields)) in assessed.iter().enumerate() {
-        let value = &fields.iter().find(|(f, _)| f == "value_usd").unwrap().1;
-        let want = if k < 11 { Field::Int(100_000 + k as i64 * 1_000) } else { Field::Null };
-        assert_eq!(value, &want, "{id}");
-    }
+    assert_eq!(check_values(layer(&s, "assessed")), 12);
     check_totals(table(&s, "zoned_Statistics"));
     let zoned = layer(&s, "zoned").clone();
-    assert_eq!(zoned.features.len(), 13);
+    // Every piece keeps its parcel's value through the overlay.
+    assert_eq!(check_values(&zoned), 13);
 
     let png = dir.path("map.png");
     s.run("share.exportMap", &json!({"path": png, "width": 320, "height": 200})).unwrap();
     let bytes = std::fs::read(&png).unwrap();
-    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() > 1000, "a map came out");
+    let map = rustgis_engine::render::decode_png(&bytes).expect("a PNG came out");
+    let colours: std::collections::HashSet<_> = map.pixels().iter().map(|p| (p.red(), p.green(), p.blue())).collect();
+    assert!(colours.len() > 2, "the map draws its layers, not only a background: {} colours", colours.len());
 
     // Reopened, the project has the same layers, pieces and totals.
     let project = dir.path("zoning.rgis");
@@ -201,7 +215,7 @@ fn join_overlay_summarise_map_save_reopen_and_share() {
     let gpkg = dir.path("zoned.gpkg");
     reopened.run("share.exportLayer", &json!({"layer": "zoned", "path": gpkg})).unwrap();
     let (back, _) = io::read_path(&gpkg).unwrap();
-    assert_eq!(back.features.len(), 13);
+    assert_eq!(check_values(&back), 13, "values survive the GeoPackage");
     let ids = |ds: &Dataset| (0..ds.features.len()).map(|r| ds.value(r, ds.field_index("parcel_id").unwrap()).clone()).collect::<Vec<_>>();
     assert_eq!(ids(&back), ids(&zoned), "parcel ids, leading zeros included");
     let area =
@@ -318,7 +332,8 @@ fn shelby_county_tract_areas_match_the_census() {
             let published =
                 ds.value(r, land).as_f64().unwrap_or_else(|| panic!("{id}: not joined")) + ds.value(r, water).as_f64().unwrap_or(0.0);
             let got = ds.value(r, area).as_f64().unwrap() * 1e6;
-            assert!((got - published).abs() <= 1e-5 * published, "{id}: {got:.0} m², the Census Bureau {published:.0} m²");
+            // The published areas are whole square metres: a metre either way is rounding.
+            assert!((got - published).abs() <= 1e-5 * published + 1.0, "{id}: {got:.0} m², the Census Bureau {published:.0} m²");
         }
     };
     let shelby = layer(&s, "shelby").clone();

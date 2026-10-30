@@ -58,12 +58,15 @@ jobs:
 
   # Everyday jobs on real data: the Census Bureau's tracts for Shelby County, Tennessee, checked
   # against the areas it publishes (crates/engine/tests/workflows.rs). The files are public domain
-  # and pinned by checksum; a changed file fails the run, a download that fails skips it.
+  # and pinned by checksum; a changed file fails the run, a download that fails skips the tests
+  # (`tested` tells the report, which then neither opens nor closes an issue).
   workflows:
     name: Workflows on real data
     needs: changed
     if: needs.changed.outputs.run == 'true'
     runs-on: ubuntu-latest
+    outputs:
+      tested: ${{ steps.data.outputs.ok }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -109,14 +112,17 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-          RESULT: ${{ needs.rust.result == 'success' && needs.workflows.result == 'success' && 'success' || 'failure' }}
+          # "incomplete": everything ran passed, but the real-data tests couldn't download their files.
+          RESULT: ${{ (needs.rust.result != 'success' || needs.workflows.result != 'success') && 'failure' || (needs.workflows.outputs.tested == 'true' && 'success' || 'incomplete') }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           title="Nightly build failed"
           open="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" \
             --json number,title --jq "[.[] | select(.title == \"$title\")][0].number // \"\"")"
-          if [ "$RESULT" = success ]; then
+          if [ "$RESULT" = incomplete ]; then
+            echo "The real-data tests didn't run (download failed): leaving the nightly issue as it is."
+          elif [ "$RESULT" = success ]; then
             if [ -n "$open" ]; then
               gh issue close "$open" -R "$GITHUB_REPOSITORY" --comment "Fixed: the nightly run on $GITHUB_SHA passed ($RUN)."
             fi
