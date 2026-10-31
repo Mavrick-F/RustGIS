@@ -177,15 +177,12 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             let mut m = map_of(s, p)?;
             m.layers.iter_mut().filter(|l| l.visible).try_for_each(load_whole)?;
             let html = web_map_html(&m, &m.name)?;
-            say_zm(s, m.layers.iter().filter(|l| l.visible).map(|l| &l.dataset), &m.name);
             Ok((m.name.clone(), html.into_bytes(), m.name))
         }
         "webLayer" => {
             let mut l = layer_of(s, p)?;
             load_whole(&mut l)?;
-            let zip = web_layer_zip(s, &l)?;
-            say_zm(s, [&l.dataset], &l.name);
-            Ok((l.name.clone(), zip, l.name.clone()))
+            Ok((l.name.clone(), web_layer_zip(s, &l)?, l.name.clone()))
         }
         "webStyle" => {
             let l = layer_of(s, p)?;
@@ -204,9 +201,7 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             m.layers.iter_mut().filter(|l| !l.is_raster() && !l.graphics).try_for_each(load_whole)?;
             let mut layers: Vec<&Dataset> = m.layers.iter().filter(|l| !l.is_raster() && !l.graphics).map(|l| &l.dataset).collect();
             layers.extend(s.project.tables.iter().map(|t| &t.dataset));
-            let zip = ogc_zip(&m.name, &layers, &[])?;
-            say_zm(s, m.layers.iter().filter(|l| !l.is_raster() && !l.graphics).map(|l| &l.dataset), &m.name);
-            Ok((m.name.clone(), zip, m.name.clone()))
+            Ok((m.name.clone(), ogc_zip(&m.name, &layers, &[])?, m.name.clone()))
         }
         "webTool" => {
             let ms = &s.project.models;
@@ -254,14 +249,6 @@ fn map_of(s: &Session, p: &Value) -> Result<Map, String> {
     };
     m.bake_groups();
     Ok(m)
-}
-
-/// Says, for each of `layers` that lost Z or M values on import, that `target` has none.
-fn say_zm<'a>(s: &mut Session, layers: impl IntoIterator<Item = &'a Dataset>, target: &str) {
-    let notes: Vec<String> = layers.into_iter().filter_map(|ds| rustgis_data::zm_export_note(ds, target)).collect();
-    for n in notes {
-        s.notify(n, false);
-    }
 }
 
 /// A streamed layer shares its whole source, not the features read for the current view.
@@ -332,6 +319,7 @@ fn share(s: &mut Session, p: &Value, kind: &str) -> CmdResult {
     s.notify(format!("Shared {name} to {path}"), false);
     // After it, so the status bar, which shows the last notice, keeps saying it.
     note_label_classes(s, kind, p);
+    note_zm(s, kind, p, &path);
     Ok(json!({"item": id, "path": path, "bytes": bytes.len()}))
 }
 
@@ -560,6 +548,23 @@ onresize=draw;draw();
         res = if m.camera.res.is_finite() && m.camera.res > 0.0 { m.camera.res } else { 40_000.0 },
         bg = bg
     ))
+}
+
+/// Says, when a shared web map, web layer or OGC API Features item has layers that lost Z or M
+/// values on import, that `target` has none: one notice, counting them. Run once the item is made,
+/// as [`note_label_classes`] is.
+pub(crate) fn note_zm(s: &mut Session, kind: &str, p: &Value, target: &str) {
+    let note = match kind {
+        "webLayer" => s.layer_id(p).ok().and_then(|id| s.map().layer(id)).and_then(|l| rustgis_data::zm_export_note([&l.dataset], target)),
+        "webMap" | "geodataService" => map_of(s, p).ok().and_then(|m| {
+            let shared = |l: &&Layer| if kind == "webMap" { l.visible } else { !l.is_raster() && !l.graphics };
+            rustgis_data::zm_export_note(m.layers.iter().filter(shared).map(|l| &l.dataset), target)
+        }),
+        _ => None,
+    };
+    if let Some(note) = note {
+        s.notify(note, false);
+    }
 }
 
 /// Says what a web layer or style (`kind`) leaves out of the labels: it labels every feature with

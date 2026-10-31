@@ -3198,7 +3198,7 @@ impl RustGisApp {
                 };
                 let ext = if ext == "shp" { "zip".to_string() } else { ext };
                 let name = format!("{}.{ext}", l.name);
-                let zm_note = rustgis_engine::data::zm_export_note(ds, &name);
+                let zm_note = rustgis_engine::data::zm_export_note([ds], &name);
                 if left_out > 0 {
                     self.session.notify(format!("{name}: {left_out} features without drawable geometry were left out"), false);
                 }

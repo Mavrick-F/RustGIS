@@ -167,11 +167,12 @@ pub struct SourceInfo {
 }
 
 impl SourceInfo {
-    /// Marks the source as having Z or M values, which reading drops, and notes it once.
-    pub(crate) fn drop_zm(&mut self) {
+    /// Marks the source as having Z or M values, which reading drops, and notes it once: in
+    /// `features` features when known (every one, when the source declares them).
+    pub(crate) fn drop_zm(&mut self, features: Option<u64>) {
         if !self.zm_dropped {
             self.zm_dropped = true;
-            self.notes.push(crate::ZM_DROPPED_NOTE.into());
+            self.notes.push(crate::zm_note(features));
         }
     }
 

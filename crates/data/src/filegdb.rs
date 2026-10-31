@@ -310,9 +310,7 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     }
     let mut ds = Dataset::new(name, layer_type, fields);
     // A multipatch's heights are kept as fields and noted below; its measures aren't.
-    if table.geometry.is_some() && (table.has_m || (table.has_z && table.shape != Shape::Multipatch)) {
-        ds.drop_zm(&mut report);
-    }
+    let zm = table.geometry.is_some() && (table.has_m || (table.has_z && table.shape != Shape::Multipatch));
     ds.crs = crs;
     let geometry_at = table.fields.iter().position(|f| f.kind == Kind::Geometry);
     let (mut curves, mut wall_hulls, mut unmerged, mut unprojected) = (0usize, 0usize, 0usize, 0usize);
@@ -367,6 +365,11 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
         report
             .messages
             .push(format!("{unprojected} features have coordinates outside their coordinate system: they are kept without geometry"));
+    }
+    if zm {
+        // The table declares them for every geometry.
+        let n = ds.features.iter().filter(|f| f.geometry.is_some()).count();
+        ds.drop_zm(&mut report, n);
     }
     if patches {
         report.messages.push("3D multipatches are drawn as their footprints, with their lowest and highest Z in z_min and z_max, and the difference in height".into());

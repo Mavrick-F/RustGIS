@@ -315,22 +315,43 @@ pub struct ReadReport {
     pub messages: Vec<String>,
 }
 
-/// What a read says when it drops Z or M values (see [`Dataset::zm_dropped`]).
-pub const ZM_DROPPED_NOTE: &str =
-    "Z or M values (heights or measures) were dropped: RustGIS keeps x and y only, so exports won't have them";
+/// What a read says when it drops Z or M values (see [`Dataset::zm_dropped`]): from `features` of
+/// them when counted, else from the source as a whole.
+pub fn zm_note(features: Option<u64>) -> String {
+    let what = match features {
+        Some(1) => "1 feature had Z or M values (heights or measures), which were".to_string(),
+        Some(n) => format!("{n} features had Z or M values (heights or measures), which were"),
+        None => "its Z or M values (heights or measures) were".to_string(),
+    };
+    format!("{what} dropped: RustGIS keeps x and y only, so exports won't have them")
+}
 
-/// What an export says when its dataset lost Z or M values on import, or `None`: `target` names
-/// what was written (a file, or the text returned).
-pub fn zm_export_note(ds: &Dataset, target: &str) -> Option<String> {
-    ds.zm_dropped.then(|| format!("{target}: has no Z or M values, which were dropped when {} was read", ds.name))
+/// What an export of `layers` says when any lost Z or M values on import, or `None`: one notice,
+/// naming them (the first few) and counting them. `target` names what was written (a file, or the
+/// text returned).
+pub fn zm_export_note<'a>(layers: impl IntoIterator<Item = &'a Dataset>, target: &str) -> Option<String> {
+    let names: Vec<&str> = layers.into_iter().filter(|ds| ds.zm_dropped).map(|ds| ds.name.as_str()).collect();
+    match names.as_slice() {
+        [] => None,
+        [one] => Some(format!("{target}: its geometry has no Z or M values, which were dropped when {one} was read")),
+        _ => {
+            let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+            let more = if names.len() > 5 { format!(" and {} more", names.len() - 5) } else { String::new() };
+            Some(format!(
+                "{target}: its geometry has no Z or M values for {} layers ({shown}{more}), which were dropped when they were read",
+                names.len()
+            ))
+        }
+    }
 }
 
 impl Dataset {
-    /// Marks the dataset as having lost Z or M values and says so in `report`, once.
-    pub(crate) fn drop_zm(&mut self, report: &mut ReadReport) {
-        if !self.zm_dropped {
+    /// Marks the dataset as having lost the Z or M values of `features` features (none: nothing)
+    /// and says so in `report`.
+    pub(crate) fn drop_zm(&mut self, report: &mut ReadReport, features: usize) {
+        if features > 0 {
             self.zm_dropped = true;
-            report.messages.push(ZM_DROPPED_NOTE.into());
+            report.messages.push(zm_note(Some(features as u64)));
         }
     }
 

@@ -1091,6 +1091,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         k if super::sharing::KINDS.iter().any(|x| x.0 == k) => {
             let (name, bytes, _) = super::sharing::share_bytes(s, k, p)?;
             super::sharing::note_label_classes(s, k, p);
+            super::sharing::note_zm(s, k, p, &name);
             (name, bytes)
         }
         k => return Err(format!("unknown item '{k}'")),

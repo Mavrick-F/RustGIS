@@ -150,9 +150,9 @@ impl ShpSource {
             notes,
             zm_dropped: false,
         };
-        // PointZ … MultiPointM: the header's type says whether the shapes carry Z or M values.
+        // PointZ … MultiPointM: the header's type says every shape carries Z or M values.
         if matches!(shape_type, 11 | 13 | 15 | 18 | 21 | 23 | 25 | 28) {
-            info.drop_zm();
+            info.drop_zm(Some(index.count));
         }
         Ok(ShpSource { info, shp: path.to_path_buf(), dbf, index, table, encoding, reproject })
     }

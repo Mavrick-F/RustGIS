@@ -92,7 +92,7 @@ fn export_layer(s: &mut Session, p: &Value) -> CmdResult {
     };
     let left_out = rustgis_data::io::write_path_in(ds, Path::new(&path), crs).map_err(|e| e.to_string())?;
     let written = ds.features.len().saturating_sub(left_out);
-    let zm_note = rustgis_data::zm_export_note(ds, &path);
+    let zm_note = rustgis_data::zm_export_note([ds], &path);
     // FlatGeobuf, KML, GPX and Shapefile hold features with geometry only (a Shapefile, only
     // geometry it can draw).
     if left_out > 0 {

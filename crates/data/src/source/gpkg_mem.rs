@@ -182,8 +182,11 @@ impl GpkgMemSource {
         }
         // Z and M are 0 (none), 1 (every geometry) or 2 (optional: looked for in the first rows).
         let (z, m) = (int(get(gc, "z")).unwrap_or(0), int(get(gc, "m")).unwrap_or(0));
-        if z == 1 || m == 1 || ((z == 2 || m == 2) && src.peek_zm()) {
-            src.info.drop_zm();
+        if z == 1 || m == 1 {
+            // Every geometry has them.
+            src.info.drop_zm(src.info.count);
+        } else if (z == 2 || m == 2) && src.peek_zm() {
+            src.info.drop_zm(None);
         }
         Ok(src)
     }
@@ -193,9 +196,10 @@ impl GpkgMemSource {
         let mut found = false;
         let mut looked = 0;
         let _ = self.db.rows(&self.table, |_, r| {
+            // Every row counts, so a table of empty geometries isn't read to its end.
+            looked += 1;
             if let Some(Val::Blob(b)) = r.get(self.geom_col) {
-                looked += 1;
-                found = super::gpkg_blob::split_blob(b).is_some_and(|(_, body)| wkb::has_zm(body));
+                found |= super::gpkg_blob::split_blob(b).is_some_and(|(_, body)| wkb::has_zm(body));
             }
             if found || looked >= 16 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
         });

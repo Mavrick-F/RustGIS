@@ -863,7 +863,7 @@ impl PostgisSource {
         let t = &src.table;
         match src.conn.with(|c| c.query_one(sql.as_str(), &[&t.schema, &t.name, &t.column])).ok().and_then(|r| r.try_get::<_, bool>(0).ok())
         {
-            Some(true) => src.info.drop_zm(),
+            Some(true) => src.info.drop_zm(None),
             Some(false) => {}
             None => src.info.notes.push("couldn't tell whether it has Z or M values, which RustGIS doesn't keep".into()),
         }

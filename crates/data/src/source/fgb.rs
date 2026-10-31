@@ -115,7 +115,7 @@ impl FgbSource {
             zm_dropped: false,
         };
         if h.has_z() || h.has_m() {
-            info.drop_zm();
+            info.drop_zm((count > 0).then_some(count));
         }
         let mut src = FgbSource { info, input, reproject };
         if src.info.geometry_type == GeometryType::None {

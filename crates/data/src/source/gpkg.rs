@@ -222,8 +222,11 @@ impl GpkgSource {
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = src.peek_kind();
         }
-        if zm.is_some_and(|(z, m)| z == 1 || m == 1 || ((z == 2 || m == 2) && src.peek_zm())) {
-            src.info.drop_zm();
+        match zm {
+            // Every geometry has them.
+            Some((z, m)) if z == 1 || m == 1 => src.info.drop_zm(src.info.count),
+            Some((z, m)) if (z == 2 || m == 2) && src.peek_zm() => src.info.drop_zm(None),
+            _ => {}
         }
         Ok(src)
     }

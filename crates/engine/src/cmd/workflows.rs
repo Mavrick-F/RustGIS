@@ -882,7 +882,7 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         "wkt" => rustgis_data::interop::to_wkt_csv(ds),
         f => return Err(format!("unknown format '{f}'")),
     };
-    let zm_note = rustgis_data::zm_export_note(ds, ps(p, "path").unwrap_or(&ds.name));
+    let zm_note = rustgis_data::zm_export_note([ds], ps(p, "path").unwrap_or(&ds.name));
     let out = match ps(p, "path") {
         Some(path) => {
             rustgis_data::io::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;

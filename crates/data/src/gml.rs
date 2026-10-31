@@ -197,8 +197,8 @@ fn geometry(g: &Node, zm: &Cell<bool>) -> Option<Geometry> {
 struct Kind {
     columns: Vec<String>,
     rows: Vec<(Option<Geometry>, BTreeMap<String, String>)>,
-    /// A geometry's Z or M values were dropped.
-    zm: Cell<bool>,
+    /// Features whose Z or M values were dropped.
+    zm: usize,
 }
 
 /// Reads a GML file into a layer per feature type (those with features).
@@ -238,6 +238,8 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         let mut attrs = BTreeMap::new();
         let mut geom = None;
         let mut bad = false;
+        // Whether the geometry kept had Z or M values.
+        let mut zm = false;
         for p in f.children().filter(|c| c.is_element()) {
             // A property holding a geometry, or a simple value.
             // A feature's bounding box (gml:boundedBy) is neither its shape nor an attribute.
@@ -257,8 +259,12 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                         None => unknown_srs = Some(s.to_string()),
                     }
                 }
-                match geometry(&g, &kind.zm) {
-                    Some(gm) => geom = Some(gm),
+                let dims = Cell::new(false);
+                match geometry(&g, &dims) {
+                    Some(gm) => {
+                        zm = dims.get();
+                        geom = Some(gm);
+                    }
                     None => bad = true,
                 }
             } else if p.children().any(|c| c.is_element() && is_gml(&c)) {
@@ -283,6 +289,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         }
         // A geometry that couldn't be read, unless another property gave the feature its shape.
         skipped += usize::from(bad && geom.is_none());
+        kind.zm += usize::from(zm && geom.is_some());
         kind.rows.push((geom, attrs));
     }
     let mut report = ReadReport { skipped, ..ReadReport::default() };
@@ -310,7 +317,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             .collect();
         let title = if single { stem.clone() } else { format!("{stem} {name}") };
         let mut ds = Dataset::new(title, GeometryType::None, fields);
-        ds.zm_dropped = kind.zm.get();
+        let zm = kind.zm;
         let mut outside = false;
         for (g, attrs) in kind.rows {
             let g = g.map(|g| match &transform {
@@ -336,8 +343,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         if file_srs.is_none() && outside {
             rep.messages.push("the GML doesn't say its coordinate system (srsName) and its coordinates aren't longitude/latitude".into());
         }
-        if ds.zm_dropped {
-            rep.messages.push(format!("{}: {}", ds.name, crate::ZM_DROPPED_NOTE));
+        if zm > 0 {
+            ds.zm_dropped = true;
+            rep.messages.push(format!("{}: {}", ds.name, crate::zm_note(Some(zm as u64))));
         }
         out.push((ds, rep));
     }
