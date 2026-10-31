@@ -1319,13 +1319,24 @@ fn input_settings(app: &mut RustGisApp, ui: &mut Ui, i: usize, n: &ModelNode) {
     }
 }
 
-/// The layer feeding a tool's first layer parameter, when it is an input node's (for its fields).
-fn source_layer(app: &RustGisApp, n: &ModelNode, spec: &ToolSpec) -> Option<String> {
-    let first = crate::panes::first_layer(spec)?;
-    match app.mb.graph.edges.iter().find(|e| e.to == n.id && e.to_port == first.name) {
+/// Resolves the named input independently, so a join's fields come from its join input.
+fn source_input(app: &RustGisApp, n: &ModelNode, input: &str) -> Option<String> {
+    match app.mb.graph.edges.iter().find(|e| e.to == n.id && e.to_port == input) {
         Some(e) => app.mb.graph.nodes.iter().find(|u| u.id == e.from && u.kind == ModelNodeKind::Input).and_then(|u| u.layer.clone()),
-        None => n.params.get(first.name).and_then(Value::as_str).map(str::to_string),
+        None => n.params.get(input).and_then(Value::as_str).map(str::to_string),
     }
+}
+
+/// Fields of a known model input. Numeric parameters refer strictly to a standalone table ID;
+/// a wire takes precedence, and tool-produced schemas remain unknown until execution.
+fn input_fields<'a>(app: &'a RustGisApp, n: &ModelNode, input: &str) -> Option<&'a [rustgis_engine::data::Field]> {
+    if !app.mb.graph.edges.iter().any(|e| e.to == n.id && e.to_port == input)
+        && let Some(id) = n.params.get(input).and_then(Value::as_u64)
+    {
+        return app.session.project.table(u32::try_from(id).ok()?).map(|t| t.dataset.fields.as_slice());
+    }
+    let name = source_input(app, n, input)?;
+    crate::panes::input_dataset(&app.session, &name).map(|d| d.fields.as_slice())
 }
 
 fn tool_settings(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, i: usize, n: &ModelNode) {
@@ -1339,20 +1350,16 @@ fn tool_settings(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, i: usize, n: &Mo
     };
     ui.label(egui::RichText::new(tl!(spec.summary)).size(11.5).color(t.text_dim));
     ui.add_space(6.0);
-    let fields: Vec<(String, bool)> = source_layer(app, n, spec)
-        .and_then(|l| {
-            let s = &app.session;
-            s.map().layer_by_name(&l).map(|x| &x.dataset).or_else(|| {
-                rustgis_engine::project::find_table(&s.project.tables, &l).and_then(|k| s.project.tables.get(k)).map(|x| &x.dataset)
-            })
-        })
-        .map(|d| d.fields.iter().map(|f| (f.name.clone(), f.ty.is_numeric())).collect())
+    let fields: Vec<(String, bool)> = crate::panes::first_layer(spec)
+        .and_then(|p| input_fields(app, n, p.name))
+        .map(|fields| fields.iter().map(|f| (f.name.clone(), f.ty.is_numeric())).collect())
         .unwrap_or_default();
     let mut set: Option<(&'static str, Value)> = None;
     let mut focus = false;
     let mut unwire: Option<&'static str> = None;
     for p in spec.params {
         let label = ui.label(egui::RichText::new(format!("{}{}", tl!(p.label), if p.required { " *" } else { "" })).size(12.0));
+        let label_id = label.id;
         if !p.help.is_empty() {
             label.on_hover_text(p.help);
         }
@@ -1416,6 +1423,20 @@ fn tool_settings(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, i: usize, n: &Mo
             ui.add_space(4.0);
             continue;
         }
+        if let Some(input) = crate::fieldlists::input(p.kind) {
+            let fields = input_fields(app, n, input);
+            let edit = ui.push_id(("mb_list", &n.id, p.name), |ui| crate::fieldlists::show(ui, p.kind, &cur, fields)).inner;
+            if edit.checkpoint {
+                app.mb.edit();
+            }
+            if let Some(value) = edit.value
+                && let Some(node) = app.mb.graph.nodes.get_mut(i)
+            {
+                set_param(node, p.name, value);
+            }
+            ui.add_space(4.0);
+            continue;
+        }
         match p.kind {
             ParamKind::Bool => {
                 let mut on = cur.as_bool().unwrap_or(text == "true" || (cur.is_null() && default == "true"));
@@ -1459,6 +1480,7 @@ fn tool_settings(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, i: usize, n: &Mo
                         }
                     })
                     .response
+                    .labelled_by(label_id)
                     .on_hover_text(tl!(p.label));
             }
             _ => {

@@ -1799,3 +1799,126 @@ fn shapefile_complete_chunks_keep_all_rows_order_attributes_and_budget() {
         .unwrap();
     assert_eq!(rows, expected.features);
 }
+
+/// Every feature of a complete traversal, in order, checking each chunk against the budget.
+fn visit_all(src: &dyn FeatureSource, extent: Option<Extent>, budget: usize) -> (Vec<Feature>, Batch, usize) {
+    let (mut rows, mut calls) = (Vec::new(), 0);
+    let summary = src
+        .visit_chunks(extent, budget, &mut |chunk| {
+            calls += 1;
+            // Only a row that alone exceeds the budget comes over it, by itself.
+            let alone_too_big = |c: &Vec<Feature>| {
+                c.len() == 1 && c.iter().all(|f| chunk_memory::feature_bytes(f) + std::mem::size_of::<Feature>() > budget)
+            };
+            assert!(chunk_memory::features_bytes(&chunk) <= budget || alone_too_big(&chunk), "{}", src.info().format);
+            rows.extend(chunk);
+            Ok(())
+        })
+        .unwrap();
+    (rows, summary, calls)
+}
+
+/// GeoPackage, FlatGeobuf and GeoParquet visit, a chunk at a time, exactly the features a whole
+/// read gives (ids, attributes, order and skipped rows), for exports. They still draw from a
+/// view window: a complete traversal on every render would be far slower.
+#[test]
+fn geopackage_flatgeobuf_and_geoparquet_visit_what_a_whole_read_gives() {
+    let d = dir().join("visit");
+    std::fs::create_dir_all(&d).unwrap();
+    let (gpkg, gpkg_scan, fgb, pq, pq_plain) =
+        (d.join("grid.gpkg"), d.join("scan.gpkg"), d.join("grid.fgb"), d.join("grid.parquet"), d.join("plain.parquet"));
+    write_gpkg(&gpkg, true);
+    write_gpkg(&gpkg_scan, false);
+    write_fgb(&fgb);
+    write_parquet(&pq, true);
+    write_parquet(&pq_plain, false);
+    let mut sources: Vec<Box<dyn FeatureSource>> = Vec::new();
+    for p in [&gpkg, &gpkg_scan, &fgb, &pq, &pq_plain] {
+        sources.push(open_path(p, None).unwrap());
+    }
+    for p in [&gpkg, &fgb, &pq] {
+        sources.push(open_bytes(&p.file_name().unwrap().to_string_lossy(), std::fs::read(p).unwrap(), None).unwrap());
+    }
+    // The browser's GeoPackage reader.
+    sources.push(Box::new(gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(std::fs::read(&gpkg_scan).unwrap())), None).unwrap()));
+    let extent = Extent::new(-100.0, -30.0, 20.0, 45.0);
+    let by_id = |mut v: Vec<Feature>| {
+        v.sort_by_key(|f| f.id);
+        v
+    };
+    for src in &sources {
+        let format = src.info().format;
+        assert!(src.visits_chunks() && !src.streams_chunks(), "{format}");
+        let whole = src.read(&Request::all()).unwrap();
+        assert!(whole.complete && whole.features.len() == 600, "{format}");
+        for budget in [256, 4096, 1 << 20] {
+            let (rows, summary, calls) = visit_all(src.as_ref(), None, budget);
+            assert_eq!(rows, whole.features, "{format} at {budget} bytes");
+            assert!(summary.complete && summary.features.is_empty(), "{format}");
+            assert_eq!((summary.matched, summary.skipped), (600, whole.skipped), "{format}");
+            assert!(budget > 4096 || calls > 1, "{format} at {budget} bytes came in one chunk");
+        }
+        // Each row alone when none fits the budget.
+        assert_eq!(visit_all(src.as_ref(), None, 1).0, whole.features, "{format}");
+        // An extent: the features a complete read of it gives (the R-tree's order may differ).
+        let part = src.read(&Request { extent: Some(extent), limit: 10_000 }).unwrap();
+        assert!(part.complete && part.features.len() == in_box(&extent), "{format}");
+        let (rows, summary, _) = visit_all(src.as_ref(), Some(extent), 1024);
+        assert!(summary.complete && summary.features.is_empty() && summary.matched == rows.len() as u64, "{format}");
+        if src.info().indexed {
+            assert_eq!(by_id(rows), by_id(part.features), "{format}");
+        } else {
+            assert_eq!(rows, part.features, "{format}");
+        }
+        assert!(visit_all(src.as_ref(), Some(Extent::new(1.0, 1.0, 2.0, 2.0)), 1024).0.is_empty(), "{format}");
+        // A visitor's error stops the traversal; a zero budget is refused before any row.
+        let mut calls = 0;
+        let stopped = src.visit_chunks(None, 256, &mut |_| {
+            calls += 1;
+            Err(DataError::Format("cancelled".into()))
+        });
+        assert!(stopped.is_err() && calls == 1, "{format}");
+        assert!(src.visit_chunks(None, 0, &mut |_| panic!("a zero budget must not emit")).is_err(), "{format}");
+        // The map's reads of the layer go on while a traversal waits on its visitor.
+        src.visit_chunks(None, 256, &mut |_| {
+            assert_eq!(src.read(&Request { extent: None, limit: 1 }).unwrap().features.len(), 1, "{format}");
+            Ok(())
+        })
+        .unwrap();
+    }
+    // A row group longer than a read takes from one: a traversal refuses it rather than leave
+    // its last rows out.
+    let capped = parquet::ParquetSource::open_path(&pq_plain, "plain").unwrap().with_group_rows(40);
+    let error = capped.visit_chunks(None, 4096, &mut |_| Ok(())).unwrap_err().to_string();
+    assert!(error.contains("row group 0 has 50 rows, more than the 40"), "{error}");
+    // A capped row group outside the extent is passed over, not refused.
+    let capped = parquet::ParquetSource::open_path(&pq, "grid").unwrap().with_group_rows(40);
+    assert!(visit_all(&capped, Some(Extent::new(178.0, 0.0, 179.0, 1.0)), 4096).0.is_empty());
+    // A GeoPackage put in place of the one added is refused, not read as the layer.
+    #[cfg(unix)]
+    {
+        let src = open_path(&gpkg, None).unwrap();
+        let other = d.join("other.gpkg");
+        write_gpkg(&other, false);
+        std::fs::rename(&other, &gpkg).unwrap();
+        let error = src.visit_chunks(None, 4096, &mut |_| Ok(())).unwrap_err().to_string();
+        assert!(error.contains("replaced"), "{error}");
+        assert_eq!(src.read(&Request::all()).unwrap().features.len(), 600);
+    }
+    // An unreadable geometry is skipped and counted, and a row without one left out, as a read does.
+    drop(sources);
+    let c = rusqlite::Connection::open(&gpkg_scan).unwrap();
+    c.execute_batch("INSERT INTO \"grid \"\"q\"\"\" (geom, name) VALUES (X'4750000300000000DEAD', 'bad'), (NULL, 'none');").unwrap();
+    drop(c);
+    let src = open_path(&gpkg_scan, None).unwrap();
+    let whole = src.read(&Request::all()).unwrap();
+    assert_eq!((whole.features.len(), whole.skipped), (600, 1));
+    let (rows, summary, _) = visit_all(src.as_ref(), None, 4096);
+    assert_eq!((rows, summary.skipped), (whole.features, 1));
+    // The browser's reader of the same file skips and leaves out the same rows.
+    let mem = gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(std::fs::read(&gpkg_scan).unwrap())), None).unwrap();
+    let whole = mem.read(&Request::all()).unwrap();
+    assert_eq!((whole.features.len(), whole.skipped), (600, 1));
+    let (rows, summary, _) = visit_all(&mem, None, 4096);
+    assert_eq!((rows, summary.skipped), (whole.features, 1));
+}

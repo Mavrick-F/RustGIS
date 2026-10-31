@@ -2919,6 +2919,7 @@ impl GpForm {
         let Some(spec) = self.tool.and_then(rustgis_engine::analysis::tool) else { return };
         for p in spec.params {
             let text = match (p.kind, given.get(p.name)) {
+                (ParamKind::Fields { .. } | ParamKind::FieldStatistics { .. }, Some(v)) => v.to_string(),
                 (_, None | Some(Value::Null)) => continue,
                 (ParamKind::RasterLayers | ParamKind::VectorLayers, Some(Value::Array(a))) => {
                     a.iter().map(|x| x.as_str().map_or_else(|| x.to_string(), str::to_string)).collect::<Vec<_>>().join(";")
@@ -3153,7 +3154,7 @@ pub(crate) fn takes_layer(kind: ParamKind, l: &rustgis_engine::map::Layer) -> bo
 /// a kind that isn't a field's.
 pub(crate) fn takes_field(kind: ParamKind, d: &rustgis_engine::data::Dataset, i: usize) -> bool {
     match kind {
-        ParamKind::Field => true,
+        ParamKind::Field | ParamKind::Fields { .. } => true,
         ParamKind::NumericField => d.fields.get(i).is_some_and(|f| f.ty.is_numeric()),
         ParamKind::CoordinateField => rustgis_engine::analysis::holds_coordinates(d, i),
         _ => false,
@@ -3368,7 +3369,15 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // A parameter that doesn't apply to the options picked (Spatial Join's search distance with
     // Intersects) is hidden, and left out of the run.
     let applies = |app: &RustGisApp, name: &str| {
-        let value = |n: &str| app.gp.values.get(n).cloned().unwrap_or_default();
+        let value = |n: &str| {
+            let text = app.gp.values.get(n).cloned().unwrap_or_default();
+            if spec.params.iter().any(|p| p.name == n && crate::fieldlists::input(p.kind).is_some()) {
+                let value = crate::fieldlists::form_value(&text);
+                value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string())
+            } else {
+                text
+            }
+        };
         rustgis_engine::analysis::param_applies(spec.id, name, &value)
     };
     for p in spec.params {
@@ -3380,6 +3389,23 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             label.on_hover_text(p.help);
         }
         let mut cur = app.gp.values.get(p.name).cloned().unwrap_or_default();
+        if let Some(input) = crate::fieldlists::input(p.kind) {
+            let name = app.gp.values.get(input).map(String::as_str).unwrap_or_default();
+            let dataset = match app.gp.tables.get(input) {
+                Some(id) => app.session.project.table(*id).map(|t| &t.dataset),
+                None => input_dataset(&app.session, name),
+            };
+            let value = crate::fieldlists::form_value(&cur);
+            if let Some(value) = ui
+                .push_id(("gp_list", p.name), |ui| crate::fieldlists::show(ui, p.kind, &value, dataset.map(|d| d.fields.as_slice())))
+                .inner
+                .value
+            {
+                app.gp.values.insert(p.name, value.to_string());
+            }
+            ui.add_space(4.0);
+            continue;
+        }
         let options: Option<Vec<String>> = match p.kind {
             // Layers by their names, then tables: the value is the name shown, and a table
             // picked is kept by its id beside it.
@@ -3600,6 +3626,7 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                             let bytes = app.gp.files.get(p.name).map(|(_, b)| b.as_slice()).unwrap_or_default();
                             json!({"name": v, "data": base64::engine::general_purpose::STANDARD.encode(bytes)})
                         }
+                        (ParamKind::Fields { .. } | ParamKind::FieldStatistics { .. }, _) => crate::fieldlists::form_value(v),
                         (ParamKind::Bool, _) => json!(v == "true"),
                         _ => json!(v),
                     };
@@ -3995,7 +4022,9 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 ui.horizontal(|ui| {
                     let input_label = ui.label(tl!("Classes"));
                     let mut k = asked;
-                    if ui.add(egui::DragValue::new(&mut k).range(1..=12)).labelled_by(input_label.id).changed() {
+                    let resp = ui.add(egui::DragValue::new(&mut k).range(1..=12)).labelled_by(input_label.id);
+                    if resp.changed() {
+                        crate::widgets::one_step_per_press(app, &resp);
                         let _ = app.run(
                             "layer.symbology",
                             json!({"type": "graduated", "field": field, "method": format!("{method:?}"), "classes": k, "ramp": ramp.name()}),
@@ -4498,28 +4527,36 @@ fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, 
             if g != GeometryType::Polyline {
                 ui.label(tl!("Color"));
                 let mut c = c32(s.fill);
-                if crate::widgets::color_button(ui, &mut c).changed() {
+                let resp = crate::widgets::color_button(ui, &mut c);
+                if resp.changed() {
+                    crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("layer.color", json!({"color": rgba(c).hex8()}));
                 }
                 ui.end_row();
             }
             ui.label(tl!(if g == GeometryType::Polyline { "Line color" } else { "Outline color" }));
             let mut c = c32(s.stroke);
-            if crate::widgets::color_button(ui, &mut c).changed() {
+            let resp = crate::widgets::color_button(ui, &mut c);
+            if resp.changed() {
+                crate::widgets::one_step_per_press(app, &resp);
                 let key = if g == GeometryType::Polyline { "layer.color" } else { "layer.outline" };
                 let _ = app.run(key, json!({"color": rgba(c).hex()}));
             }
             ui.end_row();
             let input_label = ui.label(tl!(if g == GeometryType::Polyline { "Line width" } else { "Outline width" }));
             let mut w = s.stroke_width;
-            if ui.add(egui::DragValue::new(&mut w).range(0.0..=12.0).speed(0.05).suffix(" pt")).labelled_by(input_label.id).changed() {
+            let resp = ui.add(egui::DragValue::new(&mut w).range(0.0..=12.0).speed(0.05).suffix(" pt")).labelled_by(input_label.id);
+            if resp.changed() {
+                crate::widgets::one_step_per_press(app, &resp);
                 let _ = app.run("layer.outline", json!({"width": w}));
             }
             ui.end_row();
             if g == GeometryType::Point {
                 let input_label = ui.label(tl!("Size"));
                 let mut sz = s.size;
-                if ui.add(egui::DragValue::new(&mut sz).range(1.0..=60.0).speed(0.1).suffix(" pt")).labelled_by(input_label.id).changed() {
+                let resp = ui.add(egui::DragValue::new(&mut sz).range(1.0..=60.0).speed(0.1).suffix(" pt")).labelled_by(input_label.id);
+                if resp.changed() {
+                    crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("layer.marker", json!({"size": sz}));
                 }
                 ui.end_row();
@@ -4791,11 +4828,10 @@ fn marker_rows(
     }
     let input_label = ui.label(if m.mark == LineMark::Hash { tl!("Length") } else { tl!("Size") });
     let mut size = m.size;
-    if ui
-        .add(egui::DragValue::new(&mut size).range(0.0..=MAX_LINE_MARKER_SIZE).speed(0.1).suffix(" pt"))
-        .labelled_by(input_label.id)
-        .changed()
-    {
+    let resp =
+        ui.add(egui::DragValue::new(&mut size).range(0.0..=MAX_LINE_MARKER_SIZE).speed(0.1).suffix(" pt")).labelled_by(input_label.id);
+    if resp.changed() {
+        crate::widgets::one_step_per_press(app, &resp);
         set(app, with(LineMarkers { size, ..m }));
     }
     ui.end_row();
@@ -4804,8 +4840,9 @@ fn marker_rows(
         let input_label = ui.label(tl!("Offset right"));
         let mut along = m.offset_along;
         let drag = egui::DragValue::new(&mut along).range(-MAX_STROKE_OFFSET..=MAX_STROKE_OFFSET).speed(0.05).suffix(" pt");
-        if ui.add(drag).on_hover_text(tl!("Shifts the mark right of the point (left when negative)")).labelled_by(input_label.id).changed()
-        {
+        let resp = ui.add(drag).on_hover_text(tl!("Shifts the mark right of the point (left when negative)")).labelled_by(input_label.id);
+        if resp.changed() {
+            crate::widgets::one_step_per_press(app, &resp);
             set(app, with(LineMarkers { offset_along: along, ..m }));
         }
         ui.end_row();
@@ -4830,7 +4867,9 @@ fn marker_rows(
             let input_label = ui.label(tl!("Interval"));
             let mut interval = m.interval;
             let drag = egui::DragValue::new(&mut interval).range(MIN_MARKER_INTERVAL..=MAX_MARKER_INTERVAL).speed(0.2).suffix(" pt");
-            if ui.add(drag).on_hover_text(tl!("The distance between two marks along the line")).labelled_by(input_label.id).changed() {
+            let resp = ui.add(drag).on_hover_text(tl!("The distance between two marks along the line")).labelled_by(input_label.id);
+            if resp.changed() {
+                crate::widgets::one_step_per_press(app, &resp);
                 set(app, with(LineMarkers { interval, ..m }));
             }
             ui.end_row();
@@ -4841,7 +4880,9 @@ fn marker_rows(
         let mut angle = m.angle;
         let drag = egui::DragValue::new(&mut angle).range(0.0..=359.9).speed(1.0).suffix("°");
         let tip = if m.mark == LineMark::Hash { tl!("0° crosses the line square") } else { tl!("Turned further, clockwise") };
-        if ui.add(drag).on_hover_text(tip).changed() {
+        let resp = ui.add(drag).on_hover_text(tip);
+        if resp.changed() {
+            crate::widgets::one_step_per_press(app, &resp);
             set(app, with(LineMarkers { angle, ..m }));
         }
         let mut rotate = m.rotate;
@@ -5257,7 +5298,9 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
                 ui.label(tl!("Color"));
                 ui.horizontal(|ui| {
                     let mut cc = c32(c);
-                    if crate::widgets::color_button(ui, &mut cc).changed() {
+                    let resp = crate::widgets::color_button(ui, &mut cc);
+                    if resp.changed() {
+                        crate::widgets::one_step_per_press(app, &resp);
                         set(app, LineStroke { color: Some(rgba(cc)), ..st });
                     }
                     let mut from_symbol = st.color.is_none();
@@ -5270,7 +5313,9 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
                 ui.horizontal(|ui| {
                     let mut ww = w;
                     let drag = egui::DragValue::new(&mut ww).range(0.0..=MAX_STROKE_WIDTH).speed(0.05).suffix(" pt");
-                    if ui.add_enabled(st.width.is_some(), drag).on_hover_text(tl!("Width")).changed() {
+                    let resp = ui.add_enabled(st.width.is_some(), drag).on_hover_text(tl!("Width"));
+                    if resp.changed() {
+                        crate::widgets::one_step_per_press(app, &resp);
                         set(app, LineStroke { width: Some(ww), ..st });
                     }
                     let mut from_symbol = st.width.is_none();
@@ -5287,7 +5332,9 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
                 } else {
                     tl!("Shifts the stroke sideways: positive to the right of the line's direction, negative to the left")
                 };
-                if ui.add(drag).on_hover_text(tip).changed() {
+                let resp = ui.add(drag).on_hover_text(tip);
+                if resp.changed() {
+                    crate::widgets::one_step_per_press(app, &resp);
                     set(app, LineStroke { offset: off, ..st });
                 }
                 ui.end_row();
@@ -5375,11 +5422,11 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
                     ui.label(tl!("Level"));
                     ui.horizontal(|ui| {
                         let mut lv = st.level_at(i);
-                        if ui
+                        let resp = ui
                             .add_enabled(st.level.is_some(), egui::DragValue::new(&mut lv).range(0..=255).speed(0.1))
-                            .on_hover_text(tl!("Level"))
-                            .changed()
-                        {
+                            .on_hover_text(tl!("Level"));
+                        if resp.changed() {
+                            crate::widgets::one_step_per_press(app, &resp);
                             set(app, LineStroke { level: Some(lv), ..st });
                         }
                         let mut auto = st.level.is_none();
@@ -5838,7 +5885,9 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
             ui.horizontal(|ui| {
                 let input_label = ui.label(tl!("Classes"));
                 let mut kk = k;
-                if ui.add(egui::DragValue::new(&mut kk).range(1..=32)).labelled_by(input_label.id).changed() {
+                let resp = ui.add(egui::DragValue::new(&mut kk).range(1..=32)).labelled_by(input_label.id);
+                if resp.changed() {
+                    crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("raster.symbology", json!({"type": "classify", "method": format!("{m:?}"), "classes": kk, "ramp": r}));
                 }
             });

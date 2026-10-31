@@ -520,7 +520,8 @@ fn compile_op(name: &str, args: &[Json], depth: usize) -> Option<Node> {
     })
 }
 
-/// MapLibre's `isExpressionFilter`.
+/// MapLibre's `isExpressionFilter` (the MapLibre style specification, BSD-3-Clause; see `INCLUDED`
+/// in `xtask/src/notices.rs`).
 fn is_expression_filter(j: &Json, depth: usize) -> bool {
     let a = match j {
         Json::Bool(_) => return true,

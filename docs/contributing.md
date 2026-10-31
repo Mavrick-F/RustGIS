@@ -38,13 +38,67 @@ Other workspace tasks:
 | Task | Purpose |
 | --- | --- |
 | `cargo xtask layers` | Check crate dependency direction and keep UI dependencies out of lower layers |
-| `cargo xtask notices` | Regenerate the shipped `THIRD-PARTY-LICENSES.txt` files after changing dependencies; requires `cargo-about` |
+| `cargo xtask notices` | Regenerate the shipped `THIRD-PARTY-LICENSES.txt` files after changing dependencies, or after adding code or data from another project to `INCLUDED` in `xtask/src/notices.rs` (with its licence text in `third-party/`); requires `cargo-about` |
 | `cargo xtask notices --check` | Check the notices without writing them; stale notices warn in CI but block releases |
 | `cargo xtask web-pwa <dir>` | Generate the service worker in a Trunk build output directory, such as `dist/web` |
 
 Interface strings must be translatable: use `tl!("…")` for literals and
 `i18n::fmt("… {name} …", &[("name", value)])` for messages with values. New strings can fall back
 to English until the catalogs are updated; see [Languages](i18n.md).
+
+### Faster local builds and test runs
+
+All of this is optional and on your side: the repository's profiles stay as they are, and
+`cargo xtask ci` is still the check before each commit and pull request.
+
+**Less debug information.** Much of a debug build's size and link time is debug information,
+most of it the dependencies'. In your user-level `~/.cargo/config.toml`:
+
+```toml
+[profile.dev]
+debug = "line-tables-only"   # backtraces keep file:line
+
+[profile.dev.package."*"]
+debug = false
+```
+
+On Linux, `split-debuginfo = "unpacked"` under `[profile.dev]` also keeps the linker from copying
+what is left of it, and [mold](https://github.com/rui314/mold) links faster still than the
+`rust-lld` Rust already uses on x86-64 Linux. Install mold first (the link fails without it), then:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
+The settings change every build's fingerprint, so the next build is a full one.
+
+**Build only what you're testing.** `cargo test --workspace` builds every crate's library, test
+binaries and examples; a change in `ui-egui` alone means its library twice (plain and for its unit
+tests), fifteen integration test binaries and the examples. While you work, name what you need:
+`cargo test -p rustgis-ui-egui --lib`, `cargo test -p rustgis-engine --test project_save`, or
+`cargo clippy -p rustgis-ui-egui --all-targets` to check without linking.
+
+**cargo-nextest.** [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`) runs
+the test binaries side by side, each test in its own process, and filters tests by expression:
+
+```sh
+cargo nextest run --workspace --no-fail-fast -E 'not (package(rustgis-engine) and test(hostile_params_never_panic))'
+cargo test --workspace --doc   # nextest doesn't run doctests
+```
+
+The engine's `hostile_params_never_panic`, which runs every command with junk parameters, is by far
+its slowest test; leaving it out while you iterate keeps a run short. Run it before you push, with
+`cargo nextest run -p rustgis-engine -E 'test(hostile_params_never_panic)'` or `cargo xtask ci`.
+A test that fails now and then can be retried with `--retries 1`.
+
+**`opt-level` 0 for UI work.** The workspace crates build at `opt-level = 1`. With
+`CARGO_PROFILE_DEV_OPT_LEVEL=0`, `ui-egui` rebuilds after an edit about five times faster, but the
+engine's tests run about six times slower (rasters, geometry and the hostile-parameter test), so
+it suits iterating on the interface only. Switching the level rebuilds the workspace crates.
+
+**`cargo clean` now and then.** `target/` keeps the artifacts of every branch and setting you have
+built, and can grow past a hundred gigabytes.
 
 ## Ribbon guidelines
 

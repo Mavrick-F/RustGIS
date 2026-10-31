@@ -30,6 +30,9 @@ pub struct GpkgSource {
     reproject: Reproject,
     /// A copy written for a file opened from memory, removed when the source is dropped.
     temp: Option<PathBuf>,
+    /// The database file and its identity when opened ([`file_identity`]), for a traversal on a
+    /// connection of its own to check it reads the same file.
+    file: Option<(PathBuf, Option<(u64, u64)>)>,
 }
 
 impl Drop for GpkgSource {
@@ -69,7 +72,10 @@ fn feature_tables(conn: &Connection) -> Result<Vec<String>> {
 
 impl GpkgSource {
     pub fn open(path: &Path, layer: Option<&str>) -> Result<Self> {
-        Self::open_conn(open_db(path)?, layer, None)
+        // The identity is taken before the database is opened: a file put in its place after
+        // this leaves it describing the file opened, which a traversal then refuses to swap.
+        let id = file_identity(path);
+        Self::open_conn(open_db(path)?, layer, None, id)
     }
 
     /// Opens a GeoPackage held in memory, through a temporary copy (SQLite reads files). The copy
@@ -100,7 +106,8 @@ impl GpkgSource {
             return Err(e.into());
         }
         drop(f);
-        match open_db(&p).and_then(|c| Self::open_conn(c, layer, Some(p.clone()))) {
+        let id = file_identity(&p);
+        match open_db(&p).and_then(|c| Self::open_conn(c, layer, Some(p.clone()), id)) {
             Ok(s) => Ok(s),
             Err(e) => {
                 let _ = std::fs::remove_file(&p);
@@ -109,9 +116,10 @@ impl GpkgSource {
         }
     }
 
-    /// Opens a feature table (`layer`, else the first) from its metadata, noting what reading
-    /// changes: an unknown coordinate system, other tables, Z or M values dropped.
-    fn open_conn(conn: Connection, layer: Option<&str>, temp: Option<PathBuf>) -> Result<Self> {
+    /// Opens a feature table (`layer`, else the first) on an open database from its metadata,
+    /// noting what reading changes: an unknown coordinate system, other tables, Z or M values
+    /// dropped. `id` is the file's identity taken before it was opened.
+    fn open_conn(conn: Connection, layer: Option<&str>, temp: Option<PathBuf>, id: Option<(u64, u64)>) -> Result<Self> {
         let tables = feature_tables(&conn)?;
         let table = match layer {
             Some(l) => tables
@@ -218,7 +226,8 @@ impl GpkgSource {
         // Z and M are 0 (none), 1 (every geometry) or 2 (optional: looked for in the first rows).
         let zm: Option<(i64, i64)> =
             conn.query_row("SELECT z, m FROM gpkg_geometry_columns WHERE table_name = ?1", [&table], |r| Ok((r.get(0)?, r.get(1)?))).ok();
-        let mut src = GpkgSource { info, conn: Mutex::new(Some(conn)), table, geom, pk, rtree, reproject, temp };
+        let file = conn.path().filter(|p| !p.is_empty()).map(|p| (PathBuf::from(p), id));
+        let mut src = GpkgSource { info, conn: Mutex::new(Some(conn)), table, geom, pk, rtree, reproject, temp, file };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = src.peek_kind();
         }
@@ -396,6 +405,63 @@ impl FeatureSource for GpkgSource {
             }
         }
         Ok(out)
+    }
+
+    /// Every table in a file is scanned in full, whatever its index.
+    fn visits_chunks(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// A scan in table order: the envelope in each geometry's header tests the extent before
+    /// decoding, as a read without the spatial index does, with the same statement. It runs on a
+    /// read-only connection of its own, one statement and so one snapshot of the database, so
+    /// the map's reads of the layer go on and nothing is locked while the visitor runs. A file
+    /// put in place of the one opened is refused (where the system says files' identities).
+    fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
+        let Some((path, id)) = &self.file else { return Err(DataError::Format("GeoPackage: no file to read".into())) };
+        let same_file = || {
+            if id.is_some() && file_identity(path) != *id {
+                return Err(DataError::Format(format!("{}: the file was replaced since it was added; add it again", path.display())));
+            }
+            Ok(())
+        };
+        same_file()?;
+        let conn = open_db(path)?;
+        same_file()?;
+        let req = Request { extent, limit: usize::MAX };
+        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let sql = format!("SELECT {} FROM {}", self.select_list(), quote(&self.table));
+        let mut st = conn.prepare(&sql).map_err(err)?;
+        let mut rows = st.query([]).map_err(err)?;
+        let mut out = Batch { complete: true, ..Batch::default() };
+        while let Some(r) = rows.next().map_err(err)? {
+            match self.feature(r, native.as_ref(), &req).map_err(err)? {
+                Row::Feature(f) => {
+                    out.matched += 1;
+                    chunks.push(f)?;
+                }
+                Row::Skip => {}
+                Row::Bad => out.skipped += 1,
+            }
+        }
+        chunks.flush()?;
+        Ok(out)
+    }
+}
+
+/// A file's device and inode, which tell it from another file put at its path since; `None`
+/// where the system doesn't say them.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 

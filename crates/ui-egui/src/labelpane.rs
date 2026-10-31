@@ -411,6 +411,10 @@ fn new_name(labels: &Labeling) -> String {
         .unwrap_or_default()
 }
 
+/// How a list with a search box closes: on a click outside it or a pick ([`end_search`]), not on
+/// any click (egui's default), which would close it on clicking its search box.
+pub(crate) const SEARCHED_LIST_CLOSES: egui::PopupCloseBehavior = egui::PopupCloseBehavior::CloseOnClickOutside;
+
 /// A list's search box, as its first row: the text kept for `id` while the list is reopened,
 /// lowercased to match names by. The Field and Font boxes share it, so they search alike.
 pub(crate) fn list_search(ui: &mut Ui, id: egui::Id, hint: &str) -> String {
@@ -421,9 +425,11 @@ pub(crate) fn list_search(ui: &mut Ui, id: egui::Id, hint: &str) -> String {
     text.to_lowercase()
 }
 
-/// A pick ends the search: the list opens whole next time.
+/// A pick ends the search and closes the list (a searched list stays open on other clicks, its
+/// search box's: `SEARCHED_LIST_CLOSES`): the list opens whole next time.
 pub(crate) fn end_search(ui: &Ui, id: egui::Id) {
     ui.data_mut(|d| d.remove::<String>(id));
+    ui.close();
 }
 
 /// The field the class labels with, chosen as the font is: the box shows it (or says it is gone,
@@ -444,6 +450,7 @@ fn field(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
             .selected_text(shown)
             .width(180.0)
             .height(320.0)
+            .close_behavior(SEARCHED_LIST_CLOSES)
             .show_ui(ui, |ui| {
                 let search = list_search(ui, search_id, tl!("Search fields"));
                 let mut matching = fields.iter().filter(|f| f.name.to_lowercase().contains(&search)).peekable();
@@ -822,6 +829,7 @@ pub(crate) fn family_picker(ui: &mut Ui, salt: impl std::hash::Hash + std::fmt::
         .selected_text(shown)
         .width(180.0)
         .height(320.0)
+        .close_behavior(SEARCHED_LIST_CLOSES)
         .show_ui(ui, |ui| {
             let search = list_search(ui, search_id, tl!("Search fonts"));
             if ui.selectable_label(cur.is_none(), tl!("Label font")).clicked() {
@@ -1836,6 +1844,42 @@ mod tests {
         }
         h.state_mut().run("edit.undo", json!(null)).unwrap();
         assert_eq!(labels(h.state()).class("Named").unwrap().font.as_deref(), Some("Missing test font"));
+    }
+
+    /// Clicking in a list's search box leaves the list open to type in (it closed on any click,
+    /// the box too, so nothing could be searched); a pick closes it and ends the search.
+    #[test]
+    fn a_list_stays_open_to_search_it_and_closes_on_a_pick() {
+        use egui::accesskit::Role;
+        let mut h = harness(with_cities());
+        h.run();
+        let search_for = |h: &mut egui_kittest::Harness<'static, RustGisApp>, tab: &str, list: &str, text: &str| {
+            open_tab(h, tab);
+            let before = h.query_all_by_role(Role::TextInput).count();
+            h.get_by_role_and_label(Role::ComboBox, list).click();
+            h.run();
+            // (The list's search box is the one that came with it, the last.)
+            h.query_all_by_role(Role::TextInput).last().unwrap().click();
+            h.run();
+            assert_eq!(h.query_all_by_role(Role::TextInput).count(), before + 1, "{list}: clicking its search box left it open");
+            h.query_all_by_role(Role::TextInput).last().unwrap().type_text(text);
+            h.run();
+            before
+        };
+        // The label's field.
+        let before = search_for(&mut h, "Content", "Field", "nam");
+        h.get_by_role_and_label(Role::Button, "name").click();
+        h.run();
+        assert_eq!(h.query_all_by_role(Role::TextInput).count(), before, "a pick closes it");
+        // The label's font: found by part of its name, and used.
+        let family = super::families::installed().iter().find(|f| f.listed).map(|f| f.name.clone());
+        let Some(family) = family else { return };
+        let part: String = family.chars().take(4).collect();
+        let before = search_for(&mut h, "Symbol", "Font", &part);
+        h.get_by_role_and_label(Role::Button, family.as_str()).click();
+        h.run();
+        assert_eq!(labels(h.state()).default.font.as_deref(), Some(family.as_str()));
+        assert_eq!(h.query_all_by_role(Role::TextInput).count(), before, "a pick closes it");
     }
 
     /// A class chosen that goes away (an undo, a script, the Assistant) leaves Default chosen.

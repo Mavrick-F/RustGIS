@@ -253,7 +253,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # The packages ship THIRD-PARTY-LICENSES.txt as committed: it must match Cargo.lock.
+  # The packages ship THIRD-PARTY-LICENSES.txt as committed: it must match Cargo.lock and the
+  # code and data from other projects listed in xtask/src/notices.rs.
   notices:
     name: Third-party notices
     runs-on: ubuntu-latest

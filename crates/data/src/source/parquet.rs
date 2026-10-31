@@ -47,6 +47,8 @@ pub struct ParquetSource {
     remote: Option<Arc<Remote>>,
     /// Every row group meeting a read's extent is read (a catalog's index), never a sample of them.
     exact: bool,
+    /// The most rows read from one row group: `MAX_GROUP_ROWS`, lowered by tests.
+    group_rows: usize,
 }
 
 impl ParquetSource {
@@ -231,7 +233,8 @@ impl ParquetSource {
             info.drop_zm(if all_zm { count } else { None });
         }
         let untyped = types.is_empty() && !zm;
-        let mut src = ParquetSource { info, reader, geom_col, field_cols, covering, reproject, remote, exact: false };
+        let mut src =
+            ParquetSource { info, reader, geom_col, field_cols, covering, reproject, remote, exact: false, group_rows: MAX_GROUP_ROWS };
         if untyped {
             match src.peek_zm() {
                 Some(true) => src.info.drop_zm(None),
@@ -264,6 +267,39 @@ impl ParquetSource {
     }
 }
 
+impl ParquetSource {
+    /// A source that reads at most `rows` of a row group, for tests of the cap.
+    #[cfg(test)]
+    pub(crate) fn with_group_rows(mut self, rows: usize) -> Self {
+        self.group_rows = rows;
+        self
+    }
+
+    /// The rows of row group `g` read. Row counts come from the file: bounded by what the
+    /// geometry column chunk holds, and by a cap, so a crafted count can't size a huge allocation.
+    fn rows_in(&self, md: &ParquetMetaData, g: usize) -> usize {
+        let rg = md.row_group(g);
+        let rows = usize::try_from(rg.num_rows()).unwrap_or(0);
+        let values = rg.columns().get(self.geom_col).and_then(|c| usize::try_from(c.num_values()).ok()).unwrap_or(0);
+        rows.min(values).min(self.group_rows)
+    }
+
+    /// Which rows of row group `g` have a bounding box meeting the native extent `e`, read from
+    /// the covering columns `c` alone. A row without a box is kept, for its geometry to decide.
+    fn covered_rows(&self, md: &ParquetMetaData, g: usize, e: &Extent, c: [usize; 4]) -> Result<Vec<bool>> {
+        let rg = self.reader.get_row_group(g).map_err(err)?;
+        let n = self.rows_in(md, g);
+        let cols: Vec<Vec<Option<f64>>> = c.iter().map(|&i| read_f64(rg.as_ref(), i, n)).collect::<Result<_>>()?;
+        let v = |k: usize, r: usize| cols.get(k).and_then(|c| c.get(r).copied().flatten()).unwrap_or(f64::NAN);
+        Ok((0..n)
+            .map(|r| {
+                let be = Extent::new(v(0, r), v(1, r), v(2, r), v(3, r));
+                be.is_empty() || be.intersects(e)
+            })
+            .collect())
+    }
+}
+
 impl FeatureSource for ParquetSource {
     fn info(&self) -> &SourceInfo {
         &self.info
@@ -273,14 +309,7 @@ impl FeatureSource for ParquetSource {
         let limit = clamp_limit(req.limit);
         let md = self.reader.metadata();
         let native = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
-        // Row counts come from the file: bounded by what the geometry column chunk holds, and by a
-        // cap, so a crafted count can't size a huge allocation.
-        let rows_in = |g: usize| {
-            let rg = md.row_group(g);
-            let rows = usize::try_from(rg.num_rows()).unwrap_or(0);
-            let values = rg.columns().get(self.geom_col).and_then(|c| usize::try_from(c.num_values()).ok()).unwrap_or(0);
-            rows.min(values).min(MAX_GROUP_ROWS)
-        };
+        let rows_in = |g: usize| self.rows_in(md, g);
         // Row groups whose bounding box meets the extent.
         let mut groups: Vec<usize> = (0..md.num_row_groups())
             .filter(|&g| match (native, self.covering) {
@@ -331,20 +360,7 @@ impl FeatureSource for ParquetSource {
         for &g in &groups {
             keep.push(match (native, self.covering) {
                 (Some(_), Some(_)) if inside(g) => None,
-                (Some(e), Some(c)) => {
-                    let rg = self.reader.get_row_group(g).map_err(err)?;
-                    let n = rows_in(g);
-                    let cols: Vec<Vec<Option<f64>>> = c.iter().map(|&i| read_f64(rg.as_ref(), i, n)).collect::<Result<_>>()?;
-                    let v = |k: usize, r: usize| cols.get(k).and_then(|c| c.get(r).copied().flatten()).unwrap_or(f64::NAN);
-                    Some(
-                        (0..n)
-                            .map(|r| {
-                                let be = Extent::new(v(0, r), v(1, r), v(2, r), v(3, r));
-                                be.is_empty() || be.intersects(&e)
-                            })
-                            .collect(),
-                    )
-                }
+                (Some(e), Some(c)) => Some(self.covered_rows(md, g, &e, c)?),
                 _ => None,
             });
         }
@@ -403,7 +419,7 @@ impl FeatureSource for ParquetSource {
                     continue;
                 }
                 let values = attrs.iter().map(|col| col.get(k).cloned().unwrap_or(Value::Null)).collect();
-                sample.keep(Feature { id: base + r as u64 + 1, geometry: Some(geometry), attrs: values });
+                sample.keep(Feature { id: base.saturating_add(r as u64 + 1), geometry: Some(geometry), attrs: values });
             }
         }
         let matched = if late { sample.seen() } else { matched.saturating_mul(thinned as u64) };
@@ -412,6 +428,83 @@ impl FeatureSource for ParquetSource {
 
     fn remote(&self) -> Option<Arc<Remote>> {
         self.remote.clone()
+    }
+
+    /// A file or an upload; a file by its web address is read a view at a time, not in full.
+    fn visits_chunks(&self) -> bool {
+        self.remote.is_none()
+    }
+
+    /// A row group at a time, in file order: the features, ids and skipped rows of a complete
+    /// read of the same extent. The taken rows of one row group are decoded together before
+    /// they are chunked, so the peak is a row group's columns plus a chunk.
+    fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
+        if self.remote.is_some() {
+            return Err(DataError::Unsupported("a whole GeoParquet by its web address read a chunk at a time".into()));
+        }
+        let req = Request { extent, limit: usize::MAX };
+        let md = self.reader.metadata();
+        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let mut out = Batch { complete: true, ..Batch::default() };
+        let mut base = 0u64;
+        for g in 0..md.num_row_groups() {
+            // From the declared row counts, as a read numbers them.
+            let start = base;
+            let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
+            base = base.saturating_add(declared);
+            let area = match (native, self.covering) {
+                (Some(e), Some(c)) => Some((e, c, group_extent(md, g, c))),
+                _ => None,
+            };
+            if let Some((e, _, Some(ge))) = area
+                && !ge.intersects(&e)
+            {
+                continue;
+            }
+            // A read takes at most `MAX_GROUP_ROWS` of a row group, and no more than its geometry
+            // column holds. A traversal promises every row, so a group it can't read whole is an
+            // error, not a quietly shorter export; it is refused before anything is read.
+            let readable = self.rows_in(md, g);
+            if declared > self.group_rows as u64 {
+                return Err(DataError::Format(format!(
+                    "GeoParquet: row group {g} has {declared} rows, more than the {} read from one",
+                    self.group_rows
+                )));
+            }
+            if declared > readable as u64 {
+                return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
+            }
+            let take = match area {
+                Some((e, c, ge)) if !ge.is_some_and(|ge| contains(&e, &ge)) => self.covered_rows(md, g, &e, c)?,
+                _ => vec![true; readable],
+            };
+            if !take.iter().any(|&t| t) {
+                continue;
+            }
+            let rg = self.reader.get_row_group(g).map_err(err)?;
+            let geoms = read_bytes(rg.as_ref(), self.geom_col, &take)?;
+            let attrs: Vec<Vec<Value>> = self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &take)).collect::<Result<_>>()?;
+            let wanted = take.iter().filter(|&&t| t).count();
+            if geoms.len() != wanted || attrs.iter().any(|a| a.len() != wanted) {
+                return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
+            }
+            for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
+                let geometry = geoms.get(k).and_then(|b| b.as_deref()).and_then(wkb::decode).and_then(|geom| self.reproject.geometry(geom));
+                let Some(geometry) = geometry else {
+                    out.skipped += 1;
+                    continue;
+                };
+                if !in_request(&geometry, &req) {
+                    continue;
+                }
+                let values = attrs.iter().map(|col| col.get(k).cloned().unwrap_or(Value::Null)).collect();
+                out.matched += 1;
+                chunks.push(Feature { id: start.saturating_add(r as u64 + 1), geometry: Some(geometry), attrs: values })?;
+            }
+        }
+        chunks.flush()?;
+        Ok(out)
     }
 }
 

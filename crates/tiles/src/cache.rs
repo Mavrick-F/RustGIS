@@ -127,6 +127,11 @@ pub fn set_fetcher(f: impl Fn(String, Done) + Send + Sync + 'static) {
     *fetcher().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Box::new(f)));
 }
 
+/// Undoes [`set_fetcher`]: addresses are fetched natively again (a test done with its own).
+pub fn clear_fetcher() {
+    *fetcher().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Replaces how tile pictures (PNG, JPEG, WebP) are decoded: the browser's own decoder works
 /// off the page's thread, where decoding them here held up every frame tiles arrived in. `done`
 /// must be called once, with the picture as [`RAW`] pixels, or with the bytes given back.

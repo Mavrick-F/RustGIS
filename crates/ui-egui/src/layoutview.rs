@@ -1267,7 +1267,9 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
         ui.end_row();
         ui.label(tl!("Color"));
         let mut c = crate::theme::c32(g.color);
-        if crate::widgets::color_button(ui, &mut c).changed() {
+        let resp = crate::widgets::color_button(ui, &mut c);
+        if resp.changed() {
+            crate::widgets::one_step_per_press(app, &resp);
             set(app, json!({"color": crate::theme::rgba(c).hex()}));
         }
         ui.end_row();
@@ -1616,7 +1618,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         for (label, key, current) in [("Fill", "fill", *fill), ("Outline", "outline", *outline)] {
                             ui.label(tl!(label));
                             let mut c = crate::theme::c32(current);
-                            if crate::widgets::color_button(ui, &mut c).changed() {
+                            let resp = crate::widgets::color_button(ui, &mut c);
+                            if resp.changed() {
+                                crate::widgets::one_step_per_press(app, &resp);
                                 update(app, json!({key: crate::theme::rgba(c).hex()}));
                             }
                             ui.end_row();
@@ -1673,7 +1677,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         for (label, key, current) in [("Fill", "fill", *fill), ("Outline", "outline", *outline)] {
                             ui.label(tl!(label));
                             let mut c = crate::theme::c32(current);
-                            if crate::widgets::color_button(ui, &mut c).changed() {
+                            let resp = crate::widgets::color_button(ui, &mut c);
+                            if resp.changed() {
+                                crate::widgets::one_step_per_press(app, &resp);
                                 update(app, json!({key: crate::theme::rgba(c).hex()}));
                             }
                             ui.end_row();
@@ -1692,7 +1698,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                     ElementKind::Line { color, width, dir, head } => {
                         ui.label(tl!("Color"));
                         let mut c = crate::theme::c32(*color);
-                        if crate::widgets::color_button(ui, &mut c).changed() {
+                        let resp = crate::widgets::color_button(ui, &mut c);
+                        if resp.changed() {
+                            crate::widgets::one_step_per_press(app, &resp);
                             update(app, json!({"color": crate::theme::rgba(c).hex()}));
                         }
                         ui.end_row();
@@ -1767,7 +1775,8 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         if settled.size {
             update(app, json!({"size": sz}));
         }
-        if settled.color {
+        if let Some(resp) = &settled.color {
+            crate::widgets::one_step_per_press(app, resp);
             update(app, json!({"color": crate::theme::rgba(c).hex()}));
         }
         if settled.bold {
@@ -1854,7 +1863,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             egui::Grid::new(("indicator_props", id)).num_columns(2).show(ui, |ui| {
                 ui.label(tl!("Color"));
                 let mut c = crate::theme::c32(*extent_color);
-                if crate::widgets::color_button(ui, &mut c).changed() {
+                let resp = crate::widgets::color_button(ui, &mut c);
+                if resp.changed() {
+                    crate::widgets::one_step_per_press(app, &resp);
                     update(app, json!({"extentIndicator": {"color": crate::theme::rgba(c).hex()}}));
                 }
                 ui.end_row();
@@ -2676,6 +2687,57 @@ mod tests {
         let a = line_angle((e.x, e.y, e.w, e.h), dir, head);
         assert!(a > 10.0, "turned to {a}°");
         assert_eq!(h.state().session.undo_depth(), undo + 1, "one undo step");
+    }
+
+    /// A drag in the picker of a text's colour, in the shared text form, is one undo step (#1194).
+    #[test]
+    fn a_colour_drag_in_the_format_pane_is_one_undo_step() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Colour"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
+        app.layout.selected = Some(title);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let color = |app: &RustGisApp| match &app.session.project.layouts[li].element(title).unwrap().kind {
+            ElementKind::Text { color, .. } => *color,
+            kind => panic!("{kind:?}"),
+        };
+        let before = color(h.state());
+        let undo = h.state().session.undo_depth();
+        let pane_numbers = h.query_all_by_role(Role::SpinButton).count();
+        h.get_by_role(Role::ColorWell).click();
+        h.run();
+        // The picker's first number (red) follows the pane's own.
+        let at = h.query_all_by_role(Role::SpinButton).nth(pane_numbers).unwrap().rect().center();
+        h.hover_at(at);
+        h.drag_at(at);
+        h.step();
+        for dx in [16.0, 32.0, 48.0] {
+            h.hover_at(at + vec2(dx, 0.0));
+            h.step();
+            assert_ne!(color(h.state()), before, "the page follows the picker");
+            assert_eq!(h.state().session.undo_depth(), undo + 1, "one step however many frames");
+        }
+        h.drop_at(at + vec2(48.0, 0.0));
+        h.run();
+        assert_eq!(h.state().session.undo_depth(), undo + 1);
+        h.state_mut().run("edit.undo", json!(null)).unwrap();
+        assert_eq!(color(h.state()), before);
     }
 
     /// A layout's text has the shared text form (#516): the page's dynamic text as well as the

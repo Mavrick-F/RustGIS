@@ -560,10 +560,18 @@ pub(crate) fn temp_beside(path: &Path) -> std::io::Result<std::path::PathBuf> {
 /// Writes and syncs a new file (`create_new`, so an existing file or symlink is never followed);
 /// removes it on failure.
 fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_new_with(path, |w| w.write_all(bytes))
+}
+
+/// [`write_new`] with the content written by `write`, through a buffer, as it goes.
+fn write_new_with(path: &Path, write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     let res = (|| {
-        f.write_all(bytes)?;
+        let mut w = std::io::BufWriter::new(&f);
+        write(&mut w)?;
+        w.flush()?;
+        drop(w);
         f.sync_all()
     })();
     // Close before removing a failed write, including on Windows.
@@ -577,8 +585,14 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Writes through a temporary file that is synced and renamed into place, so an interrupted
 /// write never truncates an existing file. The temporary file is removed on failure.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, |w| w.write_all(bytes))
+}
+
+/// [`write_atomic`] with the content written by `write` as it goes, so a long text needn't be
+/// held whole first. A failure in `write` leaves an existing file as it was.
+pub fn write_atomic_with(path: &Path, write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>) -> std::io::Result<()> {
     let tmp = temp_beside(path)?;
-    write_new(&tmp, bytes)?;
+    write_new_with(&tmp, write)?;
     let res = std::fs::rename(&tmp, path);
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -2342,6 +2356,16 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"two");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp files left behind");
         assert!(write_atomic(Path::new("/"), b"x").is_err());
+        // Written as it goes: a failure part way leaves the file as it was, and no temp file.
+        let failed = write_atomic_with(&p, |w| {
+            w.write_all(b"half")?;
+            Err(std::io::Error::other("stopped"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp files left behind");
+        write_atomic_with(&p, |w| w.write_all(b"th").and_then(|()| w.write_all(b"ree"))).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"three");
         std::fs::remove_dir_all(&dir).ok();
     }
 

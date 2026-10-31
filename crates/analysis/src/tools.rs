@@ -418,7 +418,7 @@ pub static TOOLS: &[ToolSpec] = &[
             P {
                 name: "statistics",
                 label: "Statistics",
-                kind: K::Text,
+                kind: K::FieldStatistics { input: "input", statistics: crate::StatisticList::Summary },
                 required: false,
                 default: "",
                 help: "The statistics to compute, as (field, statistic) pairs, e.g. [{\"field\": \"income\", \"statistic\": \"MEDIAN\"}]. Statistics: COUNT, SUM, MEAN, MIN, MAX, RANGE, STD, VARIANCE, MEDIAN, P1 to P99, IQR, CV, MODE, MINORITY, UNIQUE, FIRST, LAST, CONCATENATE, NULLS; a text field takes COUNT, MIN, MAX, FIRST, LAST, UNIQUE, CONCATENATE, MODE, MINORITY and NULLS. Leave empty to use Statistics Field.",
@@ -433,11 +433,11 @@ pub static TOOLS: &[ToolSpec] = &[
             },
             P {
                 name: "case",
-                label: "Case Field",
-                kind: K::Field,
+                label: "Case Fields",
+                kind: K::Fields { input: "input" },
                 required: false,
                 default: "",
-                help: "Groups records by this field's values. Scripts and the AI Assistant can give several fields as a list.",
+                help: "Groups records by the combination of these fields' values. Scripts and the AI Assistant can give several fields as a list.",
             },
             P {
                 name: "separator",
@@ -459,11 +459,11 @@ pub static TOOLS: &[ToolSpec] = &[
             P { name: "input", label: "Input Table", kind: K::Layer, required: true, default: "", help: "" },
             P {
                 name: "fields",
-                label: "Row Field",
-                kind: K::Field,
+                label: "Row Fields",
+                kind: K::Fields { input: "input" },
                 required: false,
                 default: "",
-                help: "Makes a row for each of this field's values. Scripts and the AI Assistant can give several fields as a list. Leave empty for one row for the whole table.",
+                help: "Makes a row for each combination of these fields' values. Leave empty for one row for the whole table. Scripts and the AI Assistant can give several fields as a list.",
             },
             P {
                 name: "pivot",
@@ -630,7 +630,7 @@ pub static TOOLS: &[ToolSpec] = &[
             P {
                 name: "merge",
                 label: "Merge Rules",
-                kind: K::Text,
+                kind: K::FieldStatistics { input: "join", statistics: crate::StatisticList::Merge },
                 required: false,
                 default: "",
                 help: "One to one: how the values of several matches are combined, e.g. [{\"field\": \"units\", \"rule\": \"sum\"}]. Rules: first, last, sum, mean, min, max, count, join (with a \"delimiter\"). Other fields keep the first match.",

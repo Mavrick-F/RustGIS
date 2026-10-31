@@ -403,6 +403,10 @@ hold. For example, the total units permitted in each district:
 gp.run={"tool":"spatialJoin","params":{"target":"districts","join":"permits","merge":[{"field":"units","rule":"sum"}]}}
 ```
 
+In the Tools pane, use **Add rule** under **Merge Rules**, pick a field from Join Features
+and its rule, and set **Delimiter** for `join`. Use **Move up**, **Move down** and **Remove** to
+manage the list. Fields without a rule keep the first match.
+
 **Join Field** (`joinField`) performs a one-off non-spatial attribute join,
 copying fields from a source table or layer (`joinTable`, specified by name or numeric table ID)
 into a `target` table or layer based on matching key values:
@@ -447,6 +451,13 @@ to 256 (field, statistic) pairs in the order the fields should appear:
 gp.run={"tool":"summaryStatistics","params":{"input":"parcels","case":["county","year"],"statistics":[{"field":"income","statistic":"MEAN"},{"field":"income","statistic":"MEDIAN"},{"field":"zoning","statistic":"MODE"}]}}
 ```
 
+In the Tools pane, use **Add statistic** to pick each field and statistic. The statistic picker
+offers the operations supported by that field's type, including percentiles `P1` through `P99`
+for numeric fields. Use **Add field** under **Case Fields** to group by several fields. Move
+entries up or down to choose their output order, or remove them. Leaving Statistics empty keeps
+the single **Statistics Field** shortcut. These lists are also available in ModelBuilder; for an
+input produced by another tool, type its field names before running the model.
+
 | Statistic | What it is |
 | --- | --- |
 | `COUNT` | Values that aren't empty |
@@ -487,6 +498,9 @@ gp.run={"tool":"pivotTable","params":{"input":"incomes","fields":"county","pivot
 | --- | --- | --- | --- |
 | A | 10 | 11 | |
 | B | 20 | | 22 |
+
+Use **Add field** under **Row Fields** in the Tools pane or ModelBuilder to choose several row
+fields and order them with **Move up** and **Move down**.
 
 Without `statistic`, each row and pivot value can have one record at most; the tool names the
 first pair with more, and the cells keep the value field's type. Give a `statistic` to combine the
