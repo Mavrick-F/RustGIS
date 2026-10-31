@@ -79,6 +79,8 @@ const GEOMETRIES: &[&str] = &[
 /// value (a height or measure) is dropped.
 fn coords(n: &Node, zm: &Cell<bool>) -> Option<Vec<Coord>> {
     let mut out = Vec::new();
+    // Only coordinates that parse count.
+    let mut extra = false;
     for c in n.descendants().filter(|d| d.is_element() && is_gml(d)) {
         match local(&c) {
             "pos" | "posList" | "lowerCorner" | "upperCorner" => {
@@ -95,7 +97,7 @@ fn coords(n: &Node, zm: &Cell<bool>) -> Option<Vec<Coord>> {
                     return None;
                 }
                 if dim > 2 && !v.is_empty() {
-                    zm.set(true);
+                    extra = true;
                 }
                 out.extend(
                     v.chunks(dim).map(|p| Coord::new(p.first().copied().unwrap_or(f64::NAN), p.get(1).copied().unwrap_or(f64::NAN))),
@@ -110,7 +112,7 @@ fn coords(n: &Node, zm: &Cell<bool>) -> Option<Vec<Coord>> {
                 {
                     let v: Vec<f64> = tuple.split(cs).map(|t| t.trim().parse().ok()).collect::<Option<_>>()?;
                     if v.len() > 2 {
-                        zm.set(true);
+                        extra = true;
                     }
                     out.push(Coord::new(*v.first()?, *v.get(1)?));
                 }
@@ -119,14 +121,18 @@ fn coords(n: &Node, zm: &Cell<bool>) -> Option<Vec<Coord>> {
                 let get =
                     |k: &str| c.children().find(|x| x.is_element() && local(x) == k).and_then(|x| text_of(&x).trim().parse::<f64>().ok());
                 if get("Z").is_some() {
-                    zm.set(true);
+                    extra = true;
                 }
                 out.push(Coord::new(get("X")?, get("Y")?));
             }
             _ => {}
         }
     }
-    (out.iter().all(|c| c.is_finite())).then_some(out)
+    let ok = out.iter().all(|c| c.is_finite());
+    if ok && extra {
+        zm.set(true);
+    }
+    ok.then_some(out)
 }
 
 fn ring(mut r: Vec<Coord>) -> Option<Vec<Coord>> {

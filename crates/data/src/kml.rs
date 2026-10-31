@@ -268,10 +268,15 @@ fn geometry(n: &Node, out: &mut Parts, depth: usize) {
     match local(n) {
         // Altitudes count only for the parts kept.
         "Point" => {
-            let alt = Cell::new(false);
-            let first = child_text(n, "coordinates").map(|c| coords(&c, &alt)).unwrap_or_default().into_iter().next();
-            if let Some(p) = first {
-                out.zm[0].set(out.zm[0].get() || alt.get());
+            // The first tuple that reads is the point; only its altitude counts.
+            let first = child_text(n, "coordinates").and_then(|c| {
+                c.split_whitespace().find_map(|t| {
+                    let alt = Cell::new(false);
+                    coords(t, &alt).into_iter().next().map(|p| (p, alt.get()))
+                })
+            });
+            if let Some((p, alt)) = first {
+                out.zm[0].set(out.zm[0].get() || alt);
                 out.points.push(p);
             }
         }

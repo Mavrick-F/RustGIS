@@ -934,11 +934,10 @@ pub(crate) fn geojson_geometry(f: &Json) -> std::result::Result<Option<Geometry>
 #[derive(Default)]
 struct Collector {
     schema: Schema,
-    /// Each feature's geometry and its values by field, typed once every feature is in.
-    features: Vec<(Option<Geometry>, Vec<(usize, Value)>)>,
+    /// Each feature's geometry, its values by field (typed once every feature is in) and whether
+    /// its geometry had heights, which are dropped.
+    features: Vec<(Option<Geometry>, Vec<(usize, Value)>, bool)>,
     skipped: usize,
-    /// Features whose heights are dropped.
-    zm: usize,
 }
 
 impl FeatureSink for Collector {
@@ -964,9 +963,8 @@ impl Collector {
         let attrs: Vec<(usize, Value)> = props.into_iter().flatten().map(|(k, v)| (self.schema.see(k, v), Value::from_json(v))).collect();
         match geojson_geometry(f) {
             Ok(geom) => {
-                // Only a geometry kept counts.
-                self.zm += usize::from(geom.is_some() && geojson_has_z(f));
-                self.features.push((geom, attrs));
+                let zm = geom.is_some() && geojson_has_z(f);
+                self.features.push((geom, attrs, zm));
             }
             Err(()) => self.skipped += 1,
         }
@@ -977,13 +975,14 @@ impl Collector {
         let mut report = ReadReport { skipped: self.skipped, ..ReadReport::default() };
         let mut ds = Dataset::new(name, GeometryType::None, self.schema.fields());
         ds.features.reserve(self.features.len());
-        ds.drop_zm(&mut report, self.zm);
         if report.skipped > 0 {
             report.messages.push(format!("{} features had unreadable geometry", report.skipped));
         }
         let declared = declared_crs(root, &mut report.messages);
         let mut unconverted = 0usize;
-        for (n, (geom, values)) in self.features.into_iter().enumerate() {
+        // Only features kept count toward the heights dropped.
+        let mut zm = 0usize;
+        for (n, (geom, values, had_z)) in self.features.into_iter().enumerate() {
             // A feature that can't be converted is dropped, and its id is not reused, as when the
             // file is read in place.
             let geom = match (&declared, geom) {
@@ -1002,6 +1001,7 @@ impl Collector {
                     *slot = coerce(v, field.ty);
                 }
             }
+            zm += usize::from(had_z);
             ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
         }
         ds.geometry_type = dominant_type(&ds);
@@ -1017,6 +1017,8 @@ impl Collector {
             // What couldn't be converted can't come back by defining the projection again.
             ds.crs_incomplete = unconverted > 0;
         }
+        // Last, as a source read in place notes it.
+        ds.drop_zm(&mut report, zm);
         (ds, report)
     }
 }
@@ -2465,6 +2467,10 @@ mod tests {
         let (ds, rep) = crate::source::materialize(&src).unwrap();
         assert!(ds.zm_dropped && rep.messages.iter().any(|m| m.ends_with(&crate::zm_note(Some(1)))), "{:?}", rep.messages);
         assert!(!crate::source::shp::ShpSource::open_path(&flat, "flat").unwrap().info().zm_dropped);
+        // A source declaring Z or M but holding no features (an empty PointZ file) loses nothing.
+        let mut empty = crate::source::shp::ShpSource::open_path(&flat, "flat").unwrap().info().clone();
+        empty.drop_zm(Some(0));
+        assert!(!empty.zm_dropped && !empty.notes.iter().any(|n| n.contains("Z or M")));
 
         // GeoJSON: a third position value, whole or in place, in a collection's member too.
         let doc = |pos: &str| {
@@ -2493,6 +2499,9 @@ mod tests {
         let layers = crate::kml::read("site.kml", kml.as_bytes()).unwrap();
         let marked: Vec<bool> = layers.iter().map(|l| l.dataset.zm_dropped).collect();
         assert_eq!(marked, [true, false]);
+        // A point keeps its first tuple, and only that tuple's altitude counts.
+        let kml = r#"<kml><Placemark><Point><coordinates>1,2 3,4,30</coordinates></Point></Placemark></kml>"#;
+        assert!(!crate::kml::read("pt.kml", kml.as_bytes()).unwrap()[0].dataset.zm_dropped);
         // A one-point line or track (left out) doesn't mark the line kept beside it.
         let kml = r#"<kml xmlns:gx="http://www.google.com/kml/ext/2.2"><Placemark><MultiGeometry><LineString><coordinates>1,2,30</coordinates></LineString><gx:Track><gx:coord>1 2 30</gx:coord></gx:Track><LineString><coordinates>0,0 1,1</coordinates></LineString></MultiGeometry></Placemark></kml>"#;
         let layers = crate::kml::read("site.kml", kml.as_bytes()).unwrap();

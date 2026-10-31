@@ -314,6 +314,8 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     ds.crs = crs;
     let geometry_at = table.fields.iter().position(|f| f.kind == Kind::Geometry);
     let (mut curves, mut wall_hulls, mut unmerged, mut unprojected) = (0usize, 0usize, 0usize, 0usize);
+    // Shapes decoded, a multipatch's too (its M values go even when it has no footprint).
+    let mut decoded = 0usize;
     let mut budget = MAX_TABLE_FACES;
     for (row, offset) in rows {
         let Some(mut values) = table.row(t, offset) else {
@@ -332,10 +334,12 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
         if let (Some(g), Some(def)) = (geometry_at.and_then(|i| values.get(i)).and_then(|v| v.blob.as_ref()), table.geometry.as_ref()) {
             match decode_geometry(g, def, &mut budget) {
                 Ok(Decoded::Geometry(geom, curved)) => {
+                    decoded += 1;
                     curves += curved;
                     geometry = Some(geom);
                 }
                 Ok(Decoded::Patch(patch)) => {
+                    decoded += 1;
                     if let (Some((lo, hi)), Some(at)) = (patch.z, z_at) {
                         attrs.resize(at, Value::Null);
                         attrs.extend([Value::Float(lo), Value::Float(hi), Value::Float(hi - lo)]);
@@ -367,9 +371,8 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
             .push(format!("{unprojected} features have coordinates outside their coordinate system: they are kept without geometry"));
     }
     if zm {
-        // The table declares them for every geometry.
-        let n = ds.features.iter().filter(|f| f.geometry.is_some()).count();
-        ds.drop_zm(&mut report, n);
+        // The table declares them for every shape.
+        ds.drop_zm(&mut report, decoded);
     }
     if patches {
         report.messages.push("3D multipatches are drawn as their footprints, with their lowest and highest Z in z_min and z_max, and the difference in height".into());

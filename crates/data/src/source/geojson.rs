@@ -59,8 +59,8 @@ struct Scan {
     /// Points, lines and polygons seen.
     kinds: [usize; 3],
     skipped: usize,
-    /// Features whose heights reading drops.
-    zm: u64,
+    /// The places of features whose heights reading drops.
+    zm: Vec<u32>,
 }
 
 impl Scan {
@@ -86,7 +86,9 @@ impl Scan {
         let b = match &geom {
             Some(g) => {
                 // Only a geometry kept counts.
-                self.zm += u64::from(geojson_has_z(f));
+                if geojson_has_z(f) {
+                    self.zm.push(u32::try_from(self.places.len()).unwrap_or(u32::MAX));
+                }
                 let e = g.extent();
                 self.extent = self.extent.union(&e);
                 if let Some(slot) = self.kinds.get_mut(kind_slot(g.kind())) {
@@ -197,8 +199,10 @@ impl GeoJsonSource {
             notes,
             zm_dropped: false,
         };
-        if scan.zm > 0 {
-            info.drop_zm(Some(scan.zm));
+        // Features the declared system can't convert are left out, and so are their heights.
+        let zm = scan.zm.iter().filter(|i| failed.binary_search(i).is_err()).count() as u64;
+        if zm > 0 {
+            info.drop_zm(Some(zm));
         }
         let unreadable = scan.skipped;
         Ok(GeoJsonSource { info, path: path.to_path_buf(), places: scan.places, boxes: scan.boxes, reproject, failed, unreadable })
