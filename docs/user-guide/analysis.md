@@ -211,8 +211,12 @@ is the layer name; `vectorToPmtiles` uses it as a file destination.
 **Buffer** distances, and the distance of **Select Layer By Location**, are measured on the Earth
 (the WGS 84 ellipsoid, as PROJ and GeographicLib measure it), not in the map's display
 projection. Each feature is buffered in an azimuthal equidistant projection on the ellipsoid
-centred on it, so a point's buffer is exact; long lines and large polygon outlines are
-buffered in stretches of a few hundred kilometres to limit projection error. Negative Buffer
+centred on it, so distances from a point are true; long lines and large polygon outlines are
+buffered in stretches of a few hundred kilometres to limit projection error. Up to 85° of
+latitude, a buffer's sides are within 0.01 % of the distance (or 1 cm). Its curves are drawn with
+straight edges (32 to a point's circle, 15 to a half circle at a line's end or a polygon's corner,
+close to GEOS and PostGIS's 8 to a quarter circle), whose corners are at the distance and whose
+middles run up to about 0.5 % of it inside the true curve. Negative Buffer
 distances shrink polygons. Buffer and Select Layer By Location limit distances to 5,000 km.
 **Calculate Geometry Attributes** measures polygon areas and perimeters, and line lengths,
 on the WGS 84 ellipsoid, independently of the map's display projection. Holes are subtracted

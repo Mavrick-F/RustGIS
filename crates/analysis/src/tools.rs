@@ -4853,6 +4853,115 @@ mod tests {
         }
     }
 
+    /// Points along each edge of each ring at the fractions `ts`, as the tools draw edges: straight
+    /// in Web Mercator.
+    fn along_edges(polys: &[Vec<Vec<Coord>>], ts: &[f64]) -> Vec<Coord> {
+        use rustgis_geom::{lonlat_to_merc, merc_to_lonlat};
+        polys
+            .iter()
+            .flatten()
+            .flat_map(|ring| ring.windows(2).map(|w| (lonlat_to_merc(w[0]), lonlat_to_merc(w[1]))).collect::<Vec<_>>())
+            .flat_map(|(a, b)| ts.iter().map(move |t| merc_to_lonlat(Coord::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)))))
+            .collect()
+    }
+
+    /// Points along the geodesic from `a` to `b` on WGS 84, at most 20 m apart.
+    fn geodesic_samples(a: Coord, b: Coord) -> Vec<Coord> {
+        use geo::InterpolatePoint;
+        let n = (rustgis_geom::haversine_m(a, b) / 20.0).ceil().max(1.0) as usize;
+        (0..=n)
+            .map(|k| geo::Geodesic.point_at_ratio_between(geo::Point::new(a.x, a.y), geo::Point::new(b.x, b.y), k as f64 / n as f64))
+            .map(|p| Coord::new(p.x(), p.y()))
+            .collect()
+    }
+
+    /// The distance (metres) from `c` to a geodesic given by its [`geodesic_samples`], and whether
+    /// its nearest point is between the ends: the nearest sample on the sphere (among every 50th,
+    /// then its neighbours), then the nearest point on the ellipsoid along the geodesic either side
+    /// of it, by golden-section search to well under a millimetre.
+    fn m_to_geodesic(c: Coord, samples: &[Coord]) -> (f64, bool) {
+        use geo::InterpolatePoint;
+        let near = |range: std::ops::Range<usize>, step: usize| {
+            range
+                .step_by(step)
+                .min_by(|&i, &j| rustgis_geom::haversine_m(c, samples[i]).total_cmp(&rustgis_geom::haversine_m(c, samples[j])))
+        };
+        let coarse = near(0..samples.len(), 50).unwrap_or(0);
+        let i = near(coarse.saturating_sub(50)..(coarse + 51).min(samples.len()), 1).unwrap_or(coarse);
+        let (lo, hi) = (samples[i.saturating_sub(1)], samples[(i + 1).min(samples.len() - 1)]);
+        let at = |t: f64| {
+            let p = geo::Geodesic.point_at_ratio_between(geo::Point::new(lo.x, lo.y), geo::Point::new(hi.x, hi.y), t);
+            on_wgs84_m(c, Coord::new(p.x(), p.y()))
+        };
+        let (mut a, mut b) = (0.0, 1.0);
+        let g = (5f64.sqrt() - 1.0) / 2.0;
+        for _ in 0..60 {
+            let (x1, x2) = (b - g * (b - a), a + g * (b - a));
+            if at(x1) <= at(x2) { b = x2 } else { a = x1 }
+        }
+        (at((a + b) / 2.0).min(at(0.0)).min(at(1.0)), i > 0 && i + 1 < samples.len())
+    }
+
+    /// The outline keeps its distance between its vertices too, not only at them (#1159): edges
+    /// drawn straight in the projection came back to lon/lat as straight lines there, so the long
+    /// sides of a 2 km buffer of a 96 km east–west line sat up to 190 m off. Every vertex, and every
+    /// edge's quarter points and midpoint as the tools draw edges (straight in Web Mercator), is now
+    /// within 0.01% of the distance (or 1 cm) along a line's sides, and no further inside an arc
+    /// than its edges cut: 32 to a point's circle and 15 to a half circle at a line's cap, as `geo`
+    /// draws them.
+    #[test]
+    fn buffer_outlines_keep_their_distance_between_vertices() {
+        let fractions = [0.25, 0.5, 0.75];
+        let points = |polys: &[Vec<Vec<Coord>>]| -> Vec<Coord> {
+            polys.iter().flatten().flatten().copied().chain(along_edges(polys, &fractions)).collect()
+        };
+        // An arc of n edges to a circle cuts d(1 − cos(π/n)) inside it between vertices.
+        let sag = |d: f64, n: f64| d * (1.0 - (std::f64::consts::PI / n).cos());
+
+        let centre = Coord::new(10.125, 46.125);
+        for c in points(&buffered(Geometry::Point(centre), 1.0)) {
+            let d = on_wgs84_m(centre, c);
+            assert!(d < 1_000.1 && d > 1_000.0 - sag(1_000.0, 32.0) - 0.1, "{c:?} is {d} m from the centre");
+        }
+
+        // A long east–west line; a diagonal one across the equator, where the stray changes side
+        // halfway along an edge (a 10 m buffer of it strayed 0.65 m at the quarter points); and a
+        // 298 km one at 84°N, whose sides needed more halvings than the limit first allowed.
+        for (a, b, km) in [
+            (Coord::new(9.875, 46.25), Coord::new(11.125, 46.25), 2.0),
+            (Coord::new(-0.6, -0.6), Coord::new(0.6, 0.6), 0.01),
+            (Coord::new(-12.559_750_946_199_074, 83.853_999_752_232_98), Coord::new(12.559_750_946_199_074, 83.853_999_752_232_98), 0.01),
+        ] {
+            let (d0, samples) = (km * 1000.0, geodesic_samples(a, b));
+            for c in points(&buffered(Geometry::Line(vec![vec![a, b]]), km)) {
+                let (d, beside) = m_to_geodesic(c, &samples);
+                // Along the sides, within 0.01% or 1 cm (and the sampler's millimetre); round the
+                // caps, within the sag of their 15 edges to a half circle.
+                let side = (d0 * 1e-4).max(0.01) + 1e-3;
+                let bound = if beside { side } else { sag(d0, 30.0) + side };
+                assert!(d < d0 + side && d > d0 - bound, "{km} km: {c:?} is {d} m from the line");
+            }
+        }
+
+        // Near a pole: a circle reaching past Web Mercator's 85.05° keeps its distance up to 85°
+        // (an edge across 85.05° was left whole, its visible part 80 km out). Within the last
+        // twentieth of a degree, where Mercator stretches its edges most, it can be 0.03% out.
+        let north = Coord::new(10.0, 83.0);
+        for c in points(&buffered(Geometry::Point(north), 1000.0)).into_iter().filter(|c| c.y.abs() < 85.0) {
+            let d = on_wgs84_m(north, c);
+            assert!(d < 1_000_000.0 * (1.0 + 1e-4) && d > 1_000_000.0 - sag(1_000_000.0, 32.0) - 100.0, "{c:?} is {d} m from {north:?}");
+        }
+
+        // Coordinates off the Earth have no geodesic: buffering them doesn't panic.
+        let off = [Coord::new(0.0, 100.0), Coord::new(20.0, 100.0)];
+        let mut ds = Dataset::new("f", GeometryType::Polyline, vec![]);
+        ds.push(Some(Geometry::Line(vec![off.to_vec()])), vec![]);
+        let m = Map(HashMap::from([("f".to_string(), ds)]));
+        if let Err(e) = crate::run("buffer", &m, &serde_json::json!({"input": "f", "distance": 1})) {
+            assert!(!e.contains("unexpectedly"), "{e}");
+        }
+    }
+
     /// Buffers are geodesic (#394): Web Mercator's scale changes with latitude, so one scale for
     /// the whole feature made a 1000 km circle at 60°N reach 872 km north and 1142 km south, and a
     /// 50 km buffer of a line from 5°S to 33°S 59 km wide at one end and 50 km at the other.
