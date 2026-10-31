@@ -4978,12 +4978,6 @@ mod tests {
         let m = Map(HashMap::from([("f".to_string(), ds)]));
         let r = crate::run("buffer", &m, &serde_json::json!({"input": "f", "distance": 1}));
         assert!(!matches!(&r, Err(e) if e.ends_with("failed unexpectedly")), "{:?}", r.err());
-
-        // Splitting is bounded: a 1 m buffer of a line zigzagging 2,000 times across 100 km, each
-        // edge long enough to need splitting, gains at most `MAX_ADDED` points per ring.
-        let zigzag: Vec<Coord> = (0..=2000).map(|i| Coord::new(10.0 + i as f64 * 6e-4, if i % 2 == 0 { 46.0 } else { 46.9 })).collect();
-        let n: usize = buffered(Geometry::Line(vec![zigzag]), 0.001).iter().flatten().map(Vec::len).sum();
-        assert!(n < 60_000, "{n} vertices");
     }
 
     /// Buffers are geodesic (#394): Web Mercator's scale changes with latitude, so one scale for

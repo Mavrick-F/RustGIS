@@ -9,11 +9,16 @@
 //! The outline keeps its distance between its vertices too, not only at them (#1159): an edge
 //! drawn straight in the plane is split before it comes back to lon/lat wherever a straight edge
 //! there would stray from it ([`OUTLINE_TOLERANCE`]), so up to 85° of latitude the sides are
-//! within 0.012% of the distance (or 1 cm): the projection's own error, under 0.0093% 150 km from
-//! its centre, and the edges' 0.002%. Arcs are drawn as `geo` draws them by default, close to
-//! GEOS and PostGIS's 8 edges to a quarter circle: a point's circle with 32 edges, a line's caps and
-//! a polygon's corners with 15 to a half circle. Between an arc's vertices the outline runs inside
-//! it, by up to 0.48% of the distance round a point and 0.55% at a cap or corner.
+//! within 0.012% of the distance (or 1 cm) wherever the feature is within 150 km of its
+//! projection's centre: the projection's own error, under 0.0093% there, and the edges' 0.002%.
+//! A winding line or outline buffered in stretches can have vertices up to [`STRETCH_M`] from a
+//! stretch's centre, where the sides are within 0.05%. A ring gains at most [`MAX_ADDED`] points,
+//! which only a ring of thousands of long edges uses up; past that, its edges are left whole.
+//!
+//! Arcs are drawn as `geo` draws them by default, close to GEOS and PostGIS's 8 edges to a quarter
+//! circle: a point's circle with 32 edges, a line's caps and a polygon's corners with 15 to a half
+//! circle. Between an arc's vertices the outline runs inside it, by up to 0.48% of the distance
+//! round a point and 0.55% at a cap or corner.
 
 use geo::{
     BooleanOps, Buffer, Contains, Coord as GC, LineString, MultiLineString, MultiPolygon, Orient, Point, Polygon, orient::Direction,
@@ -95,17 +100,17 @@ impl Plane {
             self.split(*a, *b, tolerance, 0, &mut budget, &mut dense);
         }
         dense.extend(r.0.last());
-        let r = &LineString::new(dense);
-        let lonlat: Vec<Coord> = r.0.iter().map(|p| self.0.inverse(Coord::new(p.x, p.y))).collect();
+        let dense = &LineString::new(dense);
+        let lonlat: Vec<Coord> = dense.0.iter().map(|p| self.0.inverse(Coord::new(p.x, p.y))).collect();
         let around = |lat: f64| {
             let pole = self.0.forward(Coord::new(0.0, lat));
-            Polygon::new(r.clone(), vec![]).contains(&Point::new(pole.x, pole.y))
+            Polygon::new(dense.clone(), vec![]).contains(&Point::new(pole.x, pole.y))
         };
         if around(90.0) {
-            return LineString::new(self.capped(r, &lonlat, 90.0));
+            return LineString::new(self.capped(dense, &lonlat, 90.0));
         }
         if around(-90.0) {
-            return LineString::new(self.capped(r, &lonlat, -90.0));
+            return LineString::new(self.capped(dense, &lonlat, -90.0));
         }
         let mut out: Vec<GC<f64>> = Vec::with_capacity(lonlat.len());
         for c in lonlat {
@@ -132,12 +137,12 @@ impl Plane {
         let strays = match (beyond(la), beyond(lb)) {
             // Beyond Web Mercator's 85.05° there's no straight edge to compare with.
             (true, true) => false,
-            // Across that edge: halved until each piece is on one side of it.
+            // Across that edge: halved until each piece is on one side of it or too short to stray.
             (true, false) | (false, true) => true,
             (false, false) => {
                 // `b` on `a`'s side of the antimeridian, so the straight edge is the short one.
-                let lb = Coord::new(la.x + wrap(lb.x - la.x), lb.y);
-                let (ma, mb) = (lonlat_to_merc(la), lonlat_to_merc(lb));
+                let near_b = Coord::new(la.x + wrap(lb.x - la.x), lb.y);
+                let (ma, mb) = (lonlat_to_merc(la), lonlat_to_merc(near_b));
                 [0.25, 0.5, 0.75].into_iter().any(|t| {
                     let p = at(t);
                     let chord = merc_to_lonlat(Coord::new(ma.x + t * (mb.x - ma.x), ma.y + t * (mb.y - ma.y)));
@@ -328,4 +333,20 @@ fn to_geometry(mp: &MultiPolygon<f64>) -> Option<Geometry> {
     let polys: Vec<Vec<Vec<Coord>>> =
         mp.0.iter().map(|p| std::iter::once(p.exterior()).chain(p.interiors().iter()).map(ring).collect()).collect();
     (!polys.is_empty()).then_some(Geometry::Polygon(polys))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ring_gains_at_most_max_added_points() {
+        // 2,000 edges of about 100 km zigzagging across the plane, each needing dozens of splits.
+        let plane = Plane::new(Coord::new(10.0, 46.0), 10.0);
+        let zigzag: Vec<GC<f64>> =
+            (0..=2000).map(|i| GC { x: i as f64 * 100.0 - 100_000.0, y: if i % 2 == 0 { -50_000.0 } else { 50_000.0 } }).collect();
+        let n = zigzag.len();
+        let ring = plane.ring(&LineString::new(zigzag), MIN_TOLERANCE_M);
+        assert_eq!(ring.0.len(), n + MAX_ADDED as usize);
+    }
 }
