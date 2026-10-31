@@ -75,7 +75,6 @@ impl Scan {
                 self.schema.see(k, v);
             }
         }
-        self.zm |= geojson_has_z(f);
         let Ok(geom) = geojson_geometry(f) else {
             self.skipped += 1;
             return;
@@ -86,6 +85,8 @@ impl Scan {
         };
         let b = match &geom {
             Some(g) => {
+                // Only a geometry kept counts.
+                self.zm |= geojson_has_z(f);
                 let e = g.extent();
                 self.extent = self.extent.union(&e);
                 if let Some(slot) = self.kinds.get_mut(kind_slot(g.kind())) {

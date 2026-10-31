@@ -320,9 +320,9 @@ pub const ZM_DROPPED_NOTE: &str =
     "Z or M values (heights or measures) were dropped: RustGIS keeps x and y only, so exports won't have them";
 
 /// What an export says when its dataset lost Z or M values on import, or `None`: `target` names
-/// the file written.
+/// what was written (a file, or the text returned).
 pub fn zm_export_note(ds: &Dataset, target: &str) -> Option<String> {
-    ds.zm_dropped.then(|| format!("{target}: written without Z or M values, which were dropped when {} was read", ds.name))
+    ds.zm_dropped.then(|| format!("{target}: has no Z or M values, which were dropped when {} was read", ds.name))
 }
 
 impl Dataset {

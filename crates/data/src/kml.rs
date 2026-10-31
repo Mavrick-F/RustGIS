@@ -170,7 +170,7 @@ struct Row {
     folder: String,
     style: Option<String>,
     data: Vec<(String, String)>,
-    /// Its placemark's coordinates had altitudes, which are dropped.
+    /// Its geometry's coordinates had altitudes, which are dropped.
     zm: bool,
 }
 
@@ -255,8 +255,8 @@ struct Parts {
     points: Vec<Coord>,
     lines: Vec<Vec<Coord>>,
     polygons: Vec<Vec<Vec<Coord>>>,
-    /// An altitude other than 0 was dropped.
-    zm: Cell<bool>,
+    /// An altitude other than 0 was dropped from the points, lines or polygons.
+    zm: [Cell<bool>; 3],
 }
 
 /// Adds a geometry element's parts to `out` (MultiGeometry flattened, to `MAX_DEPTH`), marking
@@ -266,16 +266,16 @@ fn geometry(n: &Node, out: &mut Parts, depth: usize) {
         return;
     }
     match local(n) {
-        "Point" => out.points.extend(child_text(n, "coordinates").map(|c| coords(&c, &out.zm)).unwrap_or_default().into_iter().take(1)),
+        "Point" => out.points.extend(child_text(n, "coordinates").map(|c| coords(&c, &out.zm[0])).unwrap_or_default().into_iter().take(1)),
         "LineString" | "LinearRing" => {
-            let c = child_text(n, "coordinates").map(|c| coords(&c, &out.zm)).unwrap_or_default();
+            let c = child_text(n, "coordinates").map(|c| coords(&c, &out.zm[1])).unwrap_or_default();
             if c.len() >= 2 {
                 out.lines.push(c);
             }
         }
         "Polygon" => {
             let ring = |b: Node| {
-                child(&b, "LinearRing").and_then(|r| child_text(&r, "coordinates")).map(|c| coords(&c, &out.zm)).filter(|c| c.len() >= 3)
+                child(&b, "LinearRing").and_then(|r| child_text(&r, "coordinates")).map(|c| coords(&c, &out.zm[2])).filter(|c| c.len() >= 3)
             };
             if let Some(outer) = child(n, "outerBoundaryIs").and_then(ring) {
                 let mut rings = vec![outer];
@@ -294,7 +294,7 @@ fn geometry(n: &Node, out: &mut Parts, depth: usize) {
                     let x = it.next()?.parse::<f64>().ok()?;
                     let y = it.next()?.parse::<f64>().ok()?;
                     if it.next().and_then(|z| z.parse::<f64>().ok()).is_some_and(|z| z != 0.0) {
-                        out.zm.set(true);
+                        out.zm[1].set(true);
                     }
                     (x.is_finite() && y.is_finite()).then(|| Coord::new(x, y))
                 })
@@ -426,8 +426,7 @@ impl Reader {
         // A placemark mixing kinds (a MultiGeometry of a point and a line) gives one feature per
         // kind, each in its layer.
         let mut any = false;
-        let zm = parts.zm.get();
-        let mut push = |geometry: Geometry, rows: &mut Vec<Row>| {
+        let mut push = |geometry: Geometry, zm: &Cell<bool>, rows: &mut Vec<Row>| {
             any = true;
             rows.push(Row {
                 geometry,
@@ -436,19 +435,19 @@ impl Reader {
                 folder: folder.clone(),
                 style: style.clone(),
                 data: data.clone(),
-                zm,
+                zm: zm.get(),
             });
         };
         match parts.points.as_slice() {
             [] => {}
-            [p] => push(Geometry::Point(*p), &mut self.rows),
-            _ => push(Geometry::MultiPoint(parts.points), &mut self.rows),
+            [p] => push(Geometry::Point(*p), &parts.zm[0], &mut self.rows),
+            _ => push(Geometry::MultiPoint(parts.points), &parts.zm[0], &mut self.rows),
         }
         if !parts.lines.is_empty() {
-            push(Geometry::Line(parts.lines), &mut self.rows);
+            push(Geometry::Line(parts.lines), &parts.zm[1], &mut self.rows);
         }
         if !parts.polygons.is_empty() {
-            push(Geometry::Polygon(parts.polygons), &mut self.rows);
+            push(Geometry::Polygon(parts.polygons), &parts.zm[2], &mut self.rows);
         }
         if !any {
             self.skipped += 1;

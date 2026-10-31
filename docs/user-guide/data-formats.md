@@ -451,7 +451,8 @@ another, such as `{"layer": "Parcels", "path": "parcels.gpkg", "crs": "EPSG:4647
 GPX, GeoParquet and CSV are always written in WGS 84.
 
 RustGIS keeps x and y only. When a source has Z or M values (heights or measures), adding it says
-they were dropped, and exporting, converting or sharing the layer says what's written lacks them.
+they were dropped, and exporting or converting the layer, or sharing it as a web map, web layer or
+OGC API Features, says what's written lacks them.
 Shapefile, GeoPackage, GeoParquet, FlatGeobuf, PostGIS, File Geodatabase, GeoJSON, KML (altitudes
 other than 0), GML and CSV WKT columns are checked; sources read through GDAL or DuckDB, and SQL
 Server tables, aren't yet. GPX elevations and LiDAR heights are kept as fields, and a File

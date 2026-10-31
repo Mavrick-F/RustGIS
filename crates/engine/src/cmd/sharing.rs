@@ -256,9 +256,7 @@ fn map_of(s: &Session, p: &Value) -> Result<Map, String> {
     Ok(m)
 }
 
-/// A streamed layer shares its whole source, not the features read for the current view.
-/// Says, for each of `layers` that lost Z or M values on import, that `target` was written without
-/// them.
+/// Says, for each of `layers` that lost Z or M values on import, that `target` has none.
 fn say_zm<'a>(s: &mut Session, layers: impl IntoIterator<Item = &'a Dataset>, target: &str) {
     let notes: Vec<String> = layers.into_iter().filter_map(|ds| rustgis_data::zm_export_note(ds, target)).collect();
     for n in notes {
@@ -266,6 +264,7 @@ fn say_zm<'a>(s: &mut Session, layers: impl IntoIterator<Item = &'a Dataset>, ta
     }
 }
 
+/// A streamed layer shares its whole source, not the features read for the current view.
 fn load_whole(l: &mut Layer) -> Result<(), String> {
     if l.is_streamed() {
         l.dataset = l.load_all()?;

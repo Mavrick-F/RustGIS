@@ -3205,10 +3205,11 @@ impl RustGisApp {
                 if ext == "zip" && rustgis_engine::data::raster::wkt::to_wkt(crs).is_none() {
                     self.session.notify(format!("{name}: no .prj written, as {} has no WKT form", crs.label()), false);
                 }
-                if let Some(note) = zm_note {
+                if self.download(&name, bytes)
+                    && let Some(note) = zm_note
+                {
                     self.session.notify(note, false);
                 }
-                self.download(&name, bytes);
             }
             "ui.exportRaster" if self.services.download.is_some() => {
                 // The web app: encode once and download.

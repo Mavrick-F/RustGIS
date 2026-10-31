@@ -887,22 +887,23 @@ pub(crate) fn geojson_attrs(f: &Json, fields: &[Field]) -> Vec<Value> {
         .collect()
 }
 
-/// Whether a feature's geometry has a third value in its positions (a height, which reading drops),
-/// judged by its first position (each member's, in a GeometryCollection).
+/// Whether a feature's geometry has a third value in any position (a height, which reading drops),
+/// a GeometryCollection's members included.
 pub(crate) fn geojson_has_z(f: &Json) -> bool {
-    /// A geometry object's first position has more than two values.
+    /// Any position under `v` (nested arrays, ending in arrays of numbers) has more than two values.
+    fn positions(v: &Json) -> bool {
+        match v.as_array() {
+            Some(a) if a.first().is_some_and(Json::is_number) => a.len() > 2,
+            Some(a) => a.iter().any(positions),
+            None => false,
+        }
+    }
+    /// A geometry object, or a collection's members, has such a position.
     fn has_z(g: &Json) -> bool {
-        if let Some(members) = g.get("geometries").and_then(Json::as_array) {
-            return members.iter().any(has_z);
+        match g.get("geometries").and_then(Json::as_array) {
+            Some(members) => members.iter().any(has_z),
+            None => g.get("coordinates").is_some_and(positions),
         }
-        let mut at = g.get("coordinates");
-        while let Some(a) = at.and_then(Json::as_array) {
-            match a.first() {
-                Some(first) if first.is_array() => at = Some(first),
-                _ => return a.len() > 2,
-            }
-        }
-        false
     }
     f.get("geometry").is_some_and(has_z)
 }
@@ -947,9 +948,12 @@ impl Collector {
         let props = f.get("properties").and_then(Json::as_object);
         // Every feature's properties count in the schema, those with unreadable geometry too.
         let attrs: Vec<(usize, Value)> = props.into_iter().flatten().map(|(k, v)| (self.schema.see(k, v), Value::from_json(v))).collect();
-        self.zm |= geojson_has_z(f);
         match geojson_geometry(f) {
-            Ok(geom) => self.features.push((geom, attrs)),
+            Ok(geom) => {
+                // Only a geometry kept counts.
+                self.zm |= geom.is_some() && geojson_has_z(f);
+                self.features.push((geom, attrs));
+            }
             Err(()) => self.skipped += 1,
         }
     }
@@ -2455,6 +2459,20 @@ mod tests {
         let path = dir.path().join("track.geojson");
         std::fs::write(&path, doc("[1,2,9]")).unwrap();
         assert!(crate::source::geojson::GeoJsonSource::open_path(&path, "track").unwrap().info().zm_dropped);
+        // A height past the first position counts; one only in a geometry that isn't read doesn't.
+        let line = r#"{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[1,2],[3,4,5]]}}"#;
+        assert!(read_geojson(line, "line").unwrap().0.zm_dropped);
+        let curve = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Curve","coordinates":[[1,2,3]]}},{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
+        let (ds, rep) = read_geojson(curve, "curve").unwrap();
+        assert!(!ds.zm_dropped && !said(&rep) && rep.skipped == 1, "{rep:?}");
+        std::fs::write(&path, curve).unwrap();
+        assert!(!crate::source::geojson::GeoJsonSource::open_path(&path, "curve").unwrap().info().zm_dropped);
+
+        // KML marks each kind's layer by its own altitudes: a 3D point beside a flat polygon.
+        let kml = r#"<kml><Placemark><MultiGeometry><Point><coordinates>1,2,30</coordinates></Point><Polygon><outerBoundaryIs><LinearRing><coordinates>0,0 1,0 1,1 0,0</coordinates></LinearRing></outerBoundaryIs></Polygon></MultiGeometry></Placemark></kml>"#;
+        let layers = crate::kml::read("site.kml", kml.as_bytes()).unwrap();
+        let marked: Vec<bool> = layers.iter().map(|l| l.dataset.zm_dropped).collect();
+        assert_eq!(marked, [true, false]);
 
         // A WKT column with Z.
         let (ds, rep) = read_csv("wkt,n\n\"POINT Z (1 2 3)\",1\n", "pts").unwrap();

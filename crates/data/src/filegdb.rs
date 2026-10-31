@@ -309,8 +309,8 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
         return Ok(None);
     }
     let mut ds = Dataset::new(name, layer_type, fields);
-    // A multipatch's heights are kept as fields and noted below.
-    if table.zm && table.geometry.is_some() && table.shape != Shape::Multipatch {
+    // A multipatch's heights are kept as fields and noted below; its measures aren't.
+    if table.geometry.is_some() && (table.has_m || (table.has_z && table.shape != Shape::Multipatch)) {
         ds.drop_zm(&mut report);
     }
     ds.crs = crs;
@@ -577,8 +577,10 @@ struct Table {
     utf8: bool,
     /// How many fields have a bit in each row's null flags.
     nullable: usize,
-    /// The geometries carry Z or M values (which reading drops).
-    zm: bool,
+    /// The geometries carry Z values (which reading drops, but a multipatch keeps as fields).
+    has_z: bool,
+    /// The geometries carry M values (which reading drops).
+    has_m: bool,
 }
 
 /// One field's value in a row: a value, or a geometry's bytes.
@@ -700,7 +702,7 @@ impl Table {
                 nullable += 1;
             }
         }
-        Ok(Table { fields, geometry, shape, utf8: flags & 0x100 != 0, nullable, zm: has_z || has_m })
+        Ok(Table { fields, geometry, shape, utf8: flags & 0x100 != 0, nullable, has_z, has_m })
     }
 
     fn field(&self, name: &str) -> Option<usize> {

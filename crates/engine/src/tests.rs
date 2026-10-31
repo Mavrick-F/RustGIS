@@ -10452,7 +10452,7 @@ fn dropped_z_values_are_said_on_import_and_export() {
         let out = dir.join(format!("out-{stream}.geojson"));
         let mark = s.notice_mark();
         s.run("share.exportLayer", &json!({"layer": id, "path": out})).unwrap();
-        let said = |s: &Session, mark| s.notices_since(mark).iter().any(|n| n.text.contains("written without Z or M values"));
+        let said = |s: &Session, mark| s.notices_since(mark).iter().any(|n| n.text.contains("has no Z or M values"));
         assert!(said(&s, mark), "stream {stream}: {:?}", s.notices_since(mark));
         assert!(std::fs::read_to_string(&out).unwrap().contains("[1.0,2.0]"));
         let mark = s.notice_mark();
