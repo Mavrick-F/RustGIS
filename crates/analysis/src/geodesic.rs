@@ -9,7 +9,8 @@
 //! The outline keeps its distance between its vertices too, not only at them (#1159): an edge
 //! drawn straight in the plane is split before it comes back to lon/lat wherever a straight edge
 //! there would stray from it ([`OUTLINE_TOLERANCE`]), so up to 85° of latitude the sides are
-//! within 0.01% of the distance (or 1 cm). Arcs are drawn as `geo` draws them by default, close to
+//! within 0.012% of the distance (or 1 cm): the projection's own error, under 0.0093% 150 km from
+//! its centre, and the edges' 0.002%. Arcs are drawn as `geo` draws them by default, close to
 //! GEOS and PostGIS's 8 edges to a quarter circle: a point's circle with 32 edges, a line's caps and
 //! a polygon's corners with 15 to a half circle. Between an arc's vertices the outline runs inside
 //! it, by up to 0.48% of the distance round a point and 0.55% at a cap or corner.
@@ -31,7 +32,8 @@ const DENSIFY_M: f64 = 10_000.0;
 /// At most this many vertices are added to one line or ring (four times round the Earth at 10 km).
 const MAX_ADDED: f64 = 16_000.0;
 /// Back in lon/lat, an outline's straight edges stay within this fraction of the distance of the
-/// edges drawn in the plane, or [`MIN_TOLERANCE_M`], whichever is more.
+/// edges drawn in the plane, or [`MIN_TOLERANCE_M`], whichever is more, on top of the projection's
+/// own error (under 0.0093% at [`ONE_PIECE_M`]).
 const OUTLINE_TOLERANCE: f64 = 2e-5;
 /// The smallest tolerance (metres): finer only adds vertices.
 const MIN_TOLERANCE_M: f64 = 0.01;
@@ -82,13 +84,15 @@ impl Plane {
         MultiPolygon::new(mp.0.iter().map(|p| Polygon::new(ring(p.exterior()), p.interiors().iter().map(ring).collect())).collect())
     }
 
-    /// A ring drawn in the plane, in lon/lat degrees, its edges split as [`Plane::split`] needs.
+    /// A ring drawn in the plane, in lon/lat degrees, its edges split as [`Plane::split`] needs, by
+    /// at most [`MAX_ADDED`] points in all, however many edges stray.
     fn ring(&self, r: &LineString<f64>, tolerance: f64) -> LineString<f64> {
         let mut dense = Vec::with_capacity(r.0.len());
+        let mut budget = MAX_ADDED as usize;
         for w in r.0.windows(2) {
             let [a, b] = w else { continue };
             dense.push(*a);
-            self.split(*a, *b, tolerance, 0, &mut dense);
+            self.split(*a, *b, tolerance, 0, &mut budget, &mut dense);
         }
         dense.extend(r.0.last());
         let r = &LineString::new(dense);
@@ -117,9 +121,9 @@ impl Plane {
     /// and midpoint are compared with the same points of the straight edge in Web Mercator, the
     /// plane the tools draw edges in (one point alone misses a stray that changes side, as along a
     /// line crossing the equator); an edge that strays is halved, and each half checked again, up
-    /// to [`MAX_SPLITS`] times.
-    fn split(&self, a: GC<f64>, b: GC<f64>, tolerance: f64, depth: u32, out: &mut Vec<GC<f64>>) {
-        if depth >= MAX_SPLITS || STRAY_PER_M2 * ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)) <= tolerance {
+    /// to [`MAX_SPLITS`] times, while the ring's `budget` of added points lasts.
+    fn split(&self, a: GC<f64>, b: GC<f64>, tolerance: f64, depth: u32, budget: &mut usize, out: &mut Vec<GC<f64>>) {
+        if *budget == 0 || depth >= MAX_SPLITS || STRAY_PER_M2 * ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)) <= tolerance {
             return;
         }
         let at = |t: f64| self.0.inverse(Coord::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)));
@@ -145,9 +149,13 @@ impl Plane {
             return;
         }
         let mid = GC { x: (a.x + b.x) / 2.0, y: (a.y + b.y) / 2.0 };
-        self.split(a, mid, tolerance, depth + 1, out);
+        self.split(a, mid, tolerance, depth + 1, budget, out);
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
         out.push(mid);
-        self.split(mid, b, tolerance, depth + 1, out);
+        self.split(mid, b, tolerance, depth + 1, budget, out);
     }
 
     /// A ring round a pole, which goes once round the globe in longitude, as a lon/lat ring: cut at

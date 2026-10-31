@@ -4876,9 +4876,9 @@ mod tests {
     }
 
     /// The distance (metres) from `c` to a geodesic given by its [`geodesic_samples`], and whether
-    /// its nearest point is between the ends: the nearest sample on the sphere (among every 50th,
-    /// then its neighbours), then the nearest point on the ellipsoid along the geodesic either side
-    /// of it, by golden-section search to well under a millimetre.
+    /// its nearest point is strictly between the ends: the nearest sample on the sphere (among
+    /// every 50th, then its neighbours), then the nearest point on the ellipsoid along the geodesic
+    /// either side of it, by golden-section search to well under a millimetre.
     fn m_to_geodesic(c: Coord, samples: &[Coord]) -> (f64, bool) {
         use geo::InterpolatePoint;
         let near = |range: std::ops::Range<usize>, step: usize| {
@@ -4888,7 +4888,8 @@ mod tests {
         };
         let coarse = near(0..samples.len(), 50).unwrap_or(0);
         let i = near(coarse.saturating_sub(50)..(coarse + 51).min(samples.len()), 1).unwrap_or(coarse);
-        let (lo, hi) = (samples[i.saturating_sub(1)], samples[(i + 1).min(samples.len() - 1)]);
+        let (first, last) = (i.saturating_sub(1), (i + 1).min(samples.len() - 1));
+        let (lo, hi) = (samples[first], samples[last]);
         let at = |t: f64| {
             let p = geo::Geodesic.point_at_ratio_between(geo::Point::new(lo.x, lo.y), geo::Point::new(hi.x, hi.y), t);
             on_wgs84_m(c, Coord::new(p.x(), p.y()))
@@ -4899,14 +4900,18 @@ mod tests {
             let (x1, x2) = (b - g * (b - a), a + g * (b - a));
             if at(x1) <= at(x2) { b = x2 } else { a = x1 }
         }
-        (at((a + b) / 2.0).min(at(0.0)).min(at(1.0)), i > 0 && i + 1 < samples.len())
+        let t = (a + b) / 2.0;
+        // Strictly between the ends unless the nearest point is the line's first or last sample.
+        let at_start = first == 0 && t < 1e-6;
+        let at_end = last == samples.len() - 1 && t > 1.0 - 1e-6;
+        (at(t).min(at(0.0)).min(at(1.0)), !at_start && !at_end)
     }
 
     /// The outline keeps its distance between its vertices too, not only at them (#1159): edges
     /// drawn straight in the projection came back to lon/lat as straight lines there, so the long
     /// sides of a 2 km buffer of a 96 km east–west line sat up to 190 m off. Every vertex, and every
     /// edge's quarter points and midpoint as the tools draw edges (straight in Web Mercator), is now
-    /// within 0.01% of the distance (or 1 cm) along a line's sides, and no further inside an arc
+    /// within 0.012% of the distance (or 1 cm) along a line's sides, and no further inside an arc
     /// than its edges cut: 32 to a point's circle and 15 to a half circle at a line's cap, as `geo`
     /// draws them.
     #[test]
@@ -4931,13 +4936,27 @@ mod tests {
             (Coord::new(9.875, 46.25), Coord::new(11.125, 46.25), 2.0),
             (Coord::new(-0.6, -0.6), Coord::new(0.6, 0.6), 0.01),
             (Coord::new(-12.559_750_946_199_074, 83.853_999_752_232_98), Coord::new(12.559_750_946_199_074, 83.853_999_752_232_98), 0.01),
+            // Longer than one projection holds (150 km from its centre): buffered in stretches,
+            // densified along the WGS 84 geodesic.
+            (Coord::new(6.0, 46.25), Coord::new(14.0, 46.25), 2.0),
         ] {
             let (d0, samples) = (km * 1000.0, geodesic_samples(a, b));
+            // A point beside the line just inside an end is held to the side's bound; one just
+            // beyond the end, to the cap's.
+            // Probes 1 m inside and beyond the end, 10 m to the side, along the geodesic's last
+            // 20 m step (in local metres, so the side is square to it at any latitude).
+            let (end, last) = (samples[samples.len() - 1], samples[samples.len() - 2]);
+            let k = end.y.to_radians().cos();
+            let (dx, dy) = (end.x - last.x, end.y - last.y);
+            for (along, beside) in [(-0.05, true), (0.05, false)] {
+                let c = Coord::new(end.x + dx * along - dy / k * 0.5, end.y + dy * along + dx * k * 0.5);
+                assert_eq!(m_to_geodesic(c, &samples).1, beside, "{c:?} {along}");
+            }
             for c in points(&buffered(Geometry::Line(vec![vec![a, b]]), km)) {
                 let (d, beside) = m_to_geodesic(c, &samples);
-                // Along the sides, within 0.01% or 1 cm (and the sampler's millimetre); round the
+                // Along the sides, within 0.012% or 1 cm (and the sampler's millimetre); round the
                 // caps, within the sag of their 15 edges to a half circle.
-                let side = (d0 * 1e-4).max(0.01) + 1e-3;
+                let side = (d0 * 1.2e-4).max(0.01) + 1e-3;
                 let bound = if beside { side } else { sag(d0, 30.0) + side };
                 assert!(d < d0 + side && d > d0 - bound, "{km} km: {c:?} is {d} m from the line");
             }
@@ -4949,7 +4968,7 @@ mod tests {
         let north = Coord::new(10.0, 83.0);
         for c in points(&buffered(Geometry::Point(north), 1000.0)).into_iter().filter(|c| c.y.abs() < 85.0) {
             let d = on_wgs84_m(north, c);
-            assert!(d < 1_000_000.0 * (1.0 + 1e-4) && d > 1_000_000.0 - sag(1_000_000.0, 32.0) - 100.0, "{c:?} is {d} m from {north:?}");
+            assert!(d < 1_000_000.0 * (1.0 + 1.2e-4) && d > 1_000_000.0 - sag(1_000_000.0, 32.0) - 100.0, "{c:?} is {d} m from {north:?}");
         }
 
         // Coordinates off the Earth have no geodesic: buffering them doesn't panic.
@@ -4957,9 +4976,14 @@ mod tests {
         let mut ds = Dataset::new("f", GeometryType::Polyline, vec![]);
         ds.push(Some(Geometry::Line(vec![off.to_vec()])), vec![]);
         let m = Map(HashMap::from([("f".to_string(), ds)]));
-        if let Err(e) = crate::run("buffer", &m, &serde_json::json!({"input": "f", "distance": 1})) {
-            assert!(!e.contains("unexpectedly"), "{e}");
-        }
+        let r = crate::run("buffer", &m, &serde_json::json!({"input": "f", "distance": 1}));
+        assert!(!matches!(&r, Err(e) if e.ends_with("failed unexpectedly")), "{:?}", r.err());
+
+        // Splitting is bounded: a 1 m buffer of a line zigzagging 2,000 times across 100 km, each
+        // edge long enough to need splitting, gains at most `MAX_ADDED` points per ring.
+        let zigzag: Vec<Coord> = (0..=2000).map(|i| Coord::new(10.0 + i as f64 * 6e-4, if i % 2 == 0 { 46.0 } else { 46.9 })).collect();
+        let n: usize = buffered(Geometry::Line(vec![zigzag]), 0.001).iter().flatten().map(Vec::len).sum();
+        assert!(n < 60_000, "{n} vertices");
     }
 
     /// Buffers are geodesic (#394): Web Mercator's scale changes with latitude, so one scale for
