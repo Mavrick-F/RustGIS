@@ -128,6 +128,8 @@ fn remote_reader(file: &Arc<Remote>) -> Result<Arc<RemoteFile>> {
 }
 
 impl ParquetSource {
+    /// Opens a GeoParquet from its `geo` metadata: geometry column, types, bbox and coordinate
+    /// system, noting Z or M values (which reading drops).
     fn new(reader: Arc<dyn FileReader>, name: &str, remote: Option<Arc<Remote>>) -> Result<Self> {
         let md = reader.metadata();
         let schema = md.file_metadata().schema_descr();
@@ -200,8 +202,14 @@ impl ParquetSource {
             Some(e) => reproject.extent_to_lonlat(&e),
             None => covering.map(|c| reproject.extent_to_lonlat(&groups_extent(md, c))).unwrap_or(Extent::EMPTY),
         };
+        // Types such as "Point Z", or a bbox with Z bounds: the geometries carry Z or M values.
+        let zm = col_meta
+            .and_then(|c| c.get("geometry_types"))
+            .and_then(|t| t.as_array())
+            .is_some_and(|t| t.iter().filter_map(|v| v.as_str()).any(|v| v.ends_with(" Z") || v.ends_with(" M") || v.ends_with(" ZM")))
+            || col_meta.and_then(|c| c.get("bbox")).and_then(|b| b.as_array()).is_some_and(|b| b.len() == 6);
         let count = u64::try_from(md.file_metadata().num_rows()).ok();
-        let info = SourceInfo {
+        let mut info = SourceInfo {
             name: name.to_string(),
             format: "GeoParquet",
             geometry_type,
@@ -211,7 +219,11 @@ impl ParquetSource {
             crs: reproject.label(),
             indexed: covering.is_some(),
             notes,
+            zm_dropped: false,
         };
+        if zm {
+            info.drop_zm();
+        }
         let mut src = ParquetSource { info, reader, geom_col, field_cols, covering, reproject, remote, exact: false };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = super::peek_kind(&src);

@@ -1725,8 +1725,12 @@ fn add_source_with(
                 s.notify(format!("{unique}: {n}"), false);
             }
             let id = s.map_mut().add_streamed(unique.clone(), layer);
-            if let (Some(r), Some(l)) = (style.clone(), s.map_mut().layer_mut(id)) {
-                l.renderer = r;
+            if let Some(l) = s.map_mut().layer_mut(id) {
+                // Kept with the layer, as a materialized read keeps it (see Dataset::zm_dropped).
+                l.dataset.zm_dropped = info.zm_dropped;
+                if let Some(r) = style.clone() {
+                    l.renderer = r;
+                }
             }
             s.active_layer = Some(id);
             ids.push(id);
@@ -2788,6 +2792,9 @@ fn add_remote(s: &mut Session, p: &Value, url: &str, src: Box<dyn rustgis_data::
         s.notify(format!("{unique}: {n}"), false);
     }
     let id = s.map_mut().add_streamed(unique.clone(), layer);
+    if let Some(l) = s.map_mut().layer_mut(id) {
+        l.dataset.zm_dropped = info.zm_dropped;
+    }
     s.active_layer = Some(id);
     let count = info.count.map(|c| c.to_string()).unwrap_or_else(|| "many".into());
     s.notify(format!("{unique}: {count} features, read in place by range from its address, a view at a time"), false);

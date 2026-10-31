@@ -74,6 +74,8 @@ fn export_map(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"path": path, "bytes": png.len()}))
 }
 
+/// Writes a layer (a streamed one's whole source) to `path`, saying what the file couldn't hold:
+/// features without drawable geometry, a missing `.prj`, Z or M values dropped on import.
 fn export_layer(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let path = ps(p, "path").ok_or("path is required")?.to_string();
@@ -90,10 +92,14 @@ fn export_layer(s: &mut Session, p: &Value) -> CmdResult {
     };
     let left_out = rustgis_data::io::write_path_in(ds, Path::new(&path), crs).map_err(|e| e.to_string())?;
     let written = ds.features.len().saturating_sub(left_out);
+    let zm_note = rustgis_data::zm_export_note(ds, &path);
     // FlatGeobuf, KML, GPX and Shapefile hold features with geometry only (a Shapefile, only
     // geometry it can draw).
     if left_out > 0 {
         s.notify(format!("{path}: {left_out} features without drawable geometry were left out"), false);
+    }
+    if let Some(note) = zm_note {
+        s.notify(note, false);
     }
     if matches!(ext.as_str(), "shp" | "zip") && rustgis_data::raster::wkt::to_wkt(crs).is_none() {
         s.notify(format!("{path}: no .prj written, as {} has no WKT form", crs.label()), false);

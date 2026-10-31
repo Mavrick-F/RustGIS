@@ -177,12 +177,15 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             let mut m = map_of(s, p)?;
             m.layers.iter_mut().filter(|l| l.visible).try_for_each(load_whole)?;
             let html = web_map_html(&m, &m.name)?;
+            say_zm(s, m.layers.iter().filter(|l| l.visible).map(|l| &l.dataset), &m.name);
             Ok((m.name.clone(), html.into_bytes(), m.name))
         }
         "webLayer" => {
             let mut l = layer_of(s, p)?;
             load_whole(&mut l)?;
-            Ok((l.name.clone(), web_layer_zip(s, &l)?, l.name.clone()))
+            let zip = web_layer_zip(s, &l)?;
+            say_zm(s, [&l.dataset], &l.name);
+            Ok((l.name.clone(), zip, l.name.clone()))
         }
         "webStyle" => {
             let l = layer_of(s, p)?;
@@ -201,7 +204,9 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             m.layers.iter_mut().filter(|l| !l.is_raster() && !l.graphics).try_for_each(load_whole)?;
             let mut layers: Vec<&Dataset> = m.layers.iter().filter(|l| !l.is_raster() && !l.graphics).map(|l| &l.dataset).collect();
             layers.extend(s.project.tables.iter().map(|t| &t.dataset));
-            Ok((m.name.clone(), ogc_zip(&m.name, &layers, &[])?, m.name.clone()))
+            let zip = ogc_zip(&m.name, &layers, &[])?;
+            say_zm(s, m.layers.iter().filter(|l| !l.is_raster() && !l.graphics).map(|l| &l.dataset), &m.name);
+            Ok((m.name.clone(), zip, m.name.clone()))
         }
         "webTool" => {
             let ms = &s.project.models;
@@ -252,6 +257,15 @@ fn map_of(s: &Session, p: &Value) -> Result<Map, String> {
 }
 
 /// A streamed layer shares its whole source, not the features read for the current view.
+/// Says, for each of `layers` that lost Z or M values on import, that `target` was written without
+/// them.
+fn say_zm<'a>(s: &mut Session, layers: impl IntoIterator<Item = &'a Dataset>, target: &str) {
+    let notes: Vec<String> = layers.into_iter().filter_map(|ds| rustgis_data::zm_export_note(ds, target)).collect();
+    for n in notes {
+        s.notify(n, false);
+    }
+}
+
 fn load_whole(l: &mut Layer) -> Result<(), String> {
     if l.is_streamed() {
         l.dataset = l.load_all()?;

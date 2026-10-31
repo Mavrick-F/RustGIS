@@ -8,6 +8,7 @@
 //! The file is hostile: no DTD is read (so no entity expansion), the node count is capped, nesting
 //! is bounded, and a malformed placemark is skipped and counted.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use roxmltree::{Node, ParsingOptions};
@@ -169,6 +170,8 @@ struct Row {
     folder: String,
     style: Option<String>,
     data: Vec<(String, String)>,
+    /// Its placemark's coordinates had altitudes, which are dropped.
+    zm: bool,
 }
 
 struct Reader {
@@ -230,12 +233,16 @@ fn style_of(n: &Node) -> Style {
 }
 
 /// Coordinates: `lon,lat[,alt]` tuples separated by white space; malformed ones are dropped.
-fn coords(s: &str) -> Vec<Coord> {
+/// `zm` is set when an altitude other than 0 (KML's default) is dropped.
+fn coords(s: &str, zm: &Cell<bool>) -> Vec<Coord> {
     s.split_whitespace()
         .filter_map(|t| {
             let mut it = t.split(',');
             let x = it.next()?.trim().parse::<f64>().ok()?;
             let y = it.next()?.trim().parse::<f64>().ok()?;
+            if it.next().and_then(|z| z.trim().parse::<f64>().ok()).is_some_and(|z| z != 0.0) {
+                zm.set(true);
+            }
             // Longitude/latitude, as KML always is.
             ((-180.0..=180.0).contains(&x) && (-90.0..=90.0).contains(&y)).then(|| Coord::new(x, y))
         })
@@ -248,23 +255,28 @@ struct Parts {
     points: Vec<Coord>,
     lines: Vec<Vec<Coord>>,
     polygons: Vec<Vec<Vec<Coord>>>,
+    /// An altitude other than 0 was dropped.
+    zm: Cell<bool>,
 }
 
+/// Adds a geometry element's parts to `out` (MultiGeometry flattened, to `MAX_DEPTH`), marking
+/// altitudes dropped.
 fn geometry(n: &Node, out: &mut Parts, depth: usize) {
     if depth > MAX_DEPTH {
         return;
     }
     match local(n) {
-        "Point" => out.points.extend(child_text(n, "coordinates").map(|c| coords(&c)).unwrap_or_default().into_iter().take(1)),
+        "Point" => out.points.extend(child_text(n, "coordinates").map(|c| coords(&c, &out.zm)).unwrap_or_default().into_iter().take(1)),
         "LineString" | "LinearRing" => {
-            let c = child_text(n, "coordinates").map(|c| coords(&c)).unwrap_or_default();
+            let c = child_text(n, "coordinates").map(|c| coords(&c, &out.zm)).unwrap_or_default();
             if c.len() >= 2 {
                 out.lines.push(c);
             }
         }
         "Polygon" => {
-            let ring =
-                |b: Node| child(&b, "LinearRing").and_then(|r| child_text(&r, "coordinates")).map(|c| coords(&c)).filter(|c| c.len() >= 3);
+            let ring = |b: Node| {
+                child(&b, "LinearRing").and_then(|r| child_text(&r, "coordinates")).map(|c| coords(&c, &out.zm)).filter(|c| c.len() >= 3)
+            };
             if let Some(outer) = child(n, "outerBoundaryIs").and_then(ring) {
                 let mut rings = vec![outer];
                 rings.extend(n.children().filter(|c| c.is_element() && local(c) == "innerBoundaryIs").filter_map(ring));
@@ -281,6 +293,9 @@ fn geometry(n: &Node, out: &mut Parts, depth: usize) {
                     let mut it = t.split_whitespace();
                     let x = it.next()?.parse::<f64>().ok()?;
                     let y = it.next()?.parse::<f64>().ok()?;
+                    if it.next().and_then(|z| z.parse::<f64>().ok()).is_some_and(|z| z != 0.0) {
+                        out.zm.set(true);
+                    }
                     (x.is_finite() && y.is_finite()).then(|| Coord::new(x, y))
                 })
                 .collect();
@@ -411,6 +426,7 @@ impl Reader {
         // A placemark mixing kinds (a MultiGeometry of a point and a line) gives one feature per
         // kind, each in its layer.
         let mut any = false;
+        let zm = parts.zm.get();
         let mut push = |geometry: Geometry, rows: &mut Vec<Row>| {
             any = true;
             rows.push(Row {
@@ -420,6 +436,7 @@ impl Reader {
                 folder: folder.clone(),
                 style: style.clone(),
                 data: data.clone(),
+                zm,
             });
         };
         match parts.points.as_slice() {
@@ -472,6 +489,7 @@ impl Reader {
                     used.push(s.clone());
                 }
                 ds.push_next(Some(r.geometry.clone()), attrs);
+                ds.zm_dropped |= r.zm;
             }
             // Extended data is typed; names, descriptions, folders and style ids stay text.
             crate::io::type_text_columns(&mut ds, &["name", "description", "folder", "style"]);
@@ -485,6 +503,9 @@ impl Reader {
                 if self.dropped_keys > 0 {
                     report.messages.push(format!("{name}: extended data past {MAX_KEYS} distinct names was left out"));
                 }
+            }
+            if ds.zm_dropped {
+                report.messages.push(format!("{}: {}", ds.name, crate::ZM_DROPPED_NOTE));
             }
             let styles = used.into_iter().filter_map(|id| self.styles.get(&id).map(|s| (id, *s))).collect();
             out.push(Layer { dataset: ds, report, styles });
@@ -541,6 +562,10 @@ mod tests {
         assert_eq!(pin.icon, Some([0, 0, 255, 255]));
         assert_eq!(pin.scale, Some(1.5));
         assert_eq!(pts.report.skipped, 1);
+        // Altitudes other than 0 (the start's 30 m, the track's) are dropped and said; the polygons
+        // have none.
+        assert!(layers[0].dataset.zm_dropped && layers[1].dataset.zm_dropped && !layers[2].dataset.zm_dropped);
+        assert!(layers[1].report.messages.iter().any(|m| m.starts_with("trip lines: Z or M values")), "{:?}", layers[1].report.messages);
         // The ground overlay has no box: it can't be laid out.
         let (overlays, undrawn) = ground_overlays("t.kml", DOC.as_bytes()).unwrap();
         assert_eq!((overlays.len(), undrawn), (0, 1));

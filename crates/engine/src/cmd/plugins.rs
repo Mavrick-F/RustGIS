@@ -479,6 +479,7 @@ impl Bridge<'_> {
             source: None,
             crs: None,
             crs_incomplete: false,
+            zm_dropped: false,
             windowed: false,
         };
         let mut gj = rustgis_data::io::to_geojson(&ds);

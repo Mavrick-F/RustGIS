@@ -162,9 +162,19 @@ pub struct SourceInfo {
     /// Things worth telling whoever adds the source (an unknown coordinate system read as
     /// longitude/latitude, tables left out).
     pub notes: Vec<String>,
+    /// The source has Z or M values, which reading drops (see [`Dataset::zm_dropped`]).
+    pub zm_dropped: bool,
 }
 
 impl SourceInfo {
+    /// Marks the source as having Z or M values, which reading drops, and notes it once.
+    pub(crate) fn drop_zm(&mut self) {
+        if !self.zm_dropped {
+            self.zm_dropped = true;
+            self.notes.push(crate::ZM_DROPPED_NOTE.into());
+        }
+    }
+
     /// The source's coordinate system, when it isn't longitude/latitude and is known by its EPSG
     /// code.
     pub fn coordinate_system(&self) -> Option<Crs> {
@@ -513,6 +523,7 @@ pub fn materialize(src: &dyn FeatureSource) -> Result<(Dataset, ReadReport)> {
     // A streamed Shapefile skips unconvertible shapes rather than retaining empty geometry.
     // Once materialized, it must still direct CRS repairs back to the original file.
     ds.crs_incomplete = (info.format == "Shapefile" && batch.skipped > 0) || src.lost_to_crs();
+    ds.zm_dropped = info.zm_dropped;
     ds.features = batch.features.into();
     let report = ReadReport {
         skipped: batch.skipped + src.skipped_at_open(),

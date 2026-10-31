@@ -63,6 +63,8 @@ impl FgbSource {
         Ok(src)
     }
 
+    /// Opens a FlatGeobuf from its header: schema, extent, coordinate system, and notes (including
+    /// Z or M values, which reading drops).
     fn new<R: Read + Seek>(r: R, input: Input, name: &str) -> Result<Self> {
         let reader = open_reader(r)?;
         let h = reader.header();
@@ -99,7 +101,7 @@ impl FgbSource {
             })
             .unwrap_or(Extent::EMPTY);
         let count = h.features_count();
-        let info = SourceInfo {
+        let mut info = SourceInfo {
             name: h.name().filter(|n| !n.trim().is_empty()).unwrap_or(name).to_string(),
             format: "FlatGeobuf",
             geometry_type,
@@ -110,7 +112,11 @@ impl FgbSource {
             // The crate's index search assumes the default node size; other files are scanned.
             indexed: h.index_node_size() == flatgeobuf::packed_r_tree::PackedRTree::DEFAULT_NODE_SIZE && count > 0,
             notes,
+            zm_dropped: false,
         };
+        if h.has_z() || h.has_m() {
+            info.drop_zm();
+        }
         let mut src = FgbSource { info, input, reproject };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = src.peek_kind();

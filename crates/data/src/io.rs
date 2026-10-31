@@ -887,6 +887,26 @@ pub(crate) fn geojson_attrs(f: &Json, fields: &[Field]) -> Vec<Value> {
         .collect()
 }
 
+/// Whether a feature's geometry has a third value in its positions (a height, which reading drops),
+/// judged by its first position (each member's, in a GeometryCollection).
+pub(crate) fn geojson_has_z(f: &Json) -> bool {
+    /// A geometry object's first position has more than two values.
+    fn has_z(g: &Json) -> bool {
+        if let Some(members) = g.get("geometries").and_then(Json::as_array) {
+            return members.iter().any(has_z);
+        }
+        let mut at = g.get("coordinates");
+        while let Some(a) = at.and_then(Json::as_array) {
+            match a.first() {
+                Some(first) if first.is_array() => at = Some(first),
+                _ => return a.len() > 2,
+            }
+        }
+        false
+    }
+    f.get("geometry").is_some_and(has_z)
+}
+
 /// A feature's geometry: `Ok(None)` for none, `Err` for one that can't be read.
 pub(crate) fn geojson_geometry(f: &Json) -> std::result::Result<Option<Geometry>, ()> {
     match f.get("geometry").filter(|g| !g.is_null()) {
@@ -902,6 +922,8 @@ struct Collector {
     /// Each feature's geometry and its values by field, typed once every feature is in.
     features: Vec<(Option<Geometry>, Vec<(usize, Value)>)>,
     skipped: usize,
+    /// A geometry had heights, which are dropped.
+    zm: bool,
 }
 
 impl FeatureSink for Collector {
@@ -919,10 +941,13 @@ impl FeatureSink for Collector {
 }
 
 impl Collector {
+    /// Takes one feature: its properties into the schema, its geometry (or counts it unreadable),
+    /// and whether it had heights.
     fn add(&mut self, f: &Json) {
         let props = f.get("properties").and_then(Json::as_object);
         // Every feature's properties count in the schema, those with unreadable geometry too.
         let attrs: Vec<(usize, Value)> = props.into_iter().flatten().map(|(k, v)| (self.schema.see(k, v), Value::from_json(v))).collect();
+        self.zm |= geojson_has_z(f);
         match geojson_geometry(f) {
             Ok(geom) => self.features.push((geom, attrs)),
             Err(()) => self.skipped += 1,
@@ -934,6 +959,9 @@ impl Collector {
         let mut report = ReadReport { skipped: self.skipped, ..ReadReport::default() };
         let mut ds = Dataset::new(name, GeometryType::None, self.schema.fields());
         ds.features.reserve(self.features.len());
+        if self.zm {
+            ds.drop_zm(&mut report);
+        }
         if report.skipped > 0 {
             report.messages.push(format!("{} features had unreadable geometry", report.skipped));
         }
@@ -1271,9 +1299,12 @@ pub(crate) fn read_rows(
         } else if let Some(w) = wkt {
             match cell(w) {
                 "" => None,
-                t => match crate::interop::parse_wkt(t) {
-                    Ok((g, s)) => {
+                t => match crate::interop::parse_wkt_zm(t) {
+                    Ok((g, s, zm)) => {
                         srid = srid.or(s);
+                        if zm {
+                            ds.drop_zm(&mut report);
+                        }
                         g
                     }
                     Err(_) => {
@@ -1750,6 +1781,12 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Option<Crs>) -> 
             report.skipped += 1;
             continue;
         };
+        if !matches!(
+            shape,
+            Shape::NullShape | Shape::Point(_) | Shape::Multipoint(_) | Shape::Polyline(_) | Shape::Polygon(_) | Shape::Multipatch(_)
+        ) {
+            ds.drop_zm(&mut report);
+        }
         let geom = match shape {
             Shape::NullShape => None,
             Shape::Point(p) => Some(Geometry::Point(pt(p.x, p.y))),
@@ -2360,7 +2397,11 @@ mod tests {
         assert!(ds.features[3].geometry.is_none());
         assert_eq!(
             rep.messages,
-            ["1 rows had geometry that isn't readable WKT", "1 rows have another kind of geometry than the layer's polyline"]
+            [
+                crate::ZM_DROPPED_NOTE,
+                "1 rows had geometry that isn't readable WKT",
+                "1 rows have another kind of geometry than the layer's polyline"
+            ]
         );
         // A named WKT column with a given system.
         let opts = CsvOptions { wkt: Some("g".into()), crs: Some(Crs::WebMercator), ..CsvOptions::default() };
@@ -2368,6 +2409,61 @@ mod tests {
             read_csv_with("g|v\nPOLYGON ((0 0, 1000 0, 1000 1000, 0 0))|1\n", "t", &CsvOptions { delimiter: Some(b'|'), ..opts }).unwrap();
         assert_eq!(ds.geometry_type, GeometryType::Polygon);
         assert_eq!(ds.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["v"]);
+    }
+
+    /// Z and M values RustGIS doesn't keep are said when read, whole or in place, and the mark
+    /// that exports will lack them survives a project save; 2D data says nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dropped_z_and_m_values_are_said() {
+        use crate::source::FeatureSource;
+        use shapefile::dbase::{Record, TableWriterBuilder};
+        let said = |r: &ReadReport| r.messages.iter().any(|m| m == crate::ZM_DROPPED_NOTE);
+        let dir = tempfile::tempdir().unwrap();
+        let shp = |name: &str, z: bool| {
+            let path = dir.path().join(name);
+            let mut w = shapefile::Writer::from_path(&path, TableWriterBuilder::new()).unwrap();
+            if z {
+                w.write_shape_and_record(&shapefile::PointZ::new(1.0, 2.0, 30.0, 0.0), &Record::default()).unwrap();
+            } else {
+                w.write_shape_and_record(&shapefile::Point::new(1.0, 2.0), &Record::default()).unwrap();
+            }
+            path
+        };
+        let (wells, flat) = (shp("wells.shp", true), shp("flat.shp", false));
+        let (ds, rep) = read_path(&wells).unwrap();
+        assert!(ds.zm_dropped && said(&rep), "{:?}", rep.messages);
+        assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(1.0, 2.0))));
+        let (ds, rep) = read_path(&flat).unwrap();
+        assert!(!ds.zm_dropped && !said(&rep));
+        let src = crate::source::shp::ShpSource::open_path(&wells, "wells").unwrap();
+        assert!(src.info().zm_dropped);
+        let (ds, rep) = crate::source::materialize(&src).unwrap();
+        assert!(ds.zm_dropped && rep.messages.iter().any(|m| m.ends_with(crate::ZM_DROPPED_NOTE)), "{:?}", rep.messages);
+        assert!(!crate::source::shp::ShpSource::open_path(&flat, "flat").unwrap().info().zm_dropped);
+
+        // GeoJSON: a third position value, whole or in place, in a collection's member too.
+        let doc = |pos: &str| {
+            format!(
+                r#"{{"type":"FeatureCollection","features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"GeometryCollection","geometries":[{{"type":"LineString","coordinates":[{pos},[3,4]]}}]}}}}]}}"#
+            )
+        };
+        let (ds, rep) = read_geojson(&doc("[1,2,9]"), "track").unwrap();
+        assert!(ds.zm_dropped && said(&rep));
+        let (ds, rep) = read_geojson(&doc("[1,2]"), "track").unwrap();
+        assert!(!ds.zm_dropped && !said(&rep));
+        let path = dir.path().join("track.geojson");
+        std::fs::write(&path, doc("[1,2,9]")).unwrap();
+        assert!(crate::source::geojson::GeoJsonSource::open_path(&path, "track").unwrap().info().zm_dropped);
+
+        // A WKT column with Z.
+        let (ds, rep) = read_csv("wkt,n\n\"POINT Z (1 2 3)\",1\n", "pts").unwrap();
+        assert!(ds.zm_dropped && said(&rep));
+
+        // Saved and opened again, the mark stays; an unmarked dataset doesn't write it.
+        let back: Dataset = serde_json::from_value(serde_json::to_value(&ds).unwrap()).unwrap();
+        assert!(back.zm_dropped);
+        assert!(serde_json::to_value(Dataset::new("x", GeometryType::Point, vec![])).unwrap().get("zm_dropped").is_none());
     }
 
     #[test]

@@ -80,6 +80,7 @@ fn streamed_kind(layer: &Layer, size: usize, native: bool) -> Layer {
         crs: if native { "EPSG:3857".into() } else { "EPSG:4326".into() },
         indexed: true,
         notes: Vec::new(),
+        zm_dropped: false,
     };
     let mut l = layer.clone();
     l.dataset.features = ds.features.iter().take(1).cloned().collect::<Vec<_>>().into();

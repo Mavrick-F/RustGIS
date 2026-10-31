@@ -38,6 +38,7 @@ impl LidarSource {
             crs: "EPSG:4326".into(),
             indexed: false,
             notes,
+            zm_dropped: false,
         };
         Ok(LidarSource { info, features: features.into_vec() })
     }

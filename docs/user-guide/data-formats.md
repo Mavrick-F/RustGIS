@@ -450,6 +450,13 @@ need an EPSG code and otherwise default to WGS 84. A layer made in RustGIS defau
 another, such as `{"layer": "Parcels", "path": "parcels.gpkg", "crs": "EPSG:4647"}`. GeoJSON, KML,
 GPX, GeoParquet and CSV are always written in WGS 84.
 
+RustGIS keeps x and y only. When a source has Z or M values (heights or measures), adding it says
+they were dropped, and exporting, converting or sharing the layer says what's written lacks them.
+Shapefile, GeoPackage, GeoParquet, FlatGeobuf, PostGIS, File Geodatabase, GeoJSON, KML (altitudes
+other than 0), GML and CSV WKT columns are checked; sources read through GDAL or DuckDB, and SQL
+Server tables, aren't yet. GPX elevations and LiDAR heights are kept as fields, and a File
+Geodatabase multipatch's heights as `z_min` and `z_max`.
+
 ## Define Projection
 
 When a Shapefile's `.prj` is missing or incorrect, right-click its layer and choose

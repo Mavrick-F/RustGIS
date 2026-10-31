@@ -109,6 +109,8 @@ impl GpkgSource {
         }
     }
 
+    /// Opens a feature table (`layer`, else the first) from its metadata, noting what reading
+    /// changes: an unknown coordinate system, other tables, Z or M values dropped.
     fn open_conn(conn: Connection, layer: Option<&str>, temp: Option<PathBuf>) -> Result<Self> {
         let tables = feature_tables(&conn)?;
         let table = match layer {
@@ -211,12 +213,36 @@ impl GpkgSource {
             crs: reproject.label(),
             indexed: rtree.is_some(),
             notes,
+            zm_dropped: false,
         };
+        // Z and M are 0 (none), 1 (every geometry) or 2 (optional: looked for in the first rows).
+        let zm: Option<(i64, i64)> =
+            conn.query_row("SELECT z, m FROM gpkg_geometry_columns WHERE table_name = ?1", [&table], |r| Ok((r.get(0)?, r.get(1)?))).ok();
         let mut src = GpkgSource { info, conn: Mutex::new(Some(conn)), table, geom, pk, rtree, reproject, temp };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = src.peek_kind();
         }
+        if zm.is_some_and(|(z, m)| z == 1 || m == 1 || ((z == 2 || m == 2) && src.peek_zm())) {
+            src.info.drop_zm();
+        }
         Ok(src)
+    }
+
+    /// Whether any of the first few geometries has Z or M values (a query that stops there).
+    fn peek_zm(&self) -> bool {
+        let Ok(guard) = self.conn.lock() else { return false };
+        let Some(conn) = guard.as_ref() else { return false };
+        let sql = format!("SELECT {g} FROM {t} WHERE {g} IS NOT NULL LIMIT 16", g = quote(&self.geom), t = quote(&self.table));
+        let Ok(mut st) = conn.prepare(&sql) else { return false };
+        let Ok(mut rows) = st.query([]) else { return false };
+        while let Ok(Some(r)) = rows.next() {
+            if let Ok(ValueRef::Blob(b)) = r.get_ref(0)
+                && split_blob(b).is_some_and(|(_, body)| wkb::has_zm(body))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The geometry type of a table declared as plain `GEOMETRY`, from its first few rows (a

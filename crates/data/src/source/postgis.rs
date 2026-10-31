@@ -761,8 +761,14 @@ impl PostgisSource {
             }
         }
         let lonlat = if srid == 0 || srid == 4326 { native.clone() } else { format!("ST_Transform({native}, 4326)") };
-        // Curves become lines; Z and M are dropped by the reader.
+        // Curves become lines; Z and M are dropped by the reader, so opening notes them when the first
+        // rows have any.
         let wkb = format!("ST_AsBinary(ST_CurveToLine({lonlat}))");
+        let sql = format!(
+            "SELECT bool_or(ST_NDims(g::geometry) > 2) FROM (SELECT {g} AS g FROM {} WHERE {g} IS NOT NULL LIMIT 16) AS s",
+            table.sql_from()
+        );
+        let zm = conn.with(|c| c.query_opt(sql.as_str(), &[])).ok().flatten().and_then(|r| r.try_get::<_, Option<bool>>(0).ok().flatten());
 
         // The columns: a single integer primary key gives the ids.
         let rel = format!("{}.{}", ident(&table.schema), ident(&table.name));
@@ -837,6 +843,7 @@ impl PostgisSource {
                 crs: if srid == 0 { "EPSG:4326".into() } else { format!("EPSG:{srid}") },
                 indexed: false,
                 notes,
+                zm_dropped: false,
             },
             conn,
             table,
@@ -848,6 +855,9 @@ impl PostgisSource {
             select,
             reproject,
         };
+        if zm == Some(true) {
+            src.info.drop_zm();
+        }
         src.info.indexed = src.has_index();
         src.info.count = src.count_rows();
         src.info.extent = src.extent();
@@ -1427,6 +1437,7 @@ mod tests {
                 crs: "EPSG:4326".into(),
                 indexed: false,
                 notes: Vec::new(),
+                zm_dropped: false,
             },
             conn: Arc::new(Conn { config: postgres::Config::new(), tls: Tls::Disable, writable: false, client: Mutex::new(None) }),
             table: Table {

@@ -237,6 +237,7 @@ fn materialize_refuses_oversized_and_incomplete_sources() {
             crs: "EPSG:4326".into(),
             indexed: false,
             notes: vec![],
+            zm_dropped: false,
         },
         batch: None,
         read: AtomicBool::new(false),

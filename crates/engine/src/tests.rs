@@ -10431,6 +10431,41 @@ fn exporting_features_refuses_to_replace_an_existing_geopackage() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A layer whose Z values were dropped on import says so when added, read whole or in place, and
+/// again when exported or converted; a 2D layer's export says nothing of it.
+#[test]
+fn dropped_z_values_are_said_on_import_and_export() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-zm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("wells.geojson");
+    std::fs::write(
+        &src,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2,30]}}]}"#,
+    )
+    .unwrap();
+    isolate_plugins();
+    let mut s = Session::new(Project::default());
+    for stream in [false, true] {
+        let mark = s.notice_mark();
+        let id = s.run("layer.addData", &json!({"path": src, "stream": stream})).unwrap()["layer"].as_u64().unwrap();
+        assert!(s.notices_since(mark).iter().any(|n| n.text.contains("Z or M values")), "stream {stream}: {:?}", s.notices_since(mark));
+        let out = dir.join(format!("out-{stream}.geojson"));
+        let mark = s.notice_mark();
+        s.run("share.exportLayer", &json!({"layer": id, "path": out})).unwrap();
+        let said = |s: &Session, mark| s.notices_since(mark).iter().any(|n| n.text.contains("written without Z or M values"));
+        assert!(said(&s, mark), "stream {stream}: {:?}", s.notices_since(mark));
+        assert!(std::fs::read_to_string(&out).unwrap().contains("[1.0,2.0]"));
+        let mark = s.notice_mark();
+        s.run("data.convert", &json!({"layer": id, "format": "wkt"})).unwrap();
+        assert!(said(&s, mark), "stream {stream}");
+    }
+    let mut s = world();
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": dir.join("cities.geojson")})).unwrap();
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("Z or M")), "{:?}", s.notices_since(mark));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn layers_export_to_geopackage_geoparquet_shapefile_and_kmz() {
     let dir = std::env::temp_dir().join(format!("rustgis-engine-export-{}", std::process::id()));
