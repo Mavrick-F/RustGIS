@@ -2017,25 +2017,97 @@ mod tests {
         hits
     }
 
+    /// A complete basemap style of the kind web maps publish: both source kinds, sprites and
+    /// glyphs, every layer type a basemap uses, and the expressions such styles use (`case`, `coalesce`,
+    /// `concat`, `geometry-type`, `has`, `interpolate`, `match`, `step`, `to-string`, `zoom` and
+    /// the comparisons) in filters, paint and layout. Every accessor is evaluated for every
+    /// layer, sample feature and zoom, then a few results are checked.
     #[test]
-    fn openfreemap_liberty() {
-        let json: Json = serde_json::from_str(include_str!("../testdata/liberty.json")).unwrap();
+    fn full_basemap_style() {
+        let line = json!(["match", ["geometry-type"], ["LineString", "MultiLineString"], true, false]);
+        let not_tunnel = json!(["!=", ["get", "brunnel"], "tunnel"]);
+        let name = json!([
+            "case",
+            ["has", "name:nonlatin"],
+            ["concat", ["get", "name:latin"], " ", ["get", "name:nonlatin"]],
+            ["coalesce", ["get", "name_en"], ["get", "name"]]
+        ]);
+        let road_width = |base: f64, top: f64| json!(["interpolate", ["exponential", 1.3], ["zoom"], 6, base, 18, top]);
+        let json = json!({
+            "version": 8,
+            "sources": {
+                "relief": {"type": "raster", "tiles": ["https://tiles.example.com/relief/{z}/{x}/{y}.png"], "tileSize": 256, "maxzoom": 6},
+                "streets": {"type": "vector", "url": "https://tiles.example.com/streets.json"}
+            },
+            "sprite": "https://tiles.example.com/sprites/basic",
+            "glyphs": "https://tiles.example.com/fonts/{fontstack}/{range}.pbf",
+            "layers": [
+                {"id": "paper", "type": "background", "paint": {"background-color": "#f4f1ea"}},
+                {"id": "relief", "type": "raster", "source": "relief", "maxzoom": 8,
+                 "paint": {"raster-opacity": ["interpolate", ["exponential", 1.4], ["zoom"], 0, 0.5, 7, 0.05]}},
+                {"id": "parks", "type": "fill", "source": "streets", "source-layer": "landuse",
+                 "filter": ["all", ["match", ["geometry-type"], ["MultiPolygon", "Polygon"], true, false], ["match", ["get", "class"], ["park", "garden"], true, false]],
+                 "paint": {"fill-color": ["match", ["get", "class"], "park", "#cfe8c0", "#dcebd0"], "fill-opacity": ["interpolate", ["linear"], ["zoom"], 8, 0.4, 12, 0.9], "fill-outline-color": "#b5d3a4", "fill-antialias": true}},
+                {"id": "marsh", "type": "fill", "source": "streets", "source-layer": "landcover", "filter": ["==", ["get", "class"], "wetland"],
+                 "paint": {"fill-pattern": "marsh_dots", "fill-translate-anchor": "map"}},
+                {"id": "water", "type": "fill", "source": "streets", "source-layer": "water", "filter": not_tunnel,
+                 "paint": {"fill-color": "#a9cbe8"}},
+                {"id": "built_up", "type": "fill", "source": "streets", "source-layer": "building", "maxzoom": 15,
+                 "filter": ["!", ["has", "hide_3d"]], "paint": {"fill-color": ["coalesce", ["get", "colour"], "#ddd6cc"]}},
+                {"id": "buildings_3d", "type": "fill-extrusion", "source": "streets", "source-layer": "building", "minzoom": 14,
+                 "paint": {"fill-extrusion-color": "#e0d8cc", "fill-extrusion-height": ["get", "render_height"], "fill-extrusion-base": ["get", "render_min_height"], "fill-extrusion-opacity": 0.7}},
+                {"id": "river", "type": "line", "source": "streets", "source-layer": "waterway",
+                 "filter": ["all", line, ["==", ["get", "class"], "river"], not_tunnel],
+                 "layout": {"line-cap": "round"}, "paint": {"line-color": "#a9cbe8", "line-width": ["interpolate", ["linear"], ["zoom"], 8, 0.5, 16, 4]}},
+                {"id": "path", "type": "line", "source": "streets", "source-layer": "transportation", "minzoom": 14,
+                 "filter": ["==", ["get", "class"], "path"],
+                 "paint": {"line-color": "#a08a70", "line-dasharray": [1.5, 1], "line-width": 1, "line-opacity": ["step", ["zoom"], 0.5, 16, 1]}},
+                {"id": "railway", "type": "line", "source": "streets", "source-layer": "transportation",
+                 "filter": ["match", ["get", "class"], ["rail", "transit"], true, false],
+                 "paint": {"line-color": "#9a9a9a", "line-width": ["step", ["zoom"], 1, 14, 2]}},
+                {"id": "road_casing", "type": "line", "source": "streets", "source-layer": "transportation", "minzoom": 6,
+                 "filter": ["all", ["match", ["get", "class"], ["motorway", "trunk", "primary"], true, false], ["match", ["get", "brunnel"], ["bridge", "tunnel"], false, true]],
+                 "layout": {"line-join": "round"}, "paint": {"line-color": "#b07040", "line-gap-width": road_width(0.5, 14.0), "line-width": 1}},
+                {"id": "road_motorway", "type": "line", "source": "streets", "source-layer": "transportation", "minzoom": 6,
+                 "filter": ["all", ["==", ["get", "class"], "motorway"], ["<=", ["coalesce", ["get", "ramp"], 0], 1], ["match", ["get", "brunnel"], ["tunnel"], false, true]],
+                 "layout": {"line-cap": "round", "line-join": "round"},
+                 "paint": {"line-color": ["interpolate", ["linear"], ["zoom"], 6, "hsl(24,80%,60%)", 9, "#f7b267"], "line-width": road_width(0.5, 14.0)}},
+                {"id": "boundary", "type": "line", "source": "streets", "source-layer": "boundary",
+                 "filter": ["all", [">=", ["get", "admin_level"], 2], ["<", ["get", "admin_level"], 5], ["!=", ["get", "maritime"], true]],
+                 "paint": {"line-color": "#8e7d9e", "line-dasharray": [3, 2], "line-width": ["case", ["==", ["get", "disputed"], 1], 0.8, 1.4]}},
+                {"id": "river_label", "type": "symbol", "source": "streets", "source-layer": "waterway", "minzoom": 9, "filter": line,
+                 "layout": {"symbol-placement": "line", "symbol-spacing": 300, "text-field": name, "text-font": ["Serif Italic"], "text-size": 13, "text-letter-spacing": 0.15, "text-max-width": 6, "text-rotation-alignment": "map"},
+                 "paint": {"text-color": "#4f7fae", "text-halo-color": "rgba(255,255,255,0.8)", "text-halo-width": 1.2}},
+                {"id": "shield", "type": "symbol", "source": "streets", "source-layer": "transportation_name",
+                 "filter": ["all", ["has", "ref"], ["<=", ["get", "ref_length"], 6]],
+                 "layout": {"icon-image": ["concat", "shield_", ["match", ["get", "network"], ["us-interstate", "us-highway"], ["get", "network"], "road"], "_", ["get", "ref_length"]],
+                            "icon-rotation-alignment": "viewport", "icon-size": 1, "text-field": ["to-string", ["get", "ref"]], "text-font": ["Sans Bold"], "text-size": 10, "text-rotation-alignment": "viewport", "symbol-placement": ["step", ["zoom"], "point", 10, "line"]}},
+                {"id": "one_way", "type": "symbol", "source": "streets", "source-layer": "transportation", "minzoom": 16,
+                 "filter": ["==", ["get", "oneway"], 1],
+                 "layout": {"icon-image": "arrow", "icon-rotate": 90, "icon-allow-overlap": true, "symbol-placement": "line", "symbol-spacing": 80}},
+                {"id": "place", "type": "symbol", "source": "streets", "source-layer": "place",
+                 "filter": ["match", ["get", "class"], ["city", "town"], true, false],
+                 "layout": {"text-field": name, "text-font": ["Sans Regular"], "text-transform": "uppercase", "text-size": ["interpolate", ["exponential", 1.2], ["zoom"], 4, 11, 11, 18],
+                            "text-anchor": "top", "text-offset": [0, 0.4], "text-padding": 2, "text-optional": true, "icon-image": ["match", ["get", "class"], "city", "dot_large", "dot_small"], "icon-optional": false},
+                 "paint": {"text-color": "#333", "text-halo-color": "#fff", "text-halo-width": 1, "text-halo-blur": 0.5}}
+            ]
+        });
         let st = Style::parse(&json).unwrap();
         let mut counts: HashMap<LayerKind, usize> = HashMap::new();
         for l in &st.layers {
             *counts.entry(l.kind).or_default() += 1;
         }
         let want = [
-            (LayerKind::Line, 67),
-            (LayerKind::Symbol, 25),
-            (LayerKind::Fill, 16),
+            (LayerKind::Line, 6),
+            (LayerKind::Symbol, 4),
+            (LayerKind::Fill, 4),
             (LayerKind::Background, 1),
             (LayerKind::Raster, 1),
             (LayerKind::FillExtrusion, 1),
         ];
         assert_eq!(counts, want.into_iter().collect());
-        assert!(matches!(st.source("openmaptiles"), Some(Source::Vector { url: Some(_), .. })));
-        assert!(matches!(st.source("ne2_shaded"), Some(Source::Raster { tile_size: 256, max_zoom: 6, .. })));
+        assert!(matches!(st.source("streets"), Some(Source::Vector { url: Some(_), .. })));
+        assert!(matches!(st.source("relief"), Some(Source::Raster { tile_size: 256, max_zoom: 6, .. })));
         assert!(st.glyphs.is_some() && st.sprite.is_some());
 
         let feats = sample_features();
@@ -2062,13 +2134,19 @@ mod tests {
         let mf = ctx(14.0, GeomKind::LineString, &mp);
         assert!(motorway.matches(&mf));
         assert!(motorway.line_width(&mf) > 1.0);
-        let wl = get("waterway_line_label");
+        let wl = get("river_label");
         let rp = props(&[("name:latin", s("Tevere")), ("name:nonlatin", s("Τίβερη"))]);
         let rf = ctx(14.0, GeomKind::LineString, &rp);
         assert_eq!(wl.text_field(&rf).as_deref(), Some("Tevere Τίβερη"));
         assert_eq!(wl.symbol_placement(&rf), SymbolPlacement::Line);
         assert!(wl.text_font(&rf).iter().any(|f| f.contains("Italic")));
-        assert!(get("natural_earth").raster_opacity(3.0) < 0.6);
+        // 0.5 + (0.05 − 0.5)·(1.4³ − 1)/(1.4⁷ − 1) at zoom 3.
+        assert!((0.40..0.44).contains(&get("relief").raster_opacity(3.0)));
+        // A step to a word: the shields follow their road from zoom 10.
+        let shield = get("shield");
+        let sp = props(&[("ref", s("A1")), ("ref_length", n(2.0))]);
+        assert_eq!(shield.symbol_placement(&ctx(8.0, GeomKind::LineString, &sp)), SymbolPlacement::Point);
+        assert_eq!(shield.symbol_placement(&ctx(14.0, GeomKind::LineString, &sp)), SymbolPlacement::Line);
     }
 
     struct Rng(u64);
