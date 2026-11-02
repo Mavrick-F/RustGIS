@@ -1,0 +1,43 @@
+name: Diagnose ARM64 width-cache corruption
+on:
+  push:
+    branches: [diag/arm64-reduction]
+permissions:
+  contents: read
+jobs:
+  reduce:
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Generate cases
+        run: python diag-repro/generate.py
+      - name: Compile and run reductions
+        shell: pwsh
+        run: |
+          rustc -vV
+          $results = @()
+          foreach ($case in Get-ChildItem target/arm64-reduction -Directory | Sort-Object Name) {
+            $levels = if ($case.Name -eq '00-original') { @(0, 1, 2, 3) } else { @(1) }
+            foreach ($level in $levels) {
+              $exe = Join-Path $case.FullName "case-$level.exe"
+              & rustc --crate-name repro --edition 2024 -C "opt-level=$level" -C "target-feature=+crt-static" -C "debuginfo=1" (Join-Path $case.FullName main.rs) -o $exe
+              if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $($case.Name) opt=$level" }
+              $stdout = Join-Path $case.FullName "stdout-$level.txt"
+              $stderr = Join-Path $case.FullName "stderr-$level.txt"
+              $process = Start-Process $exe -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+              $last = Get-Content $stdout | Select-Object -Last 1
+              $results += [pscustomobject]@{ case=$case.Name; opt=$level; exit=$process.ExitCode; last=$last }
+              Write-Host "RESULT case=$($case.Name) opt=$level exit=$($process.ExitCode) last=$last"
+            }
+          }
+          $results | ConvertTo-Json | Set-Content target/arm64-reduction/results.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: arm64-reduction
+          path: target/arm64-reduction
+          retention-days: 7
