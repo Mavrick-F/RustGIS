@@ -78,16 +78,24 @@ fn split_honors_selection_parts_repeated_vertices_and_original_coordinates() {
 }
 
 #[test]
-fn split_normalizes_sparse_and_extra_attributes_to_the_schema() {
-    let mut l = layer(GeometryType::Polyline);
-    line(&mut l, &[&[0., 1.]], "missing");
-    line(&mut l, &[&[2., 3.]], "retained");
-    l.ds.features[0].attrs.clear();
-    l.ds.features[1].attrs.push(Value::Text("extra".into()));
-    let ds = dataset(run("splitLineAtVertices", &l));
-    assert_eq!(ds.features[0].attrs, vec![Value::Null]);
-    assert_eq!(ds.features[1].attrs, vec![Value::Text("retained".into())]);
-    assert_eq!(ds.fields, l.ds.fields);
+fn conversions_pad_sparse_attributes_and_reject_values_without_fields() {
+    for tool in ["polygonToLine", "splitLineAtVertices", "featureEnvelopeToPolygon", "unsplitLine"] {
+        let polygon = tool == "polygonToLine";
+        let mut l = layer(if polygon { GeometryType::Polygon } else { GeometryType::Polyline });
+        let vertices = vec![Coord::new(0., 0.), Coord::new(2., 1.), Coord::new(0., 2.), Coord::new(0., 0.)];
+        let geometry = if polygon { Geometry::Polygon(vec![vec![vertices]]) } else { Geometry::Line(vec![vertices]) };
+        l.ds.push_next(Some(geometry), vec![]);
+        l.ds.features[0].attrs.clear();
+        let r = run(tool, &l);
+        assert!(r.messages.is_empty());
+        let ds = dataset(r);
+        assert!(!ds.features.is_empty());
+        assert!(ds.features.iter().all(|f| f.attrs == vec![Value::Null]));
+        assert_eq!(ds.fields, l.ds.fields);
+        l.ds.features[0].attrs = vec![Value::Text("retained".into()), Value::Text("extra".into())];
+        let error = rustgis_analysis::run(tool, &l, &json!({"input":"input"})).unwrap_err();
+        assert!(error.contains("feature 1 has attribute count 2 exceeding schema width 1"), "{tool}: {error}");
+    }
 }
 
 #[test]
@@ -129,6 +137,27 @@ fn unsplit_walks_reversed_out_of_order_chains_and_cycles_once() {
     assert_eq!(ds.features[0].geometry, Some(Geometry::Line(vec![coords(&[1., 2., 3., 4.])])));
     assert_eq!(ds.features[1].geometry, Some(Geometry::Line(vec![coords(&[10., 11., 12., 10.])])));
     assert_eq!(ds.features[0].attrs, vec![Value::Text("road".into())]);
+}
+
+/// Missing trailing values and explicit nulls have the same schema meaning at a join.
+/// Disconnected parts still copy the common text into each output chain.
+#[test]
+fn unsplit_joins_sparse_and_explicit_null_attributes_and_keeps_disjoint_text() {
+    let mut l = layer(GeometryType::Polyline);
+    l.ds.fields.push(Field::new("optional", FieldType::Integer));
+    let text = "road".repeat(1024);
+    line(&mut l, &[&[0., 1.], &[10., 11.]], &text);
+    line(&mut l, &[&[1., 2.]], &text);
+    l.ds.features[0].attrs.pop();
+    let r = run("unsplitLine", &l);
+    assert!(r.messages.is_empty());
+    let ds = dataset(r);
+    assert_eq!(ds.features.len(), 2);
+    assert_eq!(ds.features[0].geometry, Some(Geometry::Line(vec![coords(&[0., 1., 2.])])));
+    assert_eq!(ds.features[1].geometry, Some(Geometry::Line(vec![coords(&[10., 11.])])));
+    for f in ds.features.iter() {
+        assert_eq!(f.attrs, vec![Value::Text(text.clone()), Value::Null]);
+    }
 }
 
 #[test]

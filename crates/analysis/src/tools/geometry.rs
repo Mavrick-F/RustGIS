@@ -22,6 +22,7 @@ pub(super) fn convert(inp: &dyn Inputs, p: &Json, mode: Conversion) -> Result<To
     let mut skipped = 0;
     for row in rows(inp, p, "input", ds) {
         let Some(f) = ds.features.get(row) else { continue };
+        require_schema(f, ds.fields.len())?;
         let Some(g) = &f.geometry else {
             skipped += 1;
             continue;
@@ -95,6 +96,7 @@ fn size_segments<'a>(
 ) -> Result<(usize, Option<u64>, usize), String> {
     let (mut count, mut bytes, mut skipped) = (0usize, 0u64, 0usize);
     for f in features {
+        require_schema(f, width)?;
         let Some(g) = &f.geometry else {
             skipped += 1;
             continue;
@@ -141,13 +143,19 @@ fn segment_feature(id: u64, pair: &[Coord], own: &[Value], width: usize) -> Resu
     let mut parts = Vec::new();
     parts.try_reserve_exact(1)?;
     parts.push(coords);
+    let attrs = clone_attrs(own, width)?;
+    Ok(Feature { id, geometry: Some(Geometry::Line(parts)), attrs })
+}
+
+/// Copies schema-width attributes fallibly, including text, and pads missing values with null.
+fn clone_attrs(own: &[Value], width: usize) -> Result<Vec<Value>, TryReserveError> {
     let mut attrs = Vec::new();
     attrs.try_reserve_exact(width)?;
     for v in own.iter().take(width) {
         attrs.push(try_clone_value(v)?);
     }
     attrs.resize(width, Value::Null);
-    Ok(Feature { id, geometry: Some(Geometry::Line(parts)), attrs })
+    Ok(attrs)
 }
 
 /// Splits without duplicating an unbounded attribute payload blindly: count once, probe the
@@ -186,6 +194,14 @@ pub(super) fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     finish(out, skipped, "Split Line At Vertices")
 }
 
+/// Rejects values without field definitions before output schema normalization could drop them.
+fn require_schema(f: &Feature, width: usize) -> Result<(), String> {
+    if f.attrs.len() > width {
+        return Err(format!("Geometry conversion: feature {} has attribute count {} exceeding schema width {width}", f.id, f.attrs.len()));
+    }
+    Ok(())
+}
+
 /// Rejects invalid coordinates before extent calculation or endpoint hashing can hide them.
 fn require_finite(g: &Geometry) -> Result<(), String> {
     let mut finite = true;
@@ -221,6 +237,7 @@ pub(super) fn unsplit(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let mut skipped = 0;
     for row in rows(inp, p, "input", ds) {
         let Some(f) = ds.features.get(row) else { continue };
+        require_schema(f, ds.fields.len())?;
         let Some(g) = &f.geometry else {
             skipped += 1;
             continue;
@@ -251,7 +268,8 @@ pub(super) fn unsplit(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let joins = |c: &Coord| -> Option<&Vec<(usize, bool)>> {
         let incident = nodes.get(&endpoint(c))?;
         let [(a, _), (b, _)] = incident.as_slice() else { return None };
-        (edges.get(*a)?.1 == edges.get(*b)?.1).then_some(incident)
+        let (a, b) = (edges.get(*a)?.1, edges.get(*b)?.1);
+        (0..ds.fields.len()).all(|i| a.get(i).unwrap_or(&Value::Null) == b.get(i).unwrap_or(&Value::Null)).then_some(incident)
     };
     let mut used = vec![false; edges.len()];
     for cycles in [false, true] {
@@ -288,7 +306,8 @@ pub(super) fn unsplit(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 id = other;
                 reverse = at_end;
             }
-            out.push_next(Some(Geometry::Line(vec![line])), (*attrs).clone());
+            let attrs = clone_attrs(attrs, ds.fields.len()).map_err(|e| format!("Unsplit Line: not enough memory for attributes: {e}"))?;
+            out.push_next(Some(Geometry::Line(vec![line])), attrs);
         }
     }
     finish(out, skipped, "Unsplit Line")

@@ -594,6 +594,39 @@ with latitude or the map's projection.
   Python's `pya5`, R), `resolution` and `area_km2`. A cell across the antimeridian, or round a pole, is
   split at ±180° into two parts of one polygon, each within −180° to 180°.
 
+### Geometry conversions
+
+These tools write new layers, honor selected features, and retain source fields, attributes and
+CRS metadata. Coordinates are used directly, without projection or snapping.
+
+- **Polygon To Line** (`polygonToLine`) makes one multipart line feature per polygon feature,
+  including every outer and inner ring. Open rings are closed. Shared boundaries remain in both
+  features; the tool does not build a shared-edge topology.
+- **Split Line At Vertices** (`splitLineAtVertices`) writes one two-vertex feature for every
+  consecutive pair in every line part, with the source attributes. Repeated vertices produce
+  zero-length segments; parts are never connected across gaps. The browser checks the estimated
+  output memory, including repeated text attributes, before building the segments; unavailable
+  memory returns an error.
+- **Feature Envelope To Polygon** (`featureEnvelopeToPolygon`) writes one axis-aligned rectangle
+  around all coordinates of each feature in stored longitude/latitude axes. Point features and
+  horizontal or vertical lines have zero-area envelopes and are skipped with a count. Longitude
+  bounds are literal, including for features spanning the antimeridian.
+- **Unsplit Line** (`unsplitLine`) joins line parts at exactly equal endpoints where precisely
+  two part ends meet and all attribute values agree. Reversed parts and closed cycles are
+  supported. Branches, attribute changes, and intersections away from endpoints stay separate.
+  Every output chain retains its common attributes; no field values are discarded.
+
+Missing geometries and empty or too-short parts are skipped with a count. If skipping leaves
+no usable output, the tool returns an error. Non-finite coordinates and malformed rows with
+more attribute values than schema fields are errors; missing attribute values become null.
+
+```text
+gp.run={"tool":"polygonToLine","params":{"input":"Regions","output":"Boundaries"}}
+gp.run={"tool":"splitLineAtVertices","params":{"input":"Rivers"}}
+gp.run={"tool":"featureEnvelopeToPolygon","params":{"input":"Regions"}}
+gp.run={"tool":"unsplitLine","params":{"input":"Rivers"}}
+```
+
 ## GeoLibre tools
 
 The desktop app and the command line can also run the
@@ -1068,35 +1101,3 @@ and reporting the accuracy on held-back pixels. Trained models stay in the proje
 Share As › Deep Learning** saves one as a package to apply in other projects. **Analyze › Create
 Hosted Imagery** cuts a raster into XYZ web map tiles (PNG, transparent outside the raster) with
 a TileJSON file and a viewer page.
-
-### Geometry conversions
-
-These tools write new layers, honor selected features, and retain source fields, attributes and
-CRS metadata. Coordinates are used directly, without projection or snapping.
-
-- **Polygon To Line** (`polygonToLine`) makes one multipart line feature per polygon feature,
-  including every outer and inner ring. Open rings are closed. Shared boundaries remain in both
-  features; the tool does not build a shared-edge topology.
-- **Split Line At Vertices** (`splitLineAtVertices`) writes one two-vertex feature for every
-  consecutive pair in every line part, with the source attributes. Repeated vertices produce
-  zero-length segments; parts are never connected across gaps. The browser checks the estimated
-  output memory, including repeated text attributes, before building the segments; unavailable
-  memory returns an error.
-- **Feature Envelope To Polygon** (`featureEnvelopeToPolygon`) writes one axis-aligned rectangle
-  around all coordinates of each feature in stored longitude/latitude axes. Point features and
-  horizontal or vertical lines have zero-area envelopes and are skipped with a count. Longitude
-  bounds are literal, including for features spanning the antimeridian.
-- **Unsplit Line** (`unsplitLine`) joins line parts at exactly equal endpoints where precisely
-  two part ends meet and all attribute values agree. Reversed parts and closed cycles are
-  supported. Branches, attribute changes, and intersections away from endpoints stay separate.
-  Every output chain retains its common attributes; no field values are discarded.
-
-Missing geometries and empty or too-short parts are skipped with a count. If skipping leaves
-no usable output, the tool returns an error. Non-finite coordinates are errors.
-
-```text
-gp.run={"tool":"polygonToLine","params":{"input":"Regions","output":"Boundaries"}}
-gp.run={"tool":"splitLineAtVertices","params":{"input":"Rivers"}}
-gp.run={"tool":"featureEnvelopeToPolygon","params":{"input":"Regions"}}
-gp.run={"tool":"unsplitLine","params":{"input":"Rivers"}}
-```
