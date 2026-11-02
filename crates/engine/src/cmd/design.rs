@@ -13,6 +13,7 @@ use super::{b, f, need_feature_layer, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 mod shared_vertex;
+mod sketch;
 mod snap_vertex;
 
 /// One edited feature: its state before (none for an insert) and its row after (none for a
@@ -369,6 +370,15 @@ pub fn commands() -> Vec<C> {
         ),
         C::new("edit.explode", "Explode", "Edit › Features › Modify", explode).when(need_editable_selection),
         C::new("edit.split", "Split", "Edit › Features › Modify", split).when(need_editable_selection).params(r#"{"lon", "lat"}"#),
+        C::new("edit.cutPolygon", "Cut Polygon", "Edit › Features › Modify", sketch::cut_polygon)
+            .when(need_editable_selection)
+            .params(r#"{"line": GeoJSON LineString (lon/lat) drawn across the selected polygons}"#),
+        C::new("edit.reshape", "Reshape", "Edit › Features › Modify", sketch::reshape)
+            .when(need_editable_selection)
+            .params(r#"{"line": GeoJSON LineString (lon/lat) drawn across the selected line or polygon's boundary}"#),
+        C::new("edit.trace", "Trace Edge Path", "Edit › Features", sketch::trace).view().params(
+            r#"{"from": [lon, lat], "to": [lon, lat], "layer"?, "row"?: number (else the nearest edge within the tolerance), "tolerancePx"?: number (default: the snapping tolerance)}"#,
+        ),
         C::new("edit.traverse", "Traverse", "Edit › Features › Modify", traverse).when(need_editable).params(
             r#"{"layer"?, "start": [lon, lat], "units"?: "Meters" (default)|"Feet"|"Kilometers"|"Miles", "legs": [{"distance": number, "bearing": degrees from north}]} (closed in a polygon layer, open in a line layer)"#,
         ),

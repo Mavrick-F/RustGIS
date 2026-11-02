@@ -277,6 +277,9 @@ pub struct MapView {
     pub(crate) vertex_drag_owner: Option<crate::vertexedit::DragOwner>,
     /// Session-only opt-in for coincident polygon moves; never saved with a project or preference.
     pub move_shared_vertices: bool,
+    /// A sketch vertex clicked on an edge follows that edge from the previous vertex (Trace);
+    /// session only.
+    pub trace_edges: bool,
     /// The magnifying lens follows the pointer.
     pub magnifier: bool,
     pub popup: Option<Popup>,
@@ -375,6 +378,7 @@ impl Default for MapView {
             vertex_drag: None,
             vertex_drag_owner: None,
             move_shared_vertices: false,
+            trace_edges: false,
             magnifier: false,
             popup: None,
             popup_rev: 0,
@@ -2417,7 +2421,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
 
     // Clicks.
     if resp.double_clicked() {
-        if matches!(tool, Tool::CreateLine | Tool::CreatePolygon | Tool::Measure | Tool::MeasureArea) || vertex_shape(tool) {
+        if matches!(tool, Tool::Measure | Tool::MeasureArea) || tool.draws_edit() || vertex_shape(tool) {
             finish_sketch(app);
         } else if tool == Tool::EditVertices {
             // Its two clicks chose a vertex or a feature; zooming would lose the place.
@@ -2489,7 +2493,11 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             return;
         }
         // Sketch vertices snap to features when snapping is on.
-        let c = if tool.creates() || matches!(tool, Tool::Graphic(_) | Tool::Measure | Tool::MeasureArea) { snapped(app, c) } else { c };
+        let c = if tool.creates() || tool.draws_edit() || matches!(tool, Tool::Graphic(_) | Tool::Measure | Tool::MeasureArea) {
+            snapped(app, c)
+        } else {
+            c
+        };
         match tool {
             Tool::Explore => {
                 let r = app.session.run("identify", &json!({"lon": c.x, "lat": c.y, "tolerancePx": 5}));
@@ -2542,14 +2550,25 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             }
             // Dragged shapes ignore plain clicks.
             Tool::Graphic(s) if !vertex_shape(Tool::Graphic(s)) => {}
-            Tool::Measure | Tool::MeasureArea | Tool::CreateLine | Tool::CreatePolygon | Tool::Graphic(_) => {
+            Tool::Measure
+            | Tool::MeasureArea
+            | Tool::CreateLine
+            | Tool::CreatePolygon
+            | Tool::CutPolygon
+            | Tool::Reshape
+            | Tool::Graphic(_) => {
                 if app.map.sketch_done {
                     app.map.cancel_sketch();
                 }
                 // A double-click arrives as two clicks first; ignore the duplicate vertex.
                 let dup = app.map.sketch.last().and_then(|l| lonlat_to_screen(app, rect, *l)).is_some_and(|s| (s - p).length() < 3.0);
                 if !dup {
-                    app.map.sketch.push(c);
+                    let last = app.map.sketch.last().copied().filter(|_| app.map.trace_edges && tool.draws_edit());
+                    let along = last.and_then(|from| traced(app, from, c));
+                    match along {
+                        Some(path) => app.map.sketch.extend(path),
+                        None => app.map.sketch.push(c),
+                    }
                 }
             }
         }
@@ -2567,14 +2586,13 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
     if let Some(c) = app.map.menu_lonlat {
         resp.context_menu(|ui| crate::mapmenu::show(app, ui, c));
     }
-    if hover.is_some()
-        && matches!(tool, Tool::Measure | Tool::MeasureArea | Tool::CreateLine | Tool::CreatePolygon)
-        && !app.map.sketch.is_empty()
-    {
+    if hover.is_some() && (matches!(tool, Tool::Measure | Tool::MeasureArea) || tool.draws_edit()) && !app.map.sketch.is_empty() {
         ui.ctx().request_repaint();
     }
 }
 
+/// Finishes the sketch (a double-click): ends a measurement, adds the drawn feature, or runs Cut
+/// Polygon or Reshape on the drawn line, then clears the sketch.
 fn finish_sketch(app: &mut RustGisApp) {
     let tool = app.session.tool;
     let pts = app.map.sketch.clone();
@@ -2593,6 +2611,12 @@ fn finish_sketch(app: &mut RustGisApp) {
             let _ = app.run("edit.addFeature", with_template(app, json!({"geometry": {"type": "Polygon", "coordinates": [coords]}})));
             app.map.cancel_sketch();
         }
+        Tool::CutPolygon | Tool::Reshape if pts.len() >= 2 => {
+            let coords: Vec<[f64; 2]> = pts.iter().map(|c| [c.x, c.y]).collect();
+            let id = if tool == Tool::CutPolygon { "edit.cutPolygon" } else { "edit.reshape" };
+            let _ = app.run(id, json!({"line": {"type": "LineString", "coordinates": coords}}));
+            app.map.cancel_sketch();
+        }
         Tool::Graphic(shape) => {
             let min = if shape == "polygon" { 3 } else { 2 };
             if pts.len() >= min {
@@ -2601,6 +2625,15 @@ fn finish_sketch(app: &mut RustGisApp) {
         }
         _ => {}
     }
+}
+
+/// The path along the edge under both the last sketch vertex and a new click, after the last
+/// vertex (Trace), when there is one.
+fn traced(app: &mut RustGisApp, from: Coord, to: Coord) -> Option<Vec<Coord>> {
+    let r = app.session.run("edit.trace", &json!({"from": [from.x, from.y], "to": [to.x, to.y]})).ok()?;
+    let path: Vec<Coord> =
+        r["path"].as_array()?.iter().skip(1).filter_map(|c| Some(Coord::new(c.get(0)?.as_f64()?, c.get(1)?.as_f64()?))).collect();
+    (!path.is_empty()).then_some(path)
 }
 
 /// A point snapped to nearby features (when snapping is on).
@@ -2820,7 +2853,8 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         let closed = matches!(tool, Tool::MeasureArea | Tool::CreatePolygon | Tool::Graphic("polygon" | "lasso"));
         let placed: Vec<Option<Pos2>> = pts.iter().map(|c| lonlat_to_screen(app, rect, *c)).collect();
         let screen: Vec<Pos2> = placed.iter().flatten().copied().collect();
-        let color = if tool.creates() { Color32::from_rgb(0x16, 0x9A, 0x5A) } else { Color32::from_rgb(0xE5, 0x6A, 0x1A) };
+        let color =
+            if tool.creates() || tool.draws_edit() { Color32::from_rgb(0x16, 0x9A, 0x5A) } else { Color32::from_rgb(0xE5, 0x6A, 0x1A) };
         let all_visible = screen.len() == placed.len();
         if closed && all_visible && screen.len() >= 3 {
             p.add(egui::Shape::closed_line(screen.clone(), Stroke::new(2.0, color)));
@@ -2891,6 +2925,8 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         Tool::CreatePoint => Some("Click the map to add a point"),
         Tool::CreateLine => Some("Click to add vertices · double-click to finish the line"),
         Tool::CreatePolygon => Some("Click to add vertices · double-click to close the polygon"),
+        Tool::CutPolygon => Some("Draw a line across the selected polygons · double-click to cut them"),
+        Tool::Reshape => Some("Draw a line across the selected feature's edge · double-click to reshape it"),
         Tool::Select => Some("Click or drag a box · Shift adds · Ctrl removes"),
         Tool::SelectPolygon => {
             Some("Click vertices · click the start or double-click to select · Shift adds · Ctrl/Cmd removes · Esc cancels")
@@ -4667,5 +4703,29 @@ mod tests {
         assert_eq!(probe(&app), hit);
         app.run("group.set", json!({"group": "Notes", "transparency": 100})).unwrap();
         assert_eq!(probe(&app), None, "on a fully transparent layer");
+    }
+
+    /// Trace follows the edge under two clicks; finishing a Reshape or Cut Polygon sketch (what a
+    /// double-click does) runs its command on the drawn line and clears the sketch.
+    #[test]
+    fn trace_and_finishing_reshape_and_cut_sketches_edit_the_selection() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.template", json!({"template": "polygons", "name": "Parcels"})).unwrap();
+        let square = json!({"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
+        app.run("edit.addFeature", json!({"layer": "Parcels", "geometry": square})).unwrap();
+        app.session.zoom_to(&rustgis_engine::geom::Extent::new(-1.0, -1.0, 2.0, 2.0));
+        assert_eq!(traced(&mut app, Coord::new(0.5, 0.0), Coord::new(1.0, 0.5)), Some(vec![Coord::new(1.0, 0.0), Coord::new(1.0, 0.5)]));
+        let count = |app: &RustGisApp| app.session.map().layer_by_name("Parcels").unwrap().dataset.features.len();
+        app.run("tool.set", json!({"tool": "reshape"})).unwrap();
+        app.map.sketch = vec![Coord::new(0.2, 0.2), Coord::new(-0.5, 0.2), Coord::new(-0.5, 0.8), Coord::new(0.2, 0.8)];
+        finish_sketch(&mut app);
+        assert!(app.map.sketch.is_empty());
+        let e = app.session.map().layer_by_name("Parcels").unwrap().dataset.features[0].geometry.as_ref().unwrap().extent();
+        assert!((e.min_x + 0.5).abs() < 1e-9, "{e:?}");
+        app.run("tool.set", json!({"tool": "cutPolygon"})).unwrap();
+        app.map.sketch = vec![Coord::new(0.5, -1.0), Coord::new(0.5, 2.0)];
+        finish_sketch(&mut app);
+        assert!(app.map.sketch.is_empty());
+        assert_eq!(count(&app), 2);
     }
 }

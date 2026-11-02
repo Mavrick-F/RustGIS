@@ -1,0 +1,136 @@
+//! Cut Polygon, Reshape and Trace through their commands: attributes carried to the pieces, one
+//! undo step, and refusals that leave the layer as it was.
+use rustgis_engine::{
+    Project, Session,
+    data::{Dataset, Feature, Field, FieldType, Geometry, GeometryType, Value as Cell},
+    geom::Coord,
+};
+use serde_json::{Value, json};
+
+/// A closed rectangle.
+fn rectangle(left: f64, bottom: f64, right: f64, top: f64) -> Geometry {
+    Geometry::Polygon(vec![vec![vec![
+        Coord::new(left, bottom),
+        Coord::new(right, bottom),
+        Coord::new(right, top),
+        Coord::new(left, top),
+        Coord::new(left, bottom),
+    ]]])
+}
+
+/// One layer of the given shapes, each with a name, editing on.
+fn fixture(kind: GeometryType, shapes: Vec<Geometry>) -> (Session, u32) {
+    let mut s = Session::new(Project::new("Sketch edits"));
+    let mut data = Dataset::new("Parcels", kind, vec![Field::new("name", FieldType::Text)]);
+    data.features = shapes
+        .into_iter()
+        .enumerate()
+        .map(|(i, g)| Feature { id: i as u64, geometry: Some(g), attrs: vec![Cell::Text(format!("p{i}"))] })
+        .collect::<Vec<_>>()
+        .into();
+    let id = s.map_mut().add_dataset(data);
+    s.active_layer = Some(id);
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    s.clear_history();
+    (s, id)
+}
+
+/// The layer's whole features, so tests see attribute, id and untouched-row changes too.
+fn features(s: &Session, id: u32) -> Vec<Feature> {
+    s.map().layer(id).unwrap().dataset.features.iter().cloned().collect()
+}
+
+/// A GeoJSON LineString, the `line` parameter of Cut Polygon and Reshape.
+fn line(coords: &[[f64; 2]]) -> Value {
+    json!({"type": "LineString", "coordinates": coords})
+}
+
+#[test]
+fn cut_polygon_splits_the_selected_parcel_keeping_its_attributes() {
+    let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(0., 0., 1., 1.), rectangle(2., 0., 3., 1.)]);
+    let before = features(&s, id);
+    s.run("select.rows", &json!({"layer": id, "rows": [0]})).unwrap();
+    let r = s.run("edit.cutPolygon", &json!({"line": line(&[[0.3, -1.], [0.3, 2.]])})).unwrap();
+    assert_eq!(r, json!({"cut": 1, "pieces": 2, "missed": 0}));
+    let after = features(&s, id);
+    assert_eq!(after.len(), 3);
+    // The new piece copies the parcel's attributes; the other parcel is untouched.
+    assert_eq!(after[2].attrs, before[0].attrs);
+    assert_eq!(after[1], before[1]);
+    assert_eq!(s.map().layer(id).unwrap().selection, vec![0, 2]);
+    // One undo step puts it back.
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(features(&s, id), before);
+}
+
+#[test]
+fn a_cut_that_misses_or_bad_lines_change_nothing() {
+    let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(0., 0., 1., 1.)]);
+    let before = features(&s, id);
+    s.run("select.rows", &json!({"layer": id, "rows": [0]})).unwrap();
+    for p in [
+        json!({"line": line(&[[5., -1.], [5., 2.]])}),
+        json!({"line": line(&[[0.5, -1.], [0.5, 0.5]])}),
+        json!({"line": {"type": "Point", "coordinates": [0, 0]}}),
+        json!({"line": line(&[[0.5, -1.]])}),
+        json!({}),
+    ] {
+        assert!(s.run("edit.cutPolygon", &p).is_err(), "{p}");
+        assert!(s.run("edit.reshape", &p).is_err(), "{p}");
+    }
+    assert_eq!(features(&s, id), before);
+}
+
+#[test]
+fn a_refused_cut_of_one_selected_parcel_cuts_none_of_them() {
+    // The second parcel has a corrupt vertex (as from a damaged file): its cut is refused.
+    let mut corrupt = rectangle(0., 1., 1., 2.);
+    if let Geometry::Polygon(p) = &mut corrupt {
+        p[0][0][2] = Coord::new(f64::NAN, 2.);
+    }
+    let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(0., 0., 1., 1.), corrupt]);
+    let before = features(&s, id);
+    s.run("select.rows", &json!({"layer": id, "rows": [0, 1]})).unwrap();
+    assert!(s.run("edit.cutPolygon", &json!({"line": line(&[[0.5, -1.], [0.5, 2.]])})).is_err());
+    // (NaN never equals itself, so the healthy parcel and the row count are compared.)
+    let after = features(&s, id);
+    assert_eq!((after.len(), &after[0]), (before.len(), &before[0]));
+    // A selected parcel the line misses is counted, not cut.
+    let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(0., 0., 1., 1.), rectangle(5., 0., 6., 1.)]);
+    s.run("select.rows", &json!({"layer": id, "rows": [0, 1]})).unwrap();
+    let r = s.run("edit.cutPolygon", &json!({"line": line(&[[0.5, -1.], [0.5, 2.]])})).unwrap();
+    assert_eq!(r, json!({"cut": 1, "pieces": 2, "missed": 1}));
+}
+
+#[test]
+fn reshape_moves_a_boundary_and_needs_one_feature() {
+    let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(0., 0., 1., 1.), rectangle(2., 0., 3., 1.)]);
+    let bump = json!({"line": line(&[[0.8, 0.2], [1.5, 0.2], [1.5, 0.8], [0.8, 0.8]])});
+    s.run("select.rows", &json!({"layer": id, "rows": [0, 1]})).unwrap();
+    assert!(s.run("edit.reshape", &bump).is_err(), "two features selected");
+    s.run("select.rows", &json!({"layer": id, "rows": [0]})).unwrap();
+    s.run("edit.reshape", &bump).unwrap();
+    let Some(Geometry::Polygon(p)) = &features(&s, id)[0].geometry else { panic!("not a polygon") };
+    assert!(p[0][0].iter().any(|c| (c.x - 1.5).abs() < 1e-9), "{p:?}");
+    // A reshape that would make the ring cross itself is refused.
+    let cross = json!({"line": line(&[[0.5, -0.5], [0.5, 1.5], [0.7, 1.5], [0.7, -0.5], [0.6, -0.5], [0.6, 2.0]])});
+    let before = features(&s, id);
+    assert!(s.run("edit.reshape", &cross).is_err());
+    assert_eq!(features(&s, id), before);
+}
+
+#[test]
+fn trace_finds_the_edge_near_both_points() {
+    let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(0., 0., 1., 1.)]);
+    let r = s.run("edit.trace", &json!({"layer": id, "row": 0, "from": [0.5, 0.], "to": [1., 0.5]})).unwrap();
+    assert_eq!(r["path"], json!([[0.5, 0.0], [1.0, 0.0], [1.0, 0.5]]));
+    assert!(r["fromOffM"].as_f64().is_some_and(|d| d < 1e-6) && r["toOffM"].as_f64().is_some_and(|d| d < 1e-6), "{r}");
+    // A point off the edge is moved onto it, and how far is said.
+    let r = s.run("edit.trace", &json!({"layer": id, "row": 0, "from": [0.5, -0.1], "to": [1., 0.5]})).unwrap();
+    assert!(r["fromOffM"].as_f64().is_some_and(|d| d > 10_000.0), "{r}");
+    // Without a row, the edge is found near both points (a generous tolerance at this zoom).
+    s.zoom_to(&rustgis_engine::geom::Extent::new(-1., -1., 2., 2.));
+    let r = s.run("edit.trace", &json!({"from": [0.5, 0.], "to": [1., 0.5], "tolerancePx": 20})).unwrap();
+    assert_eq!(r["row"], 0);
+    assert!(s.run("edit.trace", &json!({"from": [0.5, 0.5], "to": [0.6, 0.6], "tolerancePx": 1})).is_err());
+}
