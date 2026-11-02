@@ -2164,7 +2164,8 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
                 table.add_numeric_field(dbf_name(n)?, 24, u8::try_from(d).unwrap_or(15))
             }
             FieldType::Boolean => table.add_logical_field(dbf_name(n)?),
-            FieldType::Text => {
+            // Dates are ISO text until Shapefile's own date fields are written.
+            FieldType::Text | FieldType::Date | FieldType::DateTime => {
                 let longest = ds.features.iter().filter_map(|r| r.attrs.get(k)).map(|v| v.to_string().len()).max().unwrap_or(0);
                 table.add_character_field(dbf_name(n)?, u8::try_from(longest.clamp(1, 254)).unwrap_or(254))
             }
@@ -2193,7 +2194,9 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
                     Value::Int(i) => Some(*i != 0),
                     _ => None,
                 }),
-                FieldType::Text => FieldValue::Character((!v.is_null()).then(|| cut(&v.to_string(), 254).to_string())),
+                FieldType::Text | FieldType::Date | FieldType::DateTime => {
+                    FieldValue::Character((!v.is_null()).then(|| cut(&v.to_string(), 254).to_string()))
+                }
             };
             rec.insert(n.clone(), value);
         }

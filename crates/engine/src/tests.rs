@@ -387,6 +387,65 @@ fn editing_features_and_fields() {
     assert_eq!(s.map().layer_by_name("Cities").unwrap().dataset.features.len(), n - 1);
 }
 
+/// A date field is added, edited as ISO text, compared in a where clause, calculated, offered to
+/// the time slider, and kept as dates through a project save; arithmetic on it is an error, and
+/// text that isn't a date is reported, not quietly stored as null.
+#[test]
+fn date_fields_work_from_adding_to_saving() {
+    use rustgis_data::Value as V;
+    let mut s = world();
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "founded", "type": "date"})).unwrap();
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "seen", "type": "datetime"})).unwrap();
+    let fields = s.run("layer.fields", &json!({"layer": "Cities"})).unwrap();
+    let types: Vec<&str> = fields.as_array().unwrap().iter().filter_map(|f| f["type"].as_str()).collect();
+    assert!(types.ends_with(&["Date", "DateTime"]), "{types:?}");
+    for (row, day) in [(0, "2026-03-05"), (1, "1999-12-31"), (2, "2026-01-01")] {
+        s.run("edit.setValue", &json!({"layer": "Cities", "row": row, "field": "founded", "value": day})).unwrap();
+    }
+    let selected = s.run("select.byAttributes", &json!({"layer": "Cities", "where": "founded >= '2026-01-01'"})).unwrap();
+    assert_eq!(selected["selected"], 2);
+    s.run("select.clear", &Value::Null).unwrap();
+    let err = s.run("edit.calculateField", &json!({"layer": "Cities", "field": "founded", "expression": "founded + 30"})).unwrap_err();
+    assert!(err.contains("arithmetic on dates"), "{err}");
+    // A date into a date-time field is its midnight; text that isn't a date is reported.
+    let mark = s.notice_mark();
+    s.run("edit.calculateField", &json!({"layer": "Cities", "field": "seen", "expression": "founded"})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("Calculate Field")), "clean results give no notice");
+    let err = s.run("edit.setValue", &json!({"layer": "Cities", "row": 0, "field": "founded", "value": "soon"})).unwrap_err();
+    assert_eq!(err, "'soon' isn't a Date value");
+    let ds = |s: &Session| s.map().layer_by_name("Cities").unwrap().dataset.clone();
+    let seen = ds(&s).field_index("seen").unwrap();
+    assert_eq!(ds(&s).value(0, seen).to_string(), "2026-03-05T00:00:00");
+    let mark = s.notice_mark();
+    s.run(
+        "edit.calculateField",
+        &json!({"layer": "Cities", "field": "founded", "expression": "CASE WHEN @row_number = 1 THEN 'soon' ELSE founded END"}),
+    )
+    .unwrap();
+    assert!(
+        s.notices_since(mark).iter().any(|n| n.text.contains("'founded' is null in 1 row, whose result isn't a Date value")),
+        "{:?}",
+        s.notices_since(mark)
+    );
+    assert!(rustgis_map::time::time_fields(&ds(&s)).iter().any(|(f, _)| f == "seen"), "the slider is offered the date field");
+    // Saved and opened, the values are still dates.
+    let dir = std::env::temp_dir().join(format!("rustgis-dates-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dates.rgis");
+    s.run("project.saveAs", &json!({"path": path.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": path.display().to_string()})).unwrap();
+    let (a, b) = (ds(&s), ds(&t));
+    let founded = b.field_index("founded").unwrap();
+    assert_eq!(b.fields[founded].ty, rustgis_data::FieldType::Date);
+    assert!(matches!(b.value(1, founded), V::Date(d) if d.to_string() == "1999-12-31"));
+    assert_eq!(
+        (0..a.features.len()).map(|r| a.value(r, seen).clone()).collect::<Vec<_>>(),
+        (0..b.features.len()).map(|r| b.value(r, seen).clone()).collect::<Vec<_>>()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A polygon layer stacks fills (a colour, hatch lines, markers on a grid), for the layer or a
 /// class of its own; junk is refused and numbers held within range; each change undoes, and the
 /// project keeps them (a layer without them saves as before).

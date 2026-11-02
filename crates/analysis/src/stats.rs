@@ -111,12 +111,14 @@ impl Stat {
         )
     }
 
-    /// The type of the statistic's output field, for a numeric field or another.
-    pub fn output_type(self, numeric: bool) -> FieldType {
+    /// The type of the statistic's output field, for a field of type `input`, or one read
+    /// `as_numbers`. A statistic that picks one of a date field's values is a date.
+    pub fn output_type(self, input: FieldType, as_numbers: bool) -> FieldType {
         match self {
             Stat::Count | Stat::Unique | Stat::Nulls => FieldType::Integer,
             Stat::Concatenate => FieldType::Text,
-            _ if numeric => FieldType::Double,
+            _ if as_numbers || input.is_numeric() => FieldType::Double,
+            Stat::Min | Stat::Max | Stat::First | Stat::Last | Stat::Mode | Stat::Minority if input.is_temporal() => input,
             _ => FieldType::Text,
         }
     }
@@ -191,6 +193,9 @@ enum KeyPart<'a> {
     Float(u64),
     Text(&'a str),
     Bool(bool),
+    Date(rustgis_data::Date),
+    /// A date-time's instant: the same moment at different offsets is one group.
+    DateTime(i64),
 }
 
 /// A value's group key.
@@ -202,6 +207,8 @@ fn key_part(v: &Value) -> KeyPart<'_> {
         Value::Float(f) => KeyPart::Float(if *f == 0.0 { 0.0f64.to_bits() } else { f.to_bits() }),
         Value::Text(t) => KeyPart::Text(t),
         Value::Bool(b) => KeyPart::Bool(*b),
+        Value::Date(d) => KeyPart::Date(*d),
+        Value::DateTime(t) => KeyPart::DateTime(t.sort_key()),
     }
 }
 
@@ -240,7 +247,8 @@ pub fn group_rows(ds: &Dataset, rows: &[usize], keys: &[usize]) -> Vec<Group> {
 }
 
 /// Orders group keys value by value: nulls, then numbers (true and false as 1 and 0) by value,
-/// then text by its lower case and then by character code. Numbers equal in value are ordered by
+/// then dates and date-times by instant (and then by their text), then text by its lower case and
+/// then by character code. Numbers equal in value are ordered by
 /// kind (1 before 1.0). This is a total order, whatever mix of kinds a field holds (text that reads
 /// as a number is still text), so the order never depends on the records'.
 fn cmp_keys(a: &[Value], b: &[Value]) -> Ordering {
@@ -259,10 +267,12 @@ fn cmp_key(x: &Value, y: &Value) -> Ordering {
     }
     let rank = |v: &Value| match v {
         Value::Null => 0,
-        Value::Text(_) => 2,
+        Value::Date(_) | Value::DateTime(_) => 2,
+        Value::Text(_) => 3,
         _ => 1,
     };
     rank(x).cmp(&rank(y)).then_with(|| match (x, y) {
+        (Value::Date(_) | Value::DateTime(_), _) => x.temporal_key().cmp(&y.temporal_key()).then_with(|| x.to_string().cmp(&y.to_string())),
         (Value::Text(a), Value::Text(b)) => {
             a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase)).then_with(|| a.cmp(b))
         }
@@ -284,7 +294,7 @@ fn cmp_number(x: &Value, y: &Value) -> Ordering {
         Value::Int(i) => N::I(*i),
         Value::Float(f) if f.is_nan() => N::F(f64::NAN),
         Value::Float(f) => N::F(f + 0.0),
-        Value::Null | Value::Text(_) => N::F(f64::NAN),
+        Value::Null | Value::Text(_) | Value::Date(_) | Value::DateTime(_) => N::F(f64::NAN),
     };
     match (n(x), n(y)) {
         (N::I(a), N::I(b)) => a.cmp(&b),
@@ -336,6 +346,9 @@ pub struct Column {
     sorted: OnceCell<Values>,
     /// With whole numbers among the values, all of them in ascending order compared exactly.
     exact: OnceCell<Vec<Value>>,
+    /// For a date field, its values beside their texts, in the same order: what MIN, MAX, FIRST,
+    /// LAST, MODE and MINORITY give. Empty for other fields.
+    dates: Vec<Value>,
 }
 
 /// Columns are equal when their values are: the sorted caches don't count.
@@ -348,7 +361,7 @@ impl PartialEq for Column {
 impl Column {
     /// A column of `values`, in record order, and `nulls` records without one.
     pub fn new(values: Values, nulls: usize) -> Column {
-        Column { values, nulls, whole: Vec::new(), sorted: OnceCell::new(), exact: OnceCell::new() }
+        Column { values, nulls, whole: Vec::new(), sorted: OnceCell::new(), exact: OnceCell::new(), dates: Vec::new() }
     }
 
     /// The values in ascending order.
@@ -396,7 +409,8 @@ impl Column {
 }
 
 /// A field's values in `rows`. A numeric field, or any field read `as_numbers`, gives numbers (a
-/// value that isn't a finite number counts as null); another gives each value's text.
+/// value that isn't a finite number counts as null); another gives each value's text, and a date
+/// field its dates as well.
 pub fn column(ds: &Dataset, rows: &[usize], field: usize, as_numbers: bool) -> Column {
     let numeric = as_numbers || ds.fields.get(field).is_some_and(|f| f.ty.is_numeric());
     let mut nulls = 0;
@@ -420,13 +434,24 @@ pub fn column(ds: &Dataset, rows: &[usize], field: usize, as_numbers: bool) -> C
         column
     } else {
         let mut out = Vec::with_capacity(rows.len());
+        let mut dates = Vec::new();
         for &r in rows {
             match ds.value(r, field) {
                 Value::Null => nulls += 1,
-                v => out.push(v.to_string()),
+                v => {
+                    out.push(v.to_string());
+                    if v.temporal_key().is_some() {
+                        dates.push(v.clone());
+                    }
+                }
             }
         }
-        Column::new(Values::Texts(out), nulls)
+        let mut column = Column::new(Values::Texts(out), nulls);
+        // Only when every value is a date, so the two lists line up.
+        if dates.len() == column_len(&column) {
+            column.dates = dates;
+        }
+        column
     }
 }
 
@@ -451,6 +476,25 @@ pub fn compute(stat: Stat, column: &Column, separator: &str) -> Value {
         }
         (Stat::Concatenate, Values::Texts(v)) if !v.is_empty() => Value::Text(v.join(separator)),
         (Stat::Unique, _) => count(column.distinct()),
+        // A date field's earliest, latest, first, last or most common date, as a date: by
+        // instant, where the text of date-times with different offsets would sort apart.
+        (Stat::Min | Stat::Max | Stat::First | Stat::Last | Stat::Mode | Stat::Minority, Values::Texts(v)) if !column.dates.is_empty() => {
+            let d = &column.dates;
+            let picked = match stat {
+                Stat::Min => d.iter().min_by_key(|x| x.temporal_key()),
+                Stat::Max => d.iter().max_by_key(|x| x.temporal_key()),
+                Stat::First => d.first(),
+                Stat::Last => d.last(),
+                _ => {
+                    let sorted = || match column.sorted() {
+                        Values::Texts(s) => s.as_slice(),
+                        Values::Numbers(_) => &[],
+                    };
+                    textual(stat, v, sorted).and_then(|t| v.iter().position(|x| x == t)).and_then(|i| d.get(i))
+                }
+            };
+            picked.cloned().unwrap_or(Value::Null)
+        }
         (_, Values::Numbers(v)) => {
             // MODE and MINORITY tell whole numbers apart exactly, as UNIQUE does.
             if let (Stat::Mode | Stat::Minority, Some(e)) = (stat, column.exact()) {
@@ -469,6 +513,14 @@ pub fn compute(stat: Stat, column: &Column, separator: &str) -> Value {
             };
             textual(stat, v, sorted).map_or(Value::Null, |t| Value::Text(t.to_string()))
         }
+    }
+}
+
+/// How many values a column holds, without its nulls.
+fn column_len(c: &Column) -> usize {
+    match &c.values {
+        Values::Numbers(v) => v.len(),
+        Values::Texts(v) => v.len(),
     }
 }
 

@@ -1136,7 +1136,10 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
             FieldType::Integer => prim(&f.name, Physical::INT64, Repetition::OPTIONAL, None)?,
             FieldType::Double => prim(&f.name, Physical::DOUBLE, Repetition::OPTIONAL, None)?,
             FieldType::Boolean => prim(&f.name, Physical::BOOLEAN, Repetition::OPTIONAL, None)?,
-            FieldType::Text => prim(&f.name, Physical::BYTE_ARRAY, Repetition::OPTIONAL, Some(LogicalType::String))?,
+            // Dates are ISO text until GeoParquet's own dates and timestamps are written.
+            FieldType::Text | FieldType::Date | FieldType::DateTime => {
+                prim(&f.name, Physical::BYTE_ARRAY, Repetition::OPTIONAL, Some(LogicalType::String))?
+            }
         });
     }
     let schema = Arc::new(Type::group_type_builder("schema").with_fields(cols).build().map_err(err)?);
@@ -1220,7 +1223,7 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
                         }));
                         c.typed::<BoolType>().write_batch(&v, Some(&d), None).map_err(err)?;
                     }
-                    FieldType::Text => {
+                    FieldType::Text | FieldType::Date | FieldType::DateTime => {
                         let (v, d) = levels(rows.iter().map(|r| match attr(r) {
                             Value::Null => None,
                             v => Some(ByteArray::from(v.to_string().into_bytes())),

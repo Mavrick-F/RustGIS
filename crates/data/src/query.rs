@@ -12,7 +12,9 @@
 //!
 //! Fields are bare names, `"quoted"` or `!quoted!`; text uses single quotes (`''` is a quote).
 //! Text matching (`=`, `LIKE`, `IN`) is case-insensitive; two values that read as numbers compare
-//! as numbers. Logic is SQL's three-valued: a comparison with a null is unknown. One exception,
+//! as numbers. A date or date-time compares with another, or with text that reads as one
+//! (`issued >= '2026-01-01'`, a date-time at midnight); text that isn't a full date compares as
+//! text. Logic is SQL's three-valued: a comparison with a null is unknown. One exception,
 //! kept from the WHERE language this replaced so saved clauses keep their rows: a NULL in an `IN`
 //! list matches nothing, so `2 NOT IN (1, NULL)` is true where SQL makes it unknown. A `LIKE`
 //! too costly to match ([`MAX_LIKE_STEPS`]) is unknown. Arithmetic on a
@@ -546,7 +548,19 @@ impl Parser<'_> {
             }
             rest.push((a, term(self)?));
         }
-        Ok(if rest.is_empty() { first } else { Expr::Chain(Box::new(first), rest) })
+        if rest.is_empty() { Ok(first) } else { self.arithmetic(first, rest) }
+    }
+    /// `first op term …`, unless a term is a date field: date arithmetic (`issued + 30`) is an
+    /// error until the language has it, rather than a column of nulls.
+    fn arithmetic(&self, first: Expr, rest: Vec<(Arith, Expr)>) -> Result<Expr, String> {
+        for e in std::iter::once(&first).chain(rest.iter().map(|(_, e)| e)) {
+            if let Expr::Field(i) = e
+                && let Some(f) = self.ds.fields.get(*i).filter(|f| f.ty.is_temporal())
+            {
+                return Err(format!("'{}' holds dates, and arithmetic on dates isn't supported yet", f.name));
+            }
+        }
+        Ok(Expr::Chain(Box::new(first), rest))
     }
     fn sum(&mut self) -> Result<Expr, String> {
         self.chain(&[Arith::Add, Arith::Sub], Self::product)
@@ -575,7 +589,7 @@ impl Parser<'_> {
             // A negative number stays a literal, so `pop > -5` keeps the fast comparison.
             (_, Expr::Lit(Value::Int(i))) => Expr::Lit(i.checked_neg().map(Value::Int).unwrap_or(Value::Float(-(i as f64)))),
             (_, Expr::Lit(Value::Float(f))) => Expr::Lit(Value::Float(-f)),
-            (_, e) => Expr::Chain(Box::new(Expr::Lit(Value::Int(0))), vec![(Arith::Sub, e)]),
+            (_, e) => self.arithmetic(Expr::Lit(Value::Int(0)), vec![(Arith::Sub, e)])?,
         })
     }
     fn power(&mut self) -> Result<Expr, String> {
@@ -586,7 +600,7 @@ impl Parser<'_> {
         self.deeper()?;
         let exp = self.unary()?;
         self.depth -= 1;
-        Ok(Expr::Chain(Box::new(base), vec![(Arith::Pow, exp)]))
+        self.arithmetic(base, vec![(Arith::Pow, exp)])
     }
     /// Whether the token at `i` starts the operator of a comparison.
     fn comparison_at(&self, i: usize) -> bool {
@@ -732,7 +746,12 @@ pub fn parse(text: &str, ds: &Dataset) -> Result<Expr, String> {
     Ok(e)
 }
 
+/// SQL `=`: dates by instant (against dates or date text), numbers as numbers, otherwise text
+/// ignoring case.
 fn eq(a: &Value, b: &Value) -> bool {
+    if let Some((x, y)) = a.temporal_keys(b) {
+        return x == y;
+    }
     match (a.as_f64(), b.as_f64()) {
         (Some(x), Some(y)) if !matches!(a, Value::Text(_)) || !matches!(b, Value::Text(_)) => x == y,
         _ => a.to_string().eq_ignore_ascii_case(&b.to_string()),
@@ -831,6 +850,7 @@ fn truth(v: &Value) -> Option<bool> {
         Value::Int(i) => Some(*i != 0),
         Value::Float(f) => (!f.is_nan()).then_some(*f != 0.0),
         Value::Text(s) => Some(!s.is_empty()),
+        Value::Date(_) | Value::DateTime(_) => Some(true),
     }
 }
 
@@ -857,8 +877,11 @@ fn whole(f: f64) -> Value {
     if f.is_finite() && f.abs() < 9e15 { Value::Int(f as i64) } else { real(f) }
 }
 
+/// `a op b`: null with a null or a date, exact on whole numbers where it can be, `+` joining text.
 fn arith(op: Arith, a: &Value, b: &Value) -> Value {
-    if a.is_null() || b.is_null() {
+    // Arithmetic on dates, which the parser refuses on a date field, is null from anything else
+    // that gives a date (`coalesce(issued, closed) + 1`).
+    if a.is_null() || b.is_null() || a.temporal_key().is_some() || b.temporal_key().is_some() {
         return Value::Null;
     }
     let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) else {

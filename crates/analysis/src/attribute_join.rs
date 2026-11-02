@@ -52,6 +52,8 @@ impl JoinKey {
             Value::Int(i) => Some(JoinKey::Int(*i)),
             Value::Text(s) => Some(JoinKey::Text(s.clone())),
             Value::Bool(b) => Some(JoinKey::Bool(*b)),
+            // Dates match as their ISO text, so a date key also matches the same text.
+            Value::Date(_) | Value::DateTime(_) => Some(JoinKey::Text(v.to_string())),
             Value::Float(f) => {
                 if !f.is_finite() {
                     return None;
@@ -91,7 +93,8 @@ impl JoinKey {
 /// How the values of two compatible key fields are compared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyComparison {
-    /// Same type, or both numeric: values compared as they are.
+    /// Same type, or both numeric: values compared as they are. A date or date-time key against
+    /// a Text key compares as its ISO text.
     Exact,
     /// A Text key against an Integer key (an all-digit id typed as a number in one file and as
     /// text in the other): the numbers are written out in full and compared with the text exactly,
@@ -105,7 +108,8 @@ pub(crate) enum KeyComparison {
 pub(crate) fn key_comparison(target_field: &Field, source_field: &Field) -> Result<KeyComparison, String> {
     let t_ty = target_field.ty;
     let s_ty = source_field.ty;
-    if t_ty == s_ty || (t_ty.is_numeric() && s_ty.is_numeric()) {
+    let date_and_text = |a: FieldType, b: FieldType| a.is_temporal() && b == FieldType::Text;
+    if t_ty == s_ty || (t_ty.is_numeric() && s_ty.is_numeric()) || date_and_text(t_ty, s_ty) || date_and_text(s_ty, t_ty) {
         Ok(KeyComparison::Exact)
     } else if matches!((t_ty, s_ty), (FieldType::Text, FieldType::Integer) | (FieldType::Integer, FieldType::Text)) {
         Ok(KeyComparison::NumberAsText)
@@ -813,12 +817,13 @@ mod tests {
     fn test_key_type_compatibility_matrix() {
         use FieldType::*;
         use KeyComparison::*;
-        let types = [Integer, Double, Text, Boolean];
+        let types = [Integer, Double, Text, Boolean, Date, DateTime];
         for t in types {
             for s in types {
                 let expected = match (t, s) {
                     _ if t == s => Some(Exact),
                     (Integer, Double) | (Double, Integer) => Some(Exact),
+                    (Text, Date | DateTime) | (Date | DateTime, Text) => Some(Exact),
                     (Text, Integer) | (Integer, Text) => Some(NumberAsText),
                     _ => None,
                 };
@@ -830,6 +835,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_date_key_matches_its_iso_text() {
+        let target = make_table("target", vec![("GEOID", FieldType::Date)], vec![vec![Value::parse("2026-03-05", FieldType::Date)]]);
+        let source = make_table(
+            "source",
+            vec![("GEOID", FieldType::Text), ("event", FieldType::Text)],
+            vec![vec![Value::Text("2026-03-05".into()), Value::Text("hearing".into())]],
+        );
+        let out = join_field(&target, &source, &key_opts(DuplicateStrategy::First)).unwrap().0;
+        assert_eq!(out.features[0].attrs[1], Value::Text("hearing".into()));
     }
 
     /// Joins one text key against one integer key, both ways round, and says whether they matched.

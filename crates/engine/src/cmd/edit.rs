@@ -20,7 +20,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layer"?, "row": number, "field": string, "value": any}"#),
         C::new("edit.addField", "Add Field", "Data › Data Design › Fields", add_field)
             .when(need_layer)
-            .params(r#"{"layer"?, "name": string, "type": "long"|"double"|"text"|"boolean"}"#),
+            .params(r#"{"layer"?, "name": string, "type": "long"|"double"|"text"|"boolean"|"date"|"datetime"}"#),
         C::new("edit.deleteField", "Delete Field", "Data › Data Design › Fields", delete_field)
             .when(need_layer)
             .params(r#"{"layer"?, "field": string}"#),
@@ -83,9 +83,13 @@ pub(crate) fn validate(g: &Geometry) -> Result<(), String> {
     }
 }
 
+/// `v` as a value of a `ty` field: through its text, a date-time into a date field as its day;
+/// what the field can't hold is null.
 pub(crate) fn coerce(v: Value, ty: FieldType) -> Value {
     match v {
         Value::Null => Value::Null,
+        // A date-time into a date field is the day it shows.
+        Value::DateTime(t) if ty == FieldType::Date => Value::Date(t.date()),
         Value::Text(t) => Value::parse(&t, ty),
         other => Value::parse(&other.to_string(), ty),
     }
@@ -122,6 +126,7 @@ fn field_index(s: &Session, id: u32, name: &str) -> Result<usize, String> {
     s.map().layer(id).and_then(|l| l.dataset.field_index(name)).ok_or_else(|| format!("no field named '{name}'"))
 }
 
+/// Sets one cell; text the field can't hold is refused.
 fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let row = p.get("row").and_then(Json::as_u64).ok_or("row is required")? as usize;
@@ -130,7 +135,13 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     let ty = l.dataset.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
     let raw = p.get("value").cloned().unwrap_or(Json::Null);
     let v = match raw {
-        Json::String(t) => Value::parse(&t, ty),
+        // Text the field can't hold (`soon` for a date) is refused, not stored as null.
+        Json::String(t) => match Value::parse(&t, ty) {
+            Value::Null if !t.trim().is_empty() && !t.trim().eq_ignore_ascii_case("<null>") => {
+                return Err(format!("'{}' isn't a {} value", t.trim(), ty.label()));
+            }
+            v => v,
+        },
         other => coerce(Value::from_json(&other), ty),
     };
     let f = l.dataset.features.get_mut(row).ok_or("no such row")?;
@@ -141,6 +152,7 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     Ok(Json::Null)
 }
 
+/// Adds an empty field of a type: long, double, text, boolean, date or datetime.
 fn add_field(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or("name is required")?;
@@ -152,6 +164,8 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
         "double" | "float" | "number" => FieldType::Double,
         "text" | "string" => FieldType::Text,
         "boolean" | "bool" => FieldType::Boolean,
+        "date" => FieldType::Date,
+        "datetime" | "date-time" | "timestamp" => FieldType::DateTime,
         other => return Err(format!("unknown field type '{other}'")),
     };
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
@@ -229,8 +243,14 @@ fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
     let calc = Calculation::parse(&expr, &l.dataset)?;
     let rows: Vec<usize> = if l.selection.is_empty() { (0..l.dataset.features.len()).collect() } else { l.selection.clone() };
     let mut out = Vec::new();
+    // Results the field can't hold (text that isn't a number or a date) are null, and counted.
+    let mut unread = 0usize;
     for r in &rows {
-        out.push((*r, coerce(calc.eval(&l.dataset, *r), ty)));
+        let v = calc.eval(&l.dataset, *r);
+        let was_null = v.is_null();
+        let v = coerce(v, ty);
+        unread += usize::from(!was_null && v.is_null());
+        out.push((*r, v));
     }
     let mut changes = Vec::new();
     for (r, v) in out {
@@ -243,6 +263,11 @@ fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
         }
     }
     super::design::apply(s, id, changes)?;
+    if unread > 0 {
+        let field = s.map().layer(id).and_then(|l| l.dataset.fields.get(fi)).map(|f| f.name.clone()).unwrap_or_default();
+        let rows = if unread == 1 { "1 row" } else { &format!("{unread} rows") };
+        s.notify(format!("Calculate Field: '{field}' is null in {rows}, whose result isn't a {} value", ty.label()), false);
+    }
     Ok(json!({"rows": rows.len()}))
 }
 
@@ -272,7 +297,21 @@ impl Calculation {
         }
         match rustgis_data::query::parse(expr, ds) {
             Ok(e) => Ok(Calculation::Expr(e)),
-            Err(err) => Calc::parse(expr, ds).map(Calculation::Calc).map_err(|_| err),
+            Err(err) => match Calc::parse(expr, ds) {
+                // Arithmetic on a date field, which the language refuses, isn't the earlier
+                // calculator's to do either.
+                Ok(c)
+                    if c.op.is_some()
+                        && [Some(&c.a), c.b.as_ref()]
+                            .into_iter()
+                            .flatten()
+                            .any(|t| matches!(t, Term::Field(i) if ds.fields.get(*i).is_some_and(|f| f.ty.is_temporal()))) =>
+                {
+                    Err(err)
+                }
+                Ok(c) => Ok(Calculation::Calc(c)),
+                Err(_) => Err(err),
+            },
         }
     }
 

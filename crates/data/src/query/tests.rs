@@ -473,3 +473,30 @@ fn a_computed_in_list_skips_nulls_and_a_long_pattern_matches_nothing() {
     assert_eq!(rows(&costly.replace(" LIKE ", " NOT LIKE ")), Vec::<usize>::new());
     assert!(!like(&"a".repeat(65536), &format!("%{}b", "a".repeat(1000))));
 }
+
+#[test]
+fn where_clauses_compare_dates() {
+    let mut d = Dataset::new("t", GeometryType::None, vec![Field::new("issued", FieldType::Date), Field::new("ts", FieldType::DateTime)]);
+    for (day, at) in
+        [("2025-12-31", "2026-03-05T00:00:00"), ("2026-01-01", "2026-03-05T09:00:00+02:00"), ("2026-06-30", "2026-03-04T23:00:00-05:00")]
+    {
+        d.push(None, vec![Value::parse(day, FieldType::Date), Value::parse(at, FieldType::DateTime)]);
+    }
+    d.push(None, vec![Value::Null, Value::Null]);
+    assert_eq!(select("issued >= '2026-01-01'", &d).unwrap(), vec![1, 2]);
+    assert_eq!(select("issued BETWEEN '2026-01-01' AND '2026-03-31'", &d).unwrap(), vec![1]);
+    assert_eq!(select("issued IN ('2026-06-30', '2025-12-31')", &d).unwrap(), vec![0, 2]);
+    // A date-time equals a date's midnight; offsets compare by instant (09:00+02:00 is 07:00Z).
+    assert_eq!(select("ts = '2026-03-05'", &d).unwrap(), vec![0]);
+    assert_eq!(select("ts < '2026-03-05T08:00Z'", &d).unwrap(), vec![0, 1, 2]);
+    assert_eq!(select("ts > '2026-03-05T04:00:00Z'", &d).unwrap(), vec![1]);
+    assert_eq!(select("ts > issued", &d).unwrap(), vec![0, 1]);
+    // Text that isn't a full date still compares as text, as saved clauses did.
+    assert_eq!(select("issued > '2026'", &d).unwrap(), vec![1, 2]);
+    assert_eq!(select("issued LIKE '2026-%'", &d).unwrap(), vec![1, 2]);
+    // Arithmetic on dates is an error, not a column of nulls.
+    assert_eq!(parse("issued + 30", &d).err().unwrap_or_default(), "'issued' holds dates, and arithmetic on dates isn't supported yet");
+    assert!(parse("-ts", &d).is_err());
+    assert_eq!(value(&parse("coalesce(issued) + 1", &d).unwrap(), &d, 0, &Env::default()), Value::Null);
+    assert_eq!(value(&parse("issued || ''", &d).unwrap(), &d, 0, &Env::default()), Value::Text("2025-12-31".into()));
+}

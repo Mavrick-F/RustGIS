@@ -453,7 +453,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     ui.end_row();
                     let input_label = ui.label(tl!("Data type"));
                     egui::ComboBox::from_id_salt("af_type").selected_text(app.dialogs.b.clone()).show_ui(ui, |ui| {
-                        for ty in ["Long", "Double", "Text", "Boolean"] {
+                        for ty in ["Long", "Double", "Text", "Boolean", "Date", "DateTime"] {
                             ui.selectable_value(&mut app.dialogs.b, ty.to_string(), ty);
                         }
                     }).response.labelled_by(input_label.id);

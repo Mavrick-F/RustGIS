@@ -2149,7 +2149,7 @@ pub(crate) fn try_clone_value(v: &Value) -> Result<Value, TryReserveError> {
             s.push_str(t);
             Value::Text(s)
         }
-        Value::Null | Value::Int(_) | Value::Float(_) | Value::Bool(_) => v.clone(),
+        Value::Null | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Date(_) | Value::DateTime(_) => v.clone(),
     })
 }
 
@@ -2250,7 +2250,7 @@ fn coordinate(v: &Value) -> Option<f64> {
                 Err(_) => return None,
             }
         }
-        Value::Null | Value::Bool(_) => return None,
+        Value::Null | Value::Bool(_) | Value::Date(_) | Value::DateTime(_) => return None,
     };
     n.is_finite().then_some(n)
 }
@@ -3204,8 +3204,8 @@ fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let mut fields: Vec<Field> = cases.iter().filter_map(|&c| ds.fields.get(c).cloned()).collect();
     fields.push(Field::new("FREQUENCY", FieldType::Integer));
     for r in &requests {
-        let (name, numeric) = ds.fields.get(r.field).map(|f| (f.name.as_str(), f.ty.is_numeric())).unwrap_or_default();
-        let field = Field::new(format!("{}_{name}", r.stat.name()), r.stat.output_type(numeric || field_only));
+        let (name, ty) = ds.fields.get(r.field).map(|f| (f.name.as_str(), f.ty)).unwrap_or(("", FieldType::Text));
+        let field = Field::new(format!("{}_{name}", r.stat.name()), r.stat.output_type(ty, field_only));
         if fields.iter().any(|f| f.name.eq_ignore_ascii_case(&field.name)) {
             return Err(format!("the output would have two fields named '{}'", field.name));
         }
@@ -3357,7 +3357,7 @@ fn pivot_table(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         return Err(format!("{} rows by {width} fields would make more than {MAX_PIVOT_CELLS} values; select fewer records", groups.len()));
     }
     let mut fields: Vec<Field> = keys.iter().filter_map(|&k| ds.fields.get(k).cloned()).collect();
-    let ty = stat.map_or(value_type, |st| st.output_type(value_type.is_numeric()));
+    let ty = stat.map_or(value_type, |st| st.output_type(value_type, false));
     let values = columns.iter().map(|c| c.key.first().unwrap_or(&Value::Null));
     let names = pivot_field_names(field_name(pivot), values, &fields);
     fields.extend(names.into_iter().map(|name| Field::new(name, ty)));

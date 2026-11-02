@@ -5,6 +5,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod color;
+pub mod date;
 mod dbf;
 pub mod dirs;
 pub mod dxf;
@@ -40,6 +41,7 @@ pub mod wkb;
 pub mod xml;
 pub mod zip;
 
+pub use date::{Date, DateTime};
 pub use geometry::{Geometry, GeometryType, VertexId};
 pub use rustgis_geom::{Coord, Extent};
 pub use value::{Field, FieldType, Value};

@@ -717,6 +717,7 @@ fn read_features(s: &Session, a: &Value) -> Result<Value, String> {
                     rustgis_engine::data::Value::Float(x) => json!(x),
                     rustgis_engine::data::Value::Bool(b) => json!(b),
                     rustgis_engine::data::Value::Text(t) => json!(clip(t, 200)),
+                    d @ (rustgis_engine::data::Value::Date(_) | rustgis_engine::data::Value::DateTime(_)) => json!(d.to_string()),
                 };
                 o.insert(field.name.clone(), v);
             }
