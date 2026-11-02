@@ -307,6 +307,7 @@ pub(super) fn unsplit(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 reverse = at_end;
             }
             let attrs = clone_attrs(attrs, ds.fields.len()).map_err(|e| format!("Unsplit Line: not enough memory for attributes: {e}"))?;
+            out.features.try_reserve(1).map_err(|e| format!("Unsplit Line: not enough memory for output rows: {e}"))?;
             out.push_next(Some(Geometry::Line(vec![line])), attrs);
         }
     }
