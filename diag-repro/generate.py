@@ -42,4 +42,105 @@ for name, (source, steps) in cases.items():
     main += "\n".join("    " + step for step in steps)
     main += '\n    println!("real ok");\n}\n'
     (case / "main.rs").write_text(main)
-print(f"Generated {len(cases)} diagnostic cases in {out}")
+
+# Combine reductions already observed to preserve the crash independently.
+combined = widths.replace("; 16]", "; 1]")
+combined = combined.replace("        let hash = hasher.finish();", "        let hash = 0;")
+combined = combined.replace("        if self.retained_bytes() > SHARD_BYTES {\n            *self = Self::default();\n        }", "")
+case = out / "10-combined"
+case.mkdir(parents=True, exist_ok=True)
+(case / "widths.rs").write_text(combined)
+(case / "main.rs").write_text((out / "02-only-panic/main.rs").read_text())
+
+standalone = {
+    "11-mutex-map": '''
+use std::{collections::HashMap, sync::Mutex};
+#[derive(Default)]
+struct Cache(Mutex<HashMap<u64, f32>>);
+impl Cache {
+    fn measure(&self, uncached: impl FnOnce() -> f32) -> f32 {
+        if let Some(width) = self.0.lock().unwrap().get(&0).copied() { return width; }
+        let width = uncached();
+        self.0.lock().unwrap().insert(0, width);
+        width
+    }
+}
+fn main() {
+    let cache = Cache::default();
+    let failed = std::panic::catch_unwind(|| cache.measure(|| panic!("measurement failed")));
+    assert!(failed.is_err());
+    println!("real ok");
+}
+''',
+    "12-mutex-option": '''
+use std::sync::Mutex;
+#[derive(Default)]
+struct Cache(Mutex<Option<f32>>);
+impl Cache {
+    fn measure(&self, uncached: impl FnOnce() -> f32) -> f32 {
+        if let Some(width) = *self.0.lock().unwrap() { return width; }
+        let width = uncached();
+        *self.0.lock().unwrap() = Some(width);
+        width
+    }
+}
+fn main() {
+    let cache = Cache::default();
+    let failed = std::panic::catch_unwind(|| cache.measure(|| panic!("measurement failed")));
+    assert!(failed.is_err());
+    println!("real ok");
+}
+''',
+    "13-mutex-unit": '''
+use std::sync::Mutex;
+fn measure(cache: &Mutex<()>, uncached: impl FnOnce() -> f32) -> f32 {
+    drop(cache.lock().unwrap());
+    uncached()
+}
+fn main() {
+    let cache = Mutex::new(());
+    let failed = std::panic::catch_unwind(|| measure(&cache, || panic!("measurement failed")));
+    assert!(failed.is_err());
+    println!("real ok");
+}
+''',
+    "14-callback-only": '''
+fn measure(uncached: impl FnOnce() -> f32) -> f32 { uncached() }
+fn main() {
+    let failed = std::panic::catch_unwind(|| measure(|| panic!("measurement failed")));
+    assert!(failed.is_err());
+    println!("real ok");
+}
+''',
+    "15-panic-only": '''
+fn main() {
+    let failed = std::panic::catch_unwind(|| panic!("measurement failed"));
+    assert!(failed.is_err());
+    println!("real ok");
+}
+''',
+    "16-unused-map": '''
+use std::collections::HashMap;
+fn main() {
+    let cache: HashMap<u64, String> = HashMap::new();
+    std::hint::black_box(&cache);
+    let failed = std::panic::catch_unwind(|| panic!("measurement failed"));
+    assert!(failed.is_err());
+    println!("real ok");
+}
+''',
+}
+standalone["17-option-explicit-guard"] = standalone["12-mutex-option"].replace(
+    "        if let Some(width) = *self.0.lock().unwrap() { return width; }",
+    "        let cached = { let guard = self.0.lock().unwrap(); *guard };\n        if let Some(width) = cached { return width; }",
+)
+standalone["18-option-array"] = standalone["12-mutex-option"].replace(
+    "#[derive(Default)]\nstruct Cache(Mutex<Option<f32>>);",
+    "struct Cache([Mutex<Option<f32>>; 16]);\nimpl Default for Cache { fn default() -> Self { Self(std::array::from_fn(|_| Mutex::new(None))) } }",
+).replace("self.0.lock()", "self.0[0].lock()")
+
+for name, source in standalone.items():
+    case = out / name
+    case.mkdir(parents=True, exist_ok=True)
+    (case / "main.rs").write_text("#![forbid(unsafe_code)]\n" + source)
+print(f"Generated {len(cases) + 1 + len(standalone)} diagnostic cases in {out}")
