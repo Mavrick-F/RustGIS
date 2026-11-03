@@ -2116,26 +2116,80 @@ pub fn shapefile_names_note(fields: &[Field], target: &str) -> Option<String> {
     // A name read from a file, like a path or layer name, can hold anything, at any length: the
     // notice stays one line, reads in the order it is written, and copies no more of a field name
     // than it shows.
-    let flat = |c: char| {
-        let reorders = matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
-        if c.is_control() || reorders || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c }
-    };
-    let shown = |name: &str| {
-        let mut out = String::new();
-        for c in name.chars().map(flat) {
-            if out.len() + c.len_utf8() > 40 {
-                out.push('…');
-                break;
-            }
-            out.push(c);
-        }
-        out
-    };
-    let target: String = target.chars().map(flat).collect();
-    let listed: Vec<String> = renamed.iter().take(5).map(|(old, new)| format!("'{}' → '{}'", shown(old), shown(new))).collect();
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let listed: Vec<String> =
+        renamed.iter().take(5).map(|(old, new)| format!("'{}' → '{}'", dbf_notice_name(old), dbf_notice_name(new))).collect();
     let more = if renamed.len() > 5 { format!(" and {} more", renamed.len() - 5) } else { String::new() };
     let count = if renamed.len() == 1 { "1 field name was".to_string() } else { format!("{} field names were", renamed.len()) };
     Some(format!("{target}: {count} changed to fit a Shapefile (10 bytes at most, unique ignoring case): {}{more}", listed.join(", ")))
+}
+
+/// Keeps a diagnostic on one line and prevents field names from reordering its text.
+fn dbf_notice_char(c: char) -> char {
+    let reorders = matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    if c.is_control() || reorders || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c }
+}
+
+/// A bounded field name for a dBase notice, with controls and directional marks flattened.
+fn dbf_notice_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars().map(dbf_notice_char) {
+        if out.len() + c.len_utf8() > 40 {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Counts text cut to 254 bytes and numeric values left empty by the dBase writer, in rows
+/// whose geometry it writes only. Each kind has one notice naming the affected fields (first
+/// five, bounded and flattened as in [`shapefile_names_note`]); a clean dataset gives none.
+pub fn shapefile_values_notes(ds: &Dataset, target: &str) -> Vec<String> {
+    let decimals: Vec<_> =
+        ds.fields.iter().enumerate().map(|(k, f)| if f.ty == FieldType::Double { dbf_decimals(ds, k) } else { 0 }).collect();
+    let mut counts = vec![(0usize, 0usize); ds.fields.len()];
+    // Geometry is examined once per row, regardless of how many attribute fields it has.
+    for row in ds.features.iter().filter(|f| shapefile_keeps(f.geometry.as_ref(), ds.geometry_type)) {
+        for (k, (field, value)) in ds.fields.iter().zip(&row.attrs).enumerate() {
+            let Some((text, numbers)) = counts.get_mut(k) else { continue };
+            match field.ty {
+                FieldType::Text if !value.is_null() && value.to_string().len() > 254 => *text += 1,
+                FieldType::Integer | FieldType::Double
+                    if value.as_f64().is_some() && dbf_number(value, field.ty, decimals.get(k).copied().unwrap_or(0)).is_none() =>
+                {
+                    *numbers += 1
+                }
+                _ => {}
+            }
+        }
+    }
+    let cut_text: usize = counts.iter().map(|(text, _)| text).sum();
+    let blanked: usize = counts.iter().map(|(_, numbers)| numbers).sum();
+    let text_fields: Vec<_> = ds.fields.iter().zip(&counts).filter(|(_, (n, _))| *n > 0).map(|(f, _)| f.name.as_str()).collect();
+    let number_fields: Vec<_> = ds.fields.iter().zip(&counts).filter(|(_, (_, n))| *n > 0).map(|(f, _)| f.name.as_str()).collect();
+    let list = |fields: &[&str]| {
+        let names: Vec<_> = fields.iter().take(5).map(|s| format!("'{}'", dbf_notice_name(s))).collect();
+        let more = if fields.len() > 5 { format!(" and {} more", fields.len() - 5) } else { String::new() };
+        format!("{}{more}", names.join(", "))
+    };
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let mut notes = Vec::new();
+    if cut_text > 0 {
+        let what = if cut_text == 1 { "1 text value was".into() } else { format!("{cut_text} text values were") };
+        notes.push(format!("{target}: {what} cut to at most 254 bytes, in {}", list(&text_fields)));
+    }
+    if blanked > 0 {
+        let what = if blanked == 1 {
+            "1 number didn't fit its dBase field".into()
+        } else {
+            format!("{blanked} numbers didn't fit their dBase fields")
+        };
+        let verb = if blanked == 1 { "was" } else { "were" };
+        notes.push(format!("{target}: {what} and {verb} left empty, in {}", list(&number_fields)));
+    }
+    notes
 }
 
 /// dBase field names (at most 10 bytes, unique without regard to case) for the fields.
@@ -2159,6 +2213,53 @@ fn dbf_names(fields: &[Field]) -> Vec<String> {
         out.push(name);
     }
     out
+}
+
+/// Decimals of the `.dbf` field for Double field `k`: as many as fit dBase's 24 characters beside
+/// the field's largest whole part, at most 15.
+fn dbf_decimals(ds: &Dataset, k: usize) -> usize {
+    let max = ds
+        .features
+        .iter()
+        .filter_map(|r| r.attrs.get(k).and_then(Value::as_f64))
+        .filter(|v| v.is_finite())
+        .fold(0.0f64, |m, v| m.max(v.abs()));
+    // Digits before the point, a sign and the point itself; the rest are decimals.
+    let int_digits = if max >= 1.0 { (max.log10().floor() as usize).saturating_add(1) } else { 1 };
+    24usize.saturating_sub(int_digits + 2).min(15)
+}
+
+/// The number a `.dbf` numeric field of type `ty` with `d` decimals holds for `v`: none for a
+/// value that isn't a number, or one rejected by the writer's size and precision checks.
+/// Rejected numbers are left empty rather than cut short.
+fn dbf_number(v: &Value, ty: FieldType, d: usize) -> Option<f64> {
+    let x = v.as_f64().filter(|x| {
+        // A whole number past 2^53 would be held only rounded (dBase's decimal text goes through
+        // f64), and one too small for the field's decimals would read 0.
+        let exact = !(matches!(v, Value::Int(i) if i.unsigned_abs() > 1 << 53)
+            || ty == FieldType::Double && *x != 0.0 && x.abs() < 0.5 * 10f64.powi(-(d as i32)));
+        exact && format!("{x:.d$}").len() <= if ty == FieldType::Integer { 18 } else { 24 }
+    })?;
+    Some(if ty == FieldType::Integer { x.round() } else { x })
+}
+
+/// Whether [`shapefile_parts_in`] writes a feature with geometry `g` to a layer of type `gt`: one
+/// of the layer's kind with something drawable (a finite point, a line part of two finite points,
+/// a polygon whose outer ring has three).
+fn shapefile_keeps(g: Option<&Geometry>, gt: GeometryType) -> bool {
+    let finite = |c: &&Coord| c.x.is_finite() && c.y.is_finite();
+    match (g, gt) {
+        (Some(g @ (Geometry::Point(_) | Geometry::MultiPoint(_))), GeometryType::Point) => {
+            let mut any = false;
+            g.for_each_coord(|c| any |= finite(&&c));
+            any
+        }
+        (Some(Geometry::Line(parts)), GeometryType::Polyline) => parts.iter().any(|p| p.iter().filter(finite).count() >= 2),
+        (Some(Geometry::Polygon(polys)), GeometryType::Polygon) => {
+            polys.iter().any(|p| p.first().is_some_and(|r| r.iter().filter(finite).count() >= 3))
+        }
+        _ => false,
+    }
 }
 
 /// A dataset as the files of a Shapefile: (extension, bytes) for `.shp`, `.shx`, `.dbf`, `.prj`
@@ -2185,15 +2286,7 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
             // 18 digits: GDAL reads a wider field as a real number.
             FieldType::Integer => table.add_numeric_field(dbf_name(n)?, 18, 0),
             FieldType::Double => {
-                let max = ds
-                    .features
-                    .iter()
-                    .filter_map(|r| r.attrs.get(k).and_then(Value::as_f64))
-                    .filter(|v| v.is_finite())
-                    .fold(0.0f64, |m, v| m.max(v.abs()));
-                // Digits before the point, a sign and the point itself; the rest are decimals.
-                let int_digits = if max >= 1.0 { (max.log10().floor() as usize).saturating_add(1) } else { 1 };
-                let d = 24usize.saturating_sub(int_digits + 2).min(15);
+                let d = dbf_decimals(ds, k);
                 if let Some(slot) = decimals.get_mut(k) {
                     *slot = d;
                 }
@@ -2211,19 +2304,7 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
         for (k, (f, n)) in ds.fields.iter().zip(&names).enumerate() {
             let v = r.attrs.get(k).unwrap_or(&Value::Null);
             let value = match f.ty {
-                FieldType::Integer | FieldType::Double => {
-                    let x = v.as_f64().filter(|x| {
-                        // Whatever doesn't fit the field is null rather than cut short; so is a
-                        // whole number past 2^53, which dBase's decimal text would hold only
-                        // rounded (it goes through f64).
-                        let d = decimals.get(k).copied().unwrap_or(0);
-                        // Likewise a number too small for the field's decimals, which would read 0.
-                        let exact = !(matches!(v, Value::Int(i) if i.unsigned_abs() > 1 << 53)
-                            || f.ty == FieldType::Double && *x != 0.0 && x.abs() < 0.5 * 10f64.powi(-(d as i32)));
-                        exact && format!("{x:.d$}").len() <= if f.ty == FieldType::Integer { 18 } else { 24 }
-                    });
-                    FieldValue::Numeric(if f.ty == FieldType::Integer { x.map(f64::round) } else { x })
-                }
+                FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals.get(k).copied().unwrap_or(0))),
                 FieldType::Boolean => FieldValue::Logical(match v {
                     Value::Bool(b) => Some(*b),
                     Value::Int(i) => Some(*i != 0),
