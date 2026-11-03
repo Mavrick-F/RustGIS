@@ -5,7 +5,9 @@
 
 use ab_glyph::{Font, FontRef, GlyphId};
 use rustgis_map::effects::Blend;
-use tiny_skia::{Color, FillRule, LineCap, LineJoin, Path, Pixmap, Transform};
+#[cfg(test)]
+use tiny_skia::Pixmap;
+use tiny_skia::{Color, FillRule, LineCap, LineJoin, Path, PixmapRef, Transform};
 
 /// The most items one drawing keeps, groups' items included: a writer's content grows with it.
 pub const MAX_ITEMS: usize = 20_000_000;
@@ -210,7 +212,7 @@ impl Drawing {
     }
 
     /// Places `image` with `transform` (see [`Image`]); a picture with nothing in it is left out.
-    pub fn image(&mut self, image: &Pixmap, transform: Transform, opacity: f32, smooth: bool) {
+    pub fn image(&mut self, image: PixmapRef, transform: Transform, opacity: f32, smooth: bool) {
         if !transform.is_finite() || opacity.is_nan() || opacity <= 0.0 {
             return;
         }
@@ -240,13 +242,15 @@ impl Drawing {
         let (count, cost) = (child.count, child.cost.saturating_sub(held));
         let outlines = std::mem::take(&mut child.outlines);
         let (_, _, items) = child.finish();
+        // (A group's own entry counts too.)
+        let cost = cost + 120;
         if self.count.saturating_add(count) > MAX_ITEMS || self.cost.saturating_add(cost) > max_cost() {
             self.overflowed = true;
             return;
         }
         self.outlines.extend(outlines);
         self.count += count;
-        self.cost += cost + 120;
+        self.cost += cost;
         let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
         let clip = clip.filter(|c| c.transform.is_finite());
         self.add(Item::Group(Group { items, opacity, blend, clip, transform }));
@@ -309,7 +313,7 @@ impl Brush {
 
 impl Image {
     /// `pm` compressed (see [`compress_rgba`]); `None` for one with nothing showing.
-    fn new(pm: &Pixmap, transform: Transform, opacity: f32, smooth: bool) -> Option<Image> {
+    fn new(pm: PixmapRef, transform: Transform, opacity: f32, smooth: bool) -> Option<Image> {
         let (rgb_z, alpha_z) = compress_rgba(pm)?;
         Some(Image { width: pm.width(), height: pm.height(), rgb_z, alpha_z, transform, opacity, smooth })
     }
@@ -318,7 +322,7 @@ impl Image {
 /// `pm`'s colours (unpremultiplied) as zlib RGB, a row at a time so a large picture never holds
 /// a second full-size copy, and its alpha as zlib grey where any pixel isn't opaque; `None` if a
 /// picture with no pixel showing, or if compressing fails.
-pub(crate) fn compress_rgba(pm: &Pixmap) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+pub(crate) fn compress_rgba(pm: PixmapRef) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     let px = pm.pixels();
     if px.iter().all(|p| p.alpha() == 0) {
         return None;
@@ -517,10 +521,10 @@ mod tests {
         d.fill(square(), no_stops, FillRule::Winding, Transform::identity());
         d.stroke(square(), Color::BLACK, Stroke { width: f32::INFINITY, ..Stroke::default() }, Transform::identity());
         let clear = Pixmap::new(3, 3).unwrap();
-        d.image(&clear, Transform::identity(), 1.0, false);
+        d.image(clear.as_ref(), Transform::identity(), 1.0, false);
         let mut red = Pixmap::new(3, 3).unwrap();
         red.fill(Color::from_rgba8(255, 0, 0, 255));
-        d.image(&red, Transform::identity(), 0.0, false);
+        d.image(red.as_ref(), Transform::identity(), 0.0, false);
         assert!(d.is_empty() && d.cost() == 0);
     }
 
@@ -572,8 +576,8 @@ mod tests {
         opaque.fill(Color::from_rgba8(10, 20, 30, 255));
         let mut half = Pixmap::new(4, 2).unwrap();
         half.fill(Color::from_rgba8(200, 100, 0, 128));
-        d.image(&opaque, Transform::identity(), 1.0, true);
-        d.image(&half, Transform::identity(), 1.0, true);
+        d.image(opaque.as_ref(), Transform::identity(), 1.0, true);
+        d.image(half.as_ref(), Transform::identity(), 1.0, true);
         let (_, _, items) = d.finish();
         let [Item::Image(a), Item::Image(b)] = items.as_slice() else { panic!("two pictures") };
         assert!(a.alpha_z.is_none());

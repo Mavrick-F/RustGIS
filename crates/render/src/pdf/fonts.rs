@@ -40,13 +40,15 @@ pub(super) struct Placed {
 
 impl Fonts {
     /// `id` of `font` (standing for `ch`), given a code in one of its Type 3 fonts the first time;
-    /// `None` for a face with no usable units per em.
+    /// `None` only past what a font can hold.
     pub fn place(&mut self, doc: &mut Doc, font: &'static FontRef<'static>, id: GlyphId, ch: char) -> Option<Placed> {
         let key = std::ptr::from_ref(font) as usize;
         let fi = match self.by_font.get(&key) {
             Some(&i) => i,
             None => {
-                let upm = font.units_per_em().filter(|u| u.is_finite() && *u > 0.0)?;
+                // A face with no usable units per em is read as the usual 1000, as the pixels read
+                // it at one unit a pixel's em: its text is kept, not left out.
+                let upm = font.units_per_em().filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1000.0);
                 self.faces.push(Face { font, upm, chunks: Vec::new(), codes: HashMap::new() });
                 self.by_font.insert(key, self.faces.len() - 1);
                 self.faces.len() - 1

@@ -179,10 +179,10 @@ impl Canvas {
         self.keep(|r| {
             let at = r.ts.pre_concat(at);
             if blend == Blend::Normal {
-                r.drawing.image(&pixmap.to_owned(), at, opacity, smooth);
+                r.drawing.image(pixmap, at, opacity, smooth);
             } else {
                 let mut one = Drawing::new(r.drawing.width, r.drawing.height);
-                one.image(&pixmap.to_owned(), at, opacity, smooth);
+                one.image(pixmap, at, opacity, smooth);
                 r.drawing.place(one, Transform::identity(), 1.0, blend, None);
             }
         });
@@ -278,11 +278,11 @@ impl Canvas {
         self.keep(|r| match clip {
             Some(c) => {
                 let mut one = Drawing::new(r.drawing.width, r.drawing.height);
-                one.image(&pic, Transform::from_translate(x0, y0), 1.0, true);
+                one.image(pic.as_ref(), Transform::from_translate(x0, y0), 1.0, true);
                 let c = Clip { transform: r.ts.pre_concat(c.transform), ..c };
                 r.drawing.place(one, r.ts, 1.0, Blend::Normal, Some(c));
             }
-            None => r.drawing.image(&pic, r.ts.pre_concat(Transform::from_translate(x0, y0)), 1.0, true),
+            None => r.drawing.image(pic.as_ref(), r.ts.pre_concat(Transform::from_translate(x0, y0)), 1.0, true),
         });
     }
 
@@ -306,7 +306,7 @@ impl Canvas {
             && let Some(pic) = self.pm.clone_rect(rect)
         {
             // In the canvas's own pixels: drawing on them isn't moved by a transform.
-            r.drawing.image(&pic, Transform::from_translate(x0 as f32, y0 as f32), 1.0, true);
+            r.drawing.image(pic.as_ref(), Transform::from_translate(x0 as f32, y0 as f32), 1.0, true);
             // Cleared where it was drawn: everything else is still transparent.
             for row in self.pm.pixels_mut().chunks_mut(w).skip(y0).take(y1 + 1 - y0) {
                 if let Some(cells) = row.get_mut(x0..=x1) {

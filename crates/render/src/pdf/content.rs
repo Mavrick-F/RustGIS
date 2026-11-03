@@ -525,11 +525,6 @@ fn clean_stops(stops: &[(f32, Color)]) -> Vec<(f32, Color)> {
         let c = only.1;
         out.push((1.0, c));
     }
-    // A first stop sharing its offset with the next holds no width: left out, so no bound lands
-    // on the domain's start (the pass below can't move a stop back past 0).
-    while out.len() > 2 && out.first().map(|f| f.0) == out.get(1).map(|s| s.0) {
-        out.remove(0);
-    }
     // A function's bounds must rise: stops at one offset (a discrete ramp's steps, its last colour
     // at 1) are drawn apart by a hair, each earlier one moved back, so a step stays a step and
     // what pads past the end takes the last colour, as the raster gradient does.
@@ -539,6 +534,11 @@ fn clean_stops(stops: &[(f32, Color)]) -> Vec<(f32, Color)> {
             stop.0 = (next - STOP_GAP).max(0.0);
         }
         next = stop.0;
+    }
+    // A first stop sharing its offset with the next holds no width: left out, so no bound lands
+    // on the domain's start (the pass above can bring one back to 0 beside the next).
+    while out.len() > 2 && out.first().map(|f| f.0) == out.get(1).map(|s| s.0) {
+        out.remove(0);
     }
     out
 }
@@ -640,7 +640,7 @@ mod tests {
         });
         let mut pic = Pixmap::new(4, 4).unwrap();
         pic.fill(Color::from_rgba8(0, 160, 0, 200));
-        d.image(&pic, Transform::from_row(10.0, 0.0, 0.0, 10.0, 210.0, 60.0), 1.0, false);
+        d.image(pic.as_ref(), Transform::from_row(10.0, 0.0, 0.0, 10.0, 210.0, 60.0), 1.0, false);
         let stops = vec![(0.0, Color::from_rgba8(255, 200, 0, 255)), (1.0, Color::from_rgba8(120, 0, 160, 255))];
         d.fill(
             rect(210.0, 120.0, 170.0, 60.0),
@@ -749,6 +749,12 @@ mod tests {
         let b: Vec<f32> =
             alike.split("/Bounds [").nth(1).unwrap().split(']').next().unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
         assert!(b.windows(2).all(|w| w[0] < w[1]), "{alike}");
+        // Stops crowded at the start: moving them apart brings one back to 0 beside the first,
+        // which is then left out, so no bound lands on the domain's start.
+        let crowded = function(&clean_stops(&[(0.0, red), (1e-6, Color::BLACK), (1e-6, blue), (1.0, red)]), false);
+        let b: Vec<f32> =
+            crowded.split("/Bounds [").nth(1).unwrap().split(']').next().unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+        assert!(b.first().is_some_and(|f| *f > 0.0) && b.windows(2).all(|w| w[0] < w[1]), "{crowded}");
         // Two stops at 0 (a stop of the user's at the start): the first, of no width, left out.
         let start: Vec<f32> = clean_stops(&[(0.0, red), (0.0, Color::BLACK), (0.5, blue)]).iter().map(|s| s.0).collect();
         assert_eq!(start, vec![0.0, 0.5, 1.0]);
