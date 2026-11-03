@@ -18,8 +18,11 @@ const MAX_WORK: usize = 50_000_000;
 
 /// Refuses an edit comparing more than [`MAX_WORK`] segment pairs.
 fn within_work(a: usize, b: usize) -> Result<(), String> {
-    if a.saturating_mul(b) > MAX_WORK { Err("the shape and the line have too many vertices to edit together".into()) } else { Ok(()) }
+    if a.saturating_mul(b) > MAX_WORK { Err(TOO_MUCH.into()) } else { Ok(()) }
 }
+
+/// Why an edit past [`MAX_WORK`] is refused.
+const TOO_MUCH: &str = "the shapes and the line have too many vertices to edit together";
 
 /// A point in Web Mercator metres and the longitude/latitude it came from.
 #[derive(Clone, Copy, Debug)]
@@ -233,7 +236,7 @@ fn faces(nodes: &Nodes, edges: &[Edge]) -> (Vec<usize>, Vec<Vec<usize>>) {
 
 /// One polygon (outer ring, then holes) cut by a line: its pieces, or `None` when the line
 /// doesn't divide it.
-fn cut_part(rings: &[Vec<Coord>], line: &[Pt]) -> Result<Option<Vec<Vec<Vec<Coord>>>>, String> {
+fn cut_part(rings: &[Vec<Coord>], line: &[Pt], work: &mut usize) -> Result<Option<Vec<Vec<Vec<Coord>>>>, String> {
     // Rings as metres, the outer one anticlockwise and holes clockwise: the inside on the left.
     let mut rs: Vec<Vec<Pt>> = Vec::new();
     for (i, r) in rings.iter().enumerate() {
@@ -244,7 +247,6 @@ fn cut_part(rings: &[Vec<Coord>], line: &[Pt]) -> Result<Option<Vec<Vec<Vec<Coor
         }
         rs.push(r);
     }
-    within_work(rs.iter().map(Vec::len).sum(), line.len())?;
     // Drawn and existing vertices first, so a crossing on one of them keeps its exact coordinates.
     let mut nodes = Nodes::default();
     for p in rs.iter().flatten().chain(line) {
@@ -271,19 +273,30 @@ fn cut_part(rings: &[Vec<Coord>], line: &[Pt]) -> Result<Option<Vec<Vec<Vec<Coor
             segs.push(Seg { a: *a, b: *b, ring: false, at: Vec::new() });
         }
     }
-    let (lo, hi) = line.iter().fold((Coord::new(f64::MAX, f64::MAX), Coord::new(f64::MIN, f64::MIN)), |(lo, hi), p| {
-        (Coord::new(lo.x.min(p.m.x), lo.y.min(p.m.y)), Coord::new(hi.x.max(p.m.x), hi.y.max(p.m.y)))
-    });
-    // The cut against the rings and itself; rings aren't checked against each other.
+    // Two segments' boxes, grown by EPS, overlap: only then can they meet.
+    let boxes_meet = |a: &Seg, b: &Seg| {
+        a.a.m.x.min(a.b.m.x) <= b.a.m.x.max(b.b.m.x) + EPS
+            && b.a.m.x.min(b.b.m.x) <= a.a.m.x.max(a.b.m.x) + EPS
+            && a.a.m.y.min(a.b.m.y) <= b.a.m.y.max(b.b.m.y) + EPS
+            && b.a.m.y.min(b.b.m.y) <= a.a.m.y.max(a.b.m.y) + EPS
+    };
+    let span = Seg {
+        a: Pt::at(line.iter().fold(Coord::new(f64::MAX, f64::MAX), |lo, p| Coord::new(lo.x.min(p.m.x), lo.y.min(p.m.y)))),
+        b: Pt::at(line.iter().fold(Coord::new(f64::MIN, f64::MIN), |hi, p| Coord::new(hi.x.max(p.m.x), hi.y.max(p.m.y)))),
+        ring: false,
+        at: Vec::new(),
+    };
+    // The cut against the ring segments near it and against itself; rings aren't checked against
+    // each other. Every pair compared counts against the edit's budget.
+    let near: Vec<usize> = (0..first_cut).filter(|&i| segs.get(i).is_some_and(|si| boxes_meet(si, &span))).collect();
     for j in first_cut..segs.len() {
-        for i in 0..j {
+        for i in near.iter().copied().chain(first_cut..j) {
+            *work += 1;
+            if *work > MAX_WORK {
+                return Err(TOO_MUCH.into());
+            }
             let (Some(si), Some(sj)) = (segs.get(i), segs.get(j)) else { continue };
-            if si.ring
-                && (si.a.m.x.max(si.b.m.x) < lo.x - EPS
-                    || si.a.m.x.min(si.b.m.x) > hi.x + EPS
-                    || si.a.m.y.max(si.b.m.y) < lo.y - EPS
-                    || si.a.m.y.min(si.b.m.y) > hi.y + EPS)
-            {
+            if !boxes_meet(si, sj) {
                 continue;
             }
             let hits = meet((si.a.m, si.b.m), (sj.a.m, sj.b.m));
@@ -456,15 +469,16 @@ fn sketch(line: &[Coord]) -> Result<Vec<Pt>, String> {
 
 /// Cuts a polygon feature along a line drawn across it. Returns `None` when the line divides no
 /// part of it; otherwise its new shapes, the largest piece first with the parts the line didn't
-/// cross, then each other piece on its own.
-pub fn cut_polygon(g: &Geometry, line: &[Coord]) -> Result<Option<Vec<Geometry>>, String> {
+/// cross, then each other piece on its own. `work` counts the segment pairs compared so far in
+/// this edit, across every feature it cuts; past 50 million the edit is refused.
+pub fn cut_polygon(g: &Geometry, line: &[Coord], work: &mut usize) -> Result<Option<Vec<Geometry>>, String> {
     let Geometry::Polygon(parts) = g else { return Ok(None) };
     let mut line = sketch(line)?;
     settle_ends(&mut line, &paths_of(g)?);
     let mut pieces: Vec<Vec<Vec<Coord>>> = Vec::new();
     let mut kept: Vec<Vec<Vec<Coord>>> = Vec::new();
     for part in parts {
-        match cut_part(part, &line)? {
+        match cut_part(part, &line, work)? {
             Some(p) => {
                 if valid(part) && !p.iter().all(|q| valid(q)) {
                     return Err(
@@ -608,6 +622,16 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Geometry, String> {
                     let mut part = part.clone();
                     if let Some(slot) = part.get_mut(ri) {
                         *slot = new;
+                    }
+                    // A hole the new outer ring leaves wholly outside was in the area cut away.
+                    if ri == 0
+                        && let Some(outer) = part.first().map(|o| vec![o.iter().map(|c| Pt::of(*c)).collect::<Vec<_>>()])
+                    {
+                        let mut k = 0;
+                        part.retain(|r| {
+                            k += 1;
+                            k == 1 || r.iter().any(|c| inside(lonlat_to_merc(*c), &outer))
+                        });
                     }
                     if part.first().is_some_and(|o| o.len() < 4) || !valid(&part) {
                         return Err("reshaping there would make the boundary cross itself or another ring".into());
@@ -761,7 +785,7 @@ mod tests {
     #[test]
     fn a_line_across_a_square_cuts_it_in_two() {
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)]]);
-        let out = cut_polygon(&g, &[c(0.3, -1.0), c(0.3, 2.0)]).unwrap().unwrap();
+        let out = cut_polygon(&g, &[c(0.3, -1.0), c(0.3, 2.0)], &mut 0).unwrap().unwrap();
         assert_eq!(out.len(), 2);
         // The larger piece first, and the two make up the whole.
         assert!(area(&out[0]) > area(&out[1]));
@@ -774,26 +798,26 @@ mod tests {
     #[test]
     fn a_line_that_stops_inside_or_misses_cuts_nothing() {
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)]]);
-        assert!(cut_polygon(&g, &[c(0.5, -1.0), c(0.5, 0.5)]).unwrap().is_none());
-        assert!(cut_polygon(&g, &[c(2.0, -1.0), c(2.0, 2.0)]).unwrap().is_none());
-        assert!(cut_polygon(&g, &[c(0.5, -1.0)]).is_err());
+        assert!(cut_polygon(&g, &[c(0.5, -1.0), c(0.5, 0.5)], &mut 0).unwrap().is_none());
+        assert!(cut_polygon(&g, &[c(2.0, -1.0), c(2.0, 2.0)], &mut 0).unwrap().is_none());
+        assert!(cut_polygon(&g, &[c(0.5, -1.0)], &mut 0).is_err());
     }
 
     #[test]
     fn line_ends_a_few_millimetres_short_of_the_edge_still_cut() {
         // About 4 mm inside the bottom and top edges, as a point snapped in another projection.
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)]]);
-        let out = cut_polygon(&g, &[c(0.3, 4e-8), c(0.3, 1.0 - 4e-8)]).unwrap().unwrap();
+        let out = cut_polygon(&g, &[c(0.3, 4e-8), c(0.3, 1.0 - 4e-8)], &mut 0).unwrap().unwrap();
         assert_eq!(out.len(), 2);
         // A centimetre and more short is not on the edge.
-        assert!(cut_polygon(&g, &[c(0.3, 2e-7), c(0.3, 1.0 - 2e-7)]).unwrap().is_none());
+        assert!(cut_polygon(&g, &[c(0.3, 2e-7), c(0.3, 1.0 - 2e-7)], &mut 0).unwrap().is_none());
     }
 
     #[test]
     fn a_zigzag_makes_three_pieces_and_holes_stay_in_theirs() {
         let hole = vec![c(0.7, 0.4), c(0.7, 0.6), c(0.9, 0.6), c(0.9, 0.4), c(0.7, 0.4)];
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0), hole]]);
-        let out = cut_polygon(&g, &[c(0.2, -1.0), c(0.2, 2.0), c(0.4, 2.0), c(0.4, -1.0)]).unwrap().unwrap();
+        let out = cut_polygon(&g, &[c(0.2, -1.0), c(0.2, 2.0), c(0.4, 2.0), c(0.4, -1.0)], &mut 0).unwrap().unwrap();
         assert_eq!(out.len(), 3);
         let total: f64 = out.iter().map(area).sum();
         assert!((total / area(&g) - 1.0).abs() < 1e-9);
@@ -806,7 +830,7 @@ mod tests {
     fn a_cut_through_a_hole_divides_the_ring_around_it() {
         let hole = vec![c(0.4, 0.4), c(0.4, 0.6), c(0.6, 0.6), c(0.6, 0.4), c(0.4, 0.4)];
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0), hole]]);
-        let out = cut_polygon(&g, &[c(0.5, -1.0), c(0.5, 2.0)]).unwrap().unwrap();
+        let out = cut_polygon(&g, &[c(0.5, -1.0), c(0.5, 2.0)], &mut 0).unwrap().unwrap();
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|g| matches!(g, Geometry::Polygon(p) if p.len() == 1 && p[0].len() == 1)));
         let total: f64 = out.iter().map(area).sum();
@@ -816,7 +840,7 @@ mod tests {
     #[test]
     fn a_part_the_line_misses_stays_with_the_largest_piece() {
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)], vec![square(5.0, 5.0, 6.0, 6.0)]]);
-        let out = cut_polygon(&g, &[c(0.5, -1.0), c(0.5, 2.0)]).unwrap().unwrap();
+        let out = cut_polygon(&g, &[c(0.5, -1.0), c(0.5, 2.0)], &mut 0).unwrap().unwrap();
         assert_eq!(out.len(), 2);
         assert!(matches!(&out[0], Geometry::Polygon(p) if p.len() == 2));
     }
@@ -832,6 +856,17 @@ mod tests {
         let shrunk = area(&out) / area(&g);
         assert!(shrunk > 0.81 && shrunk < 0.83, "{shrunk}");
         assert!(reshape(&g, &[c(2.0, 0.0), c(3.0, 0.0)]).is_err());
+    }
+
+    #[test]
+    fn reshaping_away_the_side_with_a_hole_drops_the_hole_with_it() {
+        let hole = vec![c(0.1, 0.4), c(0.1, 0.6), c(0.2, 0.6), c(0.2, 0.4), c(0.1, 0.4)];
+        let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0), hole]]);
+        let out = reshape(&g, &[c(0.3, -1.0), c(0.3, 2.0)]).unwrap();
+        let Geometry::Polygon(p) = &out else { panic!() };
+        assert_eq!(p[0].len(), 1, "the hole was on the side reshaped away");
+        let kept = area(&out) / area(&Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)]]));
+        assert!(kept > 0.69 && kept < 0.71, "{kept}");
     }
 
     #[test]

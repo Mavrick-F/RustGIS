@@ -50,12 +50,15 @@ fn cut_polygon_splits_the_selected_parcel_keeping_its_attributes() {
     let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(0., 0., 1., 1.), rectangle(2., 0., 3., 1.)]);
     let before = features(&s, id);
     s.run("select.rows", &json!({"layer": id, "rows": [0]})).unwrap();
+    // New features get an elevation; the pieces of a cut keep the feature's own values.
+    s.run("edit.elevation", &json!({"mode": "constant", "z": 5})).unwrap();
     let r = s.run("edit.cutPolygon", &json!({"line": line(&[[0.3, -1.], [0.3, 2.]])})).unwrap();
     assert_eq!(r, json!({"cut": 1, "pieces": 2, "missed": 0}));
     let after = features(&s, id);
     assert_eq!(after.len(), 3);
     // The new piece copies the parcel's attributes; the other parcel is untouched.
     assert_eq!(after[2].attrs, before[0].attrs);
+    assert!(s.map().layer(id).unwrap().dataset.field_index("z").is_none(), "no elevation field added for the pieces");
     assert_eq!(after[1], before[1]);
     assert_eq!(s.map().layer(id).unwrap().selection, vec![0, 2]);
     // One undo step puts it back.

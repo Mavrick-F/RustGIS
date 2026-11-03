@@ -2565,8 +2565,17 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                 if !dup {
                     let last = app.map.sketch.last().copied().filter(|_| app.map.trace_edges && tool.draws_edit());
                     let along = last.and_then(|from| traced(app, from, c));
+                    let limit = rustgis_engine::cmd::design::MAX_LINE;
                     match along {
-                        Some(path) => app.map.sketch.extend(path),
+                        // The path starts where the last vertex meets the edge: it replaces it.
+                        Some(path) if app.map.sketch.len().saturating_sub(1) + path.len() <= limit => {
+                            app.map.sketch.pop();
+                            app.map.sketch.extend(path);
+                        }
+                        Some(_) => {
+                            app.session.notify(tl!("Not traced: a drawn line holds at most 10,000 points"), false);
+                            app.map.sketch.push(c);
+                        }
                         None => app.map.sketch.push(c),
                     }
                 }
@@ -2627,13 +2636,14 @@ fn finish_sketch(app: &mut RustGisApp) {
     }
 }
 
-/// The path along the edge under both the last sketch vertex and a new click, after the last
-/// vertex (Trace), when there is one.
+/// The path along the edge under both the last sketch vertex and a new click (Trace), when there
+/// is one: from where the last vertex meets the edge to the click. A click with no edge under
+/// both points is an ordinary vertex: Trace only follows edges.
 fn traced(app: &mut RustGisApp, from: Coord, to: Coord) -> Option<Vec<Coord>> {
     let r = app.session.run("edit.trace", &json!({"from": [from.x, from.y], "to": [to.x, to.y]})).ok()?;
     let path: Vec<Coord> =
-        r["path"].as_array()?.iter().skip(1).filter_map(|c| Some(Coord::new(c.get(0)?.as_f64()?, c.get(1)?.as_f64()?))).collect();
-    (!path.is_empty()).then_some(path)
+        r["path"].as_array()?.iter().filter_map(|c| Some(Coord::new(c.get(0)?.as_f64()?, c.get(1)?.as_f64()?))).collect();
+    (path.len() >= 2).then_some(path)
 }
 
 /// A point snapped to nearby features (when snapping is on).
@@ -4714,7 +4724,13 @@ mod tests {
         let square = json!({"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
         app.run("edit.addFeature", json!({"layer": "Parcels", "geometry": square})).unwrap();
         app.session.zoom_to(&rustgis_engine::geom::Extent::new(-1.0, -1.0, 2.0, 2.0));
-        assert_eq!(traced(&mut app, Coord::new(0.5, 0.0), Coord::new(1.0, 0.5)), Some(vec![Coord::new(1.0, 0.0), Coord::new(1.0, 0.5)]));
+        assert_eq!(
+            traced(&mut app, Coord::new(0.5, 0.0), Coord::new(1.0, 0.5)),
+            Some(vec![Coord::new(0.5, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 0.5)])
+        );
+        // From just off the edge, the path starts on it (and replaces the last vertex).
+        let off = traced(&mut app, Coord::new(0.5, -0.001), Coord::new(1.0, 0.5)).unwrap();
+        assert!(off[0].y.abs() < 1e-9 && (off[0].x - 0.5).abs() < 1e-9, "{off:?}");
         let count = |app: &RustGisApp| app.session.map().layer_by_name("Parcels").unwrap().dataset.features.len();
         app.run("tool.set", json!({"tool": "reshape"})).unwrap();
         app.map.sketch = vec![Coord::new(0.2, 0.2), Coord::new(-0.5, 0.2), Coord::new(-0.5, 0.8), Coord::new(0.2, 0.8)];
@@ -4727,5 +4743,40 @@ mod tests {
         finish_sketch(&mut app);
         assert!(app.map.sketch.is_empty());
         assert_eq!(count(&app), 2);
+    }
+
+    /// With Trace on, two clicks on a polygon's edges draw the edge between them: the corner
+    /// between the clicks joins the sketch.
+    #[test]
+    fn clicks_with_trace_on_follow_the_edge_round_a_corner() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.template", json!({"template": "polygons", "name": "Parcels"})).unwrap();
+        let square = json!({"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
+        app.run("edit.addFeature", json!({"layer": "Parcels", "geometry": square})).unwrap();
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(1400.0, 860.0)).with_step_dt(0.016).with_max_steps(10_000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+        h.step();
+        h.state_mut().run("map.zoomToExtent", json!({"extent": [-1, -1, 2, 2]})).unwrap();
+        for _ in 0..5 {
+            h.step();
+        }
+        h.state_mut().run("ui.traceEdges", json!({"on": true})).unwrap();
+        h.state_mut().run("tool.set", json!({"tool": "createPolygon"})).unwrap();
+        selection_click(&mut h, [0.5, 0.0]);
+        for _ in 0..30 {
+            h.step();
+        }
+        selection_click(&mut h, [1.0, 0.5]);
+        let sketch = h.state().map.sketch.clone();
+        assert_eq!(sketch.len(), 3, "{sketch:?}");
+        assert_eq!(sketch[1], Coord::new(1.0, 0.0), "the corner, exactly");
+        assert!(sketch[0].y.abs() < 1e-9 && (sketch[2].x - 1.0).abs() < 1e-9, "both ends on the edge: {sketch:?}");
     }
 }

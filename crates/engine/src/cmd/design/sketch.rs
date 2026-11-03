@@ -6,11 +6,11 @@ use rustgis_data::Geometry;
 use rustgis_geom::Coord;
 use serde_json::{Value, json};
 
-use super::{Change, apply, selection_layer};
+use super::{Change, apply, apply_with, selection_layer};
 use crate::{CmdResult, Session};
 
-/// Most vertices a drawn line may have.
-const MAX_LINE: usize = 10_000;
+/// Most vertices a drawn line may have (Cut Polygon, Reshape); a sketch stops tracing at it.
+pub const MAX_LINE: usize = 10_000;
 
 /// The `line` parameter: a GeoJSON LineString in longitude/latitude.
 fn line(p: &Value) -> Result<Vec<Coord>, String> {
@@ -48,10 +48,10 @@ pub(super) fn cut_polygon(s: &mut Session, p: &Value) -> CmdResult {
     let id = selection_layer(s)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
     let mut cuts = Vec::new();
-    let mut missed = 0;
+    let (mut missed, mut work) = (0, 0);
     for &r in &l.selection {
         let Some(f) = l.dataset.features.get(r) else { continue };
-        match f.geometry.as_ref().map(|g| sketch_edit::cut_polygon(g, &line)).transpose()?.flatten() {
+        match f.geometry.as_ref().map(|g| sketch_edit::cut_polygon(g, &line, &mut work)).transpose()?.flatten() {
             Some(pieces) => {
                 for g in &pieces {
                     super::super::edit::validate(g)?;
@@ -84,7 +84,8 @@ pub(super) fn cut_polygon(s: &mut Session, p: &Value) -> CmdResult {
     let pieces = selection.len();
     l.selection = selection;
     l.touch_geometry();
-    apply(s, id, changes)?;
+    // The pieces are the feature cut up, not new features: no creation defaults.
+    apply_with(s, id, changes, false)?;
     Ok(json!({"cut": cut, "pieces": pieces, "missed": missed}))
 }
 
@@ -132,8 +133,9 @@ pub(super) fn trace(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"layer": id, "row": row, "path": path, "fromOffM": t.from_m, "toOffM": t.to_m}))
 }
 
-/// The visible line or polygon feature whose edge passes nearest both points, each within
-/// `px` pixels: (layer id, row). Measured on the map as drawn, like snapping.
+/// The drawn line or polygon feature with a ring or part passing nearest both points, each within
+/// `px` pixels: (layer id, row). Measured on the map as drawn, like snapping; rows a definition
+/// query or the time window hides aren't candidates.
 fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64) -> Option<(u32, usize)> {
     let (a, b) = (s.map().to_map(from)?, s.map().to_map(to)?);
     let tol = px * s.map().camera.res;
@@ -146,9 +148,10 @@ fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64) -> Option<(u32
             continue;
         }
         let id = l.id;
+        let drawn = l.drawn_rows(scale);
         l.projected_in(&flat, &key);
         for (row, g) in l.projected_cache().iter().enumerate() {
-            let Some(g) = g.as_ref() else { continue };
+            let Some(g) = g.as_ref().filter(|_| drawn.get(row) == Some(&true)) else { continue };
             let e = g.extent().padded(0.0, tol);
             if !e.contains(a) || !e.contains(b) {
                 continue;
@@ -158,10 +161,10 @@ fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64) -> Option<(u32
                 Geometry::Polygon(polys) => polys.iter().flatten().collect(),
                 _ => continue,
             };
-            let near = |c: Coord| {
-                paths.iter().flat_map(|p| p.windows(2)).filter_map(|w| Some(off(c, *w.first()?, *w.get(1)?))).fold(f64::MAX, f64::min)
-            };
-            let d = near(a).max(near(b));
+            // Both points near the same ring or part: the one the path will follow.
+            let near =
+                |p: &Vec<Coord>, c: Coord| p.windows(2).filter_map(|w| Some(off(c, *w.first()?, *w.get(1)?))).fold(f64::MAX, f64::min);
+            let d = paths.iter().map(|p| near(p, a).max(near(p, b))).fold(f64::MAX, f64::min);
             if d <= tol && best.is_none_or(|x| d < x.0) {
                 best = Some((d, id, row));
             }

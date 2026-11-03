@@ -14,6 +14,7 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 mod shared_vertex;
 mod sketch;
+pub use sketch::MAX_LINE;
 mod snap_vertex;
 
 /// One edited feature: its state before (none for an insert) and its row after (none for a
@@ -58,6 +59,13 @@ fn now() -> f64 {
 /// calculation rules, then domains, contingent values and constraint rules (an error undoes the
 /// whole command). Records the archive and the edit counts.
 pub(crate) fn apply(s: &mut Session, id: u32, changes: Vec<Change>) -> Result<(), String> {
+    apply_with(s, id, changes, true)
+}
+
+/// [`apply`], with `new_defaults` false for added rows that carry another feature's attributes
+/// (the pieces of a cut): they keep them, with no subtype defaults or elevation filled in.
+/// Calculation rules and checks still run on every row.
+pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_defaults: bool) -> Result<(), String> {
     if changes.is_empty() {
         return Ok(());
     }
@@ -78,7 +86,8 @@ pub(crate) fn apply(s: &mut Session, id: u32, changes: Vec<Change>) -> Result<()
             }
         }
     };
-    let new_rows: Vec<usize> = changes.iter().filter(|c| c.before.is_none()).filter_map(|c| c.row).collect();
+    let new_rows: Vec<usize> =
+        if new_defaults { changes.iter().filter(|c| c.before.is_none()).filter_map(|c| c.row).collect() } else { Vec::new() };
     let zs: Vec<(usize, Option<f64>)> = new_rows
         .iter()
         .map(|r| {
