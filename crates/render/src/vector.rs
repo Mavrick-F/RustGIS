@@ -3,7 +3,7 @@
 //! (y down, from its top left). A group composites its items as one layer: with an opacity, a
 //! blend mode and a clip, as the renderer composites a layer drawn offscreen.
 
-use ab_glyph::{FontRef, GlyphId};
+use ab_glyph::{Font, FontRef, GlyphId};
 use rustgis_map::effects::Blend;
 use tiny_skia::{Color, FillRule, LineCap, LineJoin, Path, Pixmap, Transform};
 
@@ -41,6 +41,8 @@ pub struct Drawing {
     cost: usize,
     /// Something drawn was refused: the drawing passed [`MAX_ITEMS`] or [`MAX_COST`].
     overflowed: bool,
+    /// The glyphs (by face and id) whose outlines are counted in `cost`.
+    outlines: std::collections::HashSet<(usize, u16)>,
 }
 
 /// One thing drawn.
@@ -145,7 +147,16 @@ impl Drawing {
     /// An empty drawing `width` × `height` pixels (a size that isn't positive is one pixel).
     pub fn new(width: f32, height: f32) -> Drawing {
         let size = |v: f32| if v.is_finite() && v > 0.0 { v } else { 1.0 };
-        Drawing { width: size(width), height: size(height), items: Vec::new(), open: Vec::new(), count: 0, cost: 0, overflowed: false }
+        Drawing {
+            width: size(width),
+            height: size(height),
+            items: Vec::new(),
+            open: Vec::new(),
+            count: 0,
+            cost: 0,
+            overflowed: false,
+            outlines: Default::default(),
+        }
     }
 
     /// Roughly how many bytes a writer gives it: what callers budget a document by.
@@ -185,6 +196,13 @@ impl Drawing {
     pub fn glyphs(&mut self, run: GlyphRun) {
         if !run.glyphs.is_empty() && run.size.is_finite() && run.size > 0.0 && run.transform.is_finite() {
             self.cost += 60 + run.glyphs.len() * 8;
+            // Each glyph's outline, written once in the document's fonts, counts the first time.
+            let face = std::ptr::from_ref(run.font) as usize;
+            for g in &run.glyphs {
+                if self.outlines.insert((face, g.id.0)) {
+                    self.cost += 64 + run.font.outline(g.id).map_or(0, |o| o.curves.len() * 40);
+                }
+            }
             self.push(Item::Glyphs(run));
         }
     }

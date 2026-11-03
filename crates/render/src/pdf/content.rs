@@ -502,7 +502,8 @@ fn write_matrix(out: &mut Vec<u8>, t: Transform) {
 /// The stops, offsets clamped to 0..=1 and never going back, with one at each end.
 fn clean_stops(stops: &[(f32, Color)]) -> Vec<(f32, Color)> {
     let mut out: Vec<(f32, Color)> = Vec::with_capacity(stops.len() + 2);
-    for &(t, c) in stops.iter().take(256) {
+    // (A ramp holds at most 2 × (MAX_STOPS + 2) stops: none is left out.)
+    for &(t, c) in stops {
         let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
         let t = out.last().map_or(t, |l| t.max(l.0));
         out.push((t, c));
@@ -522,8 +523,21 @@ fn clean_stops(stops: &[(f32, Color)]) -> Vec<(f32, Color)> {
         let c = only.1;
         out.push((1.0, c));
     }
+    // A function's bounds must rise: stops at one offset (a discrete ramp's steps, its last colour
+    // at 1) are drawn apart by a hair, each earlier one moved back, so a step stays a step and
+    // what pads past the end takes the last colour, as the raster gradient does.
+    let mut next = f32::INFINITY;
+    for stop in out.iter_mut().rev() {
+        if stop.0 >= next {
+            stop.0 = (next - STOP_GAP).max(0.0);
+        }
+        next = stop.0;
+    }
     out
 }
+
+/// How far apart [`clean_stops`] draws stops at one offset.
+const STOP_GAP: f32 = 1e-5;
 
 /// The function from 0..=1 to the stops' colours (or, `alpha`, their alphas), interpolated
 /// linearly between them.
@@ -713,13 +727,19 @@ mod tests {
     fn stops_are_cleaned_and_numbers_written_plainly() {
         let red = Color::from_rgba8(255, 0, 0, 255);
         assert_eq!(clean_stops(&[(0.4, red)]).iter().map(|s| s.0).collect::<Vec<_>>(), vec![0.0, 0.4, 1.0]);
-        assert_eq!(
-            clean_stops(&[(0.6, red), (f32::NAN, red), (0.2, red)]).iter().map(|s| s.0).collect::<Vec<_>>(),
-            vec![0.0, 0.6, 0.6, 0.6, 1.0]
-        );
+        // Stops at one offset are drawn apart (earlier ones moved back), so the bounds rise.
+        let apart: Vec<f32> = clean_stops(&[(0.6, red), (f32::NAN, red), (0.2, red)]).iter().map(|s| s.0).collect();
+        assert!(apart.windows(2).all(|w| w[0] < w[1]) && apart[3] == 0.6 && apart[1] > 0.599, "{apart:?}");
         assert_eq!(clean_stops(&[]).len(), 2);
         let f = function(&clean_stops(&[(0.0, red), (0.5, Color::BLACK), (1.0, red)]), false);
         assert!(f.starts_with("<< /FunctionType 3") && f.contains("/Bounds [0.5]") && f.contains("/Encode [0 1 0 1]"), "{f}");
+        // A discrete ramp's last step (two stops at 1): past the end, its last colour.
+        let blue = Color::from_rgba8(0, 0, 255, 255);
+        let f = function(&clean_stops(&[(0.0, red), (0.5, red), (0.5, Color::BLACK), (1.0, Color::BLACK), (1.0, blue)]), false);
+        assert!(f.contains("/C1 [0 0 1] /N 1 >>] /Bounds"), "the last piece ends in blue: {f}");
+        let bounds: Vec<f32> =
+            f.split("/Bounds [").nth(1).unwrap().split(']').next().unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+        assert!(bounds.windows(2).all(|w| w[0] < w[1]), "{bounds:?}");
         let s = |v: f32, p: u32| {
             let mut o = Vec::new();
             num(&mut o, v, p);

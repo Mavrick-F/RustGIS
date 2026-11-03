@@ -234,9 +234,10 @@ impl Canvas {
         self.keep(|r| r.drawing.end_group());
     }
 
-    /// Places `child`, a recording canvas, on this one as a group: moved by `transform`,
-    /// composited with `opacity` and `blend`, inside `clip` (in this canvas's space). A canvas
-    /// that draws pixels takes the child's pixels instead.
+    /// Places `child` on this one as a group: moved by `transform`, composited with `opacity` and
+    /// `blend`, inside `clip` (in this canvas's space). `child` comes from [`Canvas::sub`] (or
+    /// draws pixels), so it records only when this canvas does: its recording is placed on this
+    /// one's, its pixels on these pixels.
     pub fn place(&mut self, child: Canvas, transform: Transform, opacity: f32, blend: Blend, clip: Option<Clip>) {
         if self.rec.is_none() || !child.is_recording() {
             let paint = PixmapPaint { opacity, blend_mode: crate::blend_mode(blend), quality: tiny_skia::FilterQuality::Bilinear };
@@ -306,8 +307,13 @@ impl Canvas {
         {
             // In the canvas's own pixels: drawing on them isn't moved by a transform.
             r.drawing.image(&pic, Transform::from_translate(x0 as f32, y0 as f32), 1.0, true);
+            // Cleared where it was drawn: everything else is still transparent.
+            for row in self.pm.pixels_mut().chunks_mut(w).skip(y0).take(y1 + 1 - y0) {
+                if let Some(cells) = row.get_mut(x0..=x1) {
+                    cells.fill(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+                }
+            }
         }
-        self.pm.fill(Color::TRANSPARENT);
     }
 }
 
@@ -420,5 +426,10 @@ mod tests {
         assert_eq!(run.glyphs.iter().map(|g| g.ch).collect::<String>(), "Memphis");
         // Turned with the label, not drawn as a turned picture.
         assert!(run.transform.ky.abs() > 0.1);
+        // A halo of no width draws nothing, as on the pixels.
+        let mut c = Canvas::recording(100, 50).unwrap();
+        crate::text::draw(&mut c, &crate::PlacedLabel { halo_width: Some(0.0), ..label }, 1.0);
+        let (_, _, items) = c.into_drawing().unwrap().finish();
+        assert!(matches!(items.as_slice(), [Item::Glyphs(_)]));
     }
 }

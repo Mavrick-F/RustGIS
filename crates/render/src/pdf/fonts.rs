@@ -10,9 +10,6 @@ use ab_glyph::{Font, FontRef, GlyphId, OutlineCurve};
 use super::Doc;
 use super::content::num;
 
-/// The most curves read from one glyph (a crafted font's), as character markers read them.
-const MAX_CURVES: usize = 20_000;
-
 #[derive(Default)]
 pub(super) struct Fonts {
     faces: Vec<Face>,
@@ -152,7 +149,8 @@ fn glyph_procedure(font: &FontRef<'static>, id: GlyphId, advance: f32) -> (Vec<u
     };
     if let Some(o) = font.outline(id) {
         let mut last: Option<ab_glyph::Point> = None;
-        for c in o.curves.iter().take(MAX_CURVES) {
+        // Every curve: the outline is already read, and a glyph cut short would draw wrong.
+        for c in &o.curves {
             let (start, end) = match c {
                 OutlineCurve::Line(a, b) | OutlineCurve::Quad(a, _, b) | OutlineCurve::Cubic(a, _, _, b) => (*a, *b),
             };

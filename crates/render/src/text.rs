@@ -724,7 +724,8 @@ fn draw_upright(pm: &mut Canvas, l: &PlacedLabel, ppp: f32, ink: Ink) {
                 Some(width) => (halo_reach(width) * 1.33 * ppp).min(MAX_HALO_PX),
                 None => 1.2 * ppp,
             };
-            for &(line, left, lw, y) in &placed {
+            // (No width, no halo, as the pixels have it.)
+            for &(line, left, lw, y) in placed.iter().filter(|_| r > 0.0) {
                 let outline = if styled {
                     styled_outline(line, left, y, px, label_face(l), spacing)
                 } else {
@@ -1062,9 +1063,6 @@ fn styled_outline(text: &str, left: f32, cy: f32, px: f32, face: Face, spacing: 
     outline_of(&glyphs, (left, base), px, spacing, |gf| leans(face, f, slanted, gf))
 }
 
-/// The most curves read from one glyph's outline (a crafted font's).
-const MAX_OUTLINE_CURVES: usize = 20_000;
-
 /// `glyphs`' outlines placed as [`keep_glyphs`] places them, in pixels, as one path.
 fn outline_of(
     glyphs: &[Shaped],
@@ -1081,7 +1079,7 @@ fn outline_of(
         // Font units (y up, from the pen on the baseline) to pixels.
         let at = |p: ab_glyph::Point| (pen + (p.x + slant * p.y) * k, base - p.y * k);
         let mut last: Option<ab_glyph::Point> = None;
-        for c in o.curves.iter().take(MAX_OUTLINE_CURVES) {
+        for c in &o.curves {
             let (start, end) = match c {
                 ab_glyph::OutlineCurve::Line(a, b) | ab_glyph::OutlineCurve::Quad(a, _, b) | ab_glyph::OutlineCurve::Cubic(a, _, _, b) => {
                     (*a, *b)
