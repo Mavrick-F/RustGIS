@@ -129,7 +129,8 @@ impl Nodes {
         let (cx, cy) = Nodes::cell(p.m);
         for dx in -1..=1 {
             for dy in -1..=1 {
-                for &i in self.grid.get(&(cx + dx, cy + dy)).into_iter().flatten() {
+                // Saturating: an absurd coordinate's cell sits at the edge of the grid.
+                for &i in self.grid.get(&(cx.saturating_add(dx), cy.saturating_add(dy))).into_iter().flatten() {
                     if self.pts.get(i).is_some_and(|q| dist(q.m, p.m) <= EPS) {
                         return i;
                     }
@@ -415,10 +416,24 @@ fn cut_part(rings: &[Vec<Coord>], line: &[Pt], work: &mut usize) -> Result<Optio
 
 /// Whether a polygon is valid (simple rings, holes inside, no overlaps), in metres.
 fn valid(rings: &[Vec<Coord>]) -> bool {
+    geo_polygon(rings).is_some_and(|p| p.is_valid())
+}
+
+/// A polygon (outer ring, then holes) as a `geo` polygon in metres.
+fn geo_polygon(rings: &[Vec<Coord>]) -> Option<geo::Polygon<f64>> {
     let ring = |r: &Vec<Coord>| geo::LineString::new(r.iter().map(|c| lonlat_to_merc(*c)).map(|m| geo::coord! {x: m.x, y: m.y}).collect());
     let mut it = rings.iter();
-    let Some(outer) = it.next() else { return false };
-    geo::Polygon::new(ring(outer), it.map(ring).collect()).is_valid()
+    let outer = it.next()?;
+    Some(geo::Polygon::new(ring(outer), it.map(ring).collect()))
+}
+
+/// The area two polygons share, in square metres (0 when their boxes don't meet).
+fn shared_area(a: &geo::Polygon<f64>, b: &geo::Polygon<f64>) -> f64 {
+    use geo::{Area, BooleanOps, BoundingRect, Intersects};
+    match (a.bounding_rect(), b.bounding_rect()) {
+        (Some(x), Some(y)) if x.intersects(&y) => a.intersection(b).unsigned_area(),
+        _ => 0.0,
+    }
 }
 
 /// A polygon's area in square metres: its outer ring less its holes.
@@ -660,6 +675,15 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Reshaped, String> {
                     let holes_removed = part_len - part.len();
                     if part.first().is_some_and(|o| o.len() < 4) || !valid(&part) {
                         return Err("reshaping there would make the boundary cross itself or another ring".into());
+                    }
+                    // The other parts of a multipart feature: a reshape mustn't push into one it
+                    // didn't overlap before (a square metre counts, as in the overlap check).
+                    if let (Some(new), Some(old)) = (geo_polygon(&part), parts.get(pi).and_then(|p| geo_polygon(p))) {
+                        for sib in parts.iter().enumerate().filter(|(j, _)| *j != pi).filter_map(|(_, p)| geo_polygon(p)) {
+                            if shared_area(&new, &sib) > 1.0 && shared_area(&old, &sib) <= 1.0 {
+                                return Err("reshaping there would overlap another part of the same feature".into());
+                            }
+                        }
                     }
                     let mut parts = parts.clone();
                     if let Some(slot) = parts.get_mut(pi) {
@@ -922,6 +946,24 @@ mod tests {
     }
 
     #[test]
+    fn a_reshape_into_another_part_of_the_feature_is_refused() {
+        let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)], vec![square(2.0, 0.0, 3.0, 1.0)]]);
+        // Out from the first part's east side, across the second part.
+        assert!(reshape(&g, &[c(0.8, 0.2), c(2.5, 0.2), c(2.5, 0.8), c(0.8, 0.8)]).is_err());
+        // Out into the gap between them is fine.
+        assert!(reshape(&g, &[c(0.8, 0.2), c(1.5, 0.2), c(1.5, 0.8), c(0.8, 0.8)]).is_ok());
+    }
+
+    #[test]
+    fn absurd_longitudes_are_handled_without_a_panic() {
+        let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)]]);
+        for lon in [1e11, -1e11, 1e300] {
+            let _ = cut_polygon(&g, &[c(lon, -1.0), c(lon, 2.0)], &mut 0);
+            let _ = reshape(&g, &[c(lon, -1.0), c(lon, 2.0)]);
+        }
+    }
+
+    #[test]
     fn reshaping_a_line_replaces_a_stretch_or_an_end() {
         let g = Geometry::Line(vec![vec![c(0.0, 0.0), c(1.0, 0.0), c(2.0, 0.0), c(3.0, 0.0)]]);
         let out = reshape(&g, &[c(0.5, -0.1), c(0.5, 1.0), c(2.5, 1.0), c(2.5, -0.1)]).unwrap().geometry;
@@ -954,6 +996,8 @@ mod tests {
     fn tracing_follows_the_part_given_even_when_another_is_nearer() {
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)], vec![square(5.0, 0.0, 6.0, 1.0)]]);
         let t = trace(&g, c(0.5, 0.0), c(1.0, 0.5), Some(1)).unwrap();
-        assert!(t.path.iter().all(|p| p.x > 4.0), "{:?}", t.path);
+        assert_eq!(t.path.len(), 2, "the short way along ring 1: {:?}", t.path);
+        assert_eq!(t.path[0], c(5.0, 0.0));
+        assert!((t.path[1].x - 5.0).abs() < 1e-9 && (t.path[1].y - 0.5).abs() < 1e-9, "{:?}", t.path);
     }
 }

@@ -106,7 +106,9 @@ fn a_refused_cut_of_one_selected_parcel_cuts_none_of_them() {
     let mark = s.notice_mark();
     let r = s.run("edit.cutPolygon", &json!({"line": line(&[[0.5, -1.], [0.5, 2.]])})).unwrap();
     assert_eq!(r, json!({"cut": 1, "pieces": 2, "missed": 1}));
-    assert_eq!(s.notices_since(mark).len(), 1, "the parcel left uncut is said");
+    let notices = s.notices_since(mark);
+    assert_eq!(notices.len(), 1, "the parcel left uncut is said");
+    assert!(notices[0].text.contains("Cut Polygon left 1 selected feature(s)"), "{notices:?}");
 }
 
 #[test]

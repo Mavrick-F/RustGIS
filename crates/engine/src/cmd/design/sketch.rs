@@ -193,14 +193,25 @@ fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64, only: Option<u
             let Some((part, d)) = paths.iter().map(|p| near(p, a).max(near(p, b))).enumerate().min_by(|x, y| x.1.total_cmp(&y.1)) else {
                 continue;
             };
-            // A projection that cuts features at its edge can split a part in two: the map's
-            // part numbers then aren't the source's, and the trace picks the part itself.
-            let source = l.dataset.features.get(row).and_then(|f| f.geometry.as_ref()).map_or(0, |g| match g {
-                Geometry::Line(parts) => parts.len(),
-                Geometry::Polygon(polys) => polys.iter().map(Vec::len).sum(),
-                _ => 0,
-            });
-            let part = (source == paths.len()).then_some(part);
+            // A projection that cuts features at its edge can split or drop parts, so the map's
+            // part numbers may not be the source's. The chosen part is passed on only when it is
+            // the source part of that number, projected (same length, same first, middle and
+            // last points); otherwise the trace picks the part itself.
+            let source: Vec<&Vec<Coord>> = match l.dataset.features.get(row).and_then(|f| f.geometry.as_ref()) {
+                Some(Geometry::Line(parts)) => parts.iter().collect(),
+                Some(Geometry::Polygon(polys)) => polys.iter().flatten().collect(),
+                _ => Vec::new(),
+            };
+            let same = |src: &Vec<Coord>, drawn: &Vec<Coord>| {
+                let n = src.len();
+                n == drawn.len()
+                    && [0, n / 2, n.saturating_sub(1)].iter().all(|&i| match (src.get(i).and_then(|c| flat.forward(*c)), drawn.get(i)) {
+                        (Some(a), Some(b)) => (a.x - b.x).abs() + (a.y - b.y).abs() <= 1e-6 * (1.0 + a.x.abs() + a.y.abs()),
+                        _ => false,
+                    })
+            };
+            let part = (source.len() == paths.len() && matches!((source.get(part), paths.get(part)), (Some(s), Some(d)) if same(s, d)))
+                .then_some(part);
             if d <= tol && best.is_none_or(|x| d < x.0) {
                 best = Some((d, id, row, part));
             }

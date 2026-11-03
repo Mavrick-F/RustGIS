@@ -47,8 +47,9 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   original row keeps the largest piece, together with any parts of a multipart polygon that the
   line missed; every other piece becomes a feature of its own, and the pieces end up selected.
   Holes the line misses stay in the piece around them. A line that stops inside a polygon cuts
-  nothing there; a line end within a centimetre of an edge counts as on it. A notice says how
-  many selected features the line didn't cut (`missed` in the result).
+  nothing there; a line end within a centimetre of an edge counts as on it. When the cut
+  succeeds, a notice says how many selected features the line didn't cut (`missed` in the
+  result). A line that cuts none of them gives an error instead.
   `edit.cutPolygon={"line": {"type": "LineString", "coordinates": [[0.3, -1], [0.3, 2]]}}`.
 - **Reshape** (Edit › Tools, or the Editing pane): select one line or polygon, then draw a line
   that leaves its edge and comes back to it. For a polygon, the stretch of boundary between the
