@@ -78,6 +78,7 @@ fn a_cut_that_misses_or_bad_lines_change_nothing() {
         json!({"line": line(&[[0.5, -1.], [0.5, 0.5]])}),
         json!({"line": {"type": "Point", "coordinates": [0, 0]}}),
         json!({"line": line(&[[0.5, -1.]])}),
+        json!({"line": line(&[[500., -1.], [500., 2.]])}),
         json!({}),
     ] {
         assert!(s.run("edit.cutPolygon", &p).is_err(), "{p}");

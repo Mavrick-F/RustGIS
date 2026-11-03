@@ -280,7 +280,8 @@ pub struct MapView {
     /// A sketch vertex clicked on an edge follows that edge from the previous vertex (Trace);
     /// session only.
     pub trace_edges: bool,
-    /// The sketch reached the drawn-line limit and a notice said so: once per sketch.
+    /// A notice said the sketch reached the drawn-line limit (a trace refused, or a full sketch):
+    /// once per sketch.
     sketch_full_said: bool,
     /// The magnifying lens follows the pointer.
     pub magnifier: bool,
@@ -2647,7 +2648,11 @@ fn add_vertex(app: &mut RustGisApp, tool: Tool, c: Coord) {
             app.map.sketch.extend(path);
         }
         Some(_) => {
-            app.session.notify(tl!("Not traced: a drawn line holds at most 10,000 points"), false);
+            // Said once per sketch, like a full sketch.
+            if !app.map.sketch_full_said {
+                app.map.sketch_full_said = true;
+                app.session.notify(tl!("Not traced: a drawn line holds at most 10,000 points"), false);
+            }
             app.map.sketch.push(c);
         }
         None => app.map.sketch.push(c),
@@ -4853,13 +4858,16 @@ mod tests {
         add_vertex(&mut app, Tool::CutPolygon, Coord::new(1.0, 0.5));
         assert_eq!(app.map.sketch.len(), limit);
         assert_eq!(app.session.notices_since(mark).len(), 1);
-        // Full: nothing more is added.
+        // Full: nothing more is added, and the limit was already said for this sketch.
         add_vertex(&mut app, Tool::CutPolygon, Coord::new(0.2, 0.2));
-        assert_eq!(app.map.sketch.len(), limit);
-        assert_eq!(app.session.notices_since(mark).len(), 2);
-        // Reshape shares the limit; the full sketch was already said, so no second notice.
+        assert_eq!((app.map.sketch.len(), app.session.notices_since(mark).len()), (limit, 1));
+        // A new sketch that fills up says so once, for Reshape too.
+        app.map.cancel_sketch();
+        app.map.sketch = start(limit);
+        let mark = app.session.notice_mark();
         add_vertex(&mut app, Tool::Reshape, Coord::new(0.2, 0.2));
-        assert_eq!((app.map.sketch.len(), app.session.notices_since(mark).len()), (limit, 2));
+        add_vertex(&mut app, Tool::Reshape, Coord::new(0.3, 0.3));
+        assert_eq!((app.map.sketch.len(), app.session.notices_since(mark).len()), (limit, 1));
         // Drawing a new feature doesn't have the limit.
         add_vertex(&mut app, Tool::CreateLine, Coord::new(0.2, 0.2));
         assert_eq!(app.map.sketch.len(), limit + 1);

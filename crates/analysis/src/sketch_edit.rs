@@ -343,7 +343,13 @@ fn cut_part(rings: &[Vec<Coord>], line: &[Pt], work: &mut usize) -> Result<Optio
             }
         }
     }
-    // Only the cut's stretches inside the polygon divide it.
+    // Only the cut's stretches inside the polygon divide it. Each test walks every ring twice
+    // (inside, on the boundary): that counts against the budget too.
+    let ring_segments: usize = rs.iter().map(Vec::len).sum();
+    *work = work.saturating_add(edges.iter().filter(|e| !e.ring).count().saturating_mul(ring_segments).saturating_mul(2));
+    if *work > MAX_WORK {
+        return Err(TOO_MUCH.into());
+    }
     edges.retain(|e| {
         if e.ring {
             return true;
@@ -679,7 +685,11 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Reshaped, String> {
                     // The other parts of a multipart feature: a reshape mustn't push into one it
                     // didn't overlap before (a square metre counts, as in the overlap check).
                     if let (Some(new), Some(old)) = (geo_polygon(&part), parts.get(pi).and_then(|p| geo_polygon(p))) {
-                        for sib in parts.iter().enumerate().filter(|(j, _)| *j != pi).filter_map(|(_, p)| geo_polygon(p)) {
+                        // An invalid sibling is left out: its overlap can't be measured reliably,
+                        // and an already broken feature shouldn't block the edit.
+                        for sib in
+                            parts.iter().enumerate().filter(|(j, _)| *j != pi).filter_map(|(_, p)| geo_polygon(p)).filter(|p| p.is_valid())
+                        {
                             if shared_area(&new, &sib) > 1.0 && shared_area(&old, &sib) <= 1.0 {
                                 return Err("reshaping there would overlap another part of the same feature".into());
                             }

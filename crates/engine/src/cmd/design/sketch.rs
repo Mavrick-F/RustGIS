@@ -21,7 +21,9 @@ fn line(p: &Value) -> Result<Vec<Coord>, String> {
             if l.len() < 2 || l.len() > MAX_LINE {
                 return Err("the line needs 2 to 10,000 points (trace a shorter stretch of a detailed edge)".into());
             }
-            if l.iter().any(|c| !c.is_finite() || c.y.abs() > 90.0) {
+            // Longitudes as far as ±360°, as `edit.vertex` takes (a feature unwrapped across
+            // the antimeridian).
+            if l.iter().any(|c| !c.is_finite() || c.x.abs() > 360.0 || c.y.abs() > 90.0) {
                 return Err("the line's points are [lon, lat] in degrees".into());
             }
             Ok(l)
@@ -35,7 +37,7 @@ fn point(p: &Value, key: &str) -> Result<Coord, String> {
     p.get(key)
         .and_then(Value::as_array)
         .and_then(|a| Some(Coord::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?)))
-        .filter(|c| c.is_finite() && c.y.abs() <= 90.0)
+        .filter(|c| c.is_finite() && c.x.abs() <= 360.0 && c.y.abs() <= 90.0)
         .ok_or_else(|| format!("{key} is [lon, lat]"))
 }
 
@@ -153,9 +155,12 @@ pub(super) fn trace(s: &mut Session, p: &Value) -> CmdResult {
 /// ordinary vertex rather than a failed command.
 pub fn trace_between(s: &mut Session, from: Coord, to: Coord) -> Option<Vec<Coord>> {
     let px = s.map().editing.snapping.tolerance_px;
+    // A feature the projection split at its edge: its parts on the map aren't the source's, so
+    // the ring under the clicks can't be named. Not traced; the click is an ordinary vertex.
     let (id, row, part) = nearest_edge(s, from, to, px, None)?;
+    let part = part?;
     let g = s.map().layer(id)?.dataset.features.get(row)?.geometry.as_ref()?;
-    sketch_edit::trace(g, from, to, part).map(|t| t.path)
+    sketch_edit::trace(g, from, to, Some(part)).map(|t| t.path)
 }
 
 /// The drawn line or polygon feature with a ring or part passing nearest both points, each within
