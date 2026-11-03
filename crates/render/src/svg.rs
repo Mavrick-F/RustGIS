@@ -16,13 +16,15 @@ use rustgis_map::layout::{ElementKind, FontFamily, Layout, LineHead, PT_PER_MM, 
 
 use crate::layout::{MAX_PIXELS, PageInfo, expand, page_geometry, record_element, render_element};
 
-/// Writes `layout` as an SVG document, pictures drawn at `dpi`, and the names of the frames drawn
-/// as pictures because their vectors would pass the budget; `None` when the page can't be drawn.
-pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<(String, Vec<String>)> {
+/// Writes `layout` as an SVG document, pictures drawn at `dpi`, and the elements (id and name)
+/// drawn as pictures because their vectors would pass the budget; `None` when the page can't be drawn.
+pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<(String, Vec<(u32, String)>)> {
     let mut defs = vectors::Defs::default();
     let mut pictured = Vec::new();
-    let body = elements(layout, maps, dpi, info, &mut defs, &mut pictured)?;
+    let mut body = elements(layout, maps, dpi, info, &mut defs, &mut pictured)?;
     let (pw, ph) = (layout.width, layout.height);
+    // The head (with the defs the body refers to) goes in front of the body in place: a large
+    // export's pictures are never held twice.
     let mut s = String::new();
     let _ = write!(
         s,
@@ -41,9 +43,9 @@ pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) 
         let _ = write!(s, "<defs>\n{}</defs>\n", defs.text);
     }
     let _ = writeln!(s, r##"<rect width="{}" height="{}" fill="#ffffff"/>"##, num(pw), num(ph));
-    s.push_str(&body);
-    s.push_str("</svg>\n");
-    Some((s, pictured))
+    body.insert_str(0, &s);
+    body.push_str("</svg>\n");
+    Some((body, pictured))
 }
 
 /// Each visible element of `layout` as an SVG group (see the module), what they refer to added to
@@ -54,11 +56,13 @@ fn elements(
     dpi: f64,
     info: &PageInfo,
     defs: &mut vectors::Defs,
-    pictured: &mut Vec<String>,
+    pictured: &mut Vec<(u32, String)>,
 ) -> Option<String> {
     let ppp = page_geometry(layout, dpi).2 / PT_PER_MM;
-    let picture_dpi = picture_dpi(layout, dpi);
     let mut s = String::new();
+    // The elements drawn as pictures (past the budget): their places, filled in at the end at
+    // the resolution they share.
+    let mut as_pictures: Vec<u32> = Vec::new();
     // What the elements kept as vectors come to: held to one page's budget, as a PDF page is.
     let mut written = 0usize;
     for e in layout.elements.iter().filter(|e| e.visible) {
@@ -158,47 +162,65 @@ fn elements(
                         let _ =
                             writeln!(s, r#"<g transform="translate({} {}) scale({})">"#, num(ix), num(iy), vectors::fine((1.0 / k) as f32));
                         let (_, _, items) = drawing.finish();
-                        vectors::items(&mut s, defs, &items);
+                        vectors::items(&mut s, defs, &items)?;
                         s.push_str("</g>\n");
                         s.push_str("</g>\n");
                         continue;
                     }
-                    pictured.push(e.name.clone());
+                    pictured.push((e.id, e.name.clone()));
                 }
-                if let Some((image, [ix, iy, iw, ih])) = render_element(layout, e.id, maps, picture_dpi, info)? {
-                    let png = image.encode_png().ok()?;
-                    let _ = writeln!(
-                        s,
-                        r#"<image x="{}" y="{}" width="{}" height="{}" preserveAspectRatio="none" xlink:href="data:image/png;base64,{}"/>"#,
-                        num(ix),
-                        num(iy),
-                        num(iw),
-                        num(ih),
-                        base64::engine::general_purpose::STANDARD.encode(png)
-                    );
-                }
+                s.push_str(&picture_place(e.id));
+                as_pictures.push(e.id);
             }
         }
         s.push_str("</g>\n");
     }
+    // The pictures, at the resolution only they share (the elements kept as vectors take none).
+    let picture_dpi = picture_dpi(layout, dpi, |e| as_pictures.contains(&e.id));
+    for id in as_pictures {
+        let mut image_tag = String::new();
+        if let Some((image, [ix, iy, iw, ih])) = render_element(layout, id, maps, picture_dpi, info)? {
+            let png = image.encode_png().ok()?;
+            let _ = writeln!(
+                image_tag,
+                r#"<image x="{}" y="{}" width="{}" height="{}" preserveAspectRatio="none" xlink:href="data:image/png;base64,{}"/>"#,
+                num(ix),
+                num(iy),
+                num(iw),
+                num(ih),
+                base64::engine::general_purpose::STANDARD.encode(png)
+            );
+        }
+        let place = picture_place(id);
+        if let Some(at) = s.find(&place) {
+            s.replace_range(at..at + place.len(), &image_tag);
+        }
+    }
     Some(s)
 }
 
-/// The resolution the pictures are drawn at: `dpi`, unless together they would take more than
-/// twice the pixels of the page (surrounds usually sit on a map frame), in which case all of them
-/// are drawn at the resolution that fits, so many large frames don't grow the SVG without bound.
-fn picture_dpi(layout: &Layout, dpi: f64) -> f64 {
+/// Where element `id`'s picture goes until it is drawn: a mark no SVG text holds (text is
+/// escaped, which drops control characters).
+fn picture_place(id: u32) -> String {
+    format!("\u{0}picture-{id}\u{0}")
+}
+
+/// Whether an element is drawn as an SVG element of its own (text and shapes), not recorded.
+#[cfg(test)]
+fn written_as_svg(e: &rustgis_map::layout::Element) -> bool {
+    matches!(e.kind, ElementKind::Text { .. } | ElementKind::Rectangle { .. } | ElementKind::Ellipse { .. } | ElementKind::Line { .. })
+}
+
+/// The resolution the pictures of the elements `drawn` (as pictures) are drawn at: `dpi`, unless
+/// together they would take more than twice the pixels of the page (surrounds usually sit on a map
+/// frame), in which case all of them are drawn at the resolution that fits, so many large frames
+/// don't grow the SVG without bound.
+fn picture_dpi(layout: &Layout, dpi: f64, drawn: impl Fn(&rustgis_map::layout::Element) -> bool) -> f64 {
     let on_page = |start: f64, len: f64, page: f64| ((start + len).min(page) - start.max(0.0)).max(0.0);
     let area: f64 = layout
         .elements
         .iter()
-        .filter(|e| e.visible)
-        .filter(|e| {
-            !matches!(
-                e.kind,
-                ElementKind::Text { .. } | ElementKind::Rectangle { .. } | ElementKind::Ellipse { .. } | ElementKind::Line { .. }
-            )
-        })
+        .filter(|e| e.visible && drawn(e))
         .map(|e| on_page(e.x, e.w, layout.width) * on_page(e.y, e.h, layout.height))
         .sum();
     let k = page_geometry(layout, dpi).2;
@@ -320,16 +342,16 @@ mod tests {
             (10.0, 10.0, 40.0, 30.0),
             ElementKind::Legend { frame, title: "Map legend".into(), all_classes: true, hide_other: false, exclude: vec![] },
         );
-        assert_eq!(picture_dpi(&layout, 600.0), 600.0);
+        assert_eq!(picture_dpi(&layout, 600.0, |e| !written_as_svg(e)), 600.0);
         // A frame and an inset filling an A0 page that is already drawn at its pixel limit.
         let layout = stacked_frames(2);
-        assert_eq!(picture_dpi(&layout, 600.0), 600.0);
+        assert_eq!(picture_dpi(&layout, 600.0, |e| !written_as_svg(e)), 600.0);
     }
 
     #[test]
     fn stacked_frames_share_the_picture_budget() {
         let layout = stacked_frames(8);
-        let dpi = picture_dpi(&layout, 600.0);
+        let dpi = picture_dpi(&layout, 600.0, |e| !written_as_svg(e));
         assert!(dpi < 600.0);
         let k = page_geometry(&layout, dpi).2;
         let pixels = 8.0 * 841.0 * 1189.0 * k * k;
@@ -340,7 +362,7 @@ mod tests {
         for e in layout.elements.iter_mut().skip(1) {
             e.x = 900.0;
         }
-        assert_eq!(picture_dpi(&layout, 600.0), 600.0);
+        assert_eq!(picture_dpi(&layout, 600.0, |e| !written_as_svg(e)), 600.0);
     }
 
     #[test]
@@ -394,7 +416,7 @@ mod tests {
         let result = layout_svg(&layout, &mut maps, 72.0, &PageInfo::default());
         TEST_MAX_COST.with(|l| l.set(None));
         let (svg, pictured) = result.unwrap();
-        assert_eq!(pictured, ["Map"]);
+        assert_eq!(pictured, [(frame, "Map".to_string())]);
         let group = svg.split(&format!("<g id=\"element-{frame}\"")).nth(1).unwrap();
         assert!(group.contains("data:image/png;base64,"), "the frame as a picture");
     }

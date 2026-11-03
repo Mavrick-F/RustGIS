@@ -30,8 +30,9 @@ impl Defs {
     }
 }
 
-/// Writes `items` into `out`, in the drawing's own space (the caller's group places it).
-pub(super) fn items(out: &mut String, defs: &mut Defs, items: &[Item]) {
+/// Writes `items` into `out`, in the drawing's own space (the caller's group places it); `None`
+/// if a picture among them can't be written (an unusable result, not a gap left in the page).
+pub(super) fn items(out: &mut String, defs: &mut Defs, items: &[Item]) -> Option<()> {
     let mut rest = items.iter().peekable();
     while let Some(item) = rest.next() {
         // An opaque fill then an opaque stroke of the same path: one element, filled and stroked.
@@ -59,10 +60,11 @@ pub(super) fn items(out: &mut String, defs: &mut Defs, items: &[Item]) {
                 path_element(out, path, &format!(r#" fill="none"{}{}"#, stroke_attrs(*color, stroke), transform_attr(*transform)));
             }
             Item::Glyphs(run) => glyphs(out, defs, run),
-            Item::Image(image) => picture(out, image),
-            Item::Group(g) => group(out, defs, g),
+            Item::Image(image) => picture(out, image)?,
+            Item::Group(g) => group(out, defs, g)?,
         }
     }
+    Some(())
 }
 
 /// Writes a `<path>` of `path` with `attrs` (its paint and transform).
@@ -251,9 +253,10 @@ fn outline_data(font: &ab_glyph::FontRef<'static>, id: ab_glyph::GlyphId) -> Opt
     (!d.is_empty()).then_some(d)
 }
 
-/// A picture, as PNG, stretched over its pixels where it lies.
-fn picture(out: &mut String, image: &Image) {
-    let Some(png) = image.pixmap().and_then(|pm| pm.encode_png().ok()) else { return };
+/// A picture, as PNG, stretched over its pixels where it lies; `None` if it can't be read back or
+/// encoded.
+fn picture(out: &mut String, image: &Image) -> Option<()> {
+    let png = image.pixmap()?.encode_png().ok()?;
     let _ = writeln!(
         out,
         r#"<image width="{}" height="{}" preserveAspectRatio="none"{}{}{} xlink:href="data:image/png;base64,{}"/>"#,
@@ -264,11 +267,12 @@ fn picture(out: &mut String, image: &Image) {
         transform_attr(image.transform),
         base64::engine::general_purpose::STANDARD.encode(png)
     );
+    Some(())
 }
 
 /// A group: inside its clip (in the outer space), moved by its transform, composited with its
-/// opacity and blend mode as one isolated layer.
-fn group(out: &mut String, defs: &mut Defs, g: &Group) {
+/// opacity and blend mode as one isolated layer; `None` as [`items`] gives it.
+fn group(out: &mut String, defs: &mut Defs, g: &Group) -> Option<()> {
     let mut open = 0;
     if let Some(clip) = &g.clip {
         let id = defs.id("clip");
@@ -294,11 +298,12 @@ fn group(out: &mut String, defs: &mut Defs, g: &Group) {
         attrs.push_str(r#" style="isolation:isolate""#);
     }
     let _ = writeln!(out, "<g{attrs}>");
-    items(out, defs, &g.items);
+    items(out, defs, &g.items)?;
     out.push_str("</g>\n");
     for _ in 0..open {
         out.push_str("</g>\n");
     }
+    Some(())
 }
 
 /// The CSS `mix-blend-mode` of a blend mode.
@@ -378,7 +383,7 @@ mod tests {
         let (_, _, list) = d.finish();
         let mut defs = Defs::default();
         let mut svg = String::new();
-        items(&mut svg, &mut defs, &list);
+        items(&mut svg, &mut defs, &list).unwrap();
         assert!(svg.starts_with(r##"<path d="M0 10L20 10L20 30L0 30Z" fill="#c80000" fill-rule="evenodd" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"##), "{svg}");
         assert!(
             svg.contains(r#"fill="url(#gradient1)""#)
@@ -402,5 +407,19 @@ mod tests {
             "{svg}"
         );
         assert!(defs.text.contains(r#"<clipPath id="clip2" clipPathUnits="userSpaceOnUse"><path d="M100 10"#));
+    }
+
+    #[test]
+    fn a_picture_that_cant_be_read_back_fails_the_writing() {
+        let mut d = Drawing::new(10.0, 10.0);
+        let mut pic = tiny_skia::Pixmap::new(2, 2).unwrap();
+        pic.fill(Color::BLACK);
+        d.image(pic.as_ref(), Transform::identity(), 1.0, true);
+        let (_, _, mut list) = d.finish();
+        if let Some(Item::Image(image)) = list.first_mut() {
+            image.rgb_z = vec![1, 2, 3];
+        }
+        // An unusable result is an error, not a page with a gap in it.
+        assert!(items(&mut String::new(), &mut Defs::default(), &list).is_none());
     }
 }

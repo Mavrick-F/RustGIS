@@ -3246,7 +3246,7 @@ pub fn layout_bytes(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool) 
 /// Says which layout elements, map frames and surrounds (by name), and pages (by number) an export
 /// draws as pictures because their
 /// vectors would pass the size a page's content may come to: one notice for each, with a count.
-pub(crate) fn pictured_notices(s: &mut Session, frames: &[String], pages: &[usize]) {
+pub(crate) fn pictured_notices(s: &mut Session, frames: &[(u32, String)], pages: &[usize]) {
     let mb = rustgis_render::vector::MAX_COST >> 20;
     // The first of a list, and how many more there are.
     let listed = |items: Vec<String>, most: usize| {
@@ -3257,9 +3257,12 @@ pub(crate) fn pictured_notices(s: &mut Session, frames: &[String], pages: &[usiz
         }
         text
     };
-    let mut names: Vec<String> = frames.to_vec();
-    names.sort_unstable();
-    names.dedup();
+    // Each element once (a frame on every page of a series is one frame), by its id and name: two
+    // elements sharing a name are two.
+    let mut elements: Vec<(u32, String)> = frames.to_vec();
+    elements.sort_unstable();
+    elements.dedup();
+    let names: Vec<String> = elements.into_iter().map(|(_, name)| name).collect();
     if !names.is_empty() {
         let n = names.len();
         s.warn(format!(

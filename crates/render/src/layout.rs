@@ -61,10 +61,15 @@ pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> O
 /// [`render`] kept as vectors (for a vector PDF): text, shapes, surrounds and flat, north-up map
 /// frames as paths and glyphs, what is pixels by nature (rasters, tiles, pictures, a tilted or
 /// globe frame) as pictures drawn at `dpi`, in the drawing's pixels at that resolution. With it,
-/// the names of the frames drawn as pictures because their vectors passed
+/// the frames (id and name) drawn as pictures because their vectors passed
 /// [`crate::vector::MAX_COST`]. A drawing that overflowed all the same (its surrounds) is
 /// incomplete: [`crate::vector::Drawing::overflowed`] says so.
-pub fn render_drawing(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<(crate::vector::Drawing, Vec<String>)> {
+pub fn render_drawing(
+    layout: &Layout,
+    maps: &mut [Map],
+    dpi: f64,
+    info: &PageInfo,
+) -> Option<(crate::vector::Drawing, Vec<(u32, String)>)> {
     let (w, h, k) = page_geometry(layout, dpi);
     let bounds = tiny_skia::IntRect::from_xywh(0, 0, w, h)?;
     let mut pictured = Vec::new();
@@ -98,7 +103,7 @@ pub(crate) fn record_element(
     maps: &mut [Map],
     dpi: f64,
     info: &PageInfo,
-    pictured: &mut Vec<String>,
+    pictured: &mut Vec<(u32, String)>,
 ) -> Option<Option<(crate::vector::Drawing, [f64; 4], f64)>> {
     let Some((bounds, k, mm)) = element_bounds(layout, id, dpi)? else { return Some(None) };
     let drawing = draw_page(layout, maps, info, k, bounds, Some(id), Some(pictured))?.into_drawing()?;
@@ -128,7 +133,7 @@ fn draw_page(
     k: f64,
     bounds: tiny_skia::IntRect,
     element: Option<u32>,
-    mut record: Option<&mut Vec<String>>,
+    mut record: Option<&mut Vec<(u32, String)>>,
 ) -> Option<Canvas> {
     let ppp = k / PT_PER_MM;
     let mut pm =
@@ -199,7 +204,7 @@ fn draw_page(
                 {
                     frame_pm = pixels;
                     if let Some(list) = record.as_deref_mut() {
-                        list.push(e.name.clone());
+                        list.push((e.id, e.name.clone()));
                     }
                 }
                 if let Some(g) = grid {
@@ -2007,7 +2012,7 @@ mod tests {
         let result = render_drawing(&layout, &mut maps, 72.0, &PageInfo::default());
         TEST_MAX_COST.with(|l| l.set(None));
         let (drawing, pictured) = result.unwrap();
-        assert_eq!(pictured, ["World"]);
+        assert_eq!(pictured.iter().map(|p| p.1.as_str()).collect::<Vec<_>>(), ["World"]);
         let (_, _, items) = drawing.finish();
         assert!(items.iter().any(|i| matches!(i, Item::Image(_))), "the frame as a picture");
     }

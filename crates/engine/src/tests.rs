@@ -24671,12 +24671,17 @@ fn a_pdf_says_which_frames_and_pages_it_draws_as_pictures() {
     let mark = s.notice_mark();
     crate::cmd::layout::pictured_notices(&mut s, &[], &[]);
     assert!(s.notices_since(mark).is_empty(), "nothing drawn as a picture, nothing said");
-    let frames = ["Inset".to_string(), "Main".to_string(), "Main".to_string()];
+    // "Main" pictured on two pages is one element; another element named "Main" is a second.
+    let frames = [(3, "Inset".to_string()), (1, "Main".to_string()), (1, "Main".to_string()), (7, "Main".to_string())];
     crate::cmd::layout::pictured_notices(&mut s, &frames, &[2, 5]);
     let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
     assert_eq!(said.len(), 2, "one notice for each kind: {said:?}");
     // Each frame once, however many pages it was pictured on.
-    assert!(said[0].starts_with("The export draws 2 layout elements as pictures") && said[0].ends_with("(Inset, Main)"), "{}", said[0]);
+    assert!(
+        said[0].starts_with("The export draws 3 layout elements as pictures") && said[0].ends_with("(Main, Inset, Main)"),
+        "{}",
+        said[0]
+    );
     assert!(said[1].starts_with("The export draws 2 pages as pictures") && said[1].ends_with("(page 2, 5)"), "{}", said[1]);
     let mark = s.notice_mark();
     crate::cmd::layout::pictured_notices(&mut s, &[], &(1..=25).collect::<Vec<_>>());
