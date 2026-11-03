@@ -226,7 +226,8 @@ fn with_article(kind: &str) -> String {
 }
 
 /// Drops feature or attribute table `table`, its spatial indexes, and its rows in the GeoPackage
-/// tables that describe it (the optional ones where the file has them).
+/// tables that describe it (the optional ones where the file has them). A table named as its
+/// spatial index that isn't an R-tree is left, and the new table's index then refused.
 fn drop_table(conn: &Connection, table: &str) -> Result<()> {
     let has = |t: &str| object(conn, t).map(|k| k.as_deref() == Some("table"));
     let mut sql = String::new();
@@ -234,7 +235,18 @@ fn drop_table(conn: &Connection, table: &str) -> Result<()> {
         let mut st = conn.prepare("SELECT column_name FROM gpkg_geometry_columns WHERE lower(table_name) = lower(?1)").map_err(err)?;
         let columns = st.query_map([table], |r| r.get::<_, String>(0)).map_err(err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(err)?;
         for c in columns {
-            sql.push_str(&format!("DROP TABLE IF EXISTS {};", quote(&format!("rtree_{table}_{c}"))));
+            let index = format!("rtree_{table}_{c}");
+            let rtree: bool = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?1)
+                        AND lower(sql) LIKE 'create virtual table%using rtree%')",
+                    [&index],
+                    |r| r.get(0),
+                )
+                .map_err(err)?;
+            if rtree {
+                sql.push_str(&format!("DROP TABLE {};", quote(&index)));
+            }
         }
     }
     sql.push_str(&format!("DROP TABLE {};", quote(table)));

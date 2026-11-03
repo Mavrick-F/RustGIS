@@ -2282,15 +2282,17 @@ fn geopackage_export_adds_and_replaces_tables_and_keeps_the_others() {
 
     // A name taken (whatever its case) is refused unless replacing, and the file is unchanged.
     let before = std::fs::read(&path).unwrap();
+    let mut before_index = before.clone();
     for name in [None, Some("PERMITS"), Some("owners_idx")] {
         if name == Some("owners_idx") {
             assert_eq!(std::fs::read(&path).unwrap(), before, "the refusals changed nothing");
             rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE INDEX owners_idx ON owners (name)").unwrap();
+            before_index = std::fs::read(&path).unwrap();
         }
         let e = write_path_to(&permits, &path, Crs::LonLat, &to(GpkgMode::AddTable, name)).unwrap_err().to_string();
         assert!(e.contains("already has"), "{name:?}: {e}");
     }
-    let before_index = std::fs::read(&path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before_index, "the index refusal changed nothing");
     assert_ne!(before, before_index, "the index was added");
 
     // Replacing: fewer features, in another system, and its old spatial index gone. A view on the
@@ -2383,6 +2385,20 @@ fn geopackage_export_into_a_file_refuses_what_it_cannot_replace() {
         .unwrap();
     let e = write_path_to(&ds, &path, Crs::LonLat, &replace("permits")).unwrap_err().to_string();
     assert!(e.contains("related-tables relation"), "{e}");
+    // An ordinary table named as the spatial index is kept, and the replace refused.
+    let squatted = workspace.path().join("squatted.gpkg");
+    write_path_to(&ds, &squatted, Crs::LonLat, &GpkgTable { mode: GpkgMode::AddTable, name: Some("sites".into()) }).unwrap();
+    rusqlite::Connection::open(&squatted)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE rtree_sites_geom; CREATE TABLE rtree_sites_geom (note TEXT); INSERT INTO rtree_sites_geom VALUES ('keep');",
+        )
+        .unwrap();
+    let e = write_path_to(&ds, &squatted, Crs::LonLat, &replace("sites")).unwrap_err().to_string();
+    assert!(e.contains("rtree_sites_geom"), "{e}");
+    let kept: String =
+        rusqlite::Connection::open(&squatted).unwrap().query_row("SELECT note FROM rtree_sites_geom", [], |r| r.get(0)).unwrap();
+    assert_eq!(kept, "keep");
     let other = workspace.path().join("other.gpkg");
     std::fs::copy(&path, &other).unwrap();
     rusqlite::Connection::open(&other).unwrap().execute_batch("PRAGMA application_id = 1297105496").unwrap();

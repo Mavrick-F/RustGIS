@@ -30,7 +30,9 @@ adding (with no file there, adding makes a new GeoPackage). Replacing needs a fe
 attribute table of that name, so a misspelt name changes nothing; tiles, views and other tables
 are never replaced, nor is a table in a related-tables relation. A replaced table's own indexes,
 triggers and column descriptions go with it, and the export names any views or triggers elsewhere
-that use it. The GeoPackage's own triggers don't run while the export writes.
+that use it. The GeoPackage's own triggers don't run while the export writes. A layer read in
+place from the GeoPackage it is exported into is read whole first, rather than a chunk at a
+time, as SQLite can't read and write one file in the same export.
 From the command line, `share.exportLayer` and `share.exportTable` take `"mode": "addTable"` or
 `"replaceTable"` and an optional `"tableName"` (default: the layer's or table's name):
 

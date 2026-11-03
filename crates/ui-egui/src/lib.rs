@@ -4526,8 +4526,9 @@ mod download_service_tests {
         app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "addTable", "tableName": "borders"})).unwrap();
         assert_eq!(rustgis_engine::data::source::layers(&path).unwrap(), ["Cities", "borders"]);
         // Cancelling the pick writes nothing.
+        let before = std::fs::read(&path).unwrap();
         app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "replaceTable", "tableName": "Cities"})).unwrap();
-        assert_eq!(rustgis_engine::data::source::layers(&path).unwrap(), ["Cities", "borders"]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
