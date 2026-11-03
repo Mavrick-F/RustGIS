@@ -112,6 +112,16 @@ fn a_refused_cut_of_one_selected_parcel_cuts_none_of_them() {
     assert!(notices[0].text.contains("Cut Polygon left 1 selected feature(s)"), "{notices:?}");
 }
 
+/// A parcel unwrapped past the antimeridian (longitudes past 180°, within the ±360° taken) cuts.
+#[test]
+fn cut_polygon_accepts_longitudes_past_180() {
+    let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(265., 0., 275., 1.)]);
+    s.run("select.rows", &json!({"layer": id, "rows": [0]})).unwrap();
+    let r = s.run("edit.cutPolygon", &json!({"line": line(&[[270., -1.], [270., 2.]])})).unwrap();
+    assert_eq!(r, json!({"cut": 1, "pieces": 2, "missed": 0}));
+    assert_eq!(features(&s, id).len(), 2);
+}
+
 #[test]
 fn reshape_moves_a_boundary_and_needs_one_feature() {
     let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(0., 0., 1., 1.), rectangle(2., 0., 3., 1.)]);

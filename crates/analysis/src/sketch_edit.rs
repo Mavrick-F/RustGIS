@@ -48,9 +48,15 @@ fn dist(a: Coord, b: Coord) -> f64 {
 }
 
 /// The input as metres, refusing coordinates that don't project (a pole, NaN).
+/// Longitudes beyond ±360° (as `edit.vertex` takes, for features unwrapped across the
+/// antimeridian) aren't coordinates on the Earth.
 fn project(path: &[Coord]) -> Result<Vec<Pt>, String> {
     let pts: Vec<Pt> = path.iter().map(|c| Pt::of(*c)).collect();
-    if pts.iter().all(|p| p.m.is_finite()) { Ok(pts) } else { Err("the shape has coordinates that can't be drawn on the map".into()) }
+    if pts.iter().all(|p| p.m.is_finite() && p.ll.x.abs() <= 360.0) {
+        Ok(pts)
+    } else {
+        Err("the shape has coordinates that can't be drawn on the map".into())
+    }
 }
 
 /// Twice the signed area of a ring in metres (positive anticlockwise).
@@ -709,7 +715,9 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Reshaped, String> {
             let found: Vec<(usize, Vec<Pt>, Vec<(f64, f64, Coord)>)> = parts
                 .iter()
                 .enumerate()
-                .filter_map(|(i, p)| project(p).ok().map(|r| (i, r.clone(), crossings(&line, &r))))
+                .map(|(i, p)| project(p).map(|r| (i, r.clone(), crossings(&line, &r))))
+                .collect::<Result<Vec<_>, String>>()?
+                .into_iter()
                 .filter(|(_, _, h)| !h.is_empty())
                 .collect();
             let pick = found.iter().find(|f| f.2.len() >= 2).or(found.first());
@@ -796,15 +804,14 @@ fn nearest(path: &[Pt], c: Coord) -> Option<(f64, f64, Coord)> {
 /// way.
 /// `part`, when given, is the line part or polygon ring to follow (polygons' rings numbered in
 /// order, holes after their outer ring), as already chosen on the map.
-pub fn trace(g: &Geometry, from: Coord, to: Coord, part: Option<usize>) -> Option<Traced> {
+pub fn trace(g: &Geometry, from: Coord, to: Coord, part: Option<usize>) -> Result<Traced, String> {
     let (f, t) = (lonlat_to_merc(from), lonlat_to_merc(to));
     let closed = matches!(g, Geometry::Polygon(_));
     if !matches!(g, Geometry::Line(_) | Geometry::Polygon(_)) {
-        return None;
+        return Err("only lines and polygons can be traced".into());
     }
     // The part or ring passing nearest both points, or the one given.
-    let (path, (rf, df, mf), (rt, dt, mt)) = paths_of(g)
-        .ok()?
+    let (path, (rf, df, mf), (rt, dt, mt)) = paths_of(g)?
         .into_iter()
         .enumerate()
         .filter(|(i, _)| part.is_none_or(|k| k == *i))
@@ -812,7 +819,8 @@ pub fn trace(g: &Geometry, from: Coord, to: Coord, part: Option<usize>) -> Optio
             let (a, b) = (nearest(&p, f)?, nearest(&p, t)?);
             Some((p, a, b))
         })
-        .min_by(|x, y| x.1.1.max(x.2.1).total_cmp(&y.1.1.max(y.2.1)))?;
+        .min_by(|x, y| x.1.1.max(x.2.1).total_cmp(&y.1.1.max(y.2.1)))
+        .ok_or("the feature has no edge to trace")?;
     // An end on a vertex is that vertex; one already on the edge (a snapped point) stays as given.
     let end = |r: f64, d: f64, m: Coord, asked: Coord| match vertex_at(&path, r, m) {
         Some(v) => v,
@@ -827,7 +835,7 @@ pub fn trace(g: &Geometry, from: Coord, to: Coord, part: Option<usize>) -> Optio
     } else {
         walk(between(&path, rf, rt))
     };
-    Some(Traced { path: pts.into_iter().map(|p| p.ll).collect(), from_m: df, to_m: dt })
+    Ok(Traced { path: pts.into_iter().map(|p| p.ll).collect(), from_m: df, to_m: dt })
 }
 
 #[cfg(test)]
@@ -971,6 +979,15 @@ mod tests {
             let _ = cut_polygon(&g, &[c(lon, -1.0), c(lon, 2.0)], &mut 0);
             let _ = reshape(&g, &[c(lon, -1.0), c(lon, 2.0)]);
         }
+    }
+
+    #[test]
+    fn a_ring_far_off_the_earth_is_refused_quickly() {
+        // 50,000 vertices at one latitude and an absurd longitude: refused before any grid work.
+        let ring: Vec<Coord> = (0..50_000).map(|i| c(1e11 + i as f64, 10.0)).chain(std::iter::once(c(1e11, 10.0))).collect();
+        let g = Geometry::Polygon(vec![vec![ring]]);
+        assert!(cut_polygon(&g, &[c(0.0, 0.0), c(1.0, 1.0)], &mut 0).is_err());
+        assert!(reshape(&g, &[c(0.0, 0.0), c(1.0, 1.0)]).is_err());
     }
 
     #[test]

@@ -144,7 +144,7 @@ pub(super) fn trace(s: &mut Session, p: &Value) -> CmdResult {
         .geometry
         .as_ref()
         .ok_or("the feature has no shape")?;
-    let t = sketch_edit::trace(g, from, to, part).ok_or("only lines and polygons can be traced")?;
+    let t = sketch_edit::trace(g, from, to, part)?;
     let path: Vec<[f64; 2]> = t.path.iter().map(|c| [c.x, c.y]).collect();
     // How far each point was moved onto the edge, so a far-off point isn't taken silently.
     Ok(json!({"layer": id, "row": row, "path": path, "fromOffM": t.from_m, "toOffM": t.to_m}))
@@ -160,7 +160,7 @@ pub fn trace_between(s: &mut Session, from: Coord, to: Coord) -> Option<Vec<Coor
     let (id, row, part) = nearest_edge(s, from, to, px, None)?;
     let part = part?;
     let g = s.map().layer(id)?.dataset.features.get(row)?.geometry.as_ref()?;
-    sketch_edit::trace(g, from, to, Some(part)).map(|t| t.path)
+    sketch_edit::trace(g, from, to, Some(part)).ok().map(|t| t.path)
 }
 
 /// The drawn line or polygon feature with a ring or part passing nearest both points, each within
