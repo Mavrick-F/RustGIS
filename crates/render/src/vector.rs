@@ -41,8 +41,8 @@ pub struct Drawing {
     cost: usize,
     /// Something drawn was refused: the drawing passed [`MAX_ITEMS`] or [`MAX_COST`].
     overflowed: bool,
-    /// The glyphs (by face and id) whose outlines are counted in `cost`.
-    outlines: std::collections::HashSet<(usize, u16)>,
+    /// The glyphs (by face and id) whose outlines are counted in `cost`, and what each counted.
+    outlines: std::collections::HashMap<(usize, u16), usize>,
 }
 
 /// One thing drawn.
@@ -199,8 +199,10 @@ impl Drawing {
             // Each glyph's outline, written once in the document's fonts, counts the first time.
             let face = std::ptr::from_ref(run.font) as usize;
             for g in &run.glyphs {
-                if self.outlines.insert((face, g.id.0)) {
-                    self.cost += 64 + run.font.outline(g.id).map_or(0, |o| o.curves.len() * 40);
+                if let std::collections::hash_map::Entry::Vacant(e) = self.outlines.entry((face, g.id.0)) {
+                    let c = 64 + run.font.outline(g.id).map_or(0, |o| o.curves.len() * 40);
+                    e.insert(c);
+                    self.cost += c;
                 }
             }
             self.push(Item::Glyphs(run));
@@ -228,17 +230,21 @@ impl Drawing {
     /// Places `child` as a group: its items moved by `transform` (from its space to this
     /// drawing's), composited with `opacity` and `blend`, inside `clip` (in this drawing's
     /// space). Nothing for an empty drawing or a transform that isn't finite.
-    pub fn place(&mut self, child: Drawing, transform: Transform, opacity: f32, blend: Blend, clip: Option<Clip>) {
+    pub fn place(&mut self, mut child: Drawing, transform: Transform, opacity: f32, blend: Blend, clip: Option<Clip>) {
         self.overflowed |= child.overflowed;
         if !transform.is_finite() || child.is_empty() {
             return;
         }
-        let (count, cost) = (child.count, child.cost);
+        // Outlines this drawing already counts are written once: not counted again.
+        let held: usize = child.outlines.iter().filter(|(k, _)| self.outlines.contains_key(k)).map(|(_, c)| *c).sum();
+        let (count, cost) = (child.count, child.cost.saturating_sub(held));
+        let outlines = std::mem::take(&mut child.outlines);
         let (_, _, items) = child.finish();
         if self.count.saturating_add(count) > MAX_ITEMS || self.cost.saturating_add(cost) > max_cost() {
             self.overflowed = true;
             return;
         }
+        self.outlines.extend(outlines);
         self.count += count;
         self.cost += cost + 120;
         let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
@@ -536,6 +542,27 @@ mod tests {
         let mut fine = Drawing::new(10.0, 10.0);
         fine.fill(square(), Brush::Solid(Color::BLACK), FillRule::Winding, Transform::identity());
         assert!(!fine.overflowed());
+    }
+
+    #[test]
+    fn a_glyph_outline_counts_once_however_many_drawings_set_it() {
+        let font = crate::text::label_font().unwrap();
+        let run = || GlyphRun {
+            font,
+            size: 12.0,
+            color: Color::BLACK,
+            transform: Transform::identity(),
+            glyphs: vec![Glyph { id: ab_glyph::Font::glyph_id(font, 'W'), x: 0.0, ch: 'W' }],
+        };
+        let mut page = Drawing::new(10.0, 10.0);
+        page.glyphs(run());
+        let once = page.cost();
+        let mut child = Drawing::new(10.0, 10.0);
+        child.glyphs(run());
+        let child_cost = child.cost();
+        page.place(child, Transform::identity(), 1.0, Blend::Normal, None);
+        // The child's own run counts (60 + 8), its outline doesn't again.
+        assert_eq!(page.cost(), once + 68 + 120, "child alone came to {child_cost}");
     }
 
     #[test]

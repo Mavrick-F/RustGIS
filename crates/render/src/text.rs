@@ -724,8 +724,12 @@ fn draw_upright(pm: &mut Canvas, l: &PlacedLabel, ppp: f32, ink: Ink) {
                 Some(width) => (halo_reach(width) * 1.33 * ppp).min(MAX_HALO_PX),
                 None => 1.2 * ppp,
             };
-            // (No width, no halo, as the pixels have it.)
+            // (No width, no halo, as the pixels have it; none built once the recording has
+            // overflowed, as nothing more is kept.)
             for &(line, left, lw, y) in placed.iter().filter(|_| r > 0.0) {
+                if pm.overflowed() {
+                    break;
+                }
                 let outline = if styled {
                     styled_outline(line, left, y, px, label_face(l), spacing)
                 } else {

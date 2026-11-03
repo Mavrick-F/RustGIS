@@ -504,7 +504,9 @@ fn clean_stops(stops: &[(f32, Color)]) -> Vec<(f32, Color)> {
     let mut out: Vec<(f32, Color)> = Vec::with_capacity(stops.len() + 2);
     // (A ramp holds at most 2 × (MAX_STOPS + 2) stops: none is left out.)
     for &(t, c) in stops {
-        let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+        // On the grid the offsets are written to (six decimals), so two that would print alike
+        // are drawn apart below.
+        let t = if t.is_finite() { (t.clamp(0.0, 1.0) * 1e6).round() / 1e6 } else { 0.0 };
         let t = out.last().map_or(t, |l| t.max(l.0));
         out.push((t, c));
     }
@@ -522,6 +524,11 @@ fn clean_stops(stops: &[(f32, Color)]) -> Vec<(f32, Color)> {
     if let [only] = out.as_slice() {
         let c = only.1;
         out.push((1.0, c));
+    }
+    // A first stop sharing its offset with the next holds no width: left out, so no bound lands
+    // on the domain's start (the pass below can't move a stop back past 0).
+    while out.len() > 2 && out.first().map(|f| f.0) == out.get(1).map(|s| s.0) {
+        out.remove(0);
     }
     // A function's bounds must rise: stops at one offset (a discrete ramp's steps, its last colour
     // at 1) are drawn apart by a hair, each earlier one moved back, so a step stays a step and
@@ -737,6 +744,14 @@ mod tests {
         let blue = Color::from_rgba8(0, 0, 255, 255);
         let f = function(&clean_stops(&[(0.0, red), (0.5, red), (0.5, Color::BLACK), (1.0, Color::BLACK), (1.0, blue)]), false);
         assert!(f.contains("/C1 [0 0 1] /N 1 >>] /Bounds"), "the last piece ends in blue: {f}");
+        // Two stops that would print alike are drawn apart all the same.
+        let alike = function(&clean_stops(&[(0.0, red), (0.5, red), (0.500_000_1, blue), (1.0, blue)]), false);
+        let b: Vec<f32> =
+            alike.split("/Bounds [").nth(1).unwrap().split(']').next().unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+        assert!(b.windows(2).all(|w| w[0] < w[1]), "{alike}");
+        // Two stops at 0 (a stop of the user's at the start): the first, of no width, left out.
+        let start: Vec<f32> = clean_stops(&[(0.0, red), (0.0, Color::BLACK), (0.5, blue)]).iter().map(|s| s.0).collect();
+        assert_eq!(start, vec![0.0, 0.5, 1.0]);
         let bounds: Vec<f32> =
             f.split("/Bounds [").nth(1).unwrap().split(']').next().unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
         assert!(bounds.windows(2).all(|w| w[0] < w[1]), "{bounds:?}");
