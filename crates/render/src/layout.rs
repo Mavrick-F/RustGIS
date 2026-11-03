@@ -84,17 +84,38 @@ pub(crate) fn page_geometry(layout: &Layout, dpi: f64) -> (u32, u32, f64) {
 /// One element on transparency, allocating only its on-page pixel bounds.
 /// Outer `None` means rendering failed; inner `None` means the element is off-page.
 pub(crate) fn render_element(layout: &Layout, id: u32, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<Option<(Pixmap, [f64; 4])>> {
+    let Some((bounds, k, mm)) = element_bounds(layout, id, dpi)? else { return Some(None) };
+    let pm = draw_page(layout, maps, info, k, bounds, Some(id), None)?.into_pixmap();
+    Some(Some((pm, mm)))
+}
+
+/// [`render_element`] kept as vectors (see [`render_drawing`]): the element alone, recorded in
+/// the pixels of its on-page bounds at `dpi`, those bounds in millimetres, and the pixels a
+/// millimetre. The frames drawn as pictures (past the budget) go to `pictured`.
+pub(crate) fn record_element(
+    layout: &Layout,
+    id: u32,
+    maps: &mut [Map],
+    dpi: f64,
+    info: &PageInfo,
+    pictured: &mut Vec<String>,
+) -> Option<Option<(crate::vector::Drawing, [f64; 4], f64)>> {
+    let Some((bounds, k, mm)) = element_bounds(layout, id, dpi)? else { return Some(None) };
+    let drawing = draw_page(layout, maps, info, k, bounds, Some(id), Some(pictured))?.into_drawing()?;
+    Some(Some((drawing, mm, k)))
+}
+
+/// Element `id`'s on-page bounds in whole pixels at `dpi`, the pixels a millimetre, and the bounds
+/// in millimetres; inner `None` for an element off the page.
+fn element_bounds(layout: &Layout, id: u32, dpi: f64) -> Option<Option<(tiny_skia::IntRect, f64, [f64; 4])>> {
     let e = layout.element(id)?;
     let (w, h, k) = page_geometry(layout, dpi);
     let x0 = (e.x * k).floor().clamp(0.0, f64::from(w));
     let y0 = (e.y * k).floor().clamp(0.0, f64::from(h));
     let x1 = ((e.x + e.w) * k).ceil().clamp(0.0, f64::from(w));
     let y1 = ((e.y + e.h) * k).ceil().clamp(0.0, f64::from(h));
-    let Some(bounds) = tiny_skia::IntRect::from_xywh(x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32) else {
-        return Some(None);
-    };
-    let pm = draw_page(layout, maps, info, k, bounds, Some(id), None)?.into_pixmap();
-    Some(Some((pm, [x0 / k, y0 / k, (x1 - x0) / k, (y1 - y0) / k])))
+    let bounds = tiny_skia::IntRect::from_xywh(x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32);
+    Some(bounds.map(|b| (b, k, [x0 / k, y0 / k, (x1 - x0) / k, (y1 - y0) / k])))
 }
 
 /// Draws the selected region with the full layout's frame and dynamic-text context, recorded
