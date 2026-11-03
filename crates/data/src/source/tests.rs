@@ -330,11 +330,13 @@ fn parquet_with_bad_chunk(original: &[u8], column: usize, kind: usize) -> Vec<u8
     let md = reader.metadata().clone();
     let mut groups = md.row_groups().to_vec();
     let mut cols = groups[0].columns().to_vec();
+    let data = cols[column].data_page_offset();
     let builder = cols[column].clone().into_builder();
     cols[column] = match kind {
         0 => builder.set_dictionary_page_offset(Some(-1)),
         1 => builder.set_dictionary_page_offset(None).set_data_page_offset(-1),
         2 => builder.set_total_compressed_size(-1),
+        3 => builder.set_dictionary_page_offset(Some(data + 1)),
         _ => builder.set_dictionary_page_offset(None).set_data_page_offset(i64::MAX).set_total_compressed_size(1),
     }
     .build()
@@ -355,7 +357,7 @@ fn geoparquet_refuses_invalid_column_ranges() {
     let original = std::fs::read(&path).unwrap();
     // Attribute, geometry and bbox columns all pass through the same metadata check.
     for col in [0, 2, 3] {
-        for kind in 0..4 {
+        for kind in 0..5 {
             let bytes = parquet_with_bad_chunk(&original, col, kind);
             let error = open_bytes("bad.parquet", bytes.clone(), None).err().unwrap().to_string();
             assert!(error.contains("column chunk"), "{col}/{kind}: {error}");

@@ -567,9 +567,11 @@ fn footer_length(tail: &[u8]) -> Result<u64> {
 fn validate_chunks(md: &ParquetMetaData) -> Result<()> {
     for (g, group) in md.row_groups().iter().enumerate() {
         for (col, chunk) in group.columns().iter().enumerate() {
-            let start = chunk.dictionary_page_offset().unwrap_or(chunk.data_page_offset());
+            let data = chunk.data_page_offset();
+            let start = chunk.dictionary_page_offset().unwrap_or(data);
             let size = chunk.compressed_size();
-            if chunk.data_page_offset() < 0 || start < 0 || size < 0 || start.checked_add(size).is_none() {
+            // A dictionary page precedes the data pages; reading from a later one would skip data.
+            if data < 0 || start < 0 || start > data || size < 0 || start.checked_add(size).is_none() {
                 return Err(DataError::Format(format!("GeoParquet: row group {g}, column {col} has an invalid column chunk range")));
             }
         }
