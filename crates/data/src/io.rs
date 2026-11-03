@@ -480,9 +480,43 @@ pub fn write_path(ds: &Dataset, path: &Path) -> Result<usize> {
     write_path_in(ds, path, Crs::LonLat)
 }
 
+/// How a GeoPackage export treats a GeoPackage already at its path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpkgMode {
+    /// Writes a new file; an existing one is refused, as it may hold other tables.
+    #[default]
+    NewFile,
+    /// Adds the table to the GeoPackage (a new file when there is none); refuses a table of its
+    /// name.
+    AddTable,
+    /// Replaces the GeoPackage's feature or attribute table of its name, which must be there.
+    ReplaceTable,
+}
+
+/// Where a GeoPackage export puts its table: how, and under what name (default: the layer's).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpkgTable {
+    pub mode: GpkgMode,
+    pub name: Option<String>,
+}
+
+/// The table a GeoPackage export wrote: its name in the file (a reserved name is prefixed), and
+/// whether it replaced one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpkgWritten {
+    pub table: String,
+    pub replaced: bool,
+}
+
 /// As [`write_path`], in the coordinate system `crs` (a GeoPackage, Shapefile or FlatGeobuf; see
 /// [`write_bytes_in`]).
 pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
+    write_path_to(ds, path, crs, &GpkgTable::default()).map(|(left_out, _)| left_out)
+}
+
+/// As [`write_path_in`], a GeoPackage's table placed as `gpkg` says (other formats ignore it):
+/// also returns the table written.
+pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let projected;
     let ds = if crs == Crs::LonLat || !PROJECTED_FORMATS.contains(&ext.as_str()) {
@@ -496,11 +530,14 @@ pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
         "gpkg" => {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                crate::source::gpkg::write_in(ds, path, crs)?;
-                Ok(0)
+                let table = crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?;
+                Ok((0, Some(table)))
             }
             #[cfg(target_arch = "wasm32")]
-            Err(DataError::Unsupported("GeoPackage in the browser".into()))
+            {
+                let _ = gpkg;
+                Err(DataError::Unsupported("GeoPackage in the browser".into()))
+            }
         }
         "shp" => {
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
@@ -570,7 +607,7 @@ pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
             for stale in ["qix", "sbn", "sbx"] {
                 let _ = std::fs::remove_file(path.with_extension(stale));
             }
-            Ok(left_out)
+            Ok((left_out, None))
         }
         _ if crs != Crs::LonLat && !PROJECTED_FORMATS.contains(&ext.as_str()) => {
             Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())))
@@ -578,7 +615,7 @@ pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
         _ => {
             let (bytes, left_out) = projected_bytes(ds, &ext, crs)?;
             write_atomic(path, &bytes)?;
-            Ok(left_out)
+            Ok((left_out, None))
         }
     }
 }

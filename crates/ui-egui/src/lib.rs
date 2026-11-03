@@ -3351,6 +3351,18 @@ impl RustGisApp {
                     .find(|(_, e)| *e == ext)
                     .map(|(l, _)| *l)
                     .ok_or_else(|| format!("unknown format '{ext}'"))?;
+                // Into a GeoPackage that exists: picked to open, as it is kept, not replaced.
+                let mode = p.get("mode").and_then(Value::as_str).unwrap_or("newFile");
+                if ext == "gpkg" && mode != "newFile" {
+                    if let Some(path) = dialogs::pick_open(&["gpkg"], label) {
+                        let mut args = json!({"path": path, "mode": mode});
+                        if let Some(table) = p.get("tableName").and_then(Value::as_str) {
+                            args["tableName"] = json!(table);
+                        }
+                        return self.run("share.exportLayer", args);
+                    }
+                    return Ok(Value::Null);
+                }
                 let name = self
                     .session
                     .active_layer
@@ -4499,6 +4511,23 @@ mod download_service_tests {
         app.run("ui.exportLayer", json!({"format": "shp"})).unwrap();
         assert_eq!(changed(&app), 0, "the sample's names fit");
         assert!(!app.session.notices.iter().any(|n| n.text.contains("254 bytes") || n.text.contains("left empty")));
+    }
+
+    /// Export Features into an existing GeoPackage: the file is picked to open, not to save over,
+    /// and the layer goes in as the table named in the dialog, beside the file's others.
+    #[test]
+    fn export_features_adds_a_table_to_a_picked_geopackage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("county.gpkg");
+        let mut app = RustGisApp::with_sample();
+        app.run("share.exportLayer", json!({"layer": "Cities", "path": path})).unwrap();
+        app.session.active_layer = app.session.map().layer_by_name("Countries").map(|l| l.id);
+        crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(path.display().to_string()));
+        app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "addTable", "tableName": "borders"})).unwrap();
+        assert_eq!(rustgis_engine::data::source::layers(&path).unwrap(), ["Cities", "borders"]);
+        // Cancelling the pick writes nothing.
+        app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "replaceTable", "tableName": "Cities"})).unwrap();
+        assert_eq!(rustgis_engine::data::source::layers(&path).unwrap(), ["Cities", "borders"]);
     }
 
     #[test]

@@ -19,9 +19,23 @@ table. **Data › Export** also writes rasters to GeoTIFF, and **Data Interop** 
 KML, GPX or CSV with WKT. Layouts, reports and presentations export from their own tabs and panes
 (see [Layouts and Reports](layouts.md)).
 
-GeoPackage exports require a new filename. Exporting to an existing `.gpkg` is refused to
-protect its tables and data, even if the save dialog offers to replace the file. Export does
-not append a table to an existing GeoPackage or replace one of its tables.
+A GeoPackage export writes a new file by default, and refuses an existing `.gpkg` to protect its
+tables, even if the save dialog offers to replace the file. To put the layer into an existing
+GeoPackage instead, choose GeoPackage in **Export Features**, then under **Into** either
+**A new table in a GeoPackage** or **A table replaced in a GeoPackage**, name the table, and
+pick the file (on the desktop). The GeoPackage's other tables stay as they were: one table is
+added, or one feature or attribute table of that name is replaced with its spatial index, in a
+single transaction, so a failed export changes nothing. A name already used is refused when
+adding (with no file there, adding makes a new GeoPackage). Replacing needs a feature or
+attribute table of that name, so a misspelt name changes nothing; tiles, views and other tables
+are never replaced. A replaced table's own indexes, triggers and column descriptions go with it.
+From the command line, `share.exportLayer` and `share.exportTable` take `"mode": "addTable"` or
+`"replaceTable"` and an optional `"tableName"` (default: the layer's or table's name):
+
+```sh
+rustgis-cli run --data permits.geojson \
+  --cmd 'share.exportLayer={"layer":"permits","path":"county.gpkg","mode":"addTable"}'
+```
 
 Packages and project item files are described under [Project items](data.md#project-items).
 

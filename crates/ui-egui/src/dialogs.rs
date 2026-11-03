@@ -38,6 +38,8 @@ pub struct Dialogs {
     /// Add From Database: load the PostgreSQL table whole, to be edited and saved back.
     pub edit: bool,
     pub mode: &'static str,
+    /// Export Features' GeoPackage destination: one of [`GPKG_MODES`]' codes (empty: a new file).
+    pub gpkg_mode: &'static str,
     pub flag: bool,
     pub error: Option<String>,
     pub info: Option<String>,
@@ -164,7 +166,12 @@ impl Dialogs {
             "renameLayer" => self.text = active.map(|l| l.name.clone()).unwrap_or_default(),
             // A file name can't hold a folder separator, which a project name may.
             "saveProject" => self.text = format!("{}.rgis", s.project.name.replace(['/', '\\'], "-")),
-            "exportLayer" => self.mode = "geojson",
+            "exportLayer" => {
+                self.mode = "geojson";
+                self.gpkg_mode = "newFile";
+                // The GeoPackage table's name.
+                self.text = active.map(|l| l.name.clone()).unwrap_or_default();
+            }
             // The active layer when it is from PostGIS, else the first that is.
             "pgSave" | "pgDiscard" => {
                 let pg = |l: &&rustgis_engine::map::Layer| l.postgis.is_some();
@@ -580,6 +587,10 @@ pub const EXPORT_FORMATS: &[(&str, &str)] = &[
     ("GPX", "gpx"),
 ];
 
+/// Where Export Features puts a GeoPackage's table: (`share.exportLayer` mode, name).
+pub const GPKG_MODES: &[(&str, &str)] =
+    &[("newFile", "A new GeoPackage"), ("addTable", "A new table in a GeoPackage"), ("replaceTable", "A table replaced in a GeoPackage")];
+
 /// The formats Export Features offers: all of [`EXPORT_FORMATS`] on the desktop. The web app
 /// leaves out GeoPackage, written with SQLite, and FlatGeobuf, whose writer needs a temporary
 /// file; the browser has neither.
@@ -608,12 +619,42 @@ fn export_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             .response
             .labelled_by(input_label.id);
         ui.end_row();
+        // A GeoPackage can take the layer as one more table (desktop only: the browser offers none).
+        if app.dialogs.mode == "gpkg" && !web {
+            let into_label = ui.label(tl!("Into"));
+            let shown = GPKG_MODES.iter().find(|(m, _)| *m == app.dialogs.gpkg_mode).map_or(GPKG_MODES[0].1, |(_, l)| *l);
+            egui::ComboBox::from_id_salt("export_gpkg_mode")
+                .selected_text(tl!(shown))
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for (mode, label) in GPKG_MODES {
+                        ui.selectable_value(&mut app.dialogs.gpkg_mode, *mode, tl!(*label));
+                    }
+                })
+                .response
+                .labelled_by(into_label.id);
+            ui.end_row();
+            if !matches!(app.dialogs.gpkg_mode, "" | "newFile") {
+                let table_label = ui.label(tl!("Table"));
+                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(220.0)).labelled_by(table_label.id);
+                ui.end_row();
+            }
+        }
     });
     if app.dialogs.mode == "shp" && web {
         ui.label(egui::RichText::new(tl!("The Shapefile's files download as one zip.")).small().weak());
     }
+    let into_existing = app.dialogs.mode == "gpkg" && !web && !matches!(app.dialogs.gpkg_mode, "" | "newFile");
+    if into_existing {
+        ui.label(egui::RichText::new(tl!("Pick the GeoPackage next. Its other tables are kept.")).small().weak());
+    }
     buttons(app, ui, if web { "Download" } else { "Export…" }, |app| {
-        app.run("ui.exportLayer", json!({"format": app.dialogs.mode})).map(|_| ())
+        let mut p = json!({"format": app.dialogs.mode});
+        if into_existing {
+            p["mode"] = json!(app.dialogs.gpkg_mode);
+            p["tableName"] = json!(app.dialogs.text);
+        }
+        app.run("ui.exportLayer", p).map(|_| ())
     })
 }
 

@@ -1,0 +1,204 @@
+//! Exports into an existing GeoPackage: one table added, or one of its feature or attribute
+//! tables replaced, in a single transaction that leaves the file's other tables as they were.
+
+use super::{FEATURE_METADATA, GpkgWritten, Redo, WGS84_WKT, create_table, err, fill, plan, quote, register};
+use crate::raster::Crs;
+use crate::{DataError, Field, GeometryType, Result};
+use rusqlite::config::DbConfig;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use std::cell::Cell;
+use std::path::Path;
+use std::time::Duration;
+
+/// Writes the features `feed` hands over as table `name` of the GeoPackage at `path` (see
+/// [`super::write_features_in`]). A table of that name is refused, or, with `replace`, required:
+/// a feature or attribute table, dropped first; nothing else in the file is touched. Every
+/// change is one transaction, so a failed export leaves the file as it was.
+pub(super) fn write_features(
+    path: &Path,
+    name: &str,
+    geometry_type: GeometryType,
+    fields: &[Field],
+    crs: Crs,
+    replace: bool,
+    feed: &mut dyn FnMut(&mut dyn FnMut(&[crate::Feature]) -> Result<()>) -> Result<()>,
+) -> Result<GpkgWritten> {
+    let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    // Never made here: the file must exist, as checked before.
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(err)?;
+    // The file may be hostile: what it defines (triggers, views) may not call functions, nor write
+    // to SQLite's own records.
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true).map_err(err)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false).map_err(err)?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(err)?;
+    let (mut multi_points, mut keep_ids) = (None, true);
+    // Each choice changes at most once; an export starting again rolls back what it wrote.
+    for _ in 0..3 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
+        check_geopackage(&tx, &file)?;
+        // An attribute table has no spatial reference system.
+        let srs_id = if geometry_type == GeometryType::None { 0 } else { srs_id(&tx, crs)? };
+        let replaced = Cell::new(false);
+        let mut make = |multi| {
+            let layout = plan(name, geometry_type, fields, multi, srs_id);
+            replaced.set(make_room(&tx, &file, &layout.table, replace)?);
+            if layout.has_geom {
+                tx.execute_batch(FEATURE_METADATA).map_err(err)?;
+                let index = format!("rtree_{}_{}", layout.table, layout.geom);
+                if let Some(kind) = object(&tx, &index)? {
+                    return Err(DataError::Format(format!(
+                        "{file} already has {} named {index}, which the table's spatial index needs; choose another table name",
+                        with_article(&kind)
+                    )));
+                }
+            }
+            create_table(&tx, &layout)?;
+            Ok(layout)
+        };
+        match fill(&tx, multi_points, keep_ids, &mut make, feed)? {
+            Err(Redo::MultiPoints) => multi_points = Some(true),
+            Err(Redo::Renumber) => keep_ids = false,
+            Ok((layout, extent)) => {
+                register(&tx, &layout, extent)?;
+                tx.commit().map_err(err)?;
+                return Ok(GpkgWritten { table: layout.table, replaced: replaced.get() });
+            }
+        }
+    }
+    Err(DataError::Format("GeoPackage: the export didn't settle on a table".into()))
+}
+
+/// Refuses a database without a GeoPackage's contents and spatial reference systems.
+fn check_geopackage(conn: &Connection, file: &str) -> Result<()> {
+    for table in ["gpkg_contents", "gpkg_spatial_ref_sys"] {
+        if object(conn, table)?.as_deref() != Some("table") {
+            return Err(DataError::Format(format!("{file}: not a GeoPackage (it has no {table} table)")));
+        }
+    }
+    Ok(())
+}
+
+/// What kind of SQLite object (`table`, `view`, `index`, `trigger`) is named `name`, without
+/// regard to case as SQLite names are.
+fn object(conn: &Connection, name: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT type FROM sqlite_master WHERE lower(name) = lower(?1) LIMIT 1", [name], |r| r.get(0)).optional().map_err(err)
+}
+
+/// The GeoPackage's id for `crs`: an entry it has for the EPSG code, or with the same definition
+/// for a system without one; else one added, numbered by its EPSG code where that is free and
+/// otherwise from 100000 up, as a new file's custom system is.
+fn srs_id(conn: &Connection, crs: Crs) -> Result<i32> {
+    let epsg = crs.epsg();
+    let wkt = if epsg == 4326 { Some(WGS84_WKT.to_string()) } else { crate::raster::wkt::to_wkt(crs) };
+    let found: Option<i64> = if epsg > 0 {
+        conn.query_row(
+            "SELECT srs_id FROM gpkg_spatial_ref_sys WHERE upper(organization) = 'EPSG' AND organization_coordsys_id = ?1 ORDER BY srs_id LIMIT 1",
+            [i64::from(epsg)],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(err)?
+    } else {
+        // A system without a WKT form is found by its name.
+        let (sql, key) = match &wkt {
+            Some(wkt) => ("SELECT srs_id FROM gpkg_spatial_ref_sys WHERE definition = ?1 ORDER BY srs_id LIMIT 1", wkt.clone()),
+            None => (
+                "SELECT srs_id FROM gpkg_spatial_ref_sys WHERE srs_name = ?1 AND definition = 'undefined' AND srs_id >= 100000 ORDER BY srs_id LIMIT 1",
+                crs.label(),
+            ),
+        };
+        conn.query_row(sql, [key], |r| r.get(0)).optional().map_err(err)?
+    };
+    let id = match found {
+        Some(id) => id,
+        None => {
+            let preferred = if epsg > 0 { i64::from(epsg) } else { 100_000 };
+            let taken: bool = conn
+                .query_row("SELECT EXISTS (SELECT 1 FROM gpkg_spatial_ref_sys WHERE srs_id = ?1)", [preferred], |r| r.get(0))
+                .map_err(err)?;
+            let id = if taken {
+                conn.query_row("SELECT max(100000, max(srs_id) + 1) FROM gpkg_spatial_ref_sys", [], |r| r.get(0)).map_err(err)?
+            } else {
+                preferred
+            };
+            let (org, code) = if epsg > 0 { ("EPSG", i64::from(epsg)) } else { ("NONE", id) };
+            conn.execute(
+                "INSERT INTO gpkg_spatial_ref_sys (srs_name, srs_id, organization, organization_coordsys_id, definition, description)
+                    VALUES (?1, ?2, ?3, ?4, ?5, '')",
+                rusqlite::params![crs.label(), id, org, code, wkt.as_deref().unwrap_or("undefined")],
+            )
+            .map_err(err)?;
+            id
+        }
+    };
+    i32::try_from(id).map_err(|_| DataError::Format(format!("GeoPackage: spatial reference system id {id} is out of range")))
+}
+
+/// Clears the way for table `table`: nothing of that name, or (with `replace`, which needs one) a
+/// feature or attribute table of it, dropped with its spatial index and its GeoPackage records.
+/// Returns whether a table was replaced; anything else of the name is refused.
+fn make_room(conn: &Connection, file: &str, table: &str, replace: bool) -> Result<bool> {
+    let registered: Option<(String, String)> = conn
+        .query_row("SELECT table_name, data_type FROM gpkg_contents WHERE lower(table_name) = lower(?1)", [table], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()
+        .map_err(err)?;
+    let kind = object(conn, table)?;
+    match (kind.as_deref(), registered) {
+        // Replacing a table not there is most likely a misspelt name: the stale table would stay.
+        (None, None) if replace => {
+            Err(DataError::Format(format!("{file} has no table {table} to replace; check the name, or add the layer as a new table")))
+        }
+        (None, None) => Ok(false),
+        (None, Some((old, _))) => {
+            Err(DataError::Format(format!("{file} lists a table {old} in its contents that it doesn't have; choose another table name")))
+        }
+        (Some("table"), Some((old, data_type))) if matches!(data_type.as_str(), "features" | "attributes") => {
+            if !replace {
+                return Err(DataError::Format(format!(
+                    "{file} already has a table {old}: choose another table name, or replace that table"
+                )));
+            }
+            drop_table(conn, &old)?;
+            Ok(true)
+        }
+        (_, Some((old, data_type))) => Err(DataError::Format(format!(
+            "{file}: {old} is a {data_type} table, which an export doesn't replace; choose another table name"
+        ))),
+        (Some(kind), None) => Err(DataError::Format(format!(
+            "{file} already has {} named {table}, which an export doesn't replace; choose another table name",
+            with_article(kind)
+        ))),
+    }
+}
+
+/// An SQLite object's kind with its article: "an index", "a view".
+fn with_article(kind: &str) -> String {
+    if kind.starts_with(['a', 'e', 'i', 'o', 'u']) { format!("an {kind}") } else { format!("a {kind}") }
+}
+
+/// Drops feature or attribute table `table`, its spatial indexes, and its rows in the GeoPackage
+/// tables that describe it (the optional ones where the file has them).
+fn drop_table(conn: &Connection, table: &str) -> Result<()> {
+    let has = |t: &str| object(conn, t).map(|k| k.as_deref() == Some("table"));
+    let mut sql = String::new();
+    if has("gpkg_geometry_columns")? {
+        let mut st = conn.prepare("SELECT column_name FROM gpkg_geometry_columns WHERE lower(table_name) = lower(?1)").map_err(err)?;
+        let columns = st.query_map([table], |r| r.get::<_, String>(0)).map_err(err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(err)?;
+        for c in columns {
+            sql.push_str(&format!("DROP TABLE IF EXISTS {};", quote(&format!("rtree_{table}_{c}"))));
+        }
+    }
+    sql.push_str(&format!("DROP TABLE {};", quote(table)));
+    conn.execute_batch(&sql).map_err(err)?;
+    // `gpkg_ogr_contents` is the feature count GDAL keeps, which would otherwise outlive the table.
+    for records in
+        ["gpkg_geometry_columns", "gpkg_extensions", "gpkg_data_columns", "gpkg_metadata_reference", "gpkg_ogr_contents", "gpkg_contents"]
+    {
+        if has(records)? {
+            conn.execute(&format!("DELETE FROM {records} WHERE lower(table_name) = lower(?1)"), [table]).map_err(err)?;
+        }
+    }
+    Ok(())
+}
