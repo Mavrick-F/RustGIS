@@ -1077,7 +1077,9 @@ fn outline_of(
 ) -> Option<tiny_skia::Path> {
     let mut pb = tiny_skia::PathBuilder::new();
     for (i, &(f, id, x, _)) in glyphs.iter().enumerate() {
-        let Some(upm) = f.units_per_em().filter(|u| u.is_finite() && *u > 0.0) else { continue };
+        // A face with no usable units per em is read at the usual 1000, as its glyphs are in the
+        // PDF's fonts.
+        let upm = f.units_per_em().filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1000.0);
         let Some(o) = f.outline(id) else { continue };
         let (k, slant, pen) = (px / upm, if lean(f) { SLANT } else { 0.0 }, x0 + x + spacing * i as f32);
         // Font units (y up, from the pen on the baseline) to pixels.

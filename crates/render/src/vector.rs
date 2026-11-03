@@ -242,8 +242,9 @@ impl Drawing {
         let (count, cost) = (child.count, child.cost.saturating_sub(held));
         let outlines = std::mem::take(&mut child.outlines);
         let (_, _, items) = child.finish();
-        // (A group's own entry counts too.)
-        let cost = cost + 120;
+        // (A group's own entry counts too, and its clip's path.)
+        let clip = clip.filter(|c| c.transform.is_finite());
+        let cost = cost + 120 + clip.as_ref().map_or(0, |c| path_cost(&c.path));
         if self.count.saturating_add(count) > MAX_ITEMS || self.cost.saturating_add(cost) > max_cost() {
             self.overflowed = true;
             return;
@@ -252,7 +253,6 @@ impl Drawing {
         self.count += count;
         self.cost += cost;
         let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
-        let clip = clip.filter(|c| c.transform.is_finite());
         self.add(Item::Group(Group { items, opacity, blend, clip, transform }));
     }
 
@@ -567,6 +567,14 @@ mod tests {
         page.place(child, Transform::identity(), 1.0, Blend::Normal, None);
         // The child's own run counts (60 + 8), its outline doesn't again.
         assert_eq!(page.cost(), once + 68 + 120, "child alone came to {child_cost}");
+        // A placed group's clip counts, as a begun group's does.
+        let before = page.cost();
+        let mut clipped = Drawing::new(10.0, 10.0);
+        clipped.fill(square(), Brush::Solid(Color::BLACK), FillRule::Winding, Transform::identity());
+        let inner = clipped.cost();
+        let clip = Clip { path: square(), rule: FillRule::Winding, transform: Transform::identity() };
+        page.place(clipped, Transform::identity(), 1.0, Blend::Normal, Some(clip));
+        assert_eq!(page.cost(), before + inner + 120 + path_cost(&square()));
     }
 
     #[test]
