@@ -276,8 +276,8 @@ an existing `.gpkg`, unless told to add a table to it or replace one of its tabl
 tables are kept:
 
 ```python
-parcels.to_file("county.gpkg", mode="addTable", table_name="parcels_2026")
-parcels.to_file("county.gpkg", mode="replaceTable")   # its table named for the layer
+roads.to_file("big-cities.gpkg", mode="addTable", table_name="roads_2026")
+big.to_file("big-cities.gpkg", mode="replaceTable")   # its table named for the layer, "Big cities"
 ```
 
 `add_geojson` also takes any object with `__geo_interface__` (a Shapely geometry, a GeoSeries).

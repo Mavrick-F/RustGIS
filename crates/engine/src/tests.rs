@@ -12283,7 +12283,15 @@ fn exporting_features_adds_or_replaces_a_table_in_an_existing_geopackage() {
         assert!(s.run("share.exportLayer", &p).unwrap_err().to_string().contains("GeoPackage"), "{p}");
     }
     assert!(s.run("share.exportLayer", &json!({"path": path, "mode": "append"})).is_err());
+    // Not strings: refused, not taken for the default.
+    for p in [json!({"mode": 1}), json!({"mode": "addTable", "tableName": ["x"]})] {
+        let mut p = p;
+        p["path"] = json!(path);
+        assert!(s.run("share.exportLayer", &p).unwrap_err().to_string().contains("must be a string"), "{p}");
+    }
     assert!(!geojson.exists());
+    // The layer read in place holds the file open, which Windows won't remove.
+    drop(s);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

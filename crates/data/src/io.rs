@@ -500,12 +500,13 @@ pub struct GpkgTable {
     pub name: Option<String>,
 }
 
-/// The table a GeoPackage export wrote: its name in the file (a reserved name is prefixed), and
-/// whether it replaced one.
+/// The table a GeoPackage export wrote: its name in the file (a reserved name is prefixed),
+/// whether it replaced one, and the views and triggers on other tables that name a replaced one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpkgWritten {
     pub table: String,
     pub replaced: bool,
+    pub dependents: Vec<String>,
 }
 
 /// As [`write_path`], in the coordinate system `crs` (a GeoPackage, Shapefile or FlatGeobuf; see

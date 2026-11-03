@@ -54,13 +54,18 @@ pub fn commands() -> Vec<C> {
 /// A GeoPackage export's table, from `mode` and `tableName`, which only a GeoPackage (extension
 /// `ext`) takes.
 fn gpkg_table(p: &Value, ext: &str) -> Result<GpkgTable, String> {
-    let mode = match ps(p, "mode").map(str::trim) {
+    // Not a string is refused, not taken for the default.
+    let text = |key: &str| match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_str().map(|s| Some(s.trim())).ok_or_else(|| format!("{key} must be a string")),
+    };
+    let mode = match text("mode")? {
         None | Some("newFile") => GpkgMode::NewFile,
         Some("addTable") => GpkgMode::AddTable,
         Some("replaceTable") => GpkgMode::ReplaceTable,
         Some(other) => return Err(format!("unknown mode '{other}' (newFile, addTable or replaceTable)")),
     };
-    let name = ps(p, "tableName").map(str::trim).filter(|n| !n.is_empty()).map(String::from);
+    let name = text("tableName")?.filter(|n| !n.is_empty()).map(String::from);
     if ext != "gpkg" && (mode != GpkgMode::NewFile || name.is_some()) {
         return Err("mode and tableName are for a GeoPackage (.gpkg) export".into());
     }
@@ -68,17 +73,33 @@ fn gpkg_table(p: &Value, ext: &str) -> Result<GpkgTable, String> {
 }
 
 /// Puts the table a GeoPackage export wrote, and whether it replaced one, in its result `out`;
-/// an export into an existing GeoPackage also says so, and that a replaced table's own indexes,
-/// triggers and column descriptions went with it.
+/// an export into an existing GeoPackage also says so, what went with a replaced table, and
+/// which views and triggers elsewhere name it.
 fn report_table(s: &mut Session, path: &str, gpkg: &GpkgTable, table: Option<GpkgWritten>, out: &mut Value) {
     let Some(table) = table else { return };
     if gpkg.mode != GpkgMode::NewFile {
         let note = if table.replaced {
-            format!("{path}: replaced its table {}, dropping the old table's indexes, triggers and column descriptions", table.table)
+            format!(
+                "{path}: replaced its table {}, dropping the old table's indexes, triggers, column descriptions, metadata links and extension records",
+                table.table
+            )
         } else {
             format!("{path}: added the table {}", table.table)
         };
         s.notify(note, false);
+        if !table.dependents.is_empty() {
+            let n = table.dependents.len();
+            s.notify(
+                format!(
+                    "{path}: {n} view{} or trigger{} naming {} may no longer work if a column it uses is gone: {}",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "" } else { "s" },
+                    table.table,
+                    table.dependents.join(", ")
+                ),
+                false,
+            );
+        }
     }
     out["table"] = json!(table.table);
     out["replaced"] = json!(table.replaced);

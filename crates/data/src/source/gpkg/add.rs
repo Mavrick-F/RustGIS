@@ -30,6 +30,9 @@ pub(super) fn write_features(
     // to SQLite's own records.
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true).map_err(err)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false).map_err(err)?;
+    // Nor may its triggers run when the export writes its GeoPackage records: one could change
+    // other tables. The new table's own triggers are made after its rows are in.
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false).map_err(err)?;
     conn.busy_timeout(Duration::from_secs(5)).map_err(err)?;
     let (mut multi_points, mut keep_ids) = (None, true);
     // Each choice changes at most once; an export starting again rolls back what it wrote.
@@ -38,7 +41,8 @@ pub(super) fn write_features(
         check_geopackage(&tx, &file)?;
         // An attribute table has no spatial reference system.
         let srs_id = if geometry_type == GeometryType::None { 0 } else { srs_id(&tx, crs)? };
-        let replaced = Cell::new(false);
+        // The views and triggers naming a replaced table, when one is.
+        let replaced = Cell::new(None);
         let mut make = |multi| {
             let layout = plan(name, geometry_type, fields, multi, srs_id);
             replaced.set(make_room(&tx, &file, &layout.table, replace)?);
@@ -61,15 +65,22 @@ pub(super) fn write_features(
             Ok((layout, extent)) => {
                 register(&tx, &layout, extent)?;
                 tx.commit().map_err(err)?;
-                return Ok(GpkgWritten { table: layout.table, replaced: replaced.get() });
+                let dependents = replaced.take();
+                return Ok(GpkgWritten { table: layout.table, replaced: dependents.is_some(), dependents: dependents.unwrap_or_default() });
             }
         }
     }
     Err(DataError::Format("GeoPackage: the export didn't settle on a table".into()))
 }
 
-/// Refuses a database without a GeoPackage's contents and spatial reference systems.
+/// Refuses a database without a GeoPackage's contents and spatial reference systems, or marked
+/// as another application's (an unmarked one, as older programs write, is taken).
 fn check_geopackage(conn: &Connection, file: &str) -> Result<()> {
+    // "GPKG", and GeoPackage 1.0's and 1.1's "GP10" and "GP11".
+    let id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0)).map_err(err)?;
+    if !matches!(id, 0 | 0x4750_4B47 | 0x4750_3130 | 0x4750_3131) {
+        return Err(DataError::Format(format!("{file}: not a GeoPackage (its application id is {id:#010x})")));
+    }
     for table in ["gpkg_contents", "gpkg_spatial_ref_sys"] {
         if object(conn, table)?.as_deref() != Some("table") {
             return Err(DataError::Format(format!("{file}: not a GeoPackage (it has no {table} table)")));
@@ -136,8 +147,10 @@ fn srs_id(conn: &Connection, crs: Crs) -> Result<i32> {
 
 /// Clears the way for table `table`: nothing of that name, or (with `replace`, which needs one) a
 /// feature or attribute table of it, dropped with its spatial index and its GeoPackage records.
-/// Returns whether a table was replaced; anything else of the name is refused.
-fn make_room(conn: &Connection, file: &str, table: &str, replace: bool) -> Result<bool> {
+/// For a table replaced, returns the views and other tables' triggers whose SQL names it (they
+/// read the new table, and break if a column they use is gone); anything else of the name is
+/// refused.
+fn make_room(conn: &Connection, file: &str, table: &str, replace: bool) -> Result<Option<Vec<String>>> {
     let registered: Option<(String, String)> = conn
         .query_row("SELECT table_name, data_type FROM gpkg_contents WHERE lower(table_name) = lower(?1)", [table], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -150,7 +163,7 @@ fn make_room(conn: &Connection, file: &str, table: &str, replace: bool) -> Resul
         (None, None) if replace => {
             Err(DataError::Format(format!("{file} has no table {table} to replace; check the name, or add the layer as a new table")))
         }
-        (None, None) => Ok(false),
+        (None, None) => Ok(None),
         (None, Some((old, _))) => {
             Err(DataError::Format(format!("{file} lists a table {old} in its contents that it doesn't have; choose another table name")))
         }
@@ -160,8 +173,14 @@ fn make_room(conn: &Connection, file: &str, table: &str, replace: bool) -> Resul
                     "{file} already has a table {old}: choose another table name, or replace that table"
                 )));
             }
+            if related(conn, &old)? {
+                return Err(DataError::Format(format!(
+                    "{file}: {old} is in a related-tables relation, whose links a replaced table would break; choose another table name"
+                )));
+            }
+            let dependents = dependents(conn, &old)?;
             drop_table(conn, &old)?;
-            Ok(true)
+            Ok(Some(dependents))
         }
         (_, Some((old, data_type))) => Err(DataError::Format(format!(
             "{file}: {old} is a {data_type} table, which an export doesn't replace; choose another table name"
@@ -171,6 +190,34 @@ fn make_room(conn: &Connection, file: &str, table: &str, replace: bool) -> Resul
             with_article(kind)
         ))),
     }
+}
+
+/// Whether the GeoPackage's related-tables extension names `table` as a base, related or mapping
+/// table: its rows are linked by id, which a new table's rows don't keep.
+fn related(conn: &Connection, table: &str) -> Result<bool> {
+    if object(conn, "gpkgext_relations")?.as_deref() != Some("table") {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM gpkgext_relations WHERE lower(?1) IN
+            (lower(base_table_name), lower(related_table_name), lower(mapping_table_name)))",
+        [table],
+        |r| r.get(0),
+    )
+    .map_err(err)
+}
+
+/// The views, and triggers on other tables, whose SQL mentions `table` (by a case-blind search,
+/// so a longer name containing it counts too), by name.
+fn dependents(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut st = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type IN ('view', 'trigger') AND lower(tbl_name) != lower(?1)
+                AND instr(lower(sql), lower(?1)) > 0 ORDER BY name",
+        )
+        .map_err(err)?;
+    let names = st.query_map([table], |r| r.get::<_, String>(0)).map_err(err)?;
+    names.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
 }
 
 /// An SQLite object's kind with its article: "an index", "a view".

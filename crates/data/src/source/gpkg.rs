@@ -551,7 +551,7 @@ pub fn write_table_in(ds: &crate::Dataset, path: &Path, crs: Crs, target: &GpkgT
     let conn = Connection::open(&tmp).map_err(err)?;
     let table = build(&conn, ds, name, crs)?;
     install(conn, tmp, path)?;
-    Ok(GpkgWritten { table, replaced: false })
+    Ok(GpkgWritten { table, replaced: false, dependents: Vec::new() })
 }
 
 /// Whether an export goes into the existing GeoPackage at `path` (anything there, which opening
@@ -598,7 +598,7 @@ pub(crate) fn write_features_in(
             Ok((layout, extent)) => {
                 finish(&conn, &layout, extent)?;
                 install(conn, tmp, path)?;
-                return Ok(GpkgWritten { table: layout.table, replaced: false });
+                return Ok(GpkgWritten { table: layout.table, replaced: false, dependents: Vec::new() });
             }
         }
     }

@@ -148,7 +148,8 @@ Open questions rather than plans; discuss before building.
 ## Done
 
 - Export into an existing GeoPackage on desktop: a layer or table added as one more table, or
-  replacing one of its tables, leaving the others as they were (`share.exportLayer` `mode`).
+  replacing one of its tables, leaving the others as they were (`mode` on `share.exportLayer` and
+  `share.exportTable`).
 - Polygon editing: Cut Polygon, Reshape (polygons and lines) and Trace along an edge while
   drawing, on the map and through `edit.cutPolygon`, `edit.reshape` and `edit.trace`.
 - Geometry conversions: Polygon To Line, Split Line At Vertices, Feature Envelope To Polygon

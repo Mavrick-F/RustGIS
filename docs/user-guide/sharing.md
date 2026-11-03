@@ -28,7 +28,9 @@ added, or one feature or attribute table of that name is replaced with its spati
 single transaction, so a failed export changes nothing. A name already used is refused when
 adding (with no file there, adding makes a new GeoPackage). Replacing needs a feature or
 attribute table of that name, so a misspelt name changes nothing; tiles, views and other tables
-are never replaced. A replaced table's own indexes, triggers and column descriptions go with it.
+are never replaced, nor is a table in a related-tables relation. A replaced table's own indexes,
+triggers and column descriptions go with it, and the export names any views or triggers elsewhere
+that use it. The GeoPackage's own triggers don't run while the export writes.
 From the command line, `share.exportLayer` and `share.exportTable` take `"mode": "addTable"` or
 `"replaceTable"` and an optional `"tableName"` (default: the layer's or table's name):
 

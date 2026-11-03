@@ -587,7 +587,7 @@ pub const EXPORT_FORMATS: &[(&str, &str)] = &[
     ("GPX", "gpx"),
 ];
 
-/// Where Export Features puts a GeoPackage's table: (`share.exportLayer` mode, name).
+/// Where Export Features puts a GeoPackage's table: (`share.exportLayer` mode, label shown).
 pub const GPKG_MODES: &[(&str, &str)] =
     &[("newFile", "A new GeoPackage"), ("addTable", "A new table in a GeoPackage"), ("replaceTable", "A table replaced in a GeoPackage")];
 
