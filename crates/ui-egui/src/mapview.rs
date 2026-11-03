@@ -2563,21 +2563,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                 // A double-click arrives as two clicks first; ignore the duplicate vertex.
                 let dup = app.map.sketch.last().and_then(|l| lonlat_to_screen(app, rect, *l)).is_some_and(|s| (s - p).length() < 3.0);
                 if !dup {
-                    let last = app.map.sketch.last().copied().filter(|_| app.map.trace_edges && tool.draws_edit());
-                    let along = last.and_then(|from| traced(app, from, c));
-                    let limit = rustgis_engine::cmd::design::MAX_LINE;
-                    match along {
-                        // The path starts where the last vertex meets the edge: it replaces it.
-                        Some(path) if app.map.sketch.len().saturating_sub(1) + path.len() <= limit => {
-                            app.map.sketch.pop();
-                            app.map.sketch.extend(path);
-                        }
-                        Some(_) => {
-                            app.session.notify(tl!("Not traced: a drawn line holds at most 10,000 points"), false);
-                            app.map.sketch.push(c);
-                        }
-                        None => app.map.sketch.push(c),
-                    }
+                    add_vertex(app, tool, c);
                 }
             }
         }
@@ -2636,14 +2622,39 @@ fn finish_sketch(app: &mut RustGisApp) {
     }
 }
 
+/// Adds a clicked vertex to the sketch: along the edge from the last vertex when Trace finds one,
+/// and never past the drawn-line limit of Cut Polygon and Reshape (a notice says so).
+fn add_vertex(app: &mut RustGisApp, tool: Tool, c: Coord) {
+    let limit = rustgis_engine::cmd::design::MAX_LINE;
+    let capped = matches!(tool, Tool::CutPolygon | Tool::Reshape);
+    if capped && app.map.sketch.len() >= limit {
+        app.session.notify(tl!("Not added: a drawn line holds at most 10,000 points"), false);
+        return;
+    }
+    let last = app.map.sketch.last().copied().filter(|_| app.map.trace_edges && tool.draws_edit());
+    match last.and_then(|from| traced(app, from, c)) {
+        // The path starts where the last vertex meets the edge: it replaces it.
+        Some(path) if !capped || app.map.sketch.len() - 1 + path.len() <= limit => {
+            app.map.sketch.pop();
+            app.map.sketch.extend(path);
+        }
+        Some(_) => {
+            app.session.notify(tl!("Not traced: a drawn line holds at most 10,000 points"), false);
+            app.map.sketch.push(c);
+        }
+        None => app.map.sketch.push(c),
+    }
+}
+
 /// The path along the edge under both the last sketch vertex and a new click (Trace), when there
 /// is one: from where the last vertex meets the edge to the click. A click with no edge under
 /// both points is an ordinary vertex: Trace only follows edges.
 fn traced(app: &mut RustGisApp, from: Coord, to: Coord) -> Option<Vec<Coord>> {
-    let r = app.session.run("edit.trace", &json!({"from": [from.x, from.y], "to": [to.x, to.y]})).ok()?;
-    let path: Vec<Coord> =
-        r["path"].as_array()?.iter().filter_map(|c| Some(Coord::new(c.get(0)?.as_f64()?, c.get(1)?.as_f64()?))).collect();
-    (path.len() >= 2).then_some(path)
+    // Asked directly, not as a command: a click away from an edge isn't a failed command.
+    let path = rustgis_engine::cmd::design::trace_between(&mut app.session, from, to)?;
+    // Both clicks on the same point of the edge trace nothing: the click is an ordinary vertex.
+    let apart = path.first().zip(path.last()).is_some_and(|(a, b)| a != b);
+    (path.len() >= 2 && apart).then_some(path)
 }
 
 /// A point snapped to nearby features (when snapping is on).
@@ -2696,7 +2707,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     if editing.settings.enabled
         && editing.settings.show_vertices
         && app.session.tool != Tool::EditVertices
-        && (app.session.tool.creates() || app.ui.right == Some(crate::RightPane::Editing))
+        && (app.session.tool.creates() || app.session.tool.draws_edit() || app.ui.right == Some(crate::RightPane::Editing))
     {
         let mut verts: Vec<Coord> = Vec::new();
         for l in app.session.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster() && !l.graphics) {
@@ -2790,6 +2801,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     // Where a click would snap to.
     if app.session.map().editing.snapping.enabled
         && (app.session.tool.creates()
+            || app.session.tool.draws_edit()
             || matches!(app.session.tool, Tool::Graphic(_) | Tool::Measure | Tool::MeasureArea)
             || app.map.vertex_drag.is_some())
         && let Some(c) = app.map.pointer_lonlat
@@ -4745,10 +4757,8 @@ mod tests {
         assert_eq!(count(&app), 2);
     }
 
-    /// With Trace on, two clicks on a polygon's edges draw the edge between them: the corner
-    /// between the clicks joins the sketch.
-    #[test]
-    fn clicks_with_trace_on_follow_the_edge_round_a_corner() {
+    /// A unit-square parcel on the map, with Trace on and the Create Polygon tool.
+    fn trace_harness() -> egui_kittest::Harness<'static, RustGisApp> {
         let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
         app.run("layer.template", json!({"template": "polygons", "name": "Parcels"})).unwrap();
         let square = json!({"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
@@ -4769,6 +4779,14 @@ mod tests {
         }
         h.state_mut().run("ui.traceEdges", json!({"on": true})).unwrap();
         h.state_mut().run("tool.set", json!({"tool": "createPolygon"})).unwrap();
+        h
+    }
+
+    /// With Trace on, two clicks on a polygon's edges draw the edge between them: the corner
+    /// between the clicks joins the sketch.
+    #[test]
+    fn clicks_with_trace_on_follow_the_edge_round_a_corner() {
+        let mut h = trace_harness();
         selection_click(&mut h, [0.5, 0.0]);
         for _ in 0..30 {
             h.step();
@@ -4778,5 +4796,58 @@ mod tests {
         assert_eq!(sketch.len(), 3, "{sketch:?}");
         assert_eq!(sketch[1], Coord::new(1.0, 0.0), "the corner, exactly");
         assert!(sketch[0].y.abs() < 1e-9 && (sketch[2].x - 1.0).abs() < 1e-9, "both ends on the edge: {sketch:?}");
+    }
+
+    /// A first click just off the edge, then one on it with Trace on: the sketch starts on the edge.
+    #[test]
+    fn a_trace_from_a_click_just_off_the_edge_starts_on_it() {
+        let mut h = trace_harness();
+        selection_click(&mut h, [0.5, -0.005]);
+        for _ in 0..30 {
+            h.step();
+        }
+        selection_click(&mut h, [1.0, 0.5]);
+        let sketch = h.state().map.sketch.clone();
+        assert_eq!(sketch.len(), 3, "{sketch:?}");
+        assert!(sketch[0].y.abs() < 1e-9, "the first vertex moved onto the edge: {sketch:?}");
+    }
+
+    /// A click with Trace on but no edge near is a plain vertex, with no notice. A Cut Polygon sketch
+    /// reaches the 10,000-point limit through a trace, but not past it: a
+    /// trace that would pass it adds the click alone, and a full sketch takes no more points.
+    #[test]
+    fn a_cut_sketch_stops_at_the_line_limit() {
+        let limit = rustgis_engine::cmd::design::MAX_LINE;
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.template", json!({"template": "polygons", "name": "Parcels"})).unwrap();
+        let square = json!({"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
+        app.run("edit.addFeature", json!({"layer": "Parcels", "geometry": square})).unwrap();
+        app.session.zoom_to(&rustgis_engine::geom::Extent::new(-1.0, -1.0, 2.0, 2.0));
+        app.map.trace_edges = true;
+        // A click away from any edge is an ordinary vertex: no trace, and no notice.
+        app.map.sketch = vec![Coord::new(5.0, 5.0)];
+        let mark = app.session.notice_mark();
+        add_vertex(&mut app, Tool::CutPolygon, Coord::new(6.0, 6.0));
+        assert_eq!((app.map.sketch.len(), app.session.notices_since(mark).len()), (2, 0));
+        let start = |n: usize| {
+            let mut v = vec![Coord::new(0.5, -0.5); n - 1];
+            v.push(Coord::new(0.5, 0.0));
+            v
+        };
+        // The trace (start, corner, click) replaces the last vertex: exactly the limit.
+        app.map.sketch = start(limit - 2);
+        add_vertex(&mut app, Tool::CutPolygon, Coord::new(1.0, 0.5));
+        assert_eq!(app.map.sketch.len(), limit);
+        assert_eq!(app.map.sketch[limit - 2], Coord::new(1.0, 0.0), "traced");
+        // One more would pass it: the click alone, and a notice.
+        app.map.sketch = start(limit - 1);
+        let mark = app.session.notice_mark();
+        add_vertex(&mut app, Tool::CutPolygon, Coord::new(1.0, 0.5));
+        assert_eq!(app.map.sketch.len(), limit);
+        assert_eq!(app.session.notices_since(mark).len(), 1);
+        // Full: nothing more is added.
+        add_vertex(&mut app, Tool::CutPolygon, Coord::new(0.2, 0.2));
+        assert_eq!(app.map.sketch.len(), limit);
+        assert_eq!(app.session.notices_since(mark).len(), 2);
     }
 }

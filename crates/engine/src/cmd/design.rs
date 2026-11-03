@@ -14,7 +14,7 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 mod shared_vertex;
 mod sketch;
-pub use sketch::MAX_LINE;
+pub use sketch::{MAX_LINE, trace_between};
 mod snap_vertex;
 
 /// One edited feature: its state before (none for an insert) and its row after (none for a

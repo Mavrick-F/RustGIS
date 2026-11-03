@@ -433,6 +433,24 @@ fn polygon_area(rings: &[Vec<Coord>]) -> f64 {
         .sum()
 }
 
+/// Whether two paths meet anywhere. Past the work budget it answers yes, the cautious answer
+/// for a hole deciding whether to stay (a kept hole that crosses is then refused as invalid).
+fn touches(a: &[Pt], b: &[Pt]) -> bool {
+    if within_work(a.len(), b.len()).is_err() {
+        return true;
+    }
+    let seg = |w: &[Pt]| Some((w.first()?.m, w.get(1)?.m));
+    a.windows(2).filter_map(seg).any(|x| {
+        b.windows(2).filter_map(seg).any(|y| {
+            x.0.x.min(x.1.x) <= y.0.x.max(y.1.x) + EPS
+                && y.0.x.min(y.1.x) <= x.0.x.max(x.1.x) + EPS
+                && x.0.y.min(x.1.y) <= y.0.y.max(y.1.y) + EPS
+                && y.0.y.min(y.1.y) <= x.0.y.max(x.1.y) + EPS
+                && !meet(x, y).is_empty()
+        })
+    })
+}
+
 /// Moves a drawn line's first and last points onto the nearest edge of `paths` when they are
 /// within [`END_SNAP`] of it.
 fn settle_ends(line: &mut [Pt], paths: &[Vec<Pt>]) {
@@ -585,16 +603,18 @@ fn round_ring(ring: &[Pt], from: f64, to: f64, forward: bool) -> Vec<Pt> {
 /// Reshapes one feature with a line drawn across its boundary. A polygon's boundary between the
 /// line's first and last crossings of one ring is replaced by the line, keeping the larger of
 /// the two shapes this could make; a line's stretch between two crossings is replaced, or with
-/// one crossing, its shorter end.
-pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Geometry, String> {
+/// one crossing, its shorter end. Holes left wholly outside a reshaped outer ring were in the
+/// part reshaped away: they are removed, and counted.
+pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Reshaped, String> {
     let mut line = sketch(line)?;
     settle_ends(&mut line, &paths_of(g)?);
     match g {
         Geometry::Polygon(parts) => {
+            // The whole shape against the line, before any ring is compared.
+            within_work(parts.iter().flatten().map(Vec::len).sum(), line.len())?;
             for (pi, part) in parts.iter().enumerate() {
                 for (ri, ring) in part.iter().enumerate() {
                     let r = project(ring)?;
-                    within_work(r.len(), line.len())?;
                     let hits = crossings(&line, &r);
                     let (Some(p), Some(q)) = (hits.first(), hits.last()) else { continue };
                     if hits.len() < 2 {
@@ -620,6 +640,7 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Geometry, String> {
                         new.reverse();
                     }
                     let mut part = part.clone();
+                    let part_len = part.len();
                     if let Some(slot) = part.get_mut(ri) {
                         *slot = new;
                     }
@@ -630,9 +651,11 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Geometry, String> {
                         let mut k = 0;
                         part.retain(|r| {
                             k += 1;
-                            k == 1 || r.iter().any(|c| inside(lonlat_to_merc(*c), &outer))
+                            let hole: Vec<Pt> = r.iter().map(|c| Pt::of(*c)).collect();
+                            k == 1 || hole.iter().any(|p| inside(p.m, &outer)) || outer.iter().any(|o| touches(&hole, o))
                         });
                     }
+                    let holes_removed = part_len - part.len();
                     if part.first().is_some_and(|o| o.len() < 4) || !valid(&part) {
                         return Err("reshaping there would make the boundary cross itself or another ring".into());
                     }
@@ -640,7 +663,7 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Geometry, String> {
                     if let Some(slot) = parts.get_mut(pi) {
                         *slot = part;
                     }
-                    return Ok(Geometry::Polygon(parts));
+                    return Ok(Reshaped { geometry: Geometry::Polygon(parts), holes_removed });
                 }
             }
             Err("draw the line across the polygon's boundary, leaving and coming back".into())
@@ -698,10 +721,17 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Geometry, String> {
             if let Some(slot) = parts.get_mut(*pi) {
                 *slot = new.into_iter().map(|p| p.ll).collect();
             }
-            Ok(Geometry::Line(parts))
+            Ok(Reshaped { geometry: Geometry::Line(parts), holes_removed: 0 })
         }
         _ => Err("only lines and polygons can be reshaped".into()),
     }
+}
+
+/// A reshaped feature's new shape, and how many holes it lost (left outside its new outer ring).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reshaped {
+    pub geometry: Geometry,
+    pub holes_removed: usize,
 }
 
 /// A path traced along a feature's edge, and how far (metres) its ends were from the points
@@ -728,17 +758,21 @@ fn nearest(path: &[Pt], c: Coord) -> Option<(f64, f64, Coord)> {
 /// Traces along the edge of a line or polygon from the point on it nearest `from` to the point
 /// on the same part or ring nearest `to`: along a line between them, round a ring the shorter
 /// way.
-pub fn trace(g: &Geometry, from: Coord, to: Coord) -> Option<Traced> {
+/// `part`, when given, is the line part or polygon ring to follow (polygons' rings numbered in
+/// order, holes after their outer ring), as already chosen on the map.
+pub fn trace(g: &Geometry, from: Coord, to: Coord, part: Option<usize>) -> Option<Traced> {
     let (f, t) = (lonlat_to_merc(from), lonlat_to_merc(to));
     let closed = matches!(g, Geometry::Polygon(_));
     if !matches!(g, Geometry::Line(_) | Geometry::Polygon(_)) {
         return None;
     }
-    // The part or ring passing nearest both points.
+    // The part or ring passing nearest both points, or the one given.
     let (path, (rf, df, mf), (rt, dt, mt)) = paths_of(g)
         .ok()?
         .into_iter()
-        .filter_map(|p| {
+        .enumerate()
+        .filter(|(i, _)| part.is_none_or(|k| k == *i))
+        .filter_map(|(_, p)| {
             let (a, b) = (nearest(&p, f)?, nearest(&p, t)?);
             Some((p, a, b))
         })
@@ -848,11 +882,11 @@ mod tests {
     #[test]
     fn reshaping_a_square_moves_one_side_out() {
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)]]);
-        let out = reshape(&g, &[c(0.8, 0.2), c(1.5, 0.2), c(1.5, 0.8), c(0.8, 0.8)]).unwrap();
+        let out = reshape(&g, &[c(0.8, 0.2), c(1.5, 0.2), c(1.5, 0.8), c(0.8, 0.8)]).unwrap().geometry;
         let grown = area(&out) / area(&g);
         assert!(grown > 1.29 && grown < 1.31, "{grown}");
         // And in, the larger side kept.
-        let out = reshape(&g, &[c(1.2, 0.2), c(0.7, 0.2), c(0.7, 0.8), c(1.2, 0.8)]).unwrap();
+        let out = reshape(&g, &[c(1.2, 0.2), c(0.7, 0.2), c(0.7, 0.8), c(1.2, 0.8)]).unwrap().geometry;
         let shrunk = area(&out) / area(&g);
         assert!(shrunk > 0.81 && shrunk < 0.83, "{shrunk}");
         assert!(reshape(&g, &[c(2.0, 0.0), c(3.0, 0.0)]).is_err());
@@ -862,7 +896,9 @@ mod tests {
     fn reshaping_away_the_side_with_a_hole_drops_the_hole_with_it() {
         let hole = vec![c(0.1, 0.4), c(0.1, 0.6), c(0.2, 0.6), c(0.2, 0.4), c(0.1, 0.4)];
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0), hole]]);
-        let out = reshape(&g, &[c(0.3, -1.0), c(0.3, 2.0)]).unwrap();
+        let r = reshape(&g, &[c(0.3, -1.0), c(0.3, 2.0)]).unwrap();
+        assert_eq!(r.holes_removed, 1);
+        let out = r.geometry;
         let Geometry::Polygon(p) = &out else { panic!() };
         assert_eq!(p[0].len(), 1, "the hole was on the side reshaped away");
         let kept = area(&out) / area(&Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)]]));
@@ -870,15 +906,29 @@ mod tests {
     }
 
     #[test]
+    fn a_hole_on_the_kept_side_stays_and_one_crossing_the_new_boundary_is_refused() {
+        let hole = vec![c(0.4, 0.4), c(0.4, 0.6), c(0.6, 0.6), c(0.6, 0.4), c(0.4, 0.4)];
+        let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0), hole]]);
+        let r = reshape(&g, &[c(1.2, 0.2), c(0.7, 0.2), c(0.7, 0.8), c(1.2, 0.8)]).unwrap();
+        assert_eq!(r.holes_removed, 0);
+        assert!(matches!(&r.geometry, Geometry::Polygon(p) if p[0].len() == 2));
+        // Every vertex of this hole is outside the new boundary, but its top edge crosses it.
+        let hole = vec![c(0.4, 0.05), c(0.4, 0.15), c(0.6, 0.15), c(0.6, 0.05), c(0.4, 0.05)];
+        let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0), hole]]);
+        let finger = [c(-0.1, 0.2), c(0.45, 0.2), c(0.45, 0.1), c(0.55, 0.1), c(0.55, 0.2), c(1.1, 0.2)];
+        assert!(reshape(&g, &finger).is_err());
+    }
+
+    #[test]
     fn reshaping_a_line_replaces_a_stretch_or_an_end() {
         let g = Geometry::Line(vec![vec![c(0.0, 0.0), c(1.0, 0.0), c(2.0, 0.0), c(3.0, 0.0)]]);
-        let out = reshape(&g, &[c(0.5, -0.1), c(0.5, 1.0), c(2.5, 1.0), c(2.5, -0.1)]).unwrap();
+        let out = reshape(&g, &[c(0.5, -0.1), c(0.5, 1.0), c(2.5, 1.0), c(2.5, -0.1)]).unwrap().geometry;
         let Geometry::Line(p) = &out else { panic!() };
         assert_eq!(p[0].first(), Some(&c(0.0, 0.0)));
         assert_eq!(p[0].last(), Some(&c(3.0, 0.0)));
         assert!(!p[0].contains(&c(1.0, 0.0)) && p[0].len() == 6);
         // From a point near the end, out to somewhere new: the end is replaced.
-        let out = reshape(&g, &[c(2.5, 0.0), c(2.5, 2.0)]).unwrap();
+        let out = reshape(&g, &[c(2.5, 0.0), c(2.5, 2.0)]).unwrap().geometry;
         let Geometry::Line(p) = &out else { panic!() };
         assert_eq!(p[0].first(), Some(&c(0.0, 0.0)));
         assert!(p[0].last().is_some_and(|e| (e.y - 2.0).abs() < 1e-9));
@@ -887,13 +937,13 @@ mod tests {
     #[test]
     fn tracing_follows_a_ring_the_short_way() {
         let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)]]);
-        let t = trace(&g, c(0.5, 0.0), c(1.0, 0.5)).unwrap();
+        let t = trace(&g, c(0.5, 0.0), c(1.0, 0.5), None).unwrap();
         assert_eq!(t.path.len(), 3);
         assert_eq!(t.path[1], c(1.0, 0.0));
-        let t = trace(&g, c(0.5, 0.0), c(0.0, 0.5)).unwrap();
+        let t = trace(&g, c(0.5, 0.0), c(0.0, 0.5), None).unwrap();
         assert_eq!(t.path[1], c(0.0, 0.0));
         let l = Geometry::Line(vec![vec![c(0.0, 0.0), c(1.0, 0.0), c(2.0, 0.0)]]);
-        let t = trace(&l, c(1.8, 0.0), c(0.2, 0.0)).unwrap();
+        let t = trace(&l, c(1.8, 0.0), c(0.2, 0.0), None).unwrap();
         assert_eq!(t.path.len(), 3);
         assert!(t.from_m < 1e-6);
     }

@@ -112,14 +112,31 @@ fn reshape_moves_a_boundary_and_needs_one_feature() {
     s.run("select.rows", &json!({"layer": id, "rows": [0, 1]})).unwrap();
     assert!(s.run("edit.reshape", &bump).is_err(), "two features selected");
     s.run("select.rows", &json!({"layer": id, "rows": [0]})).unwrap();
+    let mark = s.notice_mark();
     s.run("edit.reshape", &bump).unwrap();
     let Some(Geometry::Polygon(p)) = &features(&s, id)[0].geometry else { panic!("not a polygon") };
     assert!(p[0][0].iter().any(|c| (c.x - 1.5).abs() < 1e-9), "{p:?}");
+    assert_eq!(s.notices_since(mark).len(), 0, "no hole removed, no notice");
     // A reshape that would make the ring cross itself is refused.
     let cross = json!({"line": line(&[[0.5, -0.5], [0.5, 1.5], [0.7, 1.5], [0.7, -0.5], [0.6, -0.5], [0.6, 2.0]])});
     let before = features(&s, id);
     assert!(s.run("edit.reshape", &cross).is_err());
     assert_eq!(features(&s, id), before);
+}
+
+#[test]
+fn reshaping_away_a_hole_says_so() {
+    let mut g = rectangle(0., 0., 1., 1.);
+    if let Geometry::Polygon(p) = &mut g {
+        let hole = [(0.1, 0.4), (0.1, 0.6), (0.2, 0.6), (0.2, 0.4), (0.1, 0.4)];
+        p[0].push(hole.iter().map(|(x, y)| Coord::new(*x, *y)).collect());
+    }
+    let (mut s, id) = fixture(GeometryType::Polygon, vec![g]);
+    s.run("select.rows", &json!({"layer": id, "rows": [0]})).unwrap();
+    let mark = s.notice_mark();
+    let r = s.run("edit.reshape", &json!({"line": line(&[[0.3, -1.], [0.3, 2.]])})).unwrap();
+    assert_eq!(r["holesRemoved"], 1);
+    assert_eq!(s.notices_since(mark).len(), 1, "one notice, with the count");
 }
 
 #[test]
@@ -136,4 +153,8 @@ fn trace_finds_the_edge_near_both_points() {
     let r = s.run("edit.trace", &json!({"from": [0.5, 0.], "to": [1., 0.5], "tolerancePx": 20})).unwrap();
     assert_eq!(r["row"], 0);
     assert!(s.run("edit.trace", &json!({"from": [0.5, 0.5], "to": [0.6, 0.6], "tolerancePx": 1})).is_err());
+    // A given layer limits the search: another layer's edge isn't taken.
+    let other = s.map_mut().add_dataset(Dataset::new("Empty", GeometryType::Polygon, vec![]));
+    let p = json!({"layer": other, "from": [0.5, 0.], "to": [1., 0.5], "tolerancePx": 20});
+    assert!(s.run("edit.trace", &p).is_err());
 }

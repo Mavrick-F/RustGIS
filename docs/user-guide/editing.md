@@ -53,8 +53,9 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
 - **Reshape** (Edit › Tools, or the Editing pane): select one line or polygon, then draw a line
   that leaves its edge and comes back to it. For a polygon, the stretch of boundary between the
   line's first and last crossings is replaced by the line, keeping whichever of the two possible
-  shapes is larger. A reshape that would make the boundary cross itself, or a hole cross its
-  outer ring, is refused. For a line, the stretch between two crossings is replaced. A drawn
+  shapes is larger. A hole left wholly outside the new boundary goes with the part reshaped away,
+  and a notice says how many (`holesRemoved` in the result). A reshape that would make the
+  boundary cross itself, or a hole cross its outer ring, is refused. For a line, the stretch between two crossings is replaced. A drawn
   line that crosses only once replaces the shorter end, so start on the line and draw out to
   extend or redirect an end (`edit.reshape={"line": …}`).
 - **Trace** (Edit › Features): while drawing a feature, a cut or a reshape, click a point on a
@@ -62,8 +63,8 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   them, going the shorter way round a ring; click a point partway to go the other way. Turn on
   snapping so clicks land exactly on the edge. From scripts,
   `edit.trace={"from": [lon, lat], "to": [lon, lat]}` returns the path along the nearest edge
-  passing within the snapping tolerance of both points (add `"layer"` and `"row"` to trace a
-  given feature), and how far, in metres, each point was from the edge (`fromOffM`, `toOffM`).
+  passing within the snapping tolerance of both points (`"layer"` keeps the search to one layer;
+  add `"row"` to trace a given feature), and how far, in metres, each point was from the edge (`fromOffM`, `toOffM`).
 - **Edit Vertices** (Edit › Features): reshape the selected features on the map. Their vertices
   show as square handles and each edge has a round midpoint handle. Drag a vertex to move it;
   drag a midpoint, or click an edge, to insert a vertex; click a vertex and press ++delete++ to

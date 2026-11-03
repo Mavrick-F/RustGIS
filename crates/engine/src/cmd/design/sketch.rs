@@ -97,26 +97,35 @@ pub(super) fn reshape(s: &mut Session, p: &Value) -> CmdResult {
     let [r] = l.selection.as_slice() else { return Err("select one feature to reshape".into()) };
     let r = *r;
     let f = l.dataset.features.get(r).cloned().ok_or("no such row")?;
-    let g = sketch_edit::reshape(f.geometry.as_ref().ok_or("the feature has no shape")?, &line)?;
-    super::super::edit::validate(&g)?;
+    let done = sketch_edit::reshape(f.geometry.as_ref().ok_or("the feature has no shape")?, &line)?;
+    super::super::edit::validate(&done.geometry)?;
     if let Some(feat) = l.dataset.features.get_mut(r) {
-        feat.geometry = Some(g);
+        feat.geometry = Some(done.geometry);
     }
     l.touch_geometry();
     apply(s, id, vec![Change { before: Some(f), row: Some(r) }])?;
-    Ok(json!({"row": r}))
+    let n = done.holes_removed;
+    if n > 0 {
+        s.notify(format!("Reshape removed {n} hole(s) left outside the new boundary of row {r}"), false);
+    }
+    Ok(json!({"row": r, "holesRemoved": n}))
 }
 
 /// The path along a feature's edge from `from` to `to`: a given feature's (`layer`, `row`), or
-/// else the nearest line or polygon edge passing within the tolerance of both points. Returns how
+/// else the nearest line or polygon edge passing within the tolerance of both points (in `layer`
+/// when it is given). Returns how
 /// far (metres, Web Mercator) each point was from the edge it was moved onto.
 pub(super) fn trace(s: &mut Session, p: &Value) -> CmdResult {
     let (from, to) = (point(p, "from")?, point(p, "to")?);
-    let (id, row) = match p.get("row") {
-        Some(r) => (s.layer_id(p)?, r.as_u64().ok_or("row must be a whole number")? as usize),
+    let (id, row, part) = match p.get("row") {
+        Some(r) => (s.layer_id(p)?, r.as_u64().ok_or("row must be a whole number")? as usize, None),
         None => {
             let px = super::f(p, "tolerancePx").unwrap_or(s.map().editing.snapping.tolerance_px).clamp(0.0, 100.0);
-            nearest_edge(s, from, to, px).ok_or("no line or polygon edge passes near both points")?
+            // A given layer limits the search to its features.
+            let only = if p.get("layer").is_some() { Some(s.layer_id(p)?) } else { None };
+            let (id, row, part) = nearest_edge(s, from, to, px, only).ok_or("no line or polygon edge passes near both points")?;
+            // The part chosen on the map, so the path follows the same one.
+            (id, row, Some(part))
         }
     };
     let g = s
@@ -127,23 +136,33 @@ pub(super) fn trace(s: &mut Session, p: &Value) -> CmdResult {
         .geometry
         .as_ref()
         .ok_or("the feature has no shape")?;
-    let t = sketch_edit::trace(g, from, to).ok_or("only lines and polygons can be traced")?;
+    let t = sketch_edit::trace(g, from, to, part).ok_or("only lines and polygons can be traced")?;
     let path: Vec<[f64; 2]> = t.path.iter().map(|c| [c.x, c.y]).collect();
     // How far each point was moved onto the edge, so a far-off point isn't taken silently.
     Ok(json!({"layer": id, "row": row, "path": path, "fromOffM": t.from_m, "toOffM": t.to_m}))
 }
 
+/// The path along the nearest drawn line or polygon edge passing within the snapping tolerance of
+/// both points, if any: Trace while drawing. Read-only, so a click away from an edge is just an
+/// ordinary vertex rather than a failed command.
+pub fn trace_between(s: &mut Session, from: Coord, to: Coord) -> Option<Vec<Coord>> {
+    let px = s.map().editing.snapping.tolerance_px;
+    let (id, row, part) = nearest_edge(s, from, to, px, None)?;
+    let g = s.map().layer(id)?.dataset.features.get(row)?.geometry.as_ref()?;
+    sketch_edit::trace(g, from, to, Some(part)).map(|t| t.path)
+}
+
 /// The drawn line or polygon feature with a ring or part passing nearest both points, each within
-/// `px` pixels: (layer id, row). Measured on the map as drawn, like snapping; rows a definition
+/// `px` pixels, in layer `only` when given: (layer id, row, part or ring). Measured on the map as drawn, like snapping; rows a definition
 /// query or the time window hides aren't candidates.
-fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64) -> Option<(u32, usize)> {
+fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64, only: Option<u32>) -> Option<(u32, usize, usize)> {
     let (a, b) = (s.map().to_map(from)?, s.map().to_map(to)?);
     let tol = px * s.map().camera.res;
     let scale = s.scale();
     let (flat, key) = (s.map().flat(), s.map().projection.code());
     let held = s.map().held_by_group(scale);
-    let mut best: Option<(f64, u32, usize)> = None;
-    for l in s.map_mut().layers.iter_mut().filter(|l| l.visible && !l.is_raster() && !l.graphics) {
+    let mut best: Option<(f64, u32, usize, usize)> = None;
+    for l in s.map_mut().layers.iter_mut().filter(|l| l.visible && !l.is_raster() && !l.graphics && only.is_none_or(|o| o == l.id)) {
         if !l.in_scale_range(scale) || held.contains(&l.id) {
             continue;
         }
@@ -164,13 +183,15 @@ fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64) -> Option<(u32
             // Both points near the same ring or part: the one the path will follow.
             let near =
                 |p: &Vec<Coord>, c: Coord| p.windows(2).filter_map(|w| Some(off(c, *w.first()?, *w.get(1)?))).fold(f64::MAX, f64::min);
-            let d = paths.iter().map(|p| near(p, a).max(near(p, b))).fold(f64::MAX, f64::min);
+            let Some((part, d)) = paths.iter().map(|p| near(p, a).max(near(p, b))).enumerate().min_by(|x, y| x.1.total_cmp(&y.1)) else {
+                continue;
+            };
             if d <= tol && best.is_none_or(|x| d < x.0) {
-                best = Some((d, id, row));
+                best = Some((d, id, row, part));
             }
         }
     }
-    best.map(|(_, id, row)| (id, row))
+    best.map(|(_, id, row, part)| (id, row, part))
 }
 
 /// How far `c` is from segment `a`–`b`.
