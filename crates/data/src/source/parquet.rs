@@ -342,6 +342,7 @@ impl FeatureSource for ParquetSource {
         &self.info
     }
 
+    /// Keeps rows with null geometry in whole reads; they have no location to match an extent.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let md = self.reader.metadata();
@@ -447,17 +448,23 @@ impl FeatureSource for ParquetSource {
             let base = starts.get(g).copied().unwrap_or(0);
             // The columns hold the taken rows only, in order: the k-th is row `r`.
             for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
-                // A row without a geometry is left out; one that can't be read is skipped and counted.
-                let Some(bytes) = geoms.get(k).and_then(|b| b.as_deref()) else { continue };
-                let Some(geometry) = wkb::decode(bytes).and_then(|g| self.reproject.geometry(g)) else {
-                    skipped += 1;
-                    continue;
+                // Null geometry is valid; malformed non-null WKB is skipped and counted.
+                let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
+                    Some(bytes) => {
+                        let Some(geometry) = wkb::decode(bytes).and_then(|g| self.reproject.geometry(g)) else {
+                            skipped += 1;
+                            continue;
+                        };
+                        Some(geometry)
+                    }
+                    None => None,
                 };
-                if !in_request(&geometry, req) || (late && !sample.wants()) {
+                let matches_extent = geometry.as_ref().map_or(req.extent.is_none(), |g| in_request(g, req));
+                if !matches_extent || (late && !sample.wants()) {
                     continue;
                 }
                 let values = attrs.iter().map(|col| col.get(k).cloned().unwrap_or(Value::Null)).collect();
-                sample.keep(Feature { id: base.saturating_add(r as u64 + 1), geometry: Some(geometry), attrs: values });
+                sample.keep(Feature { id: base.saturating_add(r as u64 + 1), geometry, attrs: values });
             }
         }
         let matched = if late { sample.seen() } else { matched.saturating_mul(thinned as u64) };
@@ -475,7 +482,8 @@ impl FeatureSource for ParquetSource {
 
     /// A row group at a time, in file order: the features, ids and skipped rows of a complete
     /// read of the same extent. The taken rows of one row group are decoded together before
-    /// they are chunked, so the peak is a row group's columns plus a chunk.
+    /// they are chunked, so the peak is a row group's columns plus a chunk. Null geometry is
+    /// retained without an extent filter, keeping its row and attributes in whole exports.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         if self.remote.is_some() {
@@ -528,18 +536,22 @@ impl FeatureSource for ParquetSource {
                 return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
             }
             for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
-                // A row without a geometry is left out; one that can't be read is skipped and counted.
-                let Some(bytes) = geoms.get(k).and_then(|b| b.as_deref()) else { continue };
-                let Some(geometry) = wkb::decode(bytes).and_then(|geom| self.reproject.geometry(geom)) else {
-                    out.skipped += 1;
-                    continue;
+                let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
+                    Some(bytes) => {
+                        let Some(geometry) = wkb::decode(bytes).and_then(|geom| self.reproject.geometry(geom)) else {
+                            out.skipped += 1;
+                            continue;
+                        };
+                        Some(geometry)
+                    }
+                    None => None,
                 };
-                if !in_request(&geometry, &req) {
+                if !geometry.as_ref().map_or(req.extent.is_none(), |g| in_request(g, &req)) {
                     continue;
                 }
                 let values = attrs.iter().map(|col| col.get(k).cloned().unwrap_or(Value::Null)).collect();
                 out.matched += 1;
-                chunks.push(Feature { id: start.saturating_add(r as u64 + 1), geometry: Some(geometry), attrs: values })?;
+                chunks.push(Feature { id: start.saturating_add(r as u64 + 1), geometry, attrs: values })?;
             }
         }
         chunks.flush()?;

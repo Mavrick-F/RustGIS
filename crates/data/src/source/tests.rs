@@ -688,8 +688,8 @@ fn writes_geopackage_geoparquet_and_shapefile() {
         let holds_all = matches!(ext, "gpkg" | "parquet");
         assert_eq!(left_out, if holds_all { 0 } else { 1 }, "{ext}");
         let (back, _) = crate::io::read_path(&p).unwrap();
-        // Readers skip rows without geometry (the GeoPackage still holds three, below).
-        assert_eq!(back.features.len(), 2, "{ext}");
+        // GeoParquet retains nullable geometry; the other readers omit rows without a shape.
+        assert_eq!(back.features.len(), if ext == "parquet" { 3 } else { 2 }, "{ext}");
         assert_eq!(back.geometry_type, GeometryType::Polygon, "{ext}");
         let e = back.extent();
         assert_eq!((e.min_x, e.min_y, e.max_x, e.max_y), (-30.0, -40.0, 21.0, 21.0), "{ext}");
@@ -733,6 +733,7 @@ fn writes_geopackage_geoparquet_and_shapefile() {
     }
 }
 
+/// Whole reads retain null geometry and its attributes; spatial queries require a location.
 #[test]
 fn geoparquet_exports_keep_exact_values_and_remote_extent_reads() {
     let mut ds =
@@ -749,21 +750,31 @@ fn geoparquet_exports_keep_exact_values_and_remote_extent_reads() {
     assert_eq!(local.info().fields, ds.fields);
     assert!(local.info().notes.is_empty());
     let back = local.read(&Request::all()).unwrap();
-    assert_eq!(back.features.len(), 2);
+    assert_eq!(back.features.len(), 3);
+    assert!(back.complete && back.skipped == 0);
     for (got, original) in back.features.iter().zip(&ds.features) {
         // Comparing WKB bytes also checks the coordinate bits, rather than numeric equality.
-        assert_eq!(wkb::encode(got.geometry.as_ref().unwrap()), wkb::encode(original.geometry.as_ref().unwrap()));
+        assert_eq!(got.geometry.as_ref().map(wkb::encode), original.geometry.as_ref().map(wkb::encode));
         assert_eq!(got.attrs, original.attrs);
     }
+    assert_eq!(back.features.iter().map(|f| f.id).collect::<Vec<_>>(), [1, 2, 3]);
+    let (rows, summary, _) = visit_all(local.as_ref(), None, 256);
+    assert_eq!(rows, back.features);
+    assert_eq!((summary.matched, summary.skipped), (3, 0));
+    let (whole, report) = materialize(local.as_ref()).unwrap();
+    assert_eq!(whole.features.to_vec(), back.features);
+    assert!(report.skipped == 0 && report.messages.is_empty());
     let url = "https://test.example/exact-export.parquet";
     remote::testing::serve(url, bytes);
     let source = open_driven(url);
     assert!(source.info().indexed);
+    assert_eq!(source.read(&Request::all()).unwrap().features, back.features);
     let req = Request { extent: Some(Extent::new(-90.0, 36.0, -89.0, 37.0)), limit: 10 };
     let remote = source.read(&req).unwrap();
     assert!(remote.complete);
     assert_eq!(remote.features.len(), 1);
     assert_eq!(remote.features, local.read(&req).unwrap().features);
+    assert_eq!(visit_all(local.as_ref(), req.extent, 256).0, remote.features);
 }
 
 #[test]
