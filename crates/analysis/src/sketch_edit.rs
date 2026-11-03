@@ -648,6 +648,8 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Reshaped, String> {
                     if ri == 0
                         && let Some(outer) = part.first().map(|o| vec![o.iter().map(|c| Pt::of(*c)).collect::<Vec<_>>()])
                     {
+                        // Every hole vertex against the new outer ring, within the budget.
+                        within_work(part.iter().skip(1).map(Vec::len).sum(), part.first().map_or(0, Vec::len))?;
                         let mut k = 0;
                         part.retain(|r| {
                             k += 1;
@@ -946,5 +948,12 @@ mod tests {
         let t = trace(&l, c(1.8, 0.0), c(0.2, 0.0), None).unwrap();
         assert_eq!(t.path.len(), 3);
         assert!(t.from_m < 1e-6);
+    }
+
+    #[test]
+    fn tracing_follows_the_part_given_even_when_another_is_nearer() {
+        let g = Geometry::Polygon(vec![vec![square(0.0, 0.0, 1.0, 1.0)], vec![square(5.0, 0.0, 6.0, 1.0)]]);
+        let t = trace(&g, c(0.5, 0.0), c(1.0, 0.5), Some(1)).unwrap();
+        assert!(t.path.iter().all(|p| p.x > 4.0), "{:?}", t.path);
     }
 }

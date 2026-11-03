@@ -4849,5 +4849,10 @@ mod tests {
         add_vertex(&mut app, Tool::CutPolygon, Coord::new(0.2, 0.2));
         assert_eq!(app.map.sketch.len(), limit);
         assert_eq!(app.session.notices_since(mark).len(), 2);
+        // Reshape shares the limit; drawing a new feature doesn't have it.
+        add_vertex(&mut app, Tool::Reshape, Coord::new(0.2, 0.2));
+        assert_eq!((app.map.sketch.len(), app.session.notices_since(mark).len()), (limit, 3));
+        add_vertex(&mut app, Tool::CreateLine, Coord::new(0.2, 0.2));
+        assert_eq!(app.map.sketch.len(), limit + 1);
     }
 }

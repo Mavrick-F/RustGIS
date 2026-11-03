@@ -86,6 +86,9 @@ pub(super) fn cut_polygon(s: &mut Session, p: &Value) -> CmdResult {
     l.touch_geometry();
     // The pieces are the feature cut up, not new features: no creation defaults.
     apply_with(s, id, changes, false)?;
+    if missed > 0 {
+        s.notify(format!("Cut Polygon left {missed} selected feature(s) the line didn't cut"), false);
+    }
     Ok(json!({"cut": cut, "pieces": pieces, "missed": missed}))
 }
 
@@ -118,14 +121,17 @@ pub(super) fn reshape(s: &mut Session, p: &Value) -> CmdResult {
 pub(super) fn trace(s: &mut Session, p: &Value) -> CmdResult {
     let (from, to) = (point(p, "from")?, point(p, "to")?);
     let (id, row, part) = match p.get("row") {
-        Some(r) => (s.layer_id(p)?, r.as_u64().ok_or("row must be a whole number")? as usize, None),
+        Some(r) => {
+            let row = r.as_u64().and_then(|r| usize::try_from(r).ok()).ok_or("row must be a whole number")?;
+            (s.layer_id(p)?, row, None)
+        }
         None => {
             let px = super::f(p, "tolerancePx").unwrap_or(s.map().editing.snapping.tolerance_px).clamp(0.0, 100.0);
             // A given layer limits the search to its features.
             let only = if p.get("layer").is_some() { Some(s.layer_id(p)?) } else { None };
             let (id, row, part) = nearest_edge(s, from, to, px, only).ok_or("no line or polygon edge passes near both points")?;
             // The part chosen on the map, so the path follows the same one.
-            (id, row, Some(part))
+            (id, row, part)
         }
     };
     let g = s
@@ -149,19 +155,20 @@ pub fn trace_between(s: &mut Session, from: Coord, to: Coord) -> Option<Vec<Coor
     let px = s.map().editing.snapping.tolerance_px;
     let (id, row, part) = nearest_edge(s, from, to, px, None)?;
     let g = s.map().layer(id)?.dataset.features.get(row)?.geometry.as_ref()?;
-    sketch_edit::trace(g, from, to, Some(part)).map(|t| t.path)
+    sketch_edit::trace(g, from, to, part).map(|t| t.path)
 }
 
 /// The drawn line or polygon feature with a ring or part passing nearest both points, each within
-/// `px` pixels, in layer `only` when given: (layer id, row, part or ring). Measured on the map as drawn, like snapping; rows a definition
+/// `px` pixels, in layer `only` when given: (layer id, row, part or ring when the map's parts are
+/// the source's). Measured on the map as drawn, like snapping; rows a definition
 /// query or the time window hides aren't candidates.
-fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64, only: Option<u32>) -> Option<(u32, usize, usize)> {
+fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64, only: Option<u32>) -> Option<(u32, usize, Option<usize>)> {
     let (a, b) = (s.map().to_map(from)?, s.map().to_map(to)?);
     let tol = px * s.map().camera.res;
     let scale = s.scale();
     let (flat, key) = (s.map().flat(), s.map().projection.code());
     let held = s.map().held_by_group(scale);
-    let mut best: Option<(f64, u32, usize, usize)> = None;
+    let mut best: Option<(f64, u32, usize, Option<usize>)> = None;
     for l in s.map_mut().layers.iter_mut().filter(|l| l.visible && !l.is_raster() && !l.graphics && only.is_none_or(|o| o == l.id)) {
         if !l.in_scale_range(scale) || held.contains(&l.id) {
             continue;
@@ -186,6 +193,14 @@ fn nearest_edge(s: &mut Session, from: Coord, to: Coord, px: f64, only: Option<u
             let Some((part, d)) = paths.iter().map(|p| near(p, a).max(near(p, b))).enumerate().min_by(|x, y| x.1.total_cmp(&y.1)) else {
                 continue;
             };
+            // A projection that cuts features at its edge can split a part in two: the map's
+            // part numbers then aren't the source's, and the trace picks the part itself.
+            let source = l.dataset.features.get(row).and_then(|f| f.geometry.as_ref()).map_or(0, |g| match g {
+                Geometry::Line(parts) => parts.len(),
+                Geometry::Polygon(polys) => polys.iter().map(Vec::len).sum(),
+                _ => 0,
+            });
+            let part = (source == paths.len()).then_some(part);
             if d <= tol && best.is_none_or(|x| d < x.0) {
                 best = Some((d, id, row, part));
             }

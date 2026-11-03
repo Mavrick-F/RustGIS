@@ -52,7 +52,9 @@ fn cut_polygon_splits_the_selected_parcel_keeping_its_attributes() {
     s.run("select.rows", &json!({"layer": id, "rows": [0]})).unwrap();
     // New features get an elevation; the pieces of a cut keep the feature's own values.
     s.run("edit.elevation", &json!({"mode": "constant", "z": 5})).unwrap();
+    let mark = s.notice_mark();
     let r = s.run("edit.cutPolygon", &json!({"line": line(&[[0.3, -1.], [0.3, 2.]])})).unwrap();
+    assert!(s.notices_since(mark).is_empty(), "everything selected was cut: no notice");
     assert_eq!(r, json!({"cut": 1, "pieces": 2, "missed": 0}));
     let after = features(&s, id);
     assert_eq!(after.len(), 3);
@@ -101,8 +103,10 @@ fn a_refused_cut_of_one_selected_parcel_cuts_none_of_them() {
     // A selected parcel the line misses is counted, not cut.
     let (mut s, id) = fixture(GeometryType::Polygon, vec![rectangle(0., 0., 1., 1.), rectangle(5., 0., 6., 1.)]);
     s.run("select.rows", &json!({"layer": id, "rows": [0, 1]})).unwrap();
+    let mark = s.notice_mark();
     let r = s.run("edit.cutPolygon", &json!({"line": line(&[[0.5, -1.], [0.5, 2.]])})).unwrap();
     assert_eq!(r, json!({"cut": 1, "pieces": 2, "missed": 1}));
+    assert_eq!(s.notices_since(mark).len(), 1, "the parcel left uncut is said");
 }
 
 #[test]
@@ -136,7 +140,9 @@ fn reshaping_away_a_hole_says_so() {
     let mark = s.notice_mark();
     let r = s.run("edit.reshape", &json!({"line": line(&[[0.3, -1.], [0.3, 2.]])})).unwrap();
     assert_eq!(r["holesRemoved"], 1);
-    assert_eq!(s.notices_since(mark).len(), 1, "one notice, with the count");
+    let notices = s.notices_since(mark);
+    assert_eq!(notices.len(), 1, "one notice, with the count");
+    assert!(notices[0].text.contains("Reshape removed 1 hole"), "{notices:?}");
 }
 
 #[test]
