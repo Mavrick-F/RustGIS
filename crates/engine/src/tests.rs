@@ -1711,7 +1711,7 @@ fn project_save_and_open_roundtrip() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Save As must not replace a readable project with JSON that exceeds the opening limit.
+/// Save As and packaging must not replace readable files with a project above the opening limit.
 #[test]
 fn oversized_project_save_preserves_file_and_live_state() {
     let dir = std::env::temp_dir().join(format!("rustgis-save-limit-{}", std::process::id()));
@@ -1720,6 +1720,9 @@ fn oversized_project_save_preserves_file_and_live_state() {
     let mut s = world();
     s.run("project.saveAs", &json!({"path": path})).unwrap();
     let original = std::fs::read(&path).unwrap();
+    let package = dir.join("existing.rgispkg");
+    s.run("project.package", &json!({"path": package})).unwrap();
+    let original_package = std::fs::read(&package).unwrap();
     s.run("project.rename", &json!({"name": "Unsaved work"})).unwrap();
     let source = dir.join("roads.geojson").display().to_string();
     s.project.maps[0].layers[0].dataset.source = Some(source.clone());
@@ -1727,7 +1730,10 @@ fn oversized_project_save_preserves_file_and_live_state() {
     s.project.thumbnail = Some("x".repeat(crate::project::MAX_BYTES as usize));
     let error = s.run("project.saveAs", &json!({"path": path})).unwrap_err();
     assert!(error.contains("too large"), "{error}");
+    let error = s.run("project.package", &json!({"path": package})).unwrap_err();
+    assert!(error.contains("too large"), "{error}");
     assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert_eq!(std::fs::read(&package).unwrap(), original_package);
     assert_eq!(s.project.name, "Unsaved work");
     assert_eq!(s.project.maps[0].layers[0].dataset.source.as_deref(), Some(source.as_str()));
     assert_eq!(s.path.as_deref(), Some(path.as_path()));
