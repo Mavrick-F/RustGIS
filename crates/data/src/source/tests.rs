@@ -734,6 +734,39 @@ fn writes_geopackage_geoparquet_and_shapefile() {
 }
 
 #[test]
+fn geoparquet_exports_keep_exact_values_and_remote_extent_reads() {
+    let mut ds =
+        Dataset::new("points", GeometryType::Point, vec![Field::new("bbox", FieldType::Text), Field::new("value", FieldType::Double)]);
+    ds.push(
+        Some(Geometry::Point(Coord::new(-89.12345678901234, 36.181582500000005))),
+        vec![Value::Text("東京".into()), Value::Float(0.12345678901234568)],
+    );
+    ds.push(Some(Geometry::Point(Coord::new(1.2345678901234567, -12.345678901234567))), vec![Value::Null, Value::Null]);
+    ds.push(None, vec![Value::Text("no shape".into()), Value::Float(-0.25)]);
+    let bytes = parquet::write(&ds).unwrap();
+    let local = open_bytes("exact.parquet", bytes.clone(), None).unwrap();
+    assert_eq!(local.info().count, Some(3));
+    assert_eq!(local.info().fields, ds.fields);
+    assert!(local.info().notes.is_empty());
+    let back = local.read(&Request::all()).unwrap();
+    assert_eq!(back.features.len(), 2);
+    for (got, original) in back.features.iter().zip(&ds.features) {
+        // Comparing WKB bytes also checks the coordinate bits, rather than numeric equality.
+        assert_eq!(wkb::encode(got.geometry.as_ref().unwrap()), wkb::encode(original.geometry.as_ref().unwrap()));
+        assert_eq!(got.attrs, original.attrs);
+    }
+    let url = "https://test.example/exact-export.parquet";
+    remote::testing::serve(url, bytes);
+    let source = open_driven(url);
+    assert!(source.info().indexed);
+    let req = Request { extent: Some(Extent::new(-90.0, 36.0, -89.0, 37.0)), limit: 10 };
+    let remote = source.read(&req).unwrap();
+    assert!(remote.complete);
+    assert_eq!(remote.features.len(), 1);
+    assert_eq!(remote.features, local.read(&req).unwrap().features);
+}
+
+#[test]
 fn geopackage_export_preserves_existing_database_and_wal() {
     let workspace = tempfile::tempdir().unwrap();
     let path = workspace.path().join("county.gpkg");

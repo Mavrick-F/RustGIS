@@ -1108,7 +1108,7 @@ fn wkb_type_name(g: &crate::Geometry) -> &'static str {
     }
 }
 
-/// Writes a dataset as GeoParquet 1.1 (WGS 84 longitude/latitude, WKB geometry, Snappy), with a
+/// Writes a dataset as GeoParquet 1.1 (WGS 84 longitude/latitude, WKB geometry, Zstd level 9), with a
 /// `bbox` covering column so readers can skip rows and row groups by extent. A table without
 /// geometry is written as plain Parquet.
 pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
@@ -1126,12 +1126,12 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
     out: W,
     feed: &mut dyn FnMut(&mut dyn FnMut(&[Feature]) -> Result<()>) -> Result<()>,
 ) -> Result<W> {
-    use parquet::basic::{Compression, Repetition};
+    use parquet::basic::{Compression, Encoding, Repetition, ZstdLevel};
     use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int64Type};
     use parquet::file::metadata::KeyValue;
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
-    use parquet::schema::types::Type;
+    use parquet::schema::types::{ColumnPath, Type};
 
     let has_geom = geometry_type != GeometryType::None;
     let geom_name = free_name(fields, "geometry");
@@ -1160,8 +1160,18 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
     }
     let schema = Arc::new(Type::group_type_builder("schema").with_fields(cols).build().map_err(err)?);
 
-    let props = WriterProperties::builder().set_compression(Compression::SNAPPY).set_created_by("RustGIS".to_string()).build();
-    let mut w = SerializedFileWriter::new(out, schema, Arc::new(props)).map_err(err)?;
+    let mut props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(9).map_err(err)?))
+        .set_created_by("RustGIS".to_string());
+    if has_geom {
+        // Keep the covering for range reads; split its doubles into byte streams so Zstd can
+        // compress their shared exponent bytes without rounding any coordinate values.
+        for corner in ["xmin", "ymin", "xmax", "ymax"] {
+            let path = ColumnPath::new(vec![bbox_name.clone(), corner.to_string()]);
+            props = props.set_column_dictionary_enabled(path.clone(), false).set_column_encoding(path, Encoding::BYTE_STREAM_SPLIT);
+        }
+    }
+    let mut w = SerializedFileWriter::new(out, schema, Arc::new(props.build())).map_err(err)?;
 
     /// The row group's next column writer; an error should the schema end first.
     fn next_column<'a, W: std::io::Write + Send>(
