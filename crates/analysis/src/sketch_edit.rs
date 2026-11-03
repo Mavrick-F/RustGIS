@@ -8,9 +8,9 @@ use geo::Validation;
 use rustgis_data::Geometry;
 use rustgis_geom::{Coord, lonlat_to_merc, merc_to_lonlat};
 
-/// Points closer than this (metres) are one point: a vertex snapped onto a boundary meets it.
+/// Points closer than this (Web Mercator metres) are one point: a vertex snapped onto a boundary meets it.
 const EPS: f64 = 1e-3;
-/// A drawn line's first or last point this near an edge (metres) is on it: a point snapped onto
+/// A drawn line's first or last point this near an edge (Web Mercator metres) is on it: a point snapped onto
 /// an edge in another map projection can sit a few millimetres off it in Web Mercator.
 const END_SNAP: f64 = 0.01;
 /// Most segment pairs one edit compares, so a huge shape or line can't stall the app.
@@ -52,11 +52,23 @@ fn dist(a: Coord, b: Coord) -> f64 {
 /// antimeridian) aren't coordinates on the Earth.
 fn project(path: &[Coord]) -> Result<Vec<Pt>, String> {
     let pts: Vec<Pt> = path.iter().map(|c| Pt::of(*c)).collect();
-    if pts.iter().all(|p| p.m.is_finite() && p.ll.x.abs() <= 360.0) {
+    if pts.iter().all(|p| p.m.is_finite() && p.ll.x.abs() <= 360.0 && p.ll.y.abs() <= 90.0) {
         Ok(pts)
     } else {
         Err("the shape has coordinates that can't be drawn on the map".into())
     }
+}
+
+/// A polygon ring as metres, closed: a ring stored without repeating its first point gets its
+/// closing edge.
+fn project_ring(ring: &[Coord]) -> Result<Vec<Pt>, String> {
+    let mut r = project(ring)?;
+    if let (Some(first), Some(last)) = (r.first().copied(), r.last())
+        && first.ll != last.ll
+    {
+        r.push(first);
+    }
+    Ok(r)
 }
 
 /// Twice the signed area of a ring in metres (positive anticlockwise).
@@ -247,7 +259,7 @@ fn cut_part(rings: &[Vec<Coord>], line: &[Pt], work: &mut usize) -> Result<Optio
     // Rings as metres, the outer one anticlockwise and holes clockwise: the inside on the left.
     let mut rs: Vec<Vec<Pt>> = Vec::new();
     for (i, r) in rings.iter().enumerate() {
-        let mut r = project(r)?;
+        let mut r = project_ring(r)?;
         let a = area2(&r);
         if (i == 0) != (a > 0.0) {
             r.reverse();
@@ -498,7 +510,7 @@ fn settle_ends(line: &mut [Pt], paths: &[Vec<Pt>]) {
 fn paths_of(g: &Geometry) -> Result<Vec<Vec<Pt>>, String> {
     match g {
         Geometry::Line(parts) => parts.iter().map(|p| project(p)).collect(),
-        Geometry::Polygon(polys) => polys.iter().flatten().map(|r| project(r)).collect(),
+        Geometry::Polygon(polys) => polys.iter().flatten().map(|r| project_ring(r)).collect(),
         _ => Ok(Vec::new()),
     }
 }
@@ -641,7 +653,7 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Reshaped, String> {
             within_work(parts.iter().flatten().map(Vec::len).sum(), line.len())?;
             for (pi, part) in parts.iter().enumerate() {
                 for (ri, ring) in part.iter().enumerate() {
-                    let r = project(ring)?;
+                    let r = project_ring(ring)?;
                     let hits = crossings(&line, &r);
                     let (Some(p), Some(q)) = (hits.first(), hits.last()) else { continue };
                     if hits.len() < 2 {
@@ -691,10 +703,18 @@ pub fn reshape(g: &Geometry, line: &[Coord]) -> Result<Reshaped, String> {
                     // The other parts of a multipart feature: a reshape mustn't push into one it
                     // didn't overlap before (a square metre counts, as in the overlap check).
                     if let (Some(new), Some(old)) = (geo_polygon(&part), parts.get(pi).and_then(|p| geo_polygon(p))) {
+                        // Only siblings whose box meets the new part's are validated and measured.
                         // An invalid sibling is left out: its overlap can't be measured reliably,
                         // and an already broken feature shouldn't block the edit.
-                        for sib in
-                            parts.iter().enumerate().filter(|(j, _)| *j != pi).filter_map(|(_, p)| geo_polygon(p)).filter(|p| p.is_valid())
+                        use geo::{BoundingRect, Intersects};
+                        let new_box = new.bounding_rect();
+                        let near = |p: &geo::Polygon<f64>| matches!((p.bounding_rect(), new_box), (Some(a), Some(b)) if a.intersects(&b));
+                        for sib in parts
+                            .iter()
+                            .enumerate()
+                            .filter(|(j, _)| *j != pi)
+                            .filter_map(|(_, p)| geo_polygon(p))
+                            .filter(|p| near(p) && p.is_valid())
                         {
                             if shared_area(&new, &sib) > 1.0 && shared_area(&old, &sib) <= 1.0 {
                                 return Err("reshaping there would overlap another part of the same feature".into());
@@ -778,8 +798,8 @@ pub struct Reshaped {
     pub holes_removed: usize,
 }
 
-/// A path traced along a feature's edge, and how far (metres) its ends were from the points
-/// asked for.
+/// A path traced along a feature's edge, and how far (Web Mercator metres, which exceed ground
+/// metres by 1/cos(latitude)) its ends were from the points asked for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Traced {
     pub path: Vec<Coord>,
@@ -988,6 +1008,16 @@ mod tests {
         let g = Geometry::Polygon(vec![vec![ring]]);
         assert!(cut_polygon(&g, &[c(0.0, 0.0), c(1.0, 1.0)], &mut 0).is_err());
         assert!(reshape(&g, &[c(0.0, 0.0), c(1.0, 1.0)]).is_err());
+    }
+
+    #[test]
+    fn a_ring_stored_open_is_traced_and_cut_as_closed() {
+        let open = vec![c(0.0, 0.0), c(1.0, 0.0), c(1.0, 1.0), c(0.0, 1.0)];
+        let g = Geometry::Polygon(vec![vec![open]]);
+        // Round the corner at (0, 0), over the closing edge.
+        let t = trace(&g, c(0.0, 0.5), c(0.5, 0.0), None).unwrap();
+        assert_eq!(t.path, vec![c(0.0, 0.5), c(0.0, 0.0), c(0.5, 0.0)]);
+        assert_eq!(cut_polygon(&g, &[c(0.5, -1.0), c(0.5, 2.0)], &mut 0).unwrap().map(|p| p.len()), Some(2));
     }
 
     #[test]

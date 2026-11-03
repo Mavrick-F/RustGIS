@@ -118,8 +118,8 @@ pub(super) fn reshape(s: &mut Session, p: &Value) -> CmdResult {
 
 /// The path along a feature's edge from `from` to `to`: a given feature's (`layer`, `row`), or
 /// else the nearest line or polygon edge passing within the tolerance of both points (in `layer`
-/// when it is given). Returns how
-/// far (metres, Web Mercator) each point was from the edge it was moved onto.
+/// when it is given). Returns how far (Web Mercator metres) each point was from the edge it was
+/// moved onto.
 pub(super) fn trace(s: &mut Session, p: &Value) -> CmdResult {
     let (from, to) = (point(p, "from")?, point(p, "to")?);
     let (id, row, part) = match p.get("row") {
@@ -132,7 +132,18 @@ pub(super) fn trace(s: &mut Session, p: &Value) -> CmdResult {
             // A given layer limits the search to its features.
             let only = if p.get("layer").is_some() { Some(s.layer_id(p)?) } else { None };
             let (id, row, part) = nearest_edge(s, from, to, px, only).ok_or("no line or polygon edge passes near both points")?;
-            // The part chosen on the map, so the path follows the same one.
+            // The part chosen on the map, so the path follows the same one. When the projection
+            // split the feature, that part can't be named in the source: with more than one to
+            // choose from, ask for the row (the map's Trace doesn't follow it either).
+            let parts =
+                s.map().layer(id).and_then(|l| l.dataset.features.get(row)).and_then(|f| f.geometry.as_ref()).map_or(0, |g| match g {
+                    Geometry::Line(p) => p.len(),
+                    Geometry::Polygon(p) => p.iter().map(Vec::len).sum(),
+                    _ => 0,
+                });
+            if part.is_none() && parts > 1 {
+                return Err("that feature is split where the map projection cuts it: give its layer and row to trace it".into());
+            }
             (id, row, part)
         }
     };

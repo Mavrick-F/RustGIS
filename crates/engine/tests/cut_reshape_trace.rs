@@ -119,7 +119,19 @@ fn cut_polygon_accepts_longitudes_past_180() {
     s.run("select.rows", &json!({"layer": id, "rows": [0]})).unwrap();
     let r = s.run("edit.cutPolygon", &json!({"line": line(&[[270., -1.], [270., 2.]])})).unwrap();
     assert_eq!(r, json!({"cut": 1, "pieces": 2, "missed": 0}));
-    assert_eq!(features(&s, id).len(), 2);
+    let after = features(&s, id);
+    assert_eq!(after.len(), 2);
+    // One piece on each side of 270° (sorted by west edge: they're the same size).
+    let mut spans: Vec<(f64, f64)> = after
+        .iter()
+        .map(|f| {
+            let Some(Geometry::Polygon(p)) = &f.geometry else { panic!("not a polygon") };
+            p[0][0].iter().fold((f64::MAX, f64::MIN), |(lo, hi), c| (lo.min(c.x), hi.max(c.x)))
+        })
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    assert!(near(spans[0].0, 265.) && near(spans[0].1, 270.) && near(spans[1].0, 270.) && near(spans[1].1, 275.), "{spans:?}");
 }
 
 #[test]

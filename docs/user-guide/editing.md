@@ -65,7 +65,8 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   snapping so clicks land exactly on the edge. From scripts,
   `edit.trace={"from": [lon, lat], "to": [lon, lat]}` returns the path along the nearest edge
   passing within the snapping tolerance of both points (`"layer"` keeps the search to one layer;
-  add `"row"` to trace a given feature), and how far, in metres, each point was from the edge (`fromOffM`, `toOffM`).
+  add `"row"` to trace a given feature), and how far each point was from the edge (`fromOffM`, `toOffM`, in Web Mercator metres, which
+  run longer than ground metres away from the equator).
 - **Edit Vertices** (Edit › Features): reshape the selected features on the map. Their vertices
   show as square handles and each edge has a round midpoint handle. Drag a vertex to move it;
   drag a midpoint, or click an edge, to insert a vertex; click a vertex and press ++delete++ to
