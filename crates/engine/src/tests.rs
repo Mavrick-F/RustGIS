@@ -24114,7 +24114,7 @@ fn shapefile_value_losses_reach_export_notices() {
                 "{command}: {notices:?}"
             );
             assert!(
-                notices.iter().any(|n| n.contains("3 numbers") && n.contains("id") && n.contains("number") && n.contains("left empty")),
+                notices.iter().any(|n| n.contains("3 values") && n.contains("id") && n.contains("number") && n.contains("left empty")),
                 "{command}: {notices:?}"
             );
             assert!(notices.iter().any(|n| n.contains("1 features without drawable geometry were left out")), "{command}: {notices:?}");

@@ -2143,51 +2143,75 @@ fn dbf_notice_name(name: &str) -> String {
     out
 }
 
-/// Counts text cut to 254 bytes and numeric values left empty by the dBase writer, in rows
-/// whose geometry it writes only. Each kind has one notice naming the affected fields (first
-/// five, bounded and flattened as in [`shapefile_names_note`]); a clean dataset gives none.
+/// Value losses counted independently for each dBase field, using only rows the writer keeps.
+#[derive(Clone, Copy, Default)]
+struct DbfLosses {
+    text: usize,
+    empty: usize,
+    rounded: usize,
+}
+
+/// Counts text cut to 254 bytes, non-null values left empty, and numbers rounded to the field's
+/// precision, in rows whose geometry is written. Each kind has one notice naming the affected
+/// source fields (first five, bounded and flattened); a clean dataset gives none.
 pub fn shapefile_values_notes(ds: &Dataset, target: &str) -> Vec<String> {
     let decimals: Vec<_> =
         ds.fields.iter().enumerate().map(|(k, f)| if f.ty == FieldType::Double { dbf_decimals(ds, k) } else { 0 }).collect();
-    let mut counts = vec![(0usize, 0usize); ds.fields.len()];
+    let mut counts = vec![DbfLosses::default(); ds.fields.len()];
     // Geometry is examined once per row, regardless of how many attribute fields it has.
     for row in ds.features.iter().filter(|f| shapefile_keeps(f.geometry.as_ref(), ds.geometry_type)) {
         for (k, (field, value)) in ds.fields.iter().zip(&row.attrs).enumerate() {
-            let Some((text, numbers)) = counts.get_mut(k) else { continue };
+            if value.is_null() {
+                continue;
+            }
+            let Some(loss) = counts.get_mut(k) else { continue };
             match field.ty {
-                FieldType::Text if !value.is_null() && value.to_string().len() > 254 => *text += 1,
-                FieldType::Integer | FieldType::Double
-                    if value.as_f64().is_some() && dbf_number(value, field.ty, decimals.get(k).copied().unwrap_or(0)).is_none() =>
-                {
-                    *numbers += 1
+                FieldType::Text if value.to_string().len() > 254 => loss.text += 1,
+                FieldType::Integer | FieldType::Double => {
+                    let d = decimals.get(k).copied().unwrap_or(0);
+                    match dbf_number(value, field.ty, d) {
+                        None => loss.empty += 1,
+                        Some(number) => {
+                            // The writer uses fixed decimal text, including ties rounded to even.
+                            let written = format!("{number:.d$}").parse::<f64>().ok();
+                            if written != value.as_f64() {
+                                loss.rounded += 1;
+                            }
+                        }
+                    }
                 }
+                FieldType::Boolean if dbf_boolean(value).is_none() => loss.empty += 1,
                 _ => {}
             }
         }
     }
-    let cut_text: usize = counts.iter().map(|(text, _)| text).sum();
-    let blanked: usize = counts.iter().map(|(_, numbers)| numbers).sum();
-    let text_fields: Vec<_> = ds.fields.iter().zip(&counts).filter(|(_, (n, _))| *n > 0).map(|(f, _)| f.name.as_str()).collect();
-    let number_fields: Vec<_> = ds.fields.iter().zip(&counts).filter(|(_, (_, n))| *n > 0).map(|(f, _)| f.name.as_str()).collect();
-    let list = |fields: &[&str]| {
+    let selected = |count: fn(&DbfLosses) -> usize| {
+        let total: usize = counts.iter().map(count).sum();
+        let fields: Vec<_> = ds.fields.iter().zip(&counts).filter(|(_, n)| count(n) > 0).map(|(f, _)| f.name.as_str()).collect();
         let names: Vec<_> = fields.iter().take(5).map(|s| format!("'{}'", dbf_notice_name(s))).collect();
         let more = if fields.len() > 5 { format!(" and {} more", fields.len() - 5) } else { String::new() };
-        format!("{}{more}", names.join(", "))
+        (total, format!("{}{more}", names.join(", ")))
     };
     let target: String = target.chars().map(dbf_notice_char).collect();
     let mut notes = Vec::new();
-    if cut_text > 0 {
-        let what = if cut_text == 1 { "1 text value was".into() } else { format!("{cut_text} text values were") };
-        notes.push(format!("{target}: {what} cut to at most 254 bytes, in {}", list(&text_fields)));
+    let (cut, fields) = selected(|n| n.text);
+    if cut > 0 {
+        let what = if cut == 1 { "1 text value was".into() } else { format!("{cut} text values were") };
+        notes.push(format!("{target}: {what} cut to at most 254 bytes, in {fields}"));
     }
-    if blanked > 0 {
-        let what = if blanked == 1 {
-            "1 number didn't fit its dBase field".into()
+    let (empty, fields) = selected(|n| n.empty);
+    if empty > 0 {
+        let what = if empty == 1 {
+            "1 value couldn't be written to its dBase field and was".into()
         } else {
-            format!("{blanked} numbers didn't fit their dBase fields")
+            format!("{empty} values couldn't be written to their dBase fields and were")
         };
-        let verb = if blanked == 1 { "was" } else { "were" };
-        notes.push(format!("{target}: {what} and {verb} left empty, in {}", list(&number_fields)));
+        notes.push(format!("{target}: {what} left empty, in {fields}"));
+    }
+    let (rounded, fields) = selected(|n| n.rounded);
+    if rounded > 0 {
+        let what = if rounded == 1 { "1 number was".into() } else { format!("{rounded} numbers were") };
+        notes.push(format!("{target}: {what} rounded to fit dBase field precision, in {fields}"));
     }
     notes
 }
@@ -2241,6 +2265,15 @@ fn dbf_number(v: &Value, ty: FieldType, d: usize) -> Option<f64> {
         exact && format!("{x:.d$}").len() <= if ty == FieldType::Integer { 18 } else { 24 }
     })?;
     Some(if ty == FieldType::Integer { x.round() } else { x })
+}
+
+/// The Boolean values the dBase writer accepts; an incompatible value is left empty.
+fn dbf_boolean(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        Value::Int(i) => Some(*i != 0),
+        _ => None,
+    }
 }
 
 /// Whether [`shapefile_parts_in`] writes a feature with geometry `g` to a layer of type `gt`: one
@@ -2305,11 +2338,7 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
             let v = r.attrs.get(k).unwrap_or(&Value::Null);
             let value = match f.ty {
                 FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals.get(k).copied().unwrap_or(0))),
-                FieldType::Boolean => FieldValue::Logical(match v {
-                    Value::Bool(b) => Some(*b),
-                    Value::Int(i) => Some(*i != 0),
-                    _ => None,
-                }),
+                FieldType::Boolean => FieldValue::Logical(dbf_boolean(v)),
                 FieldType::Text => FieldValue::Character((!v.is_null()).then(|| cut(&v.to_string(), 254).to_string())),
             };
             rec.insert(n.clone(), value);
@@ -3296,6 +3325,51 @@ mod tests {
         assert_eq!(names(&out), ["rivers.zip"]);
         assert_eq!(problems.len(), 1);
         assert!(problems[0].starts_with("huge.shp:") && problems[0].contains("MB"), "{problems:?}");
+    }
+
+    /// Typed datasets can retain incompatible cells or fractional values from dynamic sources.
+    #[test]
+    fn shapefile_notes_cover_incompatible_and_rounded_cells() {
+        let cases = [
+            ("integer text", FieldType::Integer, Value::Text("n/a".into()), false),
+            ("double NaN", FieldType::Double, Value::Float(f64::NAN), false),
+            ("double infinity", FieldType::Double, Value::Float(f64::INFINITY), false),
+            ("boolean text", FieldType::Boolean, Value::Text("abc".into()), false),
+            ("integer rounding", FieldType::Integer, Value::Float(2.5), true),
+            ("double rounding", FieldType::Double, Value::Float(2.55), true),
+            ("positive half", FieldType::Double, Value::Float(0.5), true),
+            ("negative half", FieldType::Double, Value::Float(-0.5), true),
+        ];
+        let mut missing = Vec::new();
+        for (name, ty, value, rounded) in cases {
+            let mut ds = Dataset::new("cells", GeometryType::Point, vec![Field::new("value", ty)]);
+            ds.push(Some(Geometry::Point(Coord::new(1., 2.))), vec![value.clone()]);
+            if name == "double rounding" {
+                // The largest whole part leaves one decimal place in this column.
+                ds.push(Some(Geometry::Point(Coord::new(3., 4.))), vec![Value::Float(1e20)]);
+            }
+            if name.ends_with("half") {
+                // A 22-digit whole part forces zero decimal places; ties round to even.
+                ds.push(Some(Geometry::Point(Coord::new(3., 4.))), vec![Value::Float(1e21)]);
+            }
+            let (bytes, _) = write_bytes(&ds, "zip").unwrap();
+            let (back, _) = read_bytes("cells.zip", &bytes).unwrap();
+            if rounded {
+                assert_ne!(back.features[0].attrs[0].as_f64(), value.as_f64(), "{name}");
+            } else {
+                assert_eq!(back.features[0].attrs[0], Value::Null, "{name}");
+            }
+            let notes = shapefile_values_notes(&ds, "cells.zip");
+            let kind = if rounded { "rounded" } else { "left empty" };
+            if !notes.iter().any(|n| n.contains(kind) && n.contains("1 ") && n.contains("value")) {
+                missing.push(name);
+            }
+            ds.features[0].attrs = vec![Value::Null];
+            assert!(shapefile_values_notes(&ds, "cells.zip").is_empty(), "null: {name}");
+            ds.features[0].attrs = vec![if ty == FieldType::Boolean { Value::Bool(false) } else { Value::Int(0) }];
+            assert!(shapefile_values_notes(&ds, "cells.zip").is_empty(), "clean: {name}");
+        }
+        assert!(missing.is_empty(), "losses without notices: {missing:?}");
     }
 
     /// The notice for field names a Shapefile can't hold names each change as the file has it,

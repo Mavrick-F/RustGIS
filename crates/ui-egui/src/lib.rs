@@ -4460,7 +4460,10 @@ mod download_service_tests {
         assert_eq!(changed(&app), 1);
         assert!(app.session.notices.iter().any(|n| n.text == "Sites.zip: 1 text value was cut to at most 254 bytes, in 'notes'"));
         assert!(
-            app.session.notices.iter().any(|n| n.text == "Sites.zip: 1 number didn't fit its dBase field and was left empty, in 'big'")
+            app.session
+                .notices
+                .iter()
+                .any(|n| n.text == "Sites.zip: 1 value couldn't be written to its dBase field and was left empty, in 'big'")
         );
         assert!(app.session.notices.iter().any(|n| n.text
             == "Sites.zip: 1 field name was changed to fit a Shapefile (10 bytes at most, unique ignoring case): \
