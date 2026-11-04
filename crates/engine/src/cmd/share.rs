@@ -52,8 +52,8 @@ pub fn commands() -> Vec<C> {
 }
 
 /// A GeoPackage export's table, from `mode` and `tableName`, which only a GeoPackage (extension
-/// `ext`) takes.
-fn gpkg_table(p: &Value, ext: &str) -> Result<GpkgTable, String> {
+/// `ext`) takes; the front end checks a request with it before asking for a file.
+pub fn gpkg_table(p: &Value, ext: &str) -> Result<GpkgTable, String> {
     // Not a string is refused, not taken for the default.
     let text = |key: &str| match p.get(key) {
         None | Some(Value::Null) => Ok(None),
