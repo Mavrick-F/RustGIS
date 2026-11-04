@@ -987,13 +987,27 @@ pub struct RustGisApp {
 }
 
 impl RustGisApp {
-    /// The layer to export: the one Export Features was opened on (`layer`, checked against its
-    /// `instance` so a reused id isn't taken for it), else the active layer.
-    fn export_target(&self, p: &Value) -> Result<u32, String> {
-        let Some(id) = p.get("layer").and_then(Value::as_u64) else {
-            return self.session.active_layer.ok_or_else(|| "select a layer in the Layers pane first".to_string());
+    /// Export Features' GeoPackage `mode` (`newFile` when not given) for a file of extension `ext`:
+    /// it and `tableName` are refused for other formats, and a `mode` that isn't text, as the
+    /// command refuses them.
+    fn export_mode<'a>(p: &'a Value, ext: &str) -> Result<&'a str, String> {
+        let mode = match p.get("mode") {
+            None | Some(Value::Null) => "newFile",
+            Some(v) => v.as_str().ok_or("mode must be a string")?,
         };
-        let id = u32::try_from(id).map_err(|_| "no such layer".to_string())?;
+        if ext != "gpkg" && (mode != "newFile" || p.get("tableName").is_some()) {
+            return Err(format!("mode and tableName are for a GeoPackage (.gpkg) export, not .{ext}"));
+        }
+        Ok(mode)
+    }
+
+    /// The layer to export: `layer` (an id or name, as commands take it; the dialog's is checked
+    /// against its `instance`, so a reused id isn't taken for it), else the active layer.
+    fn export_target(&self, p: &Value) -> Result<u32, String> {
+        if p.get("layer").is_none_or(Value::is_null) {
+            return self.session.active_layer.ok_or_else(|| "select a layer in the Layers pane first".to_string());
+        }
+        let id = self.session.layer_id(p)?;
         let l = self.session.map().layer(id).ok_or("the layer Export Features was opened on is gone")?;
         match p.get("instance").and_then(Value::as_u64) {
             Some(instance) if instance != l.instance_id() => Err("the layer Export Features was opened on is gone".into()),
@@ -3331,6 +3345,7 @@ impl RustGisApp {
                 // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
                 // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
+                Self::export_mode(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
                 let whole = if l.is_streamed() { Some(l.load_all()?) } else { None };
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
@@ -3402,13 +3417,7 @@ impl RustGisApp {
                     .map(|(l, _)| *l)
                     .ok_or_else(|| format!("unknown format '{ext}'"))?;
                 // Into a GeoPackage that exists: picked to open, as it is kept, not replaced.
-                let mode = match p.get("mode") {
-                    None | Some(Value::Null) => "newFile",
-                    Some(v) => v.as_str().ok_or("mode must be a string")?,
-                };
-                if ext != "gpkg" && (mode != "newFile" || p.get("tableName").is_some()) {
-                    return Err(format!("mode and tableName are for a GeoPackage (.gpkg) export, not .{ext}"));
-                }
+                let mode = Self::export_mode(p, &ext)?;
                 let id = self.export_target(p)?;
                 if ext == "gpkg" && mode != "newFile" {
                     if let Some(path) = dialogs::pick_open(&["gpkg"], label) {
@@ -4543,6 +4552,9 @@ mod download_service_tests {
             app
         };
         let mut app = with(true);
+        // The browser's export refuses a GeoPackage mode for another format, as the desktop's does.
+        assert!(app.run("ui.exportLayer", json!({"format": "geojson", "mode": "replaceTable"})).is_err());
+        assert_eq!(changed(&app), 0);
         app.run("ui.exportLayer", json!({"format": "shp"})).unwrap();
         assert_eq!(changed(&app), 1);
         assert!(app.session.notices.iter().any(|n| n.text == "Sites.zip: 1 text value was cut to at most 254 bytes, in 'notes'"));
@@ -4589,6 +4601,9 @@ mod download_service_tests {
         assert_eq!(rustgis_engine::data::source::layers(&path).unwrap(), ["Cities", "borders"]);
         let countries = app.session.map().layer_by_name("Countries").map(|l| l.dataset.features.len() as u64);
         assert_eq!(rustgis_engine::data::source::open_path(&path, Some("borders")).unwrap().info().count, countries);
+        // A layer by name is that layer; one not there is refused, not taken for the active one.
+        let e = app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "addTable", "layer": "Nowhere"})).unwrap_err();
+        assert!(e.contains("Nowhere"), "{e}");
         // Cancelling the pick writes nothing.
         let before = std::fs::read(&path).unwrap();
         app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "replaceTable", "tableName": "Cities"})).unwrap();
