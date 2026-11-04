@@ -6,9 +6,7 @@
 
 use std::path::Path;
 
-use crate::io::{
-    CsvWriter, GeoJsonWriter, GpkgTable, GpkgWritten, PROJECTED_FORMATS, check_projected, project_features, write_atomic_with,
-};
+use crate::io::{CsvWriter, GeoJsonWriter, GpkgTable, GpkgWritten, PROJECTED_FORMATS, check_projected, project_each, write_atomic_with};
 use crate::raster::Crs;
 use crate::source::FeatureSource;
 use crate::{DataError, Dataset, Feature, GeometryType, Result};
@@ -94,11 +92,14 @@ fn write_chunks_to(
     let mut total = 0usize;
     let mut skipped = 0usize;
     let mut feed = |add: &mut dyn FnMut(&[Feature]) -> Result<()>| -> Result<()> {
-        // A GeoPackage export that starts again feeds the features again.
+        // A GeoPackage export that starts again feeds the features again, and counts them again.
         total = 0;
+        // The writers count the features; a source that doesn't know how many leaves the total at 0.
+        crate::progress::begin(src.info().count.map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)));
         let batch = src.visit_chunks(None, bytes, &mut |mut chunk| {
             if let Some(t) = &t {
-                project_features(&mut chunk, t, crs)?;
+                // Counted as the writer writes them, so only stopped on a cancel here.
+                project_each(&mut chunk, t, crs, false)?;
             }
             total = total.saturating_add(chunk.len());
             add(&chunk)

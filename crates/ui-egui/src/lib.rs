@@ -33,6 +33,8 @@ mod docpanes;
 mod earthaccessui;
 mod editpanes;
 mod embeddingsui;
+#[cfg(not(target_arch = "wasm32"))]
+mod exportjob;
 mod failureui;
 mod fieldlists;
 mod fieldmenu;
@@ -159,6 +161,8 @@ pub const TOOL_FILE_PICK: &str = "\u{1}toolfile:";
 
 /// The preference the default raster style (`raster.setDefaultStyle`) is kept under.
 const RASTER_DEFAULTS_PREF: &str = "raster_default_style";
+/// The preference holding the favourite arrangement of publication layouts (`layout.arrangement`).
+const LAYOUT_FAVOURITE_PREF: &str = "layout_favourite_arrangement";
 
 /// A result an asynchronous service fills in when it's done (the app polls it each frame).
 pub type Slot<T> = std::sync::Arc<std::sync::Mutex<Option<T>>>;
@@ -743,6 +747,8 @@ pub struct UiState {
     pub connections_saved: u64,
     /// The default raster style last kept in the preferences.
     pub raster_defaults_saved: rustgis_engine::map::RasterDefaults,
+    /// The favourite arrangement last saved, to save it again only when it changes.
+    pub layout_favourite_saved: Value,
     /// Home › Add › Add Data › Zarr…: its store, choices and fetches.
     pub zarr: zarrui::State,
     /// Independent Zarr reads for imported GeoLibre layers; does not share the picker state.
@@ -883,6 +889,7 @@ impl Default for UiState {
             sources_saved: 0,
             connections_saved: 0,
             raster_defaults_saved: Default::default(),
+            layout_favourite_saved: Value::Null,
             zarr: Default::default(),
             geolibre_zarr: Vec::new(),
             hidden_tabs: Vec::new(),
@@ -916,6 +923,9 @@ pub struct RustGisApp {
     pub(crate) graphic_format: graphicformat::GraphicFormat,
     pub forms: editpanes::Forms,
     pub workflow: analysispane::Workflow,
+    /// An export writing its file on its own thread (see [`exportjob`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    export_job: Option<exportjob::ExportJob>,
     /// ModelBuilder's view: the model on its canvas.
     pub mb: modelbuilder::ModelBuilder,
     pub ws: workspacepanes::WorkspaceState,
@@ -1098,7 +1108,10 @@ impl RustGisApp {
         if s.active_layer.is_none() {
             s.active_layer = s.map().layers.first().map(|l| l.id);
         }
-        let ui = UiState { keymap: keymap::Keymap::new(&s.registry), ..UiState::default() };
+        // The favourite arrangement counts as saved until a command changes it, so one never set
+        // isn't written to the preferences.
+        let ui =
+            UiState { keymap: keymap::Keymap::new(&s.registry), layout_favourite_saved: s.layout_favourite.clone(), ..UiState::default() };
         RustGisApp {
             session: s,
             ui,
@@ -1110,6 +1123,8 @@ impl RustGisApp {
             graphic_format: graphicformat::GraphicFormat::default(),
             forms: editpanes::Forms { distance_units: "Meters".into(), ..editpanes::Forms::default() },
             workflow: analysispane::Workflow::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            export_job: None,
             mb: modelbuilder::ModelBuilder::default(),
             ws: workspacepanes::WorkspaceState::default(),
             time: timebar::TimeBarState::default(),
@@ -1195,6 +1210,31 @@ impl RustGisApp {
             self.session.raster_defaults = d.sanitized();
         }
         self.ui.raster_defaults_saved = self.session.raster_defaults.clone();
+        // The favourite arrangement of publication layouts; one no longer valid is passed over,
+        // said, and classic used.
+        if let Some(text) = self.services.load_pref.as_ref().and_then(|load| load(LAYOUT_FAVOURITE_PREF)) {
+            let read = serde_json::from_str::<Value>(&text)
+                .map_err(|e| e.to_string())
+                .and_then(|v| rustgis_engine::cmd::layout::parse_arrangement(&v).map(|_| v));
+            match read {
+                // A saved null is the default, named.
+                Ok(v) if v.is_null() => self.session.layout_favourite = Value::String("classic".into()),
+                Ok(v) => self.session.layout_favourite = v,
+                Err(why) => {
+                    // Notices are shown as written, and the language is set only in `start`.
+                    i18n::set_current(self.chosen_lang());
+                    self.session.layout_favourite = Value::String("classic".into());
+                    self.session.notify(
+                        crate::i18n::fmt(
+                            "The saved favourite arrangement of publication layouts can't be used ({why}), so \"classic\" is used.",
+                            &[("why", &why)],
+                        ),
+                        false,
+                    );
+                }
+            }
+        }
+        self.ui.layout_favourite_saved = self.session.layout_favourite.clone();
         self.forms.distance_units = self
             .services
             .load_pref
@@ -1741,6 +1781,13 @@ impl RustGisApp {
         autosave::end(self);
     }
 
+    /// The app closing (the desktop app's `on_exit`): an export still writing is cancelled and
+    /// given a moment to stop, so it leaves no temporary file beside its destination.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn end_exports(&mut self) {
+        exportjob::stop(self, std::time::Duration::from_secs(5));
+    }
+
     /// Whether this shell opens files by path (the desktop app; the web app picks them in the
     /// browser instead).
     pub(crate) fn opens_files(&self) -> bool {
@@ -1897,6 +1944,7 @@ impl RustGisApp {
         sourcespane::save(self);
         sourcespane::save_connections(self);
         self.save_raster_defaults();
+        self.save_layout_favourite();
         r
     }
 
@@ -1955,7 +2003,7 @@ impl RustGisApp {
             let Some(h) = self.session.project.gp_history.last().filter(|h| !h.id.is_empty()) else { return };
             finished = json!({"tool": h.id, "params": h.params});
             ("gp.run", &finished)
-        } else if matches!(id, "analysis.viewshed" | "analysis.interpolate") && params.get("ran").is_some() {
+        } else if rustgis_engine::cmd::workflows::runs_in_background(id).is_some() && params.get("ran").is_some() {
             // A raster an Analysis workflow made on a thread (`ran`): the step is the command
             // itself, which a replay runs again from its parameters.
             let mut again = params.clone();
@@ -2085,6 +2133,17 @@ impl RustGisApp {
             command: id.to_string(),
             params: params.clone(),
         });
+    }
+
+    /// Saves the favourite arrangement of publication layouts when `layout.arrangement` changed it.
+    fn save_layout_favourite(&mut self) {
+        if self.session.layout_favourite == self.ui.layout_favourite_saved {
+            return;
+        }
+        self.ui.layout_favourite_saved = self.session.layout_favourite.clone();
+        if let Some(save) = &self.services.save_pref {
+            save(LAYOUT_FAVOURITE_PREF, &self.session.layout_favourite.to_string());
+        }
     }
 
     /// Keeps the default raster style with the preferences when it changed.
@@ -2617,8 +2676,10 @@ impl RustGisApp {
                         q[k] = v.clone();
                     }
                 }
-                if p.get("zoom").and_then(Value::as_bool) == Some(true) {
-                    q["zoom"] = json!(true);
+                if let Some(zoom) =
+                    p.get("zoom").and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| matches!(s, "true" | "yes" | "1" | "on"))))
+                {
+                    q["zoom"] = json!(zoom);
                 }
                 for k in ["service", "coverage"] {
                     if p.get(k).and_then(Value::as_bool) == Some(true) {
@@ -2649,7 +2710,8 @@ impl RustGisApp {
                 }
                 let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
                 let land = slot.clone();
-                rustgis_engine::render::rustgis_tiles::cache::download_limited(
+                // A Shapefile's `.shp` address brings its `.dbf`, `.shx`, `.prj` and `.cpg` too.
+                rustgis_engine::cmd::layer::download_data(
                     &url,
                     if q.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
                         rustgis_engine::map::geolibre::MAX_TEXT
@@ -3386,6 +3448,10 @@ impl RustGisApp {
                     .map(|l| format!("{}.tif", l.name))
                     .unwrap_or_default();
                 if let Some(path) = dialogs::pick_save(&name, &["tif", "tiff"], tl!("GeoTIFF")) {
+                    // Written on a thread of its own, with progress and Cancel in the status bar.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return exportjob::start(self, "share.exportRaster", json!({"path": path}));
+                    #[cfg(target_arch = "wasm32")]
                     return self.run("share.exportRaster", json!({"path": path}));
                 }
             }
@@ -3416,7 +3482,11 @@ impl RustGisApp {
                 };
                 if gpkg.mode != rustgis_engine::data::io::GpkgMode::NewFile {
                     if let Some(path) = dialogs::pick_open(&["gpkg"], label) {
-                        return self.run("share.exportLayer", with_table(json!({"layer": id, "path": path})));
+                        let args = with_table(json!({"layer": id, "path": path}));
+                        #[cfg(not(target_arch = "wasm32"))]
+                        return exportjob::start(self, "share.exportLayer", args);
+                        #[cfg(target_arch = "wasm32")]
+                        return self.run("share.exportLayer", args);
                     }
                     return Ok(Value::Null);
                 }
@@ -3426,7 +3496,12 @@ impl RustGisApp {
                     // in the name, as in "U.S. Cities", isn't taken for one).
                     let typed = std::path::Path::new(&path).extension().is_some_and(|e| e.eq_ignore_ascii_case(&ext));
                     let path = if typed { path } else { format!("{path}.{ext}") };
-                    return self.run("share.exportLayer", with_table(json!({"layer": id, "path": path})));
+                    // Written on a thread of its own, with progress and Cancel in the status bar.
+                    let args = with_table(json!({"layer": id, "path": path}));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return exportjob::start(self, "share.exportLayer", args);
+                    #[cfg(target_arch = "wasm32")]
+                    return self.run("share.exportLayer", args);
                 }
             }
             // Add Zarr Variable, connected to a store (a link, a script).
@@ -3689,7 +3764,12 @@ impl RustGisApp {
                 Err(e) => {
                     self.session.download_failed(id);
                     rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, &p);
-                    self.session.notify(if e.starts_with(&url) { e } else { format!("{url}: {e}") }, true);
+                    // Named without the address's keys, token or signature.
+                    let e = e.strip_prefix(url.as_str()).map(|r| r.trim_start_matches(": ").to_string()).unwrap_or(e);
+                    let why = rustgis_engine::sources::redact_text(&e);
+                    // An error that names its own address (a Shapefile's part) isn't named again.
+                    let named = why.split_once(": ").is_some_and(|(head, _)| head.contains("://") && !head.contains(' '));
+                    self.session.notify(if named { why } else { format!("{}: {why}", rustgis_engine::sources::redact(&url)) }, true);
                 }
             }
         }
@@ -3698,8 +3778,26 @@ impl RustGisApp {
     /// Adds a download that landed (`layer.addDownload`), named in Recent after the connection it
     /// came from; one whose project was closed meanwhile is said and dropped.
     pub(crate) fn add_landed(&mut self, landed: serviceui::Landed, bytes: Vec<u8>) {
+        let current = self.session.download_landed(landed.id, bytes);
+        self.add_download(landed, current);
+    }
+
+    /// Adds a service layer's features that landed read already (its protocol buffer pages,
+    /// joined), as [`Self::add_landed`] adds a download.
+    pub(crate) fn add_landed_read(
+        &mut self,
+        landed: serviceui::Landed,
+        dataset: rustgis_engine::data::Dataset,
+        report: rustgis_engine::data::ReadReport,
+    ) {
+        let current = self.session.download_landed_read(landed.id, dataset, report);
+        self.add_download(landed, current);
+    }
+
+    /// Adds a download handed to the session (`current`: it still belongs to this project).
+    fn add_download(&mut self, landed: serviceui::Landed, current: bool) {
         let serviceui::Landed { id, url, params: mut p, origin } = landed;
-        if !self.session.download_landed(id, bytes) {
+        if !current {
             self.session.notify(i18n::fmt("{url}: downloaded after its project was closed, so it wasn't added", &[("url", &url)]), false);
             return;
         }
@@ -3919,6 +4017,7 @@ impl RustGisApp {
         sourcespane::save(self);
         sourcespane::save_connections(self);
         self.save_raster_defaults();
+        self.save_layout_favourite();
         cswui::poll(self);
         stacui::poll(self, ctx);
         s3ui::poll(self, ctx);
@@ -4102,11 +4201,11 @@ impl RustGisApp {
         fieldmenu::play(self, &ctx);
         chrome::shortcuts(self, &ctx);
         panes::follow_layer_filter(self);
-        // A Zarr summary, a trend or a workflow running on its thread lands whatever is in view,
-        // the File menu's backstage too, so a project saved there holds it (all are looked at: `|`,
-        // not `||`), and the frames go on while one runs so it's taken when it ends.
+        // A Zarr summary, a trend, a workflow or an export running on its thread lands whatever is
+        // in view, the File menu's backstage too, so a project saved there holds it (all are looked
+        // at: `|`, not `||`), and the frames go on while one runs so it's taken when it ends.
         #[cfg(not(target_arch = "wasm32"))]
-        if workspacepanes::land_summary(self) | analysispane::land_trend(self) | analysispane::land_job(self) {
+        if workspacepanes::land_summary(self) | analysispane::land_trend(self) | analysispane::land_job(self) | exportjob::land(self) {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         if self.ui.backstage {
@@ -4401,6 +4500,22 @@ mod record_tests {
         assert_eq!(app.ws.recording.as_ref().map(Vec::len), Some(1));
     }
 
+    /// A raster a workflow made on a thread is recorded as its command without `ran`, so a replay
+    /// works it out again (#1291 step 3).
+    #[test]
+    fn a_raster_made_on_a_thread_is_recorded_as_its_command() {
+        let mut app = RustGisApp::with_sample();
+        for id in ["analysis.viewshed", "analysis.interpolate", "raster.classify", "dl.classify", "raster.function", "imagery.mosaic"] {
+            app.ws.recording = Some(Vec::new());
+            app.record_step(id, &json!({"layer": "Cities", "ran": 7}), None);
+            let steps = app.ws.recording.as_deref().unwrap_or_default();
+            assert_eq!(
+                steps.iter().map(|s| (s.command.as_str(), s.params.clone())).collect::<Vec<_>>(),
+                [(id, json!({"layer": "Cities"}))]
+            );
+        }
+    }
+
     /// A background run's `gp.finish` is recorded as the `gp.run` it finished.
     #[test]
     fn a_tool_finished_in_the_background_is_recorded_as_its_run() {
@@ -4591,6 +4706,12 @@ mod download_service_tests {
         crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(path.display().to_string()));
         let p = json!({"format": "gpkg", "mode": "addTable", "tableName": "borders", "layer": id, "instance": instance});
         app.run("ui.exportLayer", p).unwrap();
+        // Written on a thread of its own: waits for it to land.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::exportjob::land(&mut app) {
+            assert!(std::time::Instant::now() < end, "the export never landed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(rustgis_engine::data::source::layers(&path).unwrap(), ["Cities", "borders"]);
         let countries = app.session.map().layer_by_name("Countries").map(|l| l.dataset.features.len() as u64);
         assert_eq!(rustgis_engine::data::source::open_path(&path, Some("borders")).unwrap().info().count, countries);

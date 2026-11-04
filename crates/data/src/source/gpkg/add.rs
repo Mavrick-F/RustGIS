@@ -67,6 +67,9 @@ pub(super) fn write_features(
             Err(Redo::Renumber) => keep_ids = false,
             Ok((layout, extent)) => {
                 register(&tx, &layout, extent)?;
+                // A cancel that came while it was written rolls it all back; the last look, as
+                // committing writes the table, and a Cancel after it finds it written.
+                crate::progress::check()?;
                 tx.commit().map_err(err)?;
                 let dependents = replaced.take();
                 return Ok(GpkgWritten { table: layout.table, replaced: dependents.is_some(), dependents: dependents.unwrap_or_default() });

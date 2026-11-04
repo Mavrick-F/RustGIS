@@ -68,21 +68,37 @@ where they now are (and says how many are gone), and a result that would replace
 layer, or one loaded whole meanwhile, is refused. Renaming the map while it runs is fine; after
 switching to another map, a result that adds to or changes the map is refused (one made only of
 tables or a file is still made). Opening another project drops the run. The Analysis pane's
-**Zonal Statistics**, **Viewshed** and **Interpolate (IDW)** run in the background the same way,
-with their progress and **Cancel** under the pane's inputs, one at a time; so does the map's
-right-click **Viewshed … Here**, which opens the pane to show it. Scripts, models, the AI
+**Zonal Statistics**, **Viewshed**, **Interpolate (IDW)**, **Suitability Modeler**, **Raster
+Functions** and the **Function Editor**'s chains, **Change Detection**, **Classification Wizard**
+(k-means), **Classification Tools** (from training polygons), **Indices**, **Process** (clip and resample), an ortho or
+reality workspace's **Build** (its mosaic) and **Deep Learning** (training and classifying) run in
+the background the same way, with their progress and **Cancel** under the pane's inputs, one at a
+time; so does the map's right-click
+**Viewshed … Here**, which opens the pane to show it. A model trained there is kept once its classes
+are added: a cancelled run keeps none. Scripts, models, the AI
 Assistant, the command line and the web app wait for each tool to finish.
 
-**Viewshed**, **IDW Interpolation** and **Kriging** refuse a run that would take more than a second
-or two of work on one thread (a ray step, a cell-point pair), and **Kernel Density** one whose
-points' search windows (the square around each point's radius) cover more than 50 million cells. On the desktop they run on several
-cores (up to 16), and they take as many times more work as the threads they run on. Threads share
-cores and memory, so a run at that limit can take up to about twice as long as a one-thread run at
-its own (measured on one machine, a Xeon Silver 4114; it can be longer on others); in the web app,
-on one thread, the limits stay as they are. The error names the
-limit on this computer and the threads it counted. A tool's own default cell size still follows the
-one-thread limit, so it makes the same grid on any computer; a finer cell size given is what the
-larger limit lets through.
+**Viewshed**, **IDW Interpolation** and **Kriging** have no work limit when you run them from their
+pane in the desktop app (the Tools or Analysis pane), nor does **Kernel Density** or **Deep
+Learning**: a large run shows its progress, and **Cancel** stops it within a moment, however wide
+its rows. Neither does `rustgis-cli run` typed at a terminal, which Ctrl-C stops. Where a run can't
+be stopped while it goes (a script, a model, the AI Assistant, Python, the web app, and `rustgis-cli
+run` called from another program, such as an agent or a CI job, which may wait with a timeout),
+Viewshed, IDW Interpolation and Kriging refuse a run that would take more than a second or two of
+work on one thread (a ray step, a cell-point pair), Kernel Density one whose points' search windows
+(the square around each point's radius) cover more than 50 million cells, and Deep Learning a model
+too large for its raster; its training fits a share of the sampled pixels, or fewer epochs, instead
+(`dl.train` reports the epochs it ran). A task or model recorded from a pane run keeps these limits
+when it runs again in the app, so a step the pane took on can be refused there, and a model trained
+again can differ. On the desktop these limits grow with the cores the run takes (up to 16), as many
+times more work as the threads it runs on. Threads share cores and memory, so a run at that limit
+can take up to about twice as long as a one-thread run at its own (measured on one machine, a Xeon
+Silver 4114; it can be longer on others); in the web app, on one thread, the limits stay as they
+are. The error names the limit on this computer and the threads it counted. The limits on memory
+(the cells a grid may have, and those on the following pages) hold everywhere, as does Viewshed's on
+its window: a radius covering more than 25 million cells, or 100,000 cells across, is refused. A
+tool's own default cell size still follows the one-thread limit, so it makes the same grid on any
+computer and from any caller; a finer cell size given is what a larger limit, or none, lets through.
 
 From the command line or a script (`gp.run`), a built-in tool's parameter with a list of choices, such as Buffer's
 units, takes one of them in any letter case (`"meters"` for `Meters`); any other value is an error
@@ -135,6 +151,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Split Line At Vertices | `splitLineAtVertices` | Data Management › Features |
 | Feature Envelope To Polygon | `featureEnvelopeToPolygon` | Data Management › Features |
 | Unsplit Line | `unsplitLine` | Data Management › Features |
+| Check Geometry | `checkGeometry` | Data Management › Features |
 | XY Table To Point | `xyTableToPoint` | Data Management › Features |
 | Calculate Geometry Attributes | `calculateGeometry` | Data Management › Features |
 | Simplify | `simplify` | Cartography › Generalization |
@@ -825,6 +842,52 @@ gp.run={"tool":"featureEnvelopeToPolygon","params":{"input":"Regions"}}
 gp.run={"tool":"unsplitLine","params":{"input":"Rivers"}}
 ```
 
+### Checking geometry
+
+**Check Geometry** (`checkGeometry`) finds the features whose geometry breaks the OGC Simple
+Features rules and writes them to a new layer, `<input>_check` unless you name it. Only the
+selected features are checked when some are selected. Each output row is its input feature as
+stored, with the same feature id, fields, attributes and CRS, plus two text fields: `problem`,
+the codes of what is wrong separated by `, `, and `detail`, a short description of each problem
+separated by `; ` that names the part and ring (counted from 1; ring 1 is the exterior ring),
+such as `exterior ring of part 1 crosses itself; 3 repeated vertices in ring 2 of part 1`. A
+feature with more than 20 problems lists the first 20 and counts the rest. If the input already
+has a `problem` or `detail` field, the new one gets the next free name (`problem_2`) and the
+tool says so. When nothing is wrong, the output layer is empty and the message says how many
+features were checked.
+
+| Code | What is wrong |
+| --- | --- |
+| `null_geometry` | No geometry, or one without coordinates |
+| `non_finite_coordinate` | A coordinate is not a number or infinite. The row is written without geometry, so it can't spoil the layer's extent |
+| `too_few_points` | A line part with fewer than 2 distinct points, a ring with fewer than 3, or a polygon part without rings |
+| `ring_not_closed` | A ring's last point is not its first |
+| `repeated_vertex` | The same vertex twice in a row (a closed ring's last point doesn't count) |
+| `self_intersection` | A ring crosses itself, touches itself, or runs back over itself |
+| `hole_outside_shell` | An interior ring (hole) is not inside its exterior ring |
+| `rings_intersect` | Two rings of one polygon overlap or touch along a line |
+| `disconnected_interior` | Rings of one polygon touch at points so that they cut its interior into pieces, such as a hole touching the exterior ring at two points, or three holes each touching the next |
+| `parts_overlap` | Two polygons of one multipart feature overlap or touch along a line |
+| `too_complex` | Some of the feature's checks were left out: it needs more work than the tool spends on one feature, there wasn't enough memory to check it, or the geo library's relate operation failed on some of its rings or parts (`detail` says which of the three, not which rings or parts). The checks of each ring's points still run. The tool says how many features each reason left out |
+
+Codes are listed in this order, and are never translated. The checks work in stored
+coordinates, without projection. Lines may cross themselves, so only polygon rings are checked
+for self-intersection; points are checked for missing and non-finite coordinates only. Rings may
+touch each other at single points, as long as the polygon's interior stays in one piece (checked
+once its rings have no other problem with each other); any number of rings may meet at the same
+point. An unclosed ring is reported, then checked as if it
+were closed. Ring orientation is not checked, since GeoJSON and Shapefiles wind rings in
+opposite directions. The rings of a polygon are only checked against each other when each of them is
+usable (enough points, finite coordinates, and not crossing, touching or running back over
+itself), and the parts of a feature only when each part's rings are usable and have no problem
+with each other; the tool says how many features were not fully checked this way, because some
+of their rings or parts already have problems of their own. Rings and parts that touch are compared with the
+[geo](https://github.com/georust/geo) library's relate operation.
+
+```text
+gp.run={"tool":"checkGeometry","params":{"input":"Parcels"}}
+```
+
 ## GeoLibre tools
 
 The desktop app and the command line can also run the
@@ -916,8 +979,8 @@ click them on the map:
 | Raster Functions | Slope, aspect, hillshade, NDVI, band math (`(b4-b3)/(b4+b3)`), remapping, thresholds, resampling |
 | Function Editor | Chains raster functions, each on the previous output |
 | Suitability Modeler | Scores rasters 1–10 and adds them with weights |
-| Visibility Analysis | A viewshed from a point on an elevation raster |
-| Exploratory 3D Analysis | A line of sight between two points, split into seen and hidden parts |
+| Visibility Analysis | A viewshed from a point on an elevation raster, with the Earth's curvature and the refraction of visible light (1/7, as `gdal_viewshed`) |
+| Exploratory 3D Analysis | A line of sight between two points, split into seen and hidden parts, with the same curvature and refraction |
 | Geostatistical Wizard | An IDW surface from feature values, using 12 nearest neighbours by default |
 | Network Analysis | The shortest (or cheapest, by a cost field) route over a line layer |
 | Neighborhood Explorer | What lies within a distance of a point, with sums of numeric fields |
@@ -1317,7 +1380,9 @@ the wrong field.
 
 **Analyze › Deep Learning Tools** trains a neural network (a multilayer perceptron) on the pixels
 under training polygons and classifies every pixel, adding a class raster with a confidence band
-and reporting the accuracy on held-back pixels. Trained models stay in the project; **Publish ›
+and reporting the accuracy on held-back pixels. Run from its pane in the desktop app, it trains
+on every sampled pixel for all the epochs asked, however long that takes, and can be cancelled;
+elsewhere it keeps to a few seconds of work (see the limits above). Trained models stay in the project; **Publish ›
 Share As › Deep Learning** saves one as a package to apply in other projects. **Analyze › Create
 Hosted Imagery** cuts a raster into XYZ web map tiles (PNG, transparent outside the raster) with
 a TileJSON file and a viewer page.

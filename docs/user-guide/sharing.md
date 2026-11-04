@@ -19,6 +19,13 @@ table. **Data › Export** also writes rasters to GeoTIFF, and **Data Interop** 
 KML, GPX or CSV with WKT. Layouts, reports and presentations export from their own tabs and panes
 (see [Layouts and Reports](layouts.md)).
 
+On the desktop, Export Features and Export Raster write their file in the background, so the map
+and the rest of the window stay in use. While one runs, the status bar shows its name, a progress
+bar (Export Raster's untiled GeoTIFF shows none) and **Cancel**; when it ends its messages appear
+as before. One export runs at a time. A cancelled export writes nothing, and a file it was to
+replace stays as it was. Scripts, models, the AI Assistant and the command line still wait for
+the file. Export Map and layout exports still run before the window goes on.
+
 A GeoPackage export writes a new file by default, and refuses an existing `.gpkg` to protect its
 tables, even if the save dialog offers to replace the file. To put the layer into an existing
 GeoPackage instead, choose GeoPackage in **Export Features**, then under **Into** either
