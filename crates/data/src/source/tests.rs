@@ -2519,8 +2519,8 @@ fn geopackage_export_into_a_file_refuses_what_it_cannot_replace() {
     assert_eq!(kept, "keep");
     // A spatial index declared over lines, with the module quoted, is still the index; an
     // `rtree_i32` table of that name isn't.
-    for (module, replaced) in [("\n  \"rtree\" (", true), ("rtree_i32(", false)] {
-        let file = workspace.path().join(format!("index-{replaced}.gpkg"));
+    for (module, replaced) in [("\n  \"rtree\" (", true), ("[rtree](", true), ("rtree_i32(", false)] {
+        let file = workspace.path().join(format!("index-{}.gpkg", module.len()));
         write_path_to(&ds, &file, Crs::LonLat, &GpkgTable { mode: GpkgMode::AddTable, name: Some("sites".into()) }).unwrap();
         rusqlite::Connection::open(&file)
             .unwrap()

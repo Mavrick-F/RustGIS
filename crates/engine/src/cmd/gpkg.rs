@@ -163,6 +163,21 @@ pub(crate) fn reset_sources(s: &mut Session, path: &std::path::Path, table: &str
     (n, failed)
 }
 
+/// The layers loaded for editing from `table` of the GeoPackage at `path`, by name, in every map:
+/// after the table is replaced they still hold its old rows (with their unsaved edits).
+pub(crate) fn editing(s: &Session, path: &std::path::Path, table: &str) -> Vec<String> {
+    let canonical = std::fs::canonicalize(path).ok();
+    let same = |p: &str| match (canonical.as_ref(), std::fs::canonicalize(p).ok()) {
+        (Some(a), Some(b)) => *a == b,
+        _ => std::path::Path::new(p) == path,
+    };
+    let layers = s.project.maps.iter().flat_map(|m| m.layers.iter());
+    layers
+        .filter(|l| l.gpkg.as_ref().is_some_and(|g| g.table.eq_ignore_ascii_case(table) && same(&g.path)))
+        .map(|l| l.name.clone())
+        .collect()
+}
+
 fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {

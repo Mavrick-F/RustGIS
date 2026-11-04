@@ -94,6 +94,17 @@ fn report_table(s: &mut Session, path: &str, gpkg: &GpkgTable, table: Option<Gpk
             let layers = if reread == 1 { "layer reads" } else { "layers read" };
             s.notify(format!("{path}: {reread} {layers} {} in place, now the new table", table.table), false);
         }
+        let held = if table.replaced { super::gpkg::editing(s, Path::new(path), &table.table) } else { Vec::new() };
+        if !held.is_empty() {
+            let n = held.len();
+            let (layers, show) = if n == 1 { ("layer", "shows") } else { ("layers", "show") };
+            let note = format!(
+                "{path}: {n} {layers} loaded for editing from {} still {show} the old table's rows; Discard Edits loads the new one: {}",
+                table.table,
+                held.join(", ")
+            );
+            s.notify(note, false);
+        }
         if !failed.is_empty() {
             let layers = if failed.len() == 1 { "layer" } else { "layers" };
             let note = format!(

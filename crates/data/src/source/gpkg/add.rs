@@ -258,10 +258,10 @@ fn drop_table(conn: &Connection, table: &str) -> Result<()> {
             let index = format!("rtree_{table}_{c}");
             let rtree: bool = conn
                 .query_row(
-                    // Its declaration without spaces, line breaks and quotes, so `USING "rtree" (`
+                    // Its declaration without spaces, line breaks and quotes of any kind, so `USING "rtree" (`
                     // counts and `USING rtree_i32(` doesn't.
                     "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?1)
-                        AND replace(replace(replace(replace(replace(replace(lower(sql), ' ', ''), char(9), ''), char(10), ''), char(13), ''), '\"', ''), '`', '')
+                        AND replace(replace(replace(replace(replace(replace(replace(replace(lower(sql), ' ', ''), char(9), ''), char(10), ''), char(13), ''), '\"', ''), '`', ''), '[', ''), ']', '')
                             LIKE 'createvirtualtable%usingrtree(%')",
                     [&index],
                     |r| r.get(0),

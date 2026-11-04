@@ -12515,6 +12515,17 @@ fn exporting_features_adds_or_replaces_a_table_in_an_existing_geopackage() {
     let read = s.map().layer_by_name("InPlace").map(|l| l.load_all().map(|ds| ds.features.len()));
     assert_eq!(read, Some(Ok(cities)), "its features are the new table's");
     assert!(s.notices_since(mark).iter().any(|n| n.text.ends_with("1 layer reads Countries in place, now the new table")));
+    // A layer loaded for editing from a replaced table keeps its rows and edits, and is named.
+    s.run("gpkg.addLayer", &json!({"path": path, "table": "Cities", "name": "Editing"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer": "Countries", "path": path, "mode": "replaceTable", "tableName": "Cities"})).unwrap();
+    assert!(
+        s.notices_since(mark)
+            .iter()
+            .any(|n| n.text.contains("1 layer loaded for editing from Cities still shows") && n.text.ends_with(": Editing")),
+        "{:?}",
+        s.notices_since(mark)
+    );
     // A standalone table goes in as an attribute table.
     s.run("layer.addDataText", &json!({"fileName": "owners.csv", "text": "name,n\nShelby,1\n"})).unwrap();
     let table = s.project.tables.last().map(|t| t.id).unwrap();

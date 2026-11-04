@@ -43,6 +43,9 @@ pub struct Dialogs {
     pub mode: &'static str,
     /// Export Features' GeoPackage destination: one of [`GPKG_MODES`]' codes (empty: a new file).
     pub gpkg_mode: &'static str,
+    /// The layer Export Features was opened on (its id and instance), exported whatever is
+    /// selected while the dialog stays open.
+    pub export_layer: Option<(u32, u64)>,
     pub flag: bool,
     pub error: Option<String>,
     pub info: Option<String>,
@@ -172,6 +175,7 @@ impl Dialogs {
             "exportLayer" => {
                 self.mode = "geojson";
                 self.gpkg_mode = "newFile";
+                self.export_layer = active.map(|l| (l.id, l.instance_id()));
                 // The GeoPackage table's name.
                 self.text = active.map(|l| l.name.clone()).unwrap_or_default();
             }
@@ -653,6 +657,10 @@ fn export_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     }
     buttons(app, ui, if web { "Download" } else { "Export…" }, |app| {
         let mut p = json!({"format": app.dialogs.mode});
+        if let Some((layer, instance)) = app.dialogs.export_layer {
+            p["layer"] = json!(layer);
+            p["instance"] = json!(instance);
+        }
         if into_existing {
             p["mode"] = json!(app.dialogs.gpkg_mode);
             p["tableName"] = json!(app.dialogs.text);
