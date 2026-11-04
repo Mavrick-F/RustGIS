@@ -2501,6 +2501,18 @@ fn geopackage_export_into_a_file_refuses_what_it_cannot_replace() {
     assert!(e.contains("inspections refer to permits"), "{e}");
     let kept: i64 = rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM inspections", [], |r| r.get(0)).unwrap();
     assert_eq!(kept, 1);
+    // A table referring to the GeoPackage's own records keeps its rows when a replace deletes them.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE inspections;
+             CREATE TABLE notes (layer TEXT REFERENCES gpkg_contents (table_name) ON DELETE CASCADE);
+             INSERT INTO notes VALUES ('permits');",
+        )
+        .unwrap();
+    write_path_to(&ds, &path, Crs::LonLat, &replace("permits")).unwrap();
+    let notes: i64 = rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM notes", [], |r| r.get(0)).unwrap();
+    assert_eq!(notes, 1);
     // An ordinary table named as the spatial index is kept, and the replace refused.
     let squatted = workspace.path().join("squatted.gpkg");
     write_path_to(&ds, &squatted, Crs::LonLat, &GpkgTable { mode: GpkgMode::AddTable, name: Some("sites".into()) }).unwrap();

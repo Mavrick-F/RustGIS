@@ -33,6 +33,9 @@ pub(super) fn write_features(
     // Nor may its triggers run when the export writes its GeoPackage records: one could change
     // other tables. The new table's own triggers are made after its rows are in.
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false).map_err(err)?;
+    // Nor may its foreign keys turn the export's deletes (of a replaced table's GeoPackage
+    // records) into deletes elsewhere; a table referring to the replaced one is refused instead.
+    conn.execute_batch("PRAGMA foreign_keys = OFF").map_err(err)?;
     conn.busy_timeout(Duration::from_secs(5)).map_err(err)?;
     let (mut multi_points, mut keep_ids) = (None, true);
     // Each choice changes at most once; an export starting again rolls back what it wrote.

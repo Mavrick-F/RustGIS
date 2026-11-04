@@ -3402,7 +3402,10 @@ impl RustGisApp {
                     .map(|(l, _)| *l)
                     .ok_or_else(|| format!("unknown format '{ext}'"))?;
                 // Into a GeoPackage that exists: picked to open, as it is kept, not replaced.
-                let mode = p.get("mode").and_then(Value::as_str).unwrap_or("newFile");
+                let mode = match p.get("mode") {
+                    None | Some(Value::Null) => "newFile",
+                    Some(v) => v.as_str().ok_or("mode must be a string")?,
+                };
                 if ext != "gpkg" && (mode != "newFile" || p.get("tableName").is_some()) {
                     return Err(format!("mode and tableName are for a GeoPackage (.gpkg) export, not .{ext}"));
                 }
