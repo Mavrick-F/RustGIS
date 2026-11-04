@@ -43,6 +43,8 @@ pub struct ParquetSource {
     field_cols: Vec<usize>,
     /// Leaf column indices of the bbox covering's xmin, ymin, xmax, ymax.
     covering: Option<[usize; 4]>,
+    /// The metadata declares the covering, whose null boxes then imply null geometry.
+    declared_covering: bool,
     reproject: Reproject,
     /// The file, when it is read by its web address.
     remote: Option<Arc<Remote>>,
@@ -177,6 +179,7 @@ impl ParquetSource {
         }
         let reproject = Reproject::from_epsg(code, &mut notes);
         let covering = find_covering(md, col_meta, &primary);
+        let declared_covering = col_meta.and_then(|c| c.get("covering")).and_then(|c| c.get("bbox")).is_some();
 
         let mut fields = Vec::new();
         let mut field_cols = Vec::new();
@@ -270,8 +273,18 @@ impl ParquetSource {
             info.drop_zm(if all_zm { count } else { None });
         }
         let untyped = types.is_empty() && !zm;
-        let mut src =
-            ParquetSource { info, reader, geom_col, field_cols, covering, reproject, remote, exact: false, group_rows: MAX_GROUP_ROWS };
+        let mut src = ParquetSource {
+            info,
+            reader,
+            geom_col,
+            field_cols,
+            covering,
+            declared_covering,
+            reproject,
+            remote,
+            exact: false,
+            group_rows: MAX_GROUP_ROWS,
+        };
         if untyped {
             match src.peek_zm() {
                 Some(true) => src.info.drop_zm(None),
@@ -321,8 +334,20 @@ impl ParquetSource {
         rows.min(values).min(self.group_rows)
     }
 
+    /// Whether inferred bounds may omit or count rows that only their geometry can test.
+    /// Unknown null counts require the same fallback as known nulls; declared coverings promise
+    /// that a box is present if and only if geometry is present.
+    fn needs_geometry_filter(&self, md: &ParquetMetaData, g: usize) -> bool {
+        let Some(c) = self.covering else { return true };
+        !self.declared_covering
+            && c.into_iter()
+                .chain([self.geom_col])
+                .any(|i| md.row_group(g).columns().get(i).and_then(|col| col.statistics()).and_then(|s| s.null_count_opt()) != Some(0))
+    }
+
     /// Which rows of row group `g` have a bounding box meeting the native extent `e`, read from
-    /// the covering columns `c` alone. Null boxes have no location and cannot match an extent.
+    /// the covering columns `c` alone. Null boxes cannot match a declared covering; inferred
+    /// bounds leave them for the geometry to decide.
     fn covered_rows(&self, md: &ParquetMetaData, g: usize, e: &Extent, c: [usize; 4]) -> Result<Vec<bool>> {
         let rg = self.reader.get_row_group(g).map_err(err)?;
         let n = self.rows_in(md, g);
@@ -334,7 +359,7 @@ impl ParquetSource {
         Ok((0..n)
             .map(|r| {
                 let [Some(min_x), Some(min_y), Some(max_x), Some(max_y)] = [v(0, r), v(1, r), v(2, r), v(3, r)] else {
-                    return false;
+                    return !self.declared_covering;
                 };
                 let be = Extent::new(min_x, min_y, max_x, max_y);
                 be.is_empty() || be.intersects(e)
@@ -357,7 +382,7 @@ impl FeatureSource for ParquetSource {
         // Row groups whose bounding box meets the extent.
         let mut groups: Vec<usize> = (0..md.num_row_groups())
             .filter(|&g| match (native, self.covering) {
-                (Some(e), Some(c)) => group_extent(md, g, c).is_none_or(|ge| ge.intersects(&e)),
+                (Some(e), Some(c)) => self.needs_geometry_filter(md, g) || group_extent(md, g, c).is_none_or(|ge| ge.intersects(&e)),
                 _ => true,
             })
             .collect();
@@ -416,9 +441,9 @@ impl FeatureSource for ParquetSource {
         }
         let matched: u64 =
             groups.iter().zip(&keep).map(|(&g, k)| k.as_ref().map(|k| k.iter().filter(|&&b| b).count()).unwrap_or(rows_in(g)) as u64).sum();
-        // An extent without a covering is tested on the decoded geometry: the matches are sampled
-        // as they come. Otherwise the match count is known, and every `step`-th is read.
-        let late = native.is_some() && self.covering.is_none();
+        // Without a covering, or with nullable inferred bounds, test geometry before sampling
+        // for the whole request. Otherwise the match count is known, and every `step`-th is read.
+        let late = native.is_some() && groups.iter().any(|&g| self.needs_geometry_filter(md, g));
         let mut sample = if late { Sampler::new(limit) } else { Sampler::with_total(limit, matched) };
         // The rows of each group the sample takes, decided before anything else is read.
         let takes: Vec<Vec<bool>> = groups
@@ -479,7 +504,7 @@ impl FeatureSource for ParquetSource {
                 sample.keep(Feature { id: base.saturating_add(r as u64 + 1), geometry, attrs: values });
             }
         }
-        let matched = if late { sample.seen() } else { matched.saturating_mul(thinned as u64) };
+        let matched = (if late { sample.seen() } else { matched }).saturating_mul(thinned as u64);
         Ok(Batch { matched, complete: sample.complete() && thinned == 1, skipped, features: sample.items })
     }
 
@@ -516,6 +541,7 @@ impl FeatureSource for ParquetSource {
                 _ => None,
             };
             if let Some((e, _, Some(ge))) = area
+                && !self.needs_geometry_filter(md, g)
                 && !ge.intersects(&e)
             {
                 continue;

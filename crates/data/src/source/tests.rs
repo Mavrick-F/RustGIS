@@ -788,6 +788,54 @@ fn geoparquet_exports_keep_exact_values_and_remote_extent_reads() {
     }
 }
 
+/// Inferred pre-1.1 boxes may be absent independently of geometry; sample actual spatial matches.
+#[test]
+fn geoparquet_inferred_covering_nulls_fall_back_to_geometry() {
+    use arrow_array::{BinaryArray, Float64Array, RecordBatch, StructArray};
+    use arrow_schema::{DataType, Field as AField, Schema};
+    let point = Coord::new(-89.5, 36.5);
+    let wkb = wkb::encode(&Geometry::Point(point));
+    let bbox_fields = ["xmin", "ymin", "xmax", "ymax"].map(|name| Arc::new(AField::new(name, DataType::Float64, true)));
+    let coords: Vec<arrow_array::ArrayRef> = [0.0, 0.0, 0.0, 0.0]
+        .into_iter()
+        .map(|value| Arc::new(Float64Array::from(vec![Some(value), None])) as arrow_array::ArrayRef)
+        .collect();
+    let bbox = StructArray::new(bbox_fields.iter().cloned().collect(), coords, None);
+    let schema = Arc::new(Schema::new(vec![
+        AField::new("geometry", DataType::Binary, true),
+        AField::new("bbox", DataType::Struct(bbox_fields.iter().cloned().collect()), false),
+    ]));
+    // This is an ordinary struct column in 1.0, with no declared covering/null-presence contract.
+    let geo = r#"{"version":"1.0.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":["Point"]}}}"#;
+    let props = ::parquet::file::properties::WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![::parquet::file::metadata::KeyValue::new("geo".to_string(), geo.to_string())]))
+        .build();
+    let cols: Vec<arrow_array::ArrayRef> = vec![Arc::new(BinaryArray::from(vec![None, Some(wkb.as_slice())])), Arc::new(bbox)];
+    let batch = RecordBatch::try_new(schema.clone(), cols).unwrap();
+    let mut writer = ::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    let bytes = writer.into_inner().unwrap();
+    let local = open_bytes("inferred.parquet", bytes.clone(), None).unwrap();
+    assert!(local.info().indexed);
+    assert_eq!(local.read(&Request::all()).unwrap().features.len(), 2);
+    let url = "https://test.example/inferred-covering.parquet";
+    remote::testing::serve(url, bytes);
+    let remote = open_driven(url);
+    for extent in [Extent::new(-90.0, 36.0, -89.0, 37.0), Extent::new(-180.0, -90.0, 180.0, 90.0)] {
+        for limit in [1, 10] {
+            let req = Request { extent: Some(extent), limit };
+            let expected = local.read(&req).unwrap();
+            assert_eq!(expected.features.len(), 1);
+            assert_eq!((expected.matched, expected.complete, expected.skipped), (1, true, 0));
+            assert_eq!(expected.features[0].id, 2);
+            let by_address = remote.read(&req).unwrap();
+            assert_eq!(by_address.features, expected.features);
+            assert_eq!((by_address.matched, by_address.complete, by_address.skipped), (1, true, 0));
+            assert_eq!(visit_all(local.as_ref(), req.extent, 256).0, expected.features);
+        }
+    }
+}
+
 #[test]
 fn geopackage_export_preserves_existing_database_and_wal() {
     let workspace = tempfile::tempdir().unwrap();
