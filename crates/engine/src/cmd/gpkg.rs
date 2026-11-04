@@ -134,9 +134,10 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Makes every layer read in place from `table` of the GeoPackage at `path` (or from that file
 /// with no table named) read it again, in every map: its rows were written, or (with `reopen`)
-/// the table was made anew, so its fields and system are read again too. Returns how many.
-pub(crate) fn reset_sources(s: &mut Session, path: &std::path::Path, table: &str, reopen: bool) -> usize {
-    let mut n = 0;
+/// the table was made anew, so its fields and system are read again too. Returns how many read
+/// it again, and the layers that couldn't reopen it with why (each also keeps its error).
+pub(crate) fn reset_sources(s: &mut Session, path: &std::path::Path, table: &str, reopen: bool) -> (usize, Vec<String>) {
+    let (mut n, mut failed) = (0, Vec::new());
     let canonical = std::fs::canonicalize(path).ok();
     for map in &mut s.project.maps {
         for l in map.layers.iter_mut() {
@@ -147,17 +148,19 @@ pub(crate) fn reset_sources(s: &mut Session, path: &std::path::Path, table: &str
                     _ => std::path::Path::new(p) == path,
                 })
             {
-                n += 1;
-                if reopen {
-                    // A table that can't be opened now says so when the layer is next drawn.
-                    let _ = source.reopen();
-                } else {
+                if !reopen {
                     source.reset();
+                    n += 1;
+                } else {
+                    match source.reopen() {
+                        Ok(()) => n += 1,
+                        Err(e) => failed.push(format!("{} ({e})", l.name)),
+                    }
                 }
             }
         }
     }
-    n
+    (n, failed)
 }
 
 fn save_edits(s: &mut Session, p: &Value) -> CmdResult {

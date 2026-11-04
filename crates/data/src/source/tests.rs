@@ -2385,6 +2385,19 @@ fn geopackage_export_into_a_file_refuses_what_it_cannot_replace() {
         .unwrap();
     let e = write_path_to(&ds, &path, Crs::LonLat, &replace("permits")).unwrap_err().to_string();
     assert!(e.contains("related-tables relation"), "{e}");
+    // Nor is a table others refer to by foreign key: their rows would be deleted with it.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM gpkgext_relations;
+             CREATE TABLE inspections (id INTEGER PRIMARY KEY, permit INTEGER REFERENCES permits (fid) ON DELETE CASCADE);
+             INSERT INTO inspections VALUES (1, 1);",
+        )
+        .unwrap();
+    let e = write_path_to(&ds, &path, Crs::LonLat, &replace("permits")).unwrap_err().to_string();
+    assert!(e.contains("inspections refer to permits"), "{e}");
+    let kept: i64 = rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM inspections", [], |r| r.get(0)).unwrap();
+    assert_eq!(kept, 1);
     // An ordinary table named as the spatial index is kept, and the replace refused.
     let squatted = workspace.path().join("squatted.gpkg");
     write_path_to(&ds, &squatted, Crs::LonLat, &GpkgTable { mode: GpkgMode::AddTable, name: Some("sites".into()) }).unwrap();
@@ -2401,6 +2414,19 @@ fn geopackage_export_into_a_file_refuses_what_it_cannot_replace() {
     let kept: String =
         rusqlite::Connection::open(&squatted).unwrap().query_row("SELECT note FROM rtree_sites_geom", [], |r| r.get(0)).unwrap();
     assert_eq!(kept, "keep");
+    // A spatial index declared over lines, with the module quoted, is still the index; an
+    // `rtree_i32` table of that name isn't.
+    for (module, replaced) in [("\n  \"rtree\" (", true), ("rtree_i32(", false)] {
+        let file = workspace.path().join(format!("index-{replaced}.gpkg"));
+        write_path_to(&ds, &file, Crs::LonLat, &GpkgTable { mode: GpkgMode::AddTable, name: Some("sites".into()) }).unwrap();
+        rusqlite::Connection::open(&file)
+            .unwrap()
+            .execute_batch(&format!(
+                "DROP TABLE rtree_sites_geom; CREATE VIRTUAL TABLE rtree_sites_geom USING {module}id, minx, maxx, miny, maxy);"
+            ))
+            .unwrap();
+        assert_eq!(write_path_to(&ds, &file, Crs::LonLat, &replace("sites")).is_ok(), replaced, "{module:?}");
+    }
     let other = workspace.path().join("other.gpkg");
     std::fs::copy(&path, &other).unwrap();
     rusqlite::Connection::open(&other).unwrap().execute_batch("PRAGMA application_id = 1297105496").unwrap();

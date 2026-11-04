@@ -173,6 +173,13 @@ fn make_room(conn: &Connection, file: &str, table: &str, replace: bool) -> Resul
                     "{file} already has a table {old}: choose another table name, or replace that table"
                 )));
             }
+            let children = referencing(conn, &old)?;
+            if !children.is_empty() {
+                return Err(DataError::Format(format!(
+                    "{file}: {} refer to {old} by foreign key, whose rows a replaced table would delete or break; choose another table name",
+                    children.join(", ")
+                )));
+            }
             if related(conn, &old)? {
                 return Err(DataError::Format(format!(
                     "{file}: {old} is in a related-tables relation, whose links a replaced table would break; choose another table name"
@@ -190,6 +197,19 @@ fn make_room(conn: &Connection, file: &str, table: &str, replace: bool) -> Resul
             with_article(kind)
         ))),
     }
+}
+
+/// The other tables with a foreign key to `table`. Dropping it would delete or empty their rows
+/// (SQLite enforces foreign keys here), or leave them pointing at rows that aren't the same.
+fn referencing(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut st = conn
+        .prepare(
+            "SELECT DISTINCT m.name FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+                WHERE m.type = 'table' AND lower(m.name) != lower(?1) AND lower(f.\"table\") = lower(?1) ORDER BY m.name",
+        )
+        .map_err(err)?;
+    let names = st.query_map([table], |r| r.get::<_, String>(0)).map_err(err)?;
+    names.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
 }
 
 /// Whether the GeoPackage's related-tables extension names `table` as a base, related or mapping
@@ -238,8 +258,11 @@ fn drop_table(conn: &Connection, table: &str) -> Result<()> {
             let index = format!("rtree_{table}_{c}");
             let rtree: bool = conn
                 .query_row(
+                    // Its declaration without spaces, line breaks and quotes, so `USING "rtree" (`
+                    // counts and `USING rtree_i32(` doesn't.
                     "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?1)
-                        AND (lower(sql) LIKE 'create virtual table%using rtree(%' OR lower(sql) LIKE 'create virtual table%using rtree (%'))",
+                        AND replace(replace(replace(replace(replace(replace(lower(sql), ' ', ''), char(9), ''), char(10), ''), char(13), ''), '\"', ''), '`', '')
+                            LIKE 'createvirtualtable%usingrtree(%')",
                     [&index],
                     |r| r.get(0),
                 )

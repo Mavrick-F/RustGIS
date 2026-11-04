@@ -79,7 +79,8 @@ fn gpkg_table(p: &Value, ext: &str) -> Result<GpkgTable, String> {
 fn report_table(s: &mut Session, path: &str, gpkg: &GpkgTable, table: Option<GpkgWritten>, out: &mut Value) {
     let Some(table) = table else { return };
     if gpkg.mode != GpkgMode::NewFile {
-        let reread = if table.replaced { super::gpkg::reset_sources(s, Path::new(path), &table.table, true) } else { 0 };
+        let (reread, failed) =
+            if table.replaced { super::gpkg::reset_sources(s, Path::new(path), &table.table, true) } else { (0, Vec::new()) };
         let note = if table.replaced {
             format!(
                 "{path}: replaced its table {}, dropping the old table's indexes, triggers, column descriptions, metadata links and extension records",
@@ -92,6 +93,16 @@ fn report_table(s: &mut Session, path: &str, gpkg: &GpkgTable, table: Option<Gpk
         if reread > 0 {
             let layers = if reread == 1 { "layer reads" } else { "layers read" };
             s.notify(format!("{path}: {reread} {layers} {} in place, now the new table", table.table), false);
+        }
+        if !failed.is_empty() {
+            let layers = if failed.len() == 1 { "layer" } else { "layers" };
+            let note = format!(
+                "{path}: {} {layers} reading {} in place couldn't open the new table: {}",
+                failed.len(),
+                table.table,
+                failed.join(", ")
+            );
+            s.notify(note, true);
         }
         if !table.dependents.is_empty() {
             let n = table.dependents.len();
