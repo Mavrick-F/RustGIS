@@ -239,7 +239,7 @@ fn drop_table(conn: &Connection, table: &str) -> Result<()> {
             let rtree: bool = conn
                 .query_row(
                     "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?1)
-                        AND lower(sql) LIKE 'create virtual table%using rtree%')",
+                        AND (lower(sql) LIKE 'create virtual table%using rtree(%' OR lower(sql) LIKE 'create virtual table%using rtree (%'))",
                     [&index],
                     |r| r.get(0),
                 )

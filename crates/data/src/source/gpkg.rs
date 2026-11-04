@@ -938,8 +938,8 @@ fn finish(conn: &Connection, layout: &Layout, extent: Extent) -> Result<()> {
     conn.execute_batch("COMMIT;").map_err(err)
 }
 
-/// Records the table in the GeoPackage's contents with its `extent` (named by its table name
-/// unless another table already has that identifier) and adds the triggers that keep its
+/// Records the table in the GeoPackage's contents with its `extent` (identified by its table
+/// name, numbered if another table already has that identifier) and adds the triggers that keep its
 /// spatial index in step with edits.
 fn register(conn: &Connection, layout: &Layout, extent: Extent) -> Result<()> {
     let Layout { table, geom, has_geom, geom_type, srs_id, table_q: t, geom_q: g, fid_q: i, rtree_q: rt, .. } = layout;
@@ -947,11 +947,31 @@ fn register(conn: &Connection, layout: &Layout, extent: Extent) -> Result<()> {
     let e = extent;
     let bounds: [Option<f64>; 4] = if e.is_empty() { [None; 4] } else { [Some(e.min_x), Some(e.min_y), Some(e.max_x), Some(e.max_y)] };
     let srs: Option<i64> = has_geom.then_some(i64::from(srs_id));
+    // The table's name, numbered when another table of an existing GeoPackage has it as its
+    // (unique) identifier.
+    let mut identifier = table.clone();
+    for i in 2.. {
+        let taken: bool = conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM gpkg_contents WHERE identifier = ?1)", [&identifier], |r| r.get(0))
+            .map_err(err)?;
+        if !taken {
+            break;
+        }
+        identifier = format!("{table}_{i}");
+    }
     conn.execute(
         "INSERT INTO gpkg_contents (table_name, data_type, identifier, last_change, min_x, min_y, max_x, max_y, srs_id)
-            VALUES (?1, ?2, CASE WHEN EXISTS (SELECT 1 FROM gpkg_contents WHERE identifier = ?1) THEN NULL ELSE ?1 END,
-                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![table, if has_geom { "features" } else { "attributes" }, bounds[0], bounds[1], bounds[2], bounds[3], srs],
+            VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            table,
+            if has_geom { "features" } else { "attributes" },
+            identifier,
+            bounds[0],
+            bounds[1],
+            bounds[2],
+            bounds[3],
+            srs
+        ],
     )
     .map_err(err)?;
     if has_geom {

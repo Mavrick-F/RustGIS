@@ -12264,6 +12264,17 @@ fn exporting_features_adds_or_replaces_a_table_in_an_existing_geopackage() {
     s.run("layer.addData", &json!({"path": path.display().to_string(), "layer": "Countries", "stream": true, "name": "InPlace"})).unwrap();
     s.run("share.exportLayer", &json!({"layer": "InPlace", "path": path, "mode": "addTable", "tableName": "copy"})).unwrap();
     assert_eq!(count("copy"), Some(countries as u64));
+    // Replacing the table a layer reads in place makes it read the new table, and says so.
+    let kind =
+        |s: &Session| s.map().layer_by_name("InPlace").and_then(|l| l.source.as_ref()).and_then(|src| src.info()).map(|i| i.geometry_type);
+    s.map_mut().layers.iter_mut().for_each(|l| {
+        l.sync_source(&rustgis_geom::Extent::new(-20.0, -20.0, 20.0, 20.0), true);
+    });
+    assert_eq!(kind(&s), Some(rustgis_data::GeometryType::Polygon));
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": path, "mode": "replaceTable", "tableName": "Countries"})).unwrap();
+    assert_eq!(kind(&s), Some(rustgis_data::GeometryType::Point), "the new table's");
+    assert!(s.notices_since(mark).iter().any(|n| n.text.ends_with("1 layer reads Countries in place, now the new table")));
     // A standalone table goes in as an attribute table.
     s.run("layer.addDataText", &json!({"fileName": "owners.csv", "text": "name,n\nShelby,1\n"})).unwrap();
     let table = s.project.tables.last().map(|t| t.id).unwrap();

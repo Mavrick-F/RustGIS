@@ -4525,6 +4525,8 @@ mod download_service_tests {
         crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(path.display().to_string()));
         app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "addTable", "tableName": "borders"})).unwrap();
         assert_eq!(rustgis_engine::data::source::layers(&path).unwrap(), ["Cities", "borders"]);
+        let countries = app.session.map().layer_by_name("Countries").map(|l| l.dataset.features.len() as u64);
+        assert_eq!(rustgis_engine::data::source::open_path(&path, Some("borders")).unwrap().info().count, countries);
         // Cancelling the pick writes nothing.
         let before = std::fs::read(&path).unwrap();
         app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "replaceTable", "tableName": "Cities"})).unwrap();

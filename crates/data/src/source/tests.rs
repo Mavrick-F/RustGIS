@@ -2394,8 +2394,10 @@ fn geopackage_export_into_a_file_refuses_what_it_cannot_replace() {
             "DROP TABLE rtree_sites_geom; CREATE TABLE rtree_sites_geom (note TEXT); INSERT INTO rtree_sites_geom VALUES ('keep');",
         )
         .unwrap();
+    let before = std::fs::read(&squatted).unwrap();
     let e = write_path_to(&ds, &squatted, Crs::LonLat, &replace("sites")).unwrap_err().to_string();
     assert!(e.contains("rtree_sites_geom"), "{e}");
+    assert_eq!(std::fs::read(&squatted).unwrap(), before, "the failed replace changed nothing");
     let kept: String =
         rusqlite::Connection::open(&squatted).unwrap().query_row("SELECT note FROM rtree_sites_geom", [], |r| r.get(0)).unwrap();
     assert_eq!(kept, "keep");

@@ -74,10 +74,12 @@ fn gpkg_table(p: &Value, ext: &str) -> Result<GpkgTable, String> {
 
 /// Puts the table a GeoPackage export wrote, and whether it replaced one, in its result `out`;
 /// an export into an existing GeoPackage also says so, what went with a replaced table, and
-/// which views and triggers elsewhere name it.
+/// which views and triggers elsewhere name it. Layers read in place from a replaced table read
+/// it again.
 fn report_table(s: &mut Session, path: &str, gpkg: &GpkgTable, table: Option<GpkgWritten>, out: &mut Value) {
     let Some(table) = table else { return };
     if gpkg.mode != GpkgMode::NewFile {
+        let reread = if table.replaced { super::gpkg::reset_sources(s, Path::new(path), &table.table, true) } else { 0 };
         let note = if table.replaced {
             format!(
                 "{path}: replaced its table {}, dropping the old table's indexes, triggers, column descriptions, metadata links and extension records",
@@ -87,6 +89,10 @@ fn report_table(s: &mut Session, path: &str, gpkg: &GpkgTable, table: Option<Gpk
             format!("{path}: added the table {}", table.table)
         };
         s.notify(note, false);
+        if reread > 0 {
+            let layers = if reread == 1 { "layer reads" } else { "layers read" };
+            s.notify(format!("{path}: {reread} {layers} {} in place, now the new table", table.table), false);
+        }
         if !table.dependents.is_empty() {
             let n = table.dependents.len();
             s.notify(
