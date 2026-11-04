@@ -738,12 +738,12 @@ fn writes_geopackage_geoparquet_and_shapefile() {
 fn geoparquet_exports_keep_exact_values_and_remote_extent_reads() {
     let mut ds =
         Dataset::new("points", GeometryType::Point, vec![Field::new("bbox", FieldType::Text), Field::new("value", FieldType::Double)]);
+    ds.push(None, vec![Value::Text("no shape".into()), Value::Float(-0.25)]);
     ds.push(
         Some(Geometry::Point(Coord::new(-89.12345678901234, 36.181582500000005))),
         vec![Value::Text("東京".into()), Value::Float(0.12345678901234568)],
     );
     ds.push(Some(Geometry::Point(Coord::new(1.2345678901234567, -12.345678901234567))), vec![Value::Null, Value::Null]);
-    ds.push(None, vec![Value::Text("no shape".into()), Value::Float(-0.25)]);
     let bytes = parquet::write(&ds).unwrap();
     let local = open_bytes("exact.parquet", bytes.clone(), None).unwrap();
     assert_eq!(local.info().count, Some(3));
@@ -769,12 +769,23 @@ fn geoparquet_exports_keep_exact_values_and_remote_extent_reads() {
     let source = open_driven(url);
     assert!(source.info().indexed);
     assert_eq!(source.read(&Request::all()).unwrap().features, back.features);
-    let req = Request { extent: Some(Extent::new(-90.0, 36.0, -89.0, 37.0)), limit: 10 };
-    let remote = source.read(&req).unwrap();
-    assert!(remote.complete);
-    assert_eq!(remote.features.len(), 1);
-    assert_eq!(remote.features, local.read(&req).unwrap().features);
-    assert_eq!(visit_all(local.as_ref(), req.extent, 256).0, remote.features);
+    // Null rows must not consume a sample slot, whether the group is partly or wholly inside.
+    for (extent, matched) in [(Extent::new(-90.0, 36.0, -89.0, 37.0), 1), (Extent::new(-180.0, -90.0, 180.0, 90.0), 2)] {
+        for limit in [1, 10] {
+            let req = Request { extent: Some(extent), limit };
+            let remote = source.read(&req).unwrap();
+            let local_batch = local.read(&req).unwrap();
+            assert_eq!(remote.features.len(), matched.min(limit));
+            assert_eq!((remote.matched, local_batch.matched), (matched as u64, matched as u64));
+            assert_eq!(remote.features, local_batch.features);
+            assert_eq!(remote.complete, matched <= limit);
+            if remote.complete {
+                let (rows, summary, _) = visit_all(local.as_ref(), req.extent, 256);
+                assert_eq!(rows, remote.features);
+                assert_eq!(summary.matched, remote.matched);
+            }
+        }
+    }
 }
 
 #[test]

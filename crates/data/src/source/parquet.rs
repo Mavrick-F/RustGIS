@@ -322,15 +322,21 @@ impl ParquetSource {
     }
 
     /// Which rows of row group `g` have a bounding box meeting the native extent `e`, read from
-    /// the covering columns `c` alone. A row without a box is kept, for its geometry to decide.
+    /// the covering columns `c` alone. Null boxes have no location and cannot match an extent.
     fn covered_rows(&self, md: &ParquetMetaData, g: usize, e: &Extent, c: [usize; 4]) -> Result<Vec<bool>> {
         let rg = self.reader.get_row_group(g).map_err(err)?;
         let n = self.rows_in(md, g);
         let cols: Vec<Vec<Option<f64>>> = c.iter().map(|&i| read_f64(rg.as_ref(), i, n)).collect::<Result<_>>()?;
-        let v = |k: usize, r: usize| cols.get(k).and_then(|c| c.get(r).copied().flatten()).unwrap_or(f64::NAN);
+        if cols.iter().any(|col| col.len() != n) {
+            return Err(DataError::Format(format!("GeoParquet: row group {g} has covering columns shorter than its rows")));
+        }
+        let v = |k: usize, r: usize| cols.get(k).and_then(|c| c.get(r).copied().flatten());
         Ok((0..n)
             .map(|r| {
-                let be = Extent::new(v(0, r), v(1, r), v(2, r), v(3, r));
+                let [Some(min_x), Some(min_y), Some(max_x), Some(max_y)] = [v(0, r), v(1, r), v(2, r), v(3, r)] else {
+                    return false;
+                };
+                let be = Extent::new(min_x, min_y, max_x, max_y);
                 be.is_empty() || be.intersects(e)
             })
             .collect())
@@ -357,9 +363,15 @@ impl FeatureSource for ParquetSource {
             .collect();
         // Read by address: no more row groups than a read may fetch (an evenly spread part of them,
         // a sample), and the covering's chunks of those asked for together.
-        // A row group wholly inside the extent: every row matches, its covering unread.
+        // A row group wholly inside the extent with no null boxes: every row matches,
+        // its covering unread. Unknown null counts must be checked in the covering.
         let inside = |g: usize| match (native, self.covering) {
-            (Some(e), Some(c)) => group_extent(md, g, c).is_some_and(|ge| contains(&e, &ge)),
+            (Some(e), Some(c)) => {
+                let all_boxes = c.iter().all(|&i| {
+                    md.row_group(g).columns().get(i).and_then(|col| col.statistics()).and_then(|s| s.null_count_opt()) == Some(0)
+                });
+                all_boxes && group_extent(md, g, c).is_some_and(|ge| contains(&e, &ge))
+            }
             _ => true,
         };
         let mut thinned = 1usize;
