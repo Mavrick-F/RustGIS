@@ -39,7 +39,15 @@ breaks of the rules in AGENTS.md are fixed in the pull request.
 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -q` and
 `cargo xtask layers`. The pre-commit hooks also check TOML, YAML, JSON, whitespace and large files.
 CI separately builds `rustgis-web` for `wasm32-unknown-unknown` and runs
-`cargo deny --locked check licenses` against `deny.toml`.
+`cargo deny --locked check licenses sources` against `deny.toml`, including development
+dependencies. Sources are limited to crates.io; an intentional git source needs an explicit
+allowlist entry and a pinned revision. CI also runs `python3 .github/scripts/check-cargo-sources.py`
+to reject repository Cargo configuration that replaces sources or overrides dependency paths.
+User-level Cargo mirrors are outside this repository check.
+
+Workflow actions are pinned to full commit SHAs with the previous version or branch in a comment.
+Dependabot's existing GitHub Actions updates keep these pins current. When changing an action,
+resolve the commit in that action's own repository and keep the version comment in step.
 
 Other workspace tasks:
 

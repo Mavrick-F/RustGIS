@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Reject Cargo source/path overrides in tracked repository configuration (Python 3.11+)."""
+
+from pathlib import Path
+import subprocess
+import sys
+import tomllib
+
+
+def check(root: Path) -> list[str]:
+    """Inspect tracked modern and legacy configs, including those in nested workspaces."""
+    paths = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).decode().split("\0")
+    errors = []
+    for name in paths:
+        path = Path(name)
+        if path.parent.name != ".cargo" or path.name not in {"config", "config.toml"}:
+            continue
+        try:
+            with (root / path).open("rb") as source:
+                config = tomllib.load(source)
+        except (OSError, ValueError):
+            errors.append(f"{name}: cannot read valid TOML")
+            continue
+        if config.get("source") or config.get("paths"):
+            errors.append(f"{name}: Cargo source replacements and path overrides are not allowed")
+    return errors
+
+
+if __name__ == "__main__":
+    repo = Path(__file__).resolve().parents[2]
+    try:
+        problems = check(repo)
+    except subprocess.CalledProcessError:
+        sys.exit("cannot list tracked Cargo configuration")
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    sys.exit(bool(problems))
