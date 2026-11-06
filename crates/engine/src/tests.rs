@@ -21937,6 +21937,31 @@ fn fills_come_back_after_no_fill() {
     assert!(!filled(&s), "a chosen transparent fill stays");
 }
 
+/// #1456: a definition query on a streamed source the view filters as it reads (FlatGeobuf)
+/// says nothing; one only filtering what each view reads (GeoJSON read in place) says so.
+#[test]
+fn definition_query_on_a_streamed_layer_says_when_it_filters_a_sample() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let mut ds = Dataset::new("sites", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![V::Int(1)]);
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-{}-query-sample", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fgb = dir.join("sites.fgb");
+    std::fs::write(&fgb, rustgis_data::source::fgb::write(&ds).unwrap()).unwrap();
+    let geojson = dir.join("sites.geojson");
+    std::fs::write(&geojson, rustgis_data::io::to_geojson(&ds).to_string()).unwrap();
+    let mut s = Session::new(Project::default());
+    for (path, sampled) in [(&fgb, false), (&geojson, true)] {
+        s.run("layer.addData", &json!({"path": path, "stream": true})).unwrap();
+        assert!(s.map().layer(s.active_layer.unwrap()).unwrap().is_streamed());
+        let mark = s.notice_mark();
+        s.run("layer.definitionQuery", &json!({"where": "n = 1"})).unwrap();
+        let said = s.notices_since(mark).iter().any(|n| n.text.contains("are a sample"));
+        assert_eq!(said, sampled, "{}: {:?}", path.display(), s.notices_since(mark));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Other families can be outside a streamed polygon layer's current view when No Fill runs.
 #[test]
 fn mixed_geometry_no_fill_preserves_unloaded_point_symbols() {

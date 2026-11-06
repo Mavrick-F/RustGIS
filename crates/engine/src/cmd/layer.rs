@@ -499,6 +499,21 @@ pub fn commands() -> Vec<C> {
             {
                 rustgis_data::query::parse(&q, &l.dataset)?;
             }
+            // A source the view can't filter as it reads filters a sample of a crowded view.
+            let sampled = match s.map().layer(id) {
+                Some(l) if !q.is_empty() && l.source.as_ref().and_then(|src| src.filters_while_reading()) == Some(false) => {
+                    Some(l.name.clone())
+                }
+                _ => None,
+            };
+            if let Some(name) = sampled {
+                s.notify(
+                    format!(
+                        "{name}: the query filters the features each view reads, which are a sample where a view holds too many to read, so some matches may not show (Load All Features filters every one)"
+                    ),
+                    false,
+                );
+            }
             with(s, p, |l| l.definition_query = if q.is_empty() { None } else { Some(q.clone()) })
         })
         .when(need_feature_layer)

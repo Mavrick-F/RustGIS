@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 mod render_lod;
 mod window;
+pub(crate) use window::Query;
 
 /// Retained streamed rows and geometry caches per map; excludes scratch and render/export copies.
 pub const VIEW_BYTES: usize = if cfg!(target_arch = "wasm32") { 48 * 1024 * 1024 } else { 128 * 1024 * 1024 };
@@ -80,6 +81,9 @@ pub struct SourceLayer {
     pub(crate) saved_selection: Vec<u64>,
     #[serde(skip)]
     pub(crate) window_fields: Option<usize>,
+    /// The layer's definition query, applied while a view is read rather than to the rows read.
+    #[serde(skip)]
+    pub(crate) query: Option<Query>,
     /// A source by its web address being opened (its header or footer being fetched).
     #[serde(skip)]
     opening: Option<Opening>,
@@ -873,6 +877,14 @@ impl SourceLayer {
         self.handle.is_some()
     }
 
+    /// Whether a definition query is applied as a view is read, so a view keeps up to its limit of
+    /// the matches. Otherwise (a database, GeoJSON or LiDAR read in place, a file by its web
+    /// address) it filters the features a view reads, a sample where the view holds more than a
+    /// read keeps. `None` until open.
+    pub fn filters_while_reading(&self) -> Option<bool> {
+        self.handle.as_ref().map(|h| h.visits_chunks())
+    }
+
     pub fn info(&self) -> Option<&SourceInfo> {
         self.handle.as_deref().map(|h| h.info())
     }
@@ -949,6 +961,23 @@ impl SourceLayer {
         self.reset_window();
     }
 
+    /// Reads the view again, keeping the selection parked for the next read.
+    pub(crate) fn reread(&mut self) {
+        let selected = std::mem::take(&mut self.saved_selection);
+        self.reset_window();
+        self.saved_selection = selected;
+    }
+
+    /// Applies the layer's definition query (`fields` are the layer's) as views are read; a
+    /// different one reads the view again.
+    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field]) {
+        let text = text.map(str::trim).filter(|t| !t.is_empty());
+        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice())) != text.map(|t| (t, fields)) {
+            self.query = text.map(|t| Query { text: t.to_string(), fields: fields.to_vec() });
+            self.reread();
+        }
+    }
+
     /// Drops disposable view rows while retaining decisions about the unchanged full source.
     pub(crate) fn reset_window(&mut self) {
         self.window = None;
@@ -996,6 +1025,7 @@ impl SourceLayer {
         let estimate = self.estimated_row_bytes;
         let full_read = self.full_read;
         let fields = self.window_fields;
+        let query = self.query.clone();
         let pending = Arc::new(Pending { extent, result: Mutex::new(None) });
         let p = pending.clone();
         // A source by its web address: the read runs as its bytes land (on the desktop and in
@@ -1004,7 +1034,7 @@ impl SourceLayer {
             let (h2, p2) = (h.clone(), p.clone());
             let work = Arc::new(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields)
+                    window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
                 }))
                 .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
             });
@@ -1024,7 +1054,7 @@ impl SourceLayer {
         }
         let job = move || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields)
+                window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
             }))
             .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
             .map_err(|e| e.to_string());
