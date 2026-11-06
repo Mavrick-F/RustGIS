@@ -45,6 +45,7 @@ also permits NCSA for libFuzzer. Sources are limited to crates.io; an intentiona
 allowlist entry and a pinned revision. CI also runs `python3 .github/scripts/check-cargo-sources.py`
 to reject repository Cargo configuration with `source`, `paths` or `patch` overrides, including
 case variants of `.cargo/config` and `.cargo/config.toml` used on case-insensitive filesystems.
+Tracked `.cargo` directories must be real directories.
 Config `include` directives are also rejected so those checks cannot be bypassed by loading
 another file; put intentional dependency patches in `Cargo.toml` for review.
 User-level Cargo mirrors are outside this repository check.

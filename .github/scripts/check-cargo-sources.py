@@ -2,6 +2,7 @@
 """Reject Cargo source/path overrides in tracked repository configuration (Python 3.11+)."""
 
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tomllib
@@ -9,10 +10,13 @@ import tomllib
 
 def check(root: Path) -> list[str]:
     """Inspect tracked modern and legacy configs, including those in nested workspaces."""
-    paths = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).decode().split("\0")
+    paths = os.fsdecode(subprocess.check_output(["git", "ls-files", "-z"], cwd=root)).split("\0")
     errors = []
     for name in paths:
         path = Path(name)
+        if path.name.lower() == ".cargo" and (root / path).is_symlink():
+            errors.append(f"{name}: symlinked Cargo config directories are not allowed")
+            continue
         if path.parent.name.lower() != ".cargo" or path.name.lower() not in {"config", "config.toml"}:
             continue
         try:
