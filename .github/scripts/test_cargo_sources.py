@@ -24,10 +24,12 @@ class CargoSources(unittest.TestCase):
             return MODULE.check(root)
 
     def test_build_options_are_allowed(self):
-        self.assertEqual(self.check_config(".cargo/config.toml", '[alias]\nxtask = "run -p xtask --"\n'), [])
+        for name in [".cargo/config.toml", ".Cargo/Config.toml"]:
+            with self.subTest(name=name):
+                self.assertEqual(self.check_config(name, '[alias]\nxtask = "run -p xtask --"\n'), [])
 
     def test_overrides_and_includes_are_rejected_in_both_formats(self):
-        for name in [".cargo/config", "fuzz/.cargo/config.toml"]:
+        for name in [".cargo/config", "fuzz/.cargo/config.toml", ".Cargo/Config.toml", "fuzz/.CARGO/CONFIG"]:
             for text in [
                 '[source.crates-io]\nreplace-with = "mirror"\n',
                 'paths = ["../dependency"]\n',

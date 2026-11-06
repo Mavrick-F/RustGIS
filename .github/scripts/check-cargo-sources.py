@@ -13,7 +13,7 @@ def check(root: Path) -> list[str]:
     errors = []
     for name in paths:
         path = Path(name)
-        if path.parent.name != ".cargo" or path.name not in {"config", "config.toml"}:
+        if path.parent.name.lower() != ".cargo" or path.name.lower() not in {"config", "config.toml"}:
             continue
         try:
             with (root / path).open("rb") as source:

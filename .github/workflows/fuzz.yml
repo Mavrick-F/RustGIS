@@ -44,8 +44,8 @@ jobs:
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
         with:
           tool: cargo-deny
-      # fuzz/deny.toml: the workspace's licences plus NCSA, for libFuzzer.
-      - run: cargo deny --manifest-path fuzz/Cargo.toml --locked check licenses
+      # fuzz/deny.toml: the workspace's source policy and licences plus NCSA, for libFuzzer.
+      - run: cargo deny --manifest-path fuzz/Cargo.toml --locked check licenses sources
       # The workspace's `cargo fmt --all` doesn't reach this crate.
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
 
