@@ -1971,9 +1971,14 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
             Some(src) => {
                 let format = src.info().map(|i| i.format).unwrap_or("");
                 let total = src.info().and_then(|i| i.count).map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+                let sample = if src.sampled_matches() {
+                    "{type} · {format}, read in place · a sample of {n} of the {matched} features in view matching the definition query (zoom in to see them all) · {renderer}"
+                } else {
+                    "{type} · {format}, read in place · a sample of {n} of the {matched} features in view (zoom in to see them all) · {renderer}"
+                };
                 match src.sampled() {
                     Some((n, matched)) => crate::i18n::fmt(
-                        "{type} · {format}, read in place · a sample of {n} of the {matched} features in view (zoom in to see them all) · {renderer}",
+                        sample,
                         &[
                             ("type", tl_raw!(l.geometry_type().label())),
                             ("format", format),

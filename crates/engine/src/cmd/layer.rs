@@ -501,7 +501,7 @@ pub fn commands() -> Vec<C> {
             }
             // A source the view can't filter as it reads filters a sample of a crowded view.
             let sampled = match s.map().layer(id) {
-                Some(l) if !q.is_empty() && l.source.as_ref().and_then(|src| src.filters_while_reading()) == Some(false) => {
+                Some(l) if !q.is_empty() && l.source.as_ref().is_some_and(|src| src.query_filters_a_sample()) => {
                     Some(l.name.clone())
                 }
                 _ => None,

@@ -14,6 +14,8 @@ pub(crate) struct Cache {
     pub mean_bytes: usize,
     pub feature_bytes: usize,
     pub projected_bytes: usize,
+    /// The read kept the definition query's matches (its `matched` counts them).
+    pub filtered: bool,
 }
 
 fn base_bytes(batch: &Batch, projected: &Vec<Option<Geometry>>) -> usize {
@@ -62,9 +64,11 @@ pub(super) fn read_mode(
     let read = |source: &dyn FeatureSource| -> Result<(Batch, Cache)> {
         if full { Ok(whole(source.read(req)?, projection)) } else { read_with_fields(source, req, bytes, projection, estimate, fields) }
     };
-    // A query that doesn't parse draws every feature, so the view is read as without one.
+    // A query that doesn't parse draws every feature, so the view is read as without one. A row
+    // number is a row's place in the view, which a walk of the source can't number the same way.
     let info = source.info();
-    let Some((scratch, expr)) = query.filter(|_| source.visits_chunks()).and_then(|q| {
+    let walkable = |q: &&Query| source.visits_chunks() && !q.text.to_ascii_lowercase().contains("@row_number");
+    let Some((scratch, expr)) = query.filter(walkable).and_then(|q| {
         let scratch = Dataset::new(info.name.clone(), info.geometry_type, q.fields.clone());
         rustgis_data::query::parse(&q.text, &scratch).ok().map(|e| (scratch, e))
     }) else {
@@ -79,7 +83,9 @@ pub(super) fn read_mode(
     }
     drop(first);
     let batch = read_filtered(source, req, if full { usize::MAX } else { bytes / 2 }, scratch, &expr)?;
-    if full { Ok(whole(batch, projection)) } else { fit(batch, bytes, projection, fields) }
+    let (batch, mut cache) = if full { whole(batch, projection) } else { fit(batch, bytes, projection, fields)? };
+    cache.filtered = true;
+    Ok((batch, cache))
 }
 
 /// The features of `req` that `expr` keeps, walking every feature of its extent: an evenly
@@ -126,6 +132,7 @@ fn whole(batch: Batch, projection: &crate::Projection) -> (Batch, Cache) {
         projected_bytes: crate::lod::cache_bytes(&projected),
         projected: Arc::new(projected),
         key: projection.code(),
+        filtered: false,
     };
     (batch, cache)
 }
@@ -256,7 +263,16 @@ fn trim(mut batch: Batch, mut projected: Vec<Option<Geometry>>, bytes: usize, pr
     let projected_bytes = crate::lod::cache_bytes(&projected);
     Ok((
         batch,
-        Cache { projected: Arc::new(projected), extents, vertices, key: projection.code(), mean_bytes, feature_bytes, projected_bytes },
+        Cache {
+            projected: Arc::new(projected),
+            extents,
+            vertices,
+            key: projection.code(),
+            mean_bytes,
+            feature_bytes,
+            projected_bytes,
+            filtered: false,
+        },
     ))
 }
 

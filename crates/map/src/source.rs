@@ -518,6 +518,8 @@ pub struct Window {
     pub matched: u64,
     /// How many were read.
     pub kept: usize,
+    /// The read kept the definition query's matches: `matched` counts them.
+    pub filtered: bool,
 }
 
 /// A read in flight.
@@ -877,12 +879,17 @@ impl SourceLayer {
         self.handle.is_some()
     }
 
-    /// Whether a definition query is applied as a view is read, so a view keeps up to its limit of
-    /// the matches. Otherwise (a database, GeoJSON or LiDAR read in place, a file by its web
-    /// address) it filters the features a view reads, a sample where the view holds more than a
-    /// read keeps. `None` until open.
-    pub fn filters_while_reading(&self) -> Option<bool> {
-        self.handle.as_ref().map(|h| h.visits_chunks())
+    /// Whether a definition query can filter only a sample of a view: the source can't be walked
+    /// as a view is read (a database, GeoJSON or LiDAR read in place, a file by its web address),
+    /// and holds more features than a view reads, or doesn't say how many. False until open.
+    pub fn query_filters_a_sample(&self) -> bool {
+        let Some(h) = &self.handle else { return false };
+        let most = match self.limit {
+            0 if h.remote().is_some() => REMOTE_VIEW_LIMIT,
+            0 => VIEW_LIMIT,
+            n => n,
+        };
+        !h.visits_chunks() && h.info().count.is_none_or(|c| c > most as u64)
     }
 
     pub fn info(&self) -> Option<&SourceInfo> {
@@ -974,7 +981,10 @@ impl SourceLayer {
         let text = text.map(str::trim).filter(|t| !t.is_empty());
         if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice())) != text.map(|t| (t, fields)) {
             self.query = text.map(|t| Query { text: t.to_string(), fields: fields.to_vec() });
-            self.reread();
+            // A source that can't be walked reads the same rows whatever the query.
+            if self.handle.as_ref().is_some_and(|h| h.visits_chunks()) {
+                self.reread();
+            }
         }
     }
 
@@ -1081,7 +1091,7 @@ impl SourceLayer {
                 Err(e) => {
                     self.saved_selection.clear();
                     self.error = Some(format!("couldn't start reading the layer: {e}"));
-                    self.window = Some(Window { extent, complete: true, matched: 0, kept: 0 });
+                    self.window = Some(Window { extent, complete: true, matched: 0, kept: 0, filtered: false });
                 }
             }
             return;
@@ -1101,8 +1111,9 @@ impl SourceLayer {
                 Some(Ok((b, cache))) => {
                     self.pending = None;
                     self.estimated_row_bytes = cache.mean_bytes;
+                    let filtered = cache.filtered;
                     self.ready_cache = Some(cache);
-                    let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len() };
+                    let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len(), filtered };
                     self.window = Some(w);
                     self.error = None;
                     return Polled::Done(w, b);
@@ -1113,7 +1124,7 @@ impl SourceLayer {
                     self.saved_selection.clear();
                     self.error = Some(e.clone());
                     // Not read again until the view moves past it.
-                    self.window = Some(Window { extent: p.extent, complete: true, matched: 0, kept: 0 });
+                    self.window = Some(Window { extent: p.extent, complete: true, matched: 0, kept: 0, filtered: false });
                     return Polled::Failed(e);
                 }
                 None if block && cfg!(not(target_arch = "wasm32")) && start.elapsed() < web_time::Duration::from_secs(60) => {
@@ -1135,6 +1146,12 @@ impl SourceLayer {
     /// (features read, features matching) when the window is a sample of the view.
     pub fn sampled(&self) -> Option<(usize, u64)> {
         self.window.as_ref().filter(|w| !w.complete).map(|w| (w.kept, w.matched))
+    }
+
+    /// Whether the view read kept the definition query's matches, so [`SourceLayer::sampled`]
+    /// counts matches rather than every feature in view.
+    pub fn sampled_matches(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.filtered)
     }
 }
 
