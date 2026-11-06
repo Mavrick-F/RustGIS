@@ -26,9 +26,15 @@ class CargoSources(unittest.TestCase):
     def test_build_options_are_allowed(self):
         self.assertEqual(self.check_config(".cargo/config.toml", '[alias]\nxtask = "run -p xtask --"\n'), [])
 
-    def test_replacements_and_path_overrides_are_rejected_in_both_formats(self):
+    def test_overrides_and_includes_are_rejected_in_both_formats(self):
         for name in [".cargo/config", "fuzz/.cargo/config.toml"]:
-            for text in ['[source.crates-io]\nreplace-with = "mirror"\n', 'paths = ["../dependency"]\n']:
+            for text in [
+                '[source.crates-io]\nreplace-with = "mirror"\n',
+                'paths = ["../dependency"]\n',
+                '[patch.crates-io]\nexample = { path = "../dependency" }\n',
+                'include = ["other.toml"]\n',
+                'include = [{ path = "other.toml", optional = true }]\n',
+            ]:
                 with self.subTest(name=name, text=text):
                     problems = self.check_config(name, text)
                     self.assertEqual(len(problems), 1)

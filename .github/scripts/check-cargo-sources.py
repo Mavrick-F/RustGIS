@@ -21,8 +21,8 @@ def check(root: Path) -> list[str]:
         except (OSError, ValueError):
             errors.append(f"{name}: cannot read valid TOML")
             continue
-        if config.get("source") or config.get("paths"):
-            errors.append(f"{name}: Cargo source replacements and path overrides are not allowed")
+        if any(config.get(key) for key in ("source", "paths", "patch", "include")):
+            errors.append(f"{name}: Cargo source/path/patch overrides and included configs are not allowed")
     return errors
 
 
