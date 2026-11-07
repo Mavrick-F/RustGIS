@@ -58,7 +58,7 @@ identify and run through tools like any layer; **Load All Features** loads one t
 
 ## Formats read through GDAL
 
-With [GDAL](https://gdal.org) installed (its `ogr2ogr` and `ogrinfo` on the `PATH`, GDAL 3.7 or
+With [GDAL](https://gdal.org) installed (its `ogr2ogr` and `ogrinfo` on the `PATH`, GDAL 3.8 or
 later), the desktop app also reads the vector formats below. Each layer is converted once into a
 cached, indexed FlatGeobuf, so large ones stream too: see [Formats through
 GDAL](data.md#formats-through-gdal).

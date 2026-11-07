@@ -118,12 +118,36 @@ struct LayerInfo {
     has_srs: bool,
 }
 
+/// GDAL before 3.8 ignores `ogrinfo -if` (and `ogr2ogr` refuses it), so it could open a file as
+/// another format than its type's: it is refused.
+fn check_version(ogrinfo: &Path) -> Result<()> {
+    let mut c = Command::new(ogrinfo);
+    c.arg("--version");
+    let out = output(c, LIST_TIMEOUT, "GDAL")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    match version(&text) {
+        Some(v) if v >= (3, 8) => Ok(()),
+        _ => Err(DataError::Unsupported(format!(
+            "GDAL 3.8 or later is needed (found: {})",
+            text.lines().next().unwrap_or("no version").trim()
+        ))),
+    }
+}
+
+/// GDAL's major and minor version, from `--version` (`GDAL 3.8.5, released 2024/04/02`).
+fn version(text: &str) -> Option<(u32, u32)> {
+    let v = text.trim().strip_prefix("GDAL ")?.split([',', ' ']).next()?;
+    let mut parts = v.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
 /// The vector layers of a dataset, from `ogrinfo -json`.
 fn list(src: &Path) -> Result<Vec<LayerInfo>> {
-    let ogrinfo = program("ogrinfo").ok_or_else(missing)?;
     let src = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
     // A file or folder on this computer: GDAL would fetch a `/vsicurl/` address.
     std::fs::metadata(&src)?;
+    let ogrinfo = program("ogrinfo").ok_or_else(missing)?;
+    check_version(&ogrinfo)?;
     let mut c = command(ogrinfo, drivers(&src)?);
     c.arg("-json").arg("-ro").arg("-so").arg("-nomd").arg(&src);
     let out = output(c, LIST_TIMEOUT, "GDAL")?;
@@ -131,7 +155,7 @@ fn list(src: &Path) -> Result<Vec<LayerInfo>> {
         return Err(DataError::Format(format!("GDAL: {}", String::from_utf8_lossy(&out.stderr).trim())));
     }
     let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| DataError::Format(format!("GDAL: unreadable ogrinfo output ({e}); GDAL 3.7 or later is needed")))?;
+        .map_err(|e| DataError::Format(format!("GDAL: unreadable ogrinfo output ({e}); GDAL 3.8 or later is needed")))?;
     let layers = json.get("layers").and_then(|l| l.as_array()).cloned().unwrap_or_default();
     Ok(layers
         .iter()
@@ -382,6 +406,13 @@ mod tests {
         // could name one) has none.
         assert!(EXTENSIONS.iter().all(|e| drivers(Path::new(&format!("a.{e}"))).is_ok()) && drivers(Path::new("/x/a.gdb/")).is_ok());
         assert!(drivers(Path::new("a.vrt")).is_err() && drivers(Path::new("a.gml")).is_err() && drivers(Path::new("noext")).is_err());
+        // An address is never handed to GDAL in place of a file, installed or not.
+        assert!(matches!(layers(Path::new("/vsicurl/http://127.0.0.1:9/a.osm")), Err(DataError::Io(_))));
+        // GDAL before 3.8 doesn't hold `ogrinfo` to the drivers given.
+        assert_eq!(version("GDAL 3.8.5, released 2024/04/02\n"), Some((3, 8)));
+        assert_eq!(version("GDAL 3.13.3 \"Iowa City\", released 2026/08/13"), Some((3, 13)));
+        assert!(version("GDAL 3.7.3, released 2023/10/30").is_some_and(|v| v < (3, 8)));
+        assert_eq!(version("ogrinfo: command not found"), None);
         // Pruning touches only the cache's own files.
         assert!(ours("0123456789abcdef.fgb") && ours("0123456789abcdef.key") && ours("0123456789abcdef.empty"));
         assert!(ours("0123456789abcdef.4242.tmp.fgb"));
@@ -406,9 +437,13 @@ mod tests {
             csv.display()
         );
         std::fs::write(&tab, vrt).unwrap();
-        assert!(layers(&tab).is_err());
-        // Nor is an address read in place of a file.
-        assert!(layers(Path::new("/vsicurl/http://127.0.0.1:9/a.osm")).is_err());
+        // Without its type's drivers, GDAL reads it.
+        let mut c = Command::new(program("ogrinfo").unwrap());
+        let listed = c.args(["-ro", "-so"]).arg(&tab).output().unwrap();
+        assert!(String::from_utf8_lossy(&listed.stdout).contains("private"));
+        // With them, it doesn't take it for a MapInfo table (or a GDAL that ignores them is refused).
+        let e = layers(&tab).unwrap_err().to_string();
+        assert!(e.contains("not recognized") || e.contains("3.8 or later"), "{e}");
         assert!(convert_one_in(&dir.path().join("cache"), &tab, "private", None, None, None, true).is_err());
     }
 

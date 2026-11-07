@@ -288,8 +288,8 @@ fn subdataset_file(name: &str) -> Option<&str> {
 const FOUND: &str = "\n\u{1}found\n";
 
 /// The conversion's version, in its cache key: raised when what a conversion makes changes (its
-/// options, the wrap), so older results are made again.
-const CONVERSION: u32 = 2;
+/// options, the wrap, the drivers its input may open as), so older results are made again.
+const CONVERSION: u32 = 3;
 
 /// Whether two paths name the same file: canonical paths when both resolve, else spellings
 /// compared with one separator (and, on Windows, without regard to case).
@@ -541,7 +541,11 @@ mod tests {
             tif.display()
         );
         std::fs::write(&img, vrt).unwrap();
-        assert!(convert_in(&dir.path().join("cache"), &img, None, None, None).is_err());
+        // Without its type's drivers, GDAL reads it.
+        assert!(Command::new(program("gdalinfo").unwrap()).arg(&img).status().is_ok_and(|s| s.success()));
+        // With them, it doesn't take it for an ERDAS Imagine file.
+        let e = convert_in(&dir.path().join("cache"), &img, None, None, None).unwrap_err().to_string();
+        assert!(e.contains("not recognized"), "{e}");
     }
 
     /// Runs only where GDAL is installed: a NetCDF file's variables, an HGT tile.
