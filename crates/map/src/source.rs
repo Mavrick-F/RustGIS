@@ -879,17 +879,18 @@ impl SourceLayer {
         self.handle.is_some()
     }
 
-    /// Whether a definition query can filter only a sample of a view: the source can't be walked
-    /// as a view is read (a database, GeoJSON or LiDAR read in place, a file by its web address),
-    /// and holds more features than a view reads, or doesn't say how many. False until open.
-    pub fn query_filters_a_sample(&self) -> bool {
+    /// Whether `query` can filter only a sample of a view: the view isn't walked with it (a
+    /// database, GeoJSON or LiDAR read in place, a file by its web address, or a query using a
+    /// row number), and the source holds more features than a view reads, doesn't say how many,
+    /// or the view read now is already a sample (of more bytes than a view holds). False until open.
+    pub fn query_filters_a_sample(&self, query: &str) -> bool {
         let Some(h) = &self.handle else { return false };
         let most = match self.limit {
             0 if h.remote().is_some() => REMOTE_VIEW_LIMIT,
             0 => VIEW_LIMIT,
             n => n,
         };
-        !h.visits_chunks() && h.info().count.is_none_or(|c| c > most as u64)
+        !window::walks(h.as_ref(), query) && (h.info().count.is_none_or(|c| c > most as u64) || self.sampled().is_some())
     }
 
     pub fn info(&self) -> Option<&SourceInfo> {

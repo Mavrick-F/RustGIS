@@ -64,11 +64,9 @@ pub(super) fn read_mode(
     let read = |source: &dyn FeatureSource| -> Result<(Batch, Cache)> {
         if full { Ok(whole(source.read(req)?, projection)) } else { read_with_fields(source, req, bytes, projection, estimate, fields) }
     };
-    // A query that doesn't parse draws every feature, so the view is read as without one. A row
-    // number is a row's place in the view, which a walk of the source can't number the same way.
+    // A query that doesn't parse draws every feature, so the view is read as without one.
     let info = source.info();
-    let walkable = |q: &&Query| source.visits_chunks() && !q.text.to_ascii_lowercase().contains("@row_number");
-    let Some((scratch, expr)) = query.filter(walkable).and_then(|q| {
+    let Some((scratch, expr)) = query.filter(|q| walks(source, &q.text)).and_then(|q| {
         let scratch = Dataset::new(info.name.clone(), info.geometry_type, q.fields.clone());
         rustgis_data::query::parse(&q.text, &scratch).ok().map(|e| (scratch, e))
     }) else {
@@ -86,6 +84,29 @@ pub(super) fn read_mode(
     let (batch, mut cache) = if full { whole(batch, projection) } else { fit(batch, bytes, projection, fields)? };
     cache.filtered = true;
     Ok((batch, cache))
+}
+
+/// Whether a sampled view of `source` is walked with `query`, keeping the matches: the source can
+/// be read a chunk at a time, and the query doesn't use a row number (a row's place in the view,
+/// which a walk of the source can't number the same way).
+pub(super) fn walks(source: &dyn FeatureSource, query: &str) -> bool {
+    // Outside quotes: a text or a quoted field name may hold the words.
+    let mut quote = None;
+    let bare: String = query
+        .chars()
+        .filter(|c| match quote {
+            Some(q) => {
+                quote = (*c != q).then_some(q);
+                false
+            }
+            None if matches!(c, '\'' | '"') => {
+                quote = Some(*c);
+                false
+            }
+            None => true,
+        })
+        .collect();
+    source.visits_chunks() && !bare.to_ascii_lowercase().contains("@row_number")
 }
 
 /// The features of `req` that `expr` keeps, walking every feature of its extent: an evenly

@@ -3224,11 +3224,15 @@ mod tests {
         assert_eq!((shown(&l).len(), l.dataset.features.len()), (2, 2));
         let src = l.source.as_ref().unwrap();
         assert_eq!((src.sampled(), src.sampled_matches()), (Some((2, 4)), true));
-        // A row number is a row's place in the view: the view is read as without a query.
+        // A row number is a row's place in the view: the view is read as without a query. The
+        // words in a text are only text.
         l.definition_query = Some("@row_number = 1".into());
         l.sync_source(&view, true);
         let src = l.source.as_ref().unwrap();
         assert_eq!((src.sampled(), src.sampled_matches()), (Some((2, 5)), false));
+        l.definition_query = Some(format!("n = {left_out} or 'x' = '@row_number'"));
+        l.sync_source(&view, true);
+        assert_eq!(shown(&l), [Value::Int(left_out)]);
         // A query that doesn't parse leaves the view as read without one, as for loaded layers.
         l.definition_query = Some("n = = 1".into());
         l.sync_source(&view, true);

@@ -21939,7 +21939,8 @@ fn fills_come_back_after_no_fill() {
 
 /// #1456: a definition query on a streamed source the view filters as it reads (FlatGeobuf)
 /// says nothing, nor on one only filtering what each view reads (GeoJSON read in place) when it
-/// holds no more than a view reads; past that, it says the view may be a sample.
+/// holds no more than a view reads; past that, or when the view read is already a sample, or for
+/// a row number (which no view is walked with), it says the view may be a sample.
 #[test]
 fn definition_query_on_a_streamed_layer_says_when_it_filters_a_sample() {
     use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
@@ -21953,16 +21954,29 @@ fn definition_query_on_a_streamed_layer_says_when_it_filters_a_sample() {
     let geojson = dir.join("sites.geojson");
     std::fs::write(&geojson, rustgis_data::io::to_geojson(&ds).to_string()).unwrap();
     let mut s = Session::new(Project::default());
-    // The view's limit: 0 is the default, more than the two features; 1 is fewer.
-    for (path, limit, sampled) in [(&fgb, 1, false), (&geojson, 0, false), (&geojson, 1, true)] {
+    let view = rustgis_geom::Extent::new(0.0, 0.0, 3.0, 3.0);
+    // The view's limit: 0 is the default, more than the two features; 1 is fewer. A sample
+    // already read (a view of more bytes than it holds) counts, whatever the source's count.
+    let cases = [
+        (&fgb, 1, false, "n = 1", false),
+        (&fgb, 1, false, "@row_number = 1", true),
+        (&geojson, 0, false, "n = 1", false),
+        (&geojson, 1, false, "n = 1", true),
+        (&geojson, 0, true, "n = 1", true),
+    ];
+    for (path, limit, read_sample, query, sampled) in cases {
         s.run("layer.addData", &json!({"path": path, "stream": true})).unwrap();
         let id = s.active_layer.unwrap();
         let l = s.map_mut().layer_mut(id).unwrap();
+        if read_sample {
+            l.source.as_mut().unwrap().limit = 1;
+            l.sync_source(&view, true);
+        }
         l.source.as_mut().unwrap().limit = limit;
         let mark = s.notice_mark();
-        s.run("layer.definitionQuery", &json!({"where": "n = 1"})).unwrap();
+        s.run("layer.definitionQuery", &json!({"where": query})).unwrap();
         let said = s.notices_since(mark).iter().any(|n| n.text.contains("are a sample"));
-        assert_eq!(said, sampled, "{} reading {limit}: {:?}", path.display(), s.notices_since(mark));
+        assert_eq!(said, sampled, "{} reading {limit}, {query}: {:?}", path.display(), s.notices_since(mark));
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
