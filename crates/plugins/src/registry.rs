@@ -12,7 +12,7 @@ use crate::manifest::{Permission, Runtime, valid_id, version_parts};
 pub const DEFAULT_URL: &str = "https://plugins.rustgis.app/registry.json";
 
 /// The most entries read from a registry (or a blocklist): room for tens of thousands of plugins.
-const MAX_ENTRIES: usize = 100_000;
+pub(crate) const MAX_ENTRIES: usize = 100_000;
 
 /// The largest registry downloaded (a registry entry is about 1 KB, so this is ample).
 pub const MAX_REGISTRY_BYTES: usize = 64 * 1024 * 1024;
@@ -193,20 +193,23 @@ pub fn blocklist_url(registry: &str) -> String {
 }
 
 /// Reads a blocklist (an object with a `blocked` array, or a bare array). Any other shape, or an
-/// entry without an `id`, is an error rather than an empty list, so a malformed refresh leaves
-/// the last good list in place: only `[]` or `{"blocked": []}` clears it.
+/// entry without an `id`, or more than [`MAX_ENTRIES`] entries, is an error rather than a shorter
+/// list, so a malformed refresh leaves the last good list in place: only `[]` or
+/// `{"blocked": []}` clears it.
 pub fn parse_blocklist(text: &str) -> Result<Vec<Blocked>, String> {
     let root: Value = serde_json::from_str(text).map_err(|e| format!("the blocklist isn't valid JSON: {e}"))?;
     let list = match root {
         Value::Array(a) => a,
         Value::Object(mut o) => match o.remove("blocked") {
             Some(Value::Array(a)) => a,
-            _ => return Err("the blocklist has no `blocked` list".into()),
+            _ => return Err("the blocklist has no 'blocked' list".into()),
         },
-        _ => return Err("the blocklist isn't a list or an object with a `blocked` list".into()),
+        _ => return Err("the blocklist isn't a list or an object with a 'blocked' list".into()),
     };
+    if list.len() > MAX_ENTRIES {
+        return Err(format!("the blocklist has {} entries; at most {MAX_ENTRIES} can be read", list.len()));
+    }
     list.into_iter()
-        .take(MAX_ENTRIES)
         .enumerate()
         .map(|(i, v)| serde_json::from_value::<Blocked>(v).map_err(|e| format!("blocklist entry {}: {e}", i + 1)))
         .collect()

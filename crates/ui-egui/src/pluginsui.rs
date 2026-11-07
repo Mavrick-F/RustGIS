@@ -615,9 +615,17 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                 Some(Ok(b)) => {
                     let text = String::from_utf8_lossy(&b).to_string();
                     #[cfg(not(target_arch = "wasm32"))]
-                    let pulled = rp::store::save_blocklist(&registry, &text).unwrap_or_default();
+                    let pulled = rp::store::save_blocklist(&registry, &text);
                     #[cfg(target_arch = "wasm32")]
-                    let pulled = rp::registry::parse_blocklist(&text).map(|l| rp::apply_blocklist(&registry, l)).unwrap_or_default();
+                    let pulled = rp::registry::parse_blocklist(&text).map(|l| rp::apply_blocklist(&registry, l));
+                    // One that can't be read leaves the list in force as it was.
+                    let pulled = pulled.unwrap_or_else(|e| {
+                        app.session.warn(crate::i18n::fmt(
+                            "The plugin blocklist couldn't be read ({error}); the plugins withdrawn before stay blocked.",
+                            &[("error", &e)],
+                        ));
+                        Vec::new()
+                    });
                     for name in pulled {
                         app.session.notify(
                             crate::i18n::fmt("{name} was withdrawn from the plugin registry and has been turned off.", &[("name", &name)]),

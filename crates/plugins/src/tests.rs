@@ -392,6 +392,12 @@ fn registries_and_blocklists_are_read_defensively() {
     assert!(registry::blocked(&list, "x", "anything").is_some());
     assert!(registry::blocked(&list, "y", &sha).is_some());
     assert!(registry::blocked(&list, "y", &"b".repeat(64)).is_none());
+    // A list too long to read whole is refused, not cut short.
+    let entry = json!({"id": "x"});
+    let full = Value::Array(vec![entry.clone(); registry::MAX_ENTRIES]);
+    assert_eq!(registry::parse_blocklist(&full.to_string()).unwrap().len(), registry::MAX_ENTRIES);
+    let over = Value::Array(vec![entry; registry::MAX_ENTRIES + 1]);
+    assert!(registry::parse_blocklist(&over.to_string()).unwrap_err().contains("at most"));
 }
 
 /// Blocklisting unloads affected plugins and prevents them from being loaded again.
@@ -404,7 +410,15 @@ fn blocked_plugins_are_unloaded_and_refused() {
     let pkg = Package::from_zip(&testing::package("unit-blocked", &[])).unwrap();
     assert!(crate::load(pkg, "t").unwrap_err().contains("malware"));
     // A refresh of the wrong shape is refused and leaves the withdrawal in place.
-    for text in ["{}", r#"{"blocked": {}}"#, r#"{"blocked": null}"#, "1", r#"[{"reason": "no id"}]"#, "[1]"] {
+    for text in [
+        "{}",
+        r#"{"blocked": {}}"#,
+        r#"{"blocked": null}"#,
+        "1",
+        r#"[{"reason": "no id"}]"#,
+        "[1]",
+        r#"[{"id": "ok"}, {"reason": "no id"}]"#,
+    ] {
         assert!(crate::store::save_blocklist(registry::DEFAULT_URL, text).is_err(), "{text}");
         assert!(crate::blocked("unit-blocked", "any").is_some(), "{text} cleared the blocklist");
     }

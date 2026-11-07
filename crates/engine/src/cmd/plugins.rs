@@ -150,14 +150,17 @@ fn enable(_: &mut Session, p: &Value) -> CmdResult {
 
 /// The registry at `url` with each plugin's installed version. Applies its blocklist.
 #[cfg(not(target_arch = "wasm32"))]
-fn fetch_registry(url: &str) -> Result<Vec<rustgis_plugins::registry::Entry>, String> {
+fn fetch_registry(s: &mut Session, url: &str) -> Result<Vec<rustgis_plugins::registry::Entry>, String> {
     use rustgis_plugins::registry;
     let text = registry::fetch(url, registry::MAX_REGISTRY_BYTES)?;
     let entries = registry::parse(&String::from_utf8_lossy(&text), url)?;
-    // A registry without a blocklist blocks nothing; one that can't be fetched or read leaves
-    // the cached list in place.
-    if let Ok(b) = registry::fetch(&registry::blocklist_url(url), 4 * 1024 * 1024) {
-        let _ = rustgis_plugins::store::save_blocklist(url, &String::from_utf8_lossy(&b));
+    // A registry without a blocklist blocks nothing; one that can't be fetched leaves the cached
+    // list in place, and so does one that can't be read, with a warning.
+    let blocklist = registry::blocklist_url(url);
+    if let Ok(b) = registry::fetch(&blocklist, 4 * 1024 * 1024)
+        && let Err(e) = rustgis_plugins::store::save_blocklist(url, &String::from_utf8_lossy(&b))
+    {
+        s.warn(format!("{blocklist}: {e}; the plugins withdrawn before stay blocked"));
     }
     Ok(entries)
 }
@@ -178,15 +181,17 @@ pub fn entry_status(e: &rustgis_plugins::registry::Entry) -> Value {
     v
 }
 
-fn browse(_: &mut Session, p: &Value) -> CmdResult {
+/// `plugin.registry`: the registry's plugins, each with its installed version (see
+/// [`fetch_registry`]).
+fn browse(s: &mut Session, p: &Value) -> CmdResult {
     let url = ps(p, "url").map(str::trim).filter(|s| !s.is_empty()).unwrap_or(rustgis_plugins::registry::DEFAULT_URL);
     #[cfg(not(target_arch = "wasm32"))]
     {
-        Ok(Value::Array(fetch_registry(url)?.iter().map(entry_status).collect()))
+        Ok(Value::Array(fetch_registry(s, url)?.iter().map(entry_status).collect()))
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = url;
+        let _ = (s, url);
         Err("in the browser, browse plugins in the Plugin Manager".into())
     }
 }
@@ -220,19 +225,21 @@ pub fn install_checked(e: &rustgis_plugins::registry::Entry, bytes: &[u8]) -> Re
     install_bytes(bytes)
 }
 
-fn install_from_registry(_: &mut Session, p: &Value) -> CmdResult {
+/// Installs the plugin `id` from the registry, checked against its entry (see [`install_checked`]),
+/// after applying the registry's blocklist.
+fn install_from_registry(s: &mut Session, p: &Value) -> CmdResult {
     let id = ps(p, "id").ok_or("id is required")?;
     let url = ps(p, "url").map(str::trim).filter(|s| !s.is_empty()).unwrap_or(rustgis_plugins::registry::DEFAULT_URL);
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let entries = fetch_registry(url)?;
+        let entries = fetch_registry(s, url)?;
         let e = entries.iter().find(|e| e.id == id).ok_or_else(|| format!("the registry has no plugin '{id}'"))?;
         let bytes = rustgis_plugins::registry::fetch(&e.package, rustgis_plugins::package::MAX_PACKAGE)?;
         Ok(install_checked(e, &bytes)?.info())
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (id, url);
+        let _ = (s, id, url);
         Err("in the browser, install plugins from the Plugin Manager".into())
     }
 }
