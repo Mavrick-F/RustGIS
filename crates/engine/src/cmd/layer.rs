@@ -507,10 +507,13 @@ pub fn commands() -> Vec<C> {
                 _ => None,
             };
             if let Some((name, (count, most))) = sampled {
-                let count = count.map_or_else(|| "an unknown number of".to_string(), |c| c.to_string());
+                let read = match count {
+                    Some(count) => format!("at most {most} of the layer's {count} features"),
+                    None => format!("at most {most} features; the layer doesn't say how many it holds"),
+                };
                 s.notify(
                     format!(
-                        "{name}: the query filters the features each view reads (at most {most} of the layer's {count} features), a sample where a view holds more, so some matches may not show (Load All Features filters every one)"
+                        "{name}: the query filters the features each view reads ({read}), a sample where a view holds more, so some matches may not show (Load All Features filters every one)"
                     ),
                     false,
                 );
