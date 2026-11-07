@@ -35,9 +35,21 @@ pub struct Origin {
 }
 
 impl Origin {
-    /// Origin for transports without redirects or DNS visibility, such as the browser.
-    pub(crate) fn named(url: &str) -> Self {
+    /// Origin for a trusted transport's normalized final destination when DNS is opaque,
+    /// such as the browser. This does not perform normalization or grant credentials.
+    pub fn named(url: &str) -> Self {
         Self { url: url.to_owned(), reach: reach(crate::logins::inner(url)) }
+    }
+
+    /// Provenance for a trusted native transport's actual peer, never its DNS candidates.
+    /// Forbidden peers and non-web destinations are rejected before their bytes are accepted.
+    pub fn connected(url: &str, peer: IpAddr) -> Result<Self, String> {
+        let observed = ip_reach(peer);
+        check_reach(url, observed)?;
+        if observed == Reach::Forbidden {
+            return Err("that peer address is never fetched".into());
+        }
+        Ok(Self { url: url.into(), reach: observed })
     }
 
     /// Checks a descendant without replacing the document's observed reach with host spelling.
@@ -139,8 +151,28 @@ pub fn check(url: &str, from: Option<&str>) -> Result<(), String> {
     check_reach(url, from.map_or(Reach::Local, |u| reach(crate::logins::inner(u))))
 }
 
-/// Unwraps runtime addresses and applies one inherited reach ceiling through every wrapper.
-fn check_reach(url: &str, ceiling: Reach) -> Result<(), String> {
+/// Keeps a selected account only on its own effective server. Explicit anonymous reads stay
+/// anonymous for descendants; neither wrapper can grant a wider network reach.
+pub(crate) fn inherit(from: &str, to: &str) -> Result<String, String> {
+    let (plain, anonymous) = crate::s3::split_anonymous(from);
+    if anonymous {
+        return Ok(crate::s3::anonymous(to));
+    }
+    if let Some(bound) = rustgis_data::s3_address::parse(plain).map_err(str::to_string)? {
+        let old = crate::s3::bound_destination(plain)?.ok_or("not a saved S3 address")?;
+        let candidate = rustgis_data::s3_address::bind(bound.binding, bound.endpoint, to).map_err(str::to_string)?;
+        let new = crate::s3::bound_destination(&candidate)?.ok_or("not a saved S3 address")?;
+        if crate::logins::origin(&old).is_some_and(|origin| Some(origin) == crate::logins::origin(&new)) {
+            return Ok(candidate);
+        }
+        return Ok(to.to_string());
+    }
+    Ok(crate::logins::inherit(from, to))
+}
+
+/// Checks a transport's normalized destination under its inherited runtime ceiling, unwrapping
+/// account markers without widening it. Call before sending; Forbidden is always refused.
+pub fn check_reach(url: &str, ceiling: Reach) -> Result<(), String> {
     crate::logins::check(url).map_err(str::to_string)?;
     if let Some(bound) = rustgis_data::login_address::parse(url).map_err(str::to_string)? {
         return check_reach(bound.url, ceiling);

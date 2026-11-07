@@ -228,14 +228,17 @@ command line, including private CAs trusted by the operating system. The web app
 Tile addresses are checked after filling their placeholders, as well as when a style or
 TileJSON document supplies them. A document on the internet cannot direct tiles into the local
 network. Explicitly selected self-hosted servers remain supported, including ordinary
-hostnames resolved by local DNS. Native fetchers filter the resolved IPs before connecting,
+hostnames resolved by local DNS, with local fallback when the same hostname also returns
+public addresses. Native fetchers filter the resolved IPs before connecting,
 using the supplying document's actual connection reach. Link-local and unspecified addresses
 are always refused. Document redirects also change the base for relative references.
 Native redirects are checked at each hop. In the web app, use the final service address:
-redirect destinations are hidden from the app and are refused instead of followed unchecked.
+tile, style, TileJSON and sprite redirects, including HTTP-to-HTTPS upgrades and CDN hops,
+are refused because the browser hides their destinations from the app.
 The browser controls DNS resolution and local-network access; the app cannot inspect its
-resolved IPs. Native tile and document requests connect directly, without an environment
-HTTP proxy, so a proxy cannot resolve destinations beyond these checks.
+resolved IPs. Native tile and document requests, and file downloads through **From URL…**,
+connect directly without an environment HTTP proxy, so a proxy cannot resolve destinations
+beyond these checks. See [network downloads](data.md#network-downloads) if your network requires a proxy.
 
 The gallery's **Web Basemaps** need no API key: the OpenFreeMap vector maps (Liberty, Bright,
 Positron, Dark, Fiord) and USGS Imagery. Choosing one replaces the other web basemaps; tick

@@ -18,7 +18,7 @@ use crate::cache::Payload;
 use crate::draw::{Drawn, Frame, Label, Pass, draw_layers, tiles_in};
 use crate::mvt::{GeomKind, Tile};
 use crate::source::{Resolve, Resolved, Spec, resolve};
-use crate::sprite::{self, Load, Sprite};
+use crate::sprite::{Load, Sprite};
 use crate::style::{FeatureCtx, LayerKind, LineCap, LineJoin, PATTERNS, Rgba, Source, StyleLayer};
 use crate::template;
 
@@ -77,13 +77,14 @@ pub fn vector_tiles(spec: &Spec, frame: &Frame, view: &Extent, reach: Option<&Ex
     let src = r.style.sources.iter().find(|(id, _)| *id == source).map(|(_, s)| s)?;
     let mut pending = false;
     let mut error = crate::draw::left_out(&r, frame, true);
-    let items = match tiles_in(src, view, reach, frame, zoom, &mut pending) {
-        Ok(items) => items,
-        Err(e) => {
-            crate::draw::add_error(&mut error, e);
-            Vec::new()
-        }
-    };
+    let items = tiles_in(src, view, reach, frame, zoom, &mut pending, &mut error);
+    // Mesh backgrounds cover only returned data squares. When selection leaves holes,
+    // ordinary drawing paints the whole background and the remaining geometry together.
+    if error.is_some()
+        && r.style.layers.iter().any(|l| l.kind == LayerKind::Background && shown_in(l, f32::from(level), f32::from(level) + 1.0))
+    {
+        return None;
+    }
     let tiles = items.into_iter().map(|it| DataTile { payload: it.payload, at: it.at, z: it.z, clip: it.clip }).collect();
     let mut d = Drawn::default();
     if let Some(size) = labels {
@@ -233,7 +234,7 @@ fn average(img: &tiny_skia::Pixmap) -> Option<[f32; 4]> {
 /// the next level, in its order. Its background, when it has one, is the first run, filling the
 /// square.
 pub fn shapes(style: &Resolved, source: &str, tile: &Tile, level: u8) -> TileShapes {
-    shapes_with(style, source, tile, level, &|| sprite::load_from(&style.sprites, false, style.from.as_ref()))
+    shapes_with(style, source, tile, level, &|| style.load_sprites(false))
 }
 
 /// [`shapes`], with `load` to load the style's sprites.

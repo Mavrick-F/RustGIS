@@ -93,6 +93,11 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// Loads every rendering path's sprite sheets under this style's actual origin.
+    pub fn load_sprites(&self, hi_dpi: bool) -> crate::sprite::Load {
+        crate::sprite::load_from(&self.sprites, hi_dpi, self.from.as_ref())
+    }
+
     /// Whether it may still be used as it is.
     fn current(&self) -> bool {
         !self.waiting && (self.left_out.is_empty() || self.made.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < cache::RETRY)
@@ -108,6 +113,7 @@ fn kept(old: Arc<Resolved>, new: Arc<Resolved>) -> Arc<Resolved> {
         || old.style != new.style
         || old.sprites != new.sprites
         || old.attribution != new.attribution
+        || old.from != new.from
     {
         return new;
     }
@@ -863,6 +869,103 @@ mod tests {
         }
     }
 
+    /// A refused shard leaves its squares empty while the same source's valid squares draw.
+    /// Both a template list and a host switch are exercised without contacting a server.
+    #[test]
+    fn refused_tile_shards_leave_the_other_tiles_drawn() {
+        let _turn = cache::turn();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let observed = sent.clone();
+        let mut tile = tiny_skia::Pixmap::new(1, 1).unwrap();
+        tile.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let bytes = tile.encode_png().unwrap();
+        cache::set_fetcher(move |url, done| {
+            observed.lock().unwrap().push(url);
+            done(Ok(bytes.clone()));
+        });
+        let public = "http://partial-tiles.example/{z}/{x}/{y}";
+        let from = address::Origin::named("https://partial-style.example/style.json");
+        for x in 0..2 {
+            for y in 0..2 {
+                cache::get_tile_from(&format!("http://partial-tiles.example/1/{x}/{y}"), cache::Want::Image, Some(&from));
+            }
+        }
+        cache::wait(std::time::Duration::from_secs(2));
+        for tiles in [
+            vec!["http://{switch:127.0.0.1}/{z}/{x}/{y}", public],
+            vec!["http://{switch:127.0.0.1,partial-tiles.example}/{z}/{x}/{y}"],
+            vec![public],
+        ] {
+            let clean = tiles == [public];
+            let doc = json!({"version":8,"sources":{"s":{"type":"raster","tileSize":32,"maxzoom":1,"tiles":tiles}},
+                "layers":[{"id":"r","type":"raster","source":"s"}]});
+            let mut style = Style::parse(&doc).unwrap();
+            let spec = spec(Kind::Style, &format!("{}?{}", from.url, tiles.len()));
+            let sources = resolve_sources(&mut style, &spec, &from).unwrap().unwrap();
+            let r = Resolved {
+                style,
+                from: Some(from.clone()),
+                sprites: Vec::new(),
+                attribution: Vec::new(),
+                left_out: sources.left_out,
+                made: Mutex::new(Instant::now()),
+                waiting: false,
+            };
+            let frame = crate::draw::tests::world_frame();
+            let mut pm = tiny_skia::Pixmap::new(64, 64).unwrap();
+            let mut drawn = crate::draw::Drawn::default();
+            crate::draw::draw_layers(Some(&mut pm), (64, 64), &frame.extent(64, 64), &r, &frame, crate::draw::Pass::All, &mut drawn);
+            assert_eq!(pm.pixel(48, 16).unwrap().red(), 255, "a refused shard must not hide a valid tile");
+            assert_eq!(pm.pixel(16, 16).unwrap().alpha(), if clean { 255 } else { 0 });
+            assert_eq!(drawn.error.is_none(), clean, "{:?}", drawn.error);
+            if let Some(error) = drawn.error {
+                assert_eq!(error.matches("local network").count(), 1);
+            }
+            assert!(!drawn.pending);
+        }
+        assert!(sent.lock().unwrap().iter().all(|url| url.starts_with("http://partial-tiles.example/")));
+    }
+
+    /// A refused vector shard must not remove the style background over that square.
+    /// Falling back to the ordinary drawing path covers both all-refused and mixed shards.
+    #[test]
+    fn refused_vector_destinations_keep_the_style_background() {
+        let _turn = cache::turn();
+        cache::set_fetcher(|_, done| done(Ok(Vec::new())));
+        let frame = crate::draw::Frame { left: -100.0, top: 100.0, m_per_px: 1.0, ppp: 1.0 };
+        for tiles in [
+            vec!["http://{switch:127.0.0.1}/{z}/{x}/{y}"],
+            vec!["http://{switch:127.0.0.1}/{z}/{x}/{y}", "http://background-public.example/{z}/{x}/{y}"],
+        ] {
+            let doc = json!({"version":8,"sources":{"s":{"type":"vector","tiles":tiles}},"layers":[
+                {"id":"bg","type":"background","paint":{"background-color":"#f00"}},
+                {"id":"fill","type":"fill","source":"s","source-layer":"l"}]});
+            let mut style = Style::parse(&doc).unwrap();
+            let spec = spec(Kind::Style, &format!("https://background-style.example/{}", tiles.len()));
+            let from = address::Origin::named(&spec.url);
+            let sources = resolve_sources(&mut style, &spec, &from).unwrap().unwrap();
+            let ready = Arc::new(Resolved {
+                style,
+                from: Some(from),
+                sprites: Vec::new(),
+                attribution: Vec::new(),
+                left_out: sources.left_out,
+                made: Mutex::new(Instant::now()),
+                waiting: false,
+            });
+            resolved().lock().unwrap().insert(spec.key(), ready);
+            let view = frame.extent(200, 200);
+            assert!(
+                crate::shapes::vector_tiles(&spec, &frame, &view, None, None).is_none(),
+                "background needs the complete fallback drawing"
+            );
+            let mut image = tiny_skia::Pixmap::new(200, 200).unwrap();
+            let drawn = crate::draw::draw(&mut image, &spec, 1.0, &frame, false);
+            assert_eq!(image.pixel(16, 16).unwrap().red(), 255);
+            assert!(drawn.error.is_some());
+        }
+    }
+
     /// Label-only sources are checked too, even when the GPU or prepared pictures draw
     /// a different source's shapes. Neither renderer may discard a label refusal.
     #[test]
@@ -1166,6 +1269,10 @@ mod tests {
         assert!(!old.current());
         let r = kept(old.clone(), made(&["dem: gone"], Instant::now()));
         assert!(Arc::ptr_eq(&r, &old) && r.current());
+        // Equal content from another origin must not retain the old root's authority.
+        let mut moved = made(&["dem: gone"], Instant::now());
+        Arc::get_mut(&mut moved).unwrap().from = Some(address::Origin::named("https://refreshed-style.example/style.json"));
+        assert!(Arc::ptr_eq(&kept(old.clone(), moved.clone()), &moved));
         // Something else (or nothing) left out, or another style: the new one.
         let new = made(&[], Instant::now());
         assert!(Arc::ptr_eq(&kept(old.clone(), new.clone()), &new));

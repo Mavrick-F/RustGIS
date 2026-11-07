@@ -201,6 +201,15 @@ pub fn expand(template: &str, t: TileId, tile_size: u32, tms: bool, subdomains: 
 /// Resolves `href` against the document at `base` (for addresses inside a style or TileJSON).
 pub fn join(base: &str, href: &str) -> String {
     let href = crate::logins::inner(href);
+    match rustgis_data::s3_address::parse(base) {
+        Ok(Some(bound)) => return crate::address::inherit(base, &join(bound.url, href)).unwrap_or_else(|_| base.to_string()),
+        Err(_) => return base.to_string(),
+        Ok(None) => {}
+    }
+    let (plain, anonymous) = crate::s3::split_anonymous(base);
+    if anonymous {
+        return crate::s3::anonymous(&join(plain, href));
+    }
     match rustgis_data::login_address::parse(base) {
         Ok(Some(bound)) => return crate::logins::inherit(base, &join(bound.url, href)),
         Err(_) => return base.to_string(),

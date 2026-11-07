@@ -53,12 +53,14 @@ pub enum State {
 /// Called once with a fetch's bytes or error.
 pub type Done = Box<dyn FnOnce(Result<Vec<u8>, String>) + Send>;
 
+/// Bytes and the actual effective origin observed by a replacement transport.
 #[derive(Debug)]
-struct Fetched {
-    bytes: Vec<u8>,
-    origin: crate::address::Origin,
+pub struct Fetched {
+    pub bytes: Vec<u8>,
+    pub origin: crate::address::Origin,
 }
-type FetchedDone = Box<dyn FnOnce(Result<Fetched, String>) + Send>;
+/// A policy-aware fetch completes once with bytes and their final provenance, or an error.
+pub type FetchedDone = Box<dyn FnOnce(Result<Fetched, String>) + Send>;
 /// Called once with a download's bytes or what is known of its failure (#509).
 pub type DoneDetailed = Box<dyn FnOnce(Result<Vec<u8>, Failure>) + Send>;
 // The carrier lives with source I/O so lower-layer workers inherit the same context.
@@ -86,7 +88,7 @@ pub(crate) fn caller_callback<T: Send + 'static>(
     })
 }
 
-type Fetcher = Box<dyn Fn(String, Done, &'static [u16]) + Send + Sync>;
+type Fetcher = Box<dyn Fn(String, crate::address::Reach, FetchedDone, &'static [u16]) + Send + Sync>;
 /// Hands back a decoded picture: [`RAW`] pixels, or the encoded bytes it was given when it
 /// couldn't decode them (they are decoded here then).
 pub type Decoded = Box<dyn FnOnce(Result<Vec<u8>, Vec<u8>>) + Send>;
@@ -158,6 +160,9 @@ fn waker() -> &'static Mutex<Option<Arc<dyn Fn() + Send + Sync>>> {
 
 /// Replaces how addresses are fetched (the browser's `fetch`). `done` must be called once.
 /// Decode download markers with [`split_download_limit`] and enforce their budget while reading.
+/// The legacy byte-only hook is a trusted embedding override responsible for its own
+/// destination policy. New transports should use set_fetcher_with_origin to receive the
+/// inherited ceiling and report actual provenance; this hook cannot report redirects or peers.
 pub fn set_fetcher(f: impl Fn(String, Done) + Send + Sync + 'static) {
     set_fetcher_omitting(move |url, done, _| f(url, done));
 }
@@ -166,7 +171,35 @@ pub fn set_fetcher(f: impl Fn(String, Done) + Send + Sync + 'static) {
 /// map's edge): a transport keeping diagnostics passes them to
 /// [`RequestDiagnostics::omit_statuses`], so it records what the native transport records.
 pub fn set_fetcher_omitting(f: impl Fn(String, Done, &'static [u16]) + Send + Sync + 'static) {
-    *fetcher().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Box::new(f)));
+    *fetcher().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Box::new(move |url, _, done, omit| {
+        let origin = crate::address::Origin::named(&crate::s3::bound_destination(&url).ok().flatten().unwrap_or_else(|| url.clone()));
+        f(url, Box::new(move |r| done(r.map(|bytes| Fetched { bytes, origin }))), omit);
+    })));
+}
+
+/// Installs a trusted transport that checks normalized URLs, redirects and (when available)
+/// actual peers against the supplied ceiling BEFORE sending. Completion reports final
+/// provenance atomically with the bytes. Browser transports use Origin::named on a normalized
+/// destination; native transports use Origin::connected with the socket's actual peer.
+pub fn set_fetcher_with_origin(f: impl Fn(String, crate::address::Reach, FetchedDone, &'static [u16]) + Send + Sync + 'static) {
+    *fetcher().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Box::new(move |url, ceiling, done, omit| {
+        let original = url.clone();
+        f(
+            url,
+            ceiling,
+            Box::new(move |result| {
+                done(result.and_then(|mut fetched| {
+                    crate::address::check_reach(&fetched.origin.url, ceiling)?;
+                    if fetched.origin.reach > ceiling {
+                        return Err("the fetched answer exceeds its request's network reach".into());
+                    }
+                    fetched.origin.url = crate::address::inherit(&original, &fetched.origin.url)?;
+                    Ok(fetched)
+                }));
+            }),
+            omit,
+        );
+    })));
 }
 
 /// Undoes [`set_fetcher`]: addresses are fetched natively again (a test done with its own).
@@ -413,16 +446,33 @@ pub(crate) fn get_from(url: &str, want: Want, from: Option<&crate::address::Orig
 
 /// Returns JSON and its effective origin from the same cache entry and lock acquisition.
 pub(crate) fn document(url: &str, from: Option<&crate::address::Origin>) -> (State, Option<crate::address::Origin>) {
-    request(url, Want::Json, &[], from)
+    let (state, origin, _) = request(url, Want::Json, &[], from);
+    (state, origin)
+}
+
+/// A drawable tile and any omissions in a usable partial composite, from the same lookup.
+pub(crate) fn tile_noted(url: &str, want: Want, from: Option<&crate::address::Origin>) -> (State, Option<String>) {
+    let (state, _, note) = request(url, want, TILE_OMIT, from);
+    (state, note)
+}
+
+/// Missing tiles and a view's unfetched dropped work are ordinary gaps, not drawing errors.
+pub(crate) fn routine_tile_failure(error: &str) -> bool {
+    error == DROPPED || http_status(error).is_some_and(|status| TILE_OMIT.contains(&status))
 }
 
 /// The statuses a map tile's request omits ([`get_tile`]).
 const TILE_OMIT: &[u16] = &[404, 410];
 
 /// [`get`] with the statuses that are expected answers for this fetch.
-fn request(url: &str, want: Want, omit: &'static [u16], from: Option<&crate::address::Origin>) -> (State, Option<crate::address::Origin>) {
+fn request(
+    url: &str,
+    want: Want,
+    omit: &'static [u16],
+    from: Option<&crate::address::Origin>,
+) -> (State, Option<crate::address::Origin>, Option<String>) {
     if let Err(e) = crate::logins::check(resource_of(url)) {
-        return (State::Failed(e.to_string()), None);
+        return (State::Failed(e.to_string()), None, None);
     }
     // A map tile of a layer in another system: its service's picture as it comes, or made from
     // its pictures (#769).
@@ -450,9 +500,9 @@ fn request(url: &str, want: Want, omit: &'static [u16], from: Option<&crate::add
                     drop(c);
                     return refused_request(url, message);
                 }
-                return (State::Ready(p.clone()), origin.clone());
+                return (State::Ready(p.clone()), origin.clone(), None);
             }
-            Entry::Pending => return (State::Pending, None),
+            Entry::Pending => return (State::Pending, None, None),
             Entry::Failed(e, at) if ceiling <= slot.ceiling && at.elapsed() < retry_wait(e, RETRY) => {
                 // A server that said when to come back (429 or 503 with `Retry-After`) is asked
                 // again then: the map draws again at that time, though nothing else draws it.
@@ -460,7 +510,7 @@ fn request(url: &str, want: Want, omit: &'static [u16], from: Option<&crate::add
                 if let Some(wait) = retry_after(e) {
                     notify_at(*at + wait);
                 }
-                return (State::Failed(e.clone()), None);
+                return (State::Failed(e.clone()), None, None);
             }
             Entry::Failed(..) => {}
         }
@@ -468,6 +518,7 @@ fn request(url: &str, want: Want, omit: &'static [u16], from: Option<&crate::add
     if crate::warp::is_warp(url) {
         drop(c);
         // Made once its pictures are here; asked again (as the map draws) until then.
+        let mut note = None;
         return (
             match crate::warp::make(url, from) {
                 crate::warp::Made::Waiting => State::Pending,
@@ -481,27 +532,31 @@ fn request(url: &str, want: Want, omit: &'static [u16], from: Option<&crate::add
                     );
                     State::Ready(payload)
                 }
-                crate::warp::Made::ForNow(payload) => State::Ready(payload),
+                crate::warp::Made::ForNow(payload, omitted) => {
+                    note = Some(omitted);
+                    State::Ready(payload)
+                }
                 crate::warp::Made::Failed(e) => {
                     store_from(url, Entry::Failed(e.clone(), Instant::now()), ceiling);
                     State::Failed(e)
                 }
             },
             None,
+            note,
         );
     }
     let asked_at = crate::mbtiles::epoch();
     c.slots.insert(url.to_string(), Slot { entry: Entry::Pending, ceiling, used: tick, asked: now });
     drop(c);
     start(url.to_string(), want, omit, asked_at, ceiling);
-    (State::Pending, None)
+    (State::Pending, None, None)
 }
 
 /// A cache-policy refusal is a failed request too: record it like a transport refusal,
 /// after releasing the cache lock, so it cannot become unexplained missing tiles.
-fn refused_request(url: &str, message: String) -> (State, Option<crate::address::Origin>) {
+fn refused_request(url: &str, message: String) -> (State, Option<crate::address::Origin>, Option<String>) {
     RequestDiagnostics::new(url, "GET").failed(&Failure::from(message.clone()));
-    (State::Failed(message), None)
+    (State::Failed(message), None, None)
 }
 
 /// What the cache holds for `url`, without fetching it.
@@ -1133,7 +1188,12 @@ fn download_detailed_within(url: &str, max: usize, timeout: std::time::Duration,
     });
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
     match f {
-        Some(f) => f(marked.clone(), Box::new(move |r| done(r.map_err(|e| Failure::new(&marked, e)))), omit),
+        Some(f) => f(
+            marked.clone(),
+            crate::address::Reach::Local,
+            Box::new(move |r| done(r.map(|fetched| fetched.bytes).map_err(|e| Failure::new(&marked, e)))),
+            omit,
+        ),
         None => native::download_within(marked, timeout, omit, done),
     }
 }
@@ -1342,12 +1402,7 @@ fn fetch_reached(url: String, ceiling: crate::address::Reach, done: FetchedDone,
     let done: FetchedDone = Box::new(move |r| done(crate::logins::check(resource_of(&key)).map_err(str::to_string).and(r)));
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
     match f {
-        Some(f) => {
-            // Browser redirects are refused; the adapter checks the actual normalized URL.
-            // Custom fetchers must enforce the same destination boundary.
-            let origin = crate::address::Origin::named(&crate::s3::bound_destination(&url).ok().flatten().unwrap_or_else(|| url.clone()));
-            f(url, Box::new(move |r| done(r.map(|bytes| Fetched { bytes, origin }))), omit)
-        }
+        Some(f) => f(url, ceiling, done, omit),
         None => native::fetch_reached(url, ceiling, done, omit),
     }
 }
@@ -1720,7 +1775,6 @@ mod native {
             crate::address::check(&url, None).map_err(|e| ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)))?;
             let ceiling = if self.public_only { Reach::Public } else { Reach::Local };
             let all = self.inner.resolve(uri, config, timeout)?;
-            let ceiling = if all.iter().any(|a| crate::address::ip_reach(a.ip()) == Reach::Public) { Reach::Public } else { ceiling };
             let mut kept = self.empty();
             for a in all.iter().filter(|a| {
                 let reach = crate::address::ip_reach(a.ip());
@@ -1735,6 +1789,49 @@ mod native {
                 return Err(ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg)));
             }
             Ok(kept)
+        }
+    }
+
+    /// Resolver filtering retains explicit local fallback while removing forbidden peers.
+    /// Public-document requests never receive local candidates. This fixture opens no sockets.
+    #[cfg(test)]
+    #[test]
+    fn mixed_dns_destinations_keep_local_only_when_allowed() {
+        use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+        #[derive(Debug)]
+        struct Answer(bool);
+        impl Resolver for Answer {
+            fn resolve(
+                &self,
+                _: &ureq::http::Uri,
+                _: &ureq::config::Config,
+                _: ureq::unversioned::transport::NextTimeout,
+            ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+                let mut all = self.empty();
+                all.push("127.0.0.1:80".parse().unwrap());
+                all.push("169.254.169.254:80".parse().unwrap());
+                if self.0 {
+                    all.push("203.0.113.1:80".parse().unwrap());
+                }
+                Ok(all)
+            }
+        }
+        let uri = "http://mixed-dns.example/".parse().unwrap();
+        let config = config_builder(std::time::Duration::from_secs(1)).build();
+        for mixed in [true, false] {
+            for public_only in [true, false] {
+                let result = CheckedResolver { inner: Answer(mixed), public_only }.resolve(&uri, &config, Default::default());
+                if !mixed && public_only {
+                    assert!(result.unwrap_err().to_string().contains("resolves to"));
+                } else {
+                    let kept = result.unwrap();
+                    assert_eq!(kept.len(), if mixed && !public_only { 2 } else { 1 });
+                    assert!(kept.iter().all(|a| crate::address::ip_reach(a.ip()) != Reach::Forbidden));
+                    if public_only {
+                        assert!(kept.iter().all(|a| crate::address::ip_reach(a.ip()) == Reach::Public));
+                    }
+                }
+            }
         }
     }
 
@@ -1767,8 +1864,61 @@ mod native {
             details: &ureq::unversioned::transport::ConnectionDetails,
             chained: Option<()>,
         ) -> Result<Option<Self::Out>, ureq::Error> {
-            let reach = details.addrs.first().map_or(Reach::Public, |a| crate::address::ip_reach(a.ip()));
-            Ok(self.0.connect(details, chained)?.map(|inner| Box::new(ReachedTransport { inner, reach }) as Self::Out))
+            use ureq::unversioned::transport::time::Duration;
+            let first = details.addrs.first().map_or(Reach::Public, |a| crate::address::ip_reach(a.ip()));
+            let mixed = details.addrs.iter().any(|a| crate::address::ip_reach(a.ip()) != first);
+            if !mixed {
+                return Ok(self.0.connect(details, chained)?.map(|inner| Box::new(ReachedTransport { inner, reach: first }) as Self::Out));
+            }
+            // The transport API does not expose its peer. Try at most two homogeneous
+            // groups under one deadline, so success identifies the actual reach without
+            // losing an explicitly selected server's fallback or changing its TLS name.
+            let other = if first == Reach::Public { Reach::Local } else { Reach::Public };
+            let began = web_time::Instant::now();
+            let mut last = None;
+            for (index, reach) in [first, other].into_iter().enumerate() {
+                let mut addrs = details.resolver.empty();
+                for address in details.addrs.iter().filter(|a| crate::address::ip_reach(a.ip()) == reach) {
+                    addrs.push(*address);
+                }
+                let mut attempt = connection_at(details, addrs);
+                attempt.now = (details.current_time)();
+                if !details.timeout.after.is_not_happening() {
+                    let left = details.timeout.after.saturating_sub(began.elapsed());
+                    if left.is_zero() {
+                        return Err(ureq::Error::Timeout(details.timeout.reason));
+                    }
+                    attempt.timeout.after = Duration::Exact(left / (2 - index) as u32);
+                }
+                match self.0.connect(&attempt, chained) {
+                    Ok(Some(inner)) => return Ok(Some(Box::new(ReachedTransport { inner, reach }) as Self::Out)),
+                    Ok(None) => {}
+                    Err(e) => last = Some(e),
+                }
+            }
+            match last {
+                Some(error) => Err(error),
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// Reuses URI, TLS, cancellation and resolver settings while narrowing socket candidates.
+    fn connection_at<'a>(
+        d: &ureq::unversioned::transport::ConnectionDetails<'a>,
+        addrs: ureq::unversioned::resolver::ResolvedSocketAddrs,
+    ) -> ureq::unversioned::transport::ConnectionDetails<'a> {
+        ureq::unversioned::transport::ConnectionDetails {
+            uri: d.uri,
+            addrs,
+            config: d.config,
+            request_level: d.request_level,
+            resolver: d.resolver,
+            now: d.now,
+            timeout: d.timeout,
+            current_time: d.current_time.clone(),
+            run_connector: d.run_connector.clone(),
+            register_shutdown: d.register_shutdown.clone(),
         }
     }
 
@@ -1821,12 +1971,24 @@ mod native {
     #[cfg(test)]
     /// Exercises classified DNS and real HTTP while routing every connection to an owned listener.
     pub(super) fn fixture_agent(answer: std::net::SocketAddr, listener: std::net::SocketAddr, public_only: bool) -> ureq::Agent {
+        fixture_answers(vec![answer], listener, public_only, false)
+    }
+
+    /// Mixed-DNS fixtures fail the synthetic public connection without opening a socket;
+    /// all other fixture connections go only to the listener owned by the test.
+    #[cfg(test)]
+    fn fixture_answers(
+        answers: Vec<std::net::SocketAddr>,
+        listener: std::net::SocketAddr,
+        public_only: bool,
+        fail_public: bool,
+    ) -> ureq::Agent {
         use ureq::unversioned::{
             resolver::Resolver,
             transport::{ConnectionDetails, Connector, DefaultConnector, Transport},
         };
         #[derive(Debug)]
-        struct Dns(std::net::SocketAddr);
+        struct Dns(Vec<std::net::SocketAddr>);
         impl Resolver for Dns {
             fn resolve(
                 &self,
@@ -1836,39 +1998,53 @@ mod native {
             ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
                 let mut addresses = self.empty();
                 let literal = uri.host().and_then(|h| h.parse::<std::net::IpAddr>().ok());
-                addresses.push(literal.map_or(self.0, |ip| std::net::SocketAddr::new(ip, uri.port_u16().unwrap_or(80))));
+                if let Some(ip) = literal {
+                    addresses.push(std::net::SocketAddr::new(ip, uri.port_u16().unwrap_or(80)));
+                } else {
+                    for answer in &self.0 {
+                        addresses.push(*answer);
+                    }
+                }
                 Ok(addresses)
             }
         }
         #[derive(Debug)]
-        struct Route(std::net::SocketAddr);
+        struct Route(std::net::SocketAddr, bool);
         impl Connector<()> for Route {
             type Out = Box<dyn Transport>;
             fn connect(&self, d: &ConnectionDetails, _: Option<()>) -> Result<Option<Self::Out>, ureq::Error> {
+                if self.1 && d.addrs.first().is_some_and(|a| crate::address::ip_reach(a.ip()) == Reach::Public) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into());
+                }
                 let mut addrs = d.addrs.clone();
                 for address in addrs.iter_mut() {
                     *address = self.0;
                 }
-                let fixture = ConnectionDetails {
-                    uri: d.uri,
-                    addrs,
-                    config: d.config,
-                    request_level: d.request_level,
-                    resolver: d.resolver,
-                    now: d.now,
-                    timeout: d.timeout,
-                    current_time: d.current_time.clone(),
-                    run_connector: d.run_connector.clone(),
-                    register_shutdown: d.register_shutdown.clone(),
-                };
+                let fixture = connection_at(d, addrs);
                 DefaultConnector::default().connect(&fixture, None)
             }
         }
         ureq::Agent::with_parts(
             config_builder(std::time::Duration::from_secs(2)).build(),
-            ReachConnector(Route(listener)),
-            CheckedResolver { inner: Dns(answer), public_only },
+            ReachConnector(Route(listener, fail_public)),
+            CheckedResolver { inner: Dns(answers), public_only },
         )
+    }
+
+    /// Actual requests exercise resolver filtering, connector fallback and retained provenance.
+    #[cfg(test)]
+    #[test]
+    fn mixed_dns_destinations_preserve_explicit_local_fallback() {
+        let _turn = super::turn();
+        let base = super::tests::serve(vec!["HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".into()]);
+        let listener = base.strip_prefix("http://").unwrap().parse().unwrap();
+        let answers = vec!["203.0.113.1:80".parse().unwrap(), "127.0.0.1:80".parse().unwrap()];
+        let public = fixture_answers(answers.clone(), listener, true, true);
+        assert!(fetch_answer(&public, "http://mixed-fixture.example/style.json", Reach::Public, false, &[]).is_err());
+        let explicit = fixture_answers(answers, listener, false, true);
+        let got = fetch_answer(&explicit, "http://mixed-fixture.example/style.json", Reach::Local, false, &[]).unwrap();
+        assert_eq!(got.bytes, b"tile");
+        assert_eq!(got.origin.reach, Reach::Local);
     }
 
     /// A download agent that connects only to internet addresses.
@@ -1934,7 +2110,11 @@ mod native {
                 }
                 diagnostics.sending();
                 super::check_current()?;
-                let req = req.config().timeout_global(agent.config().timeouts().global).build();
+                let req = if sending.config().timeouts().global == agent.config().timeouts().global {
+                    req
+                } else {
+                    req.config().timeout_global(agent.config().timeouts().global).build()
+                };
                 let (resp, reached) = connected(|| req.call()).map_err(unanswered)?;
                 ceiling = ceiling.min(reached);
                 diagnostics.answered(resp.status().as_u16());
@@ -2252,7 +2432,11 @@ mod native {
                 diagnostics.sending();
                 super::check_current()?;
                 // Narrowing the connection pool must retain the caller's download timeout.
-                let req = req.config().timeout_global(agent.config().timeouts().global).build();
+                let req = if sending.config().timeouts().global == agent.config().timeouts().global {
+                    req
+                } else {
+                    req.config().timeout_global(agent.config().timeouts().global).build()
+                };
                 let (mut resp, reached) = connected(|| req.call()).map_err(unanswered)?;
                 ceiling = ceiling.min(reached);
                 let status = resp.status().as_u16();
@@ -2328,7 +2512,8 @@ mod native {
                 same_origin &= crate::logins::origin(&next) == first_origin;
                 at = next;
             };
-            let origin = Origin { url: if same_origin { crate::logins::inherit(url, &at) } else { at }, reach: ceiling };
+            let retained = if same_origin || crate::s3::split_anonymous(url).1 { crate::address::inherit(url, &at)? } else { at };
+            let origin = Origin { url: retained, reach: ceiling };
             if resp.status().as_u16() == 204 {
                 return Ok(Fetched { bytes: Vec::new(), origin });
             }
@@ -3180,7 +3365,7 @@ mod tests {
 
     /// A server on this computer answering each request with the next of `answers`.
     #[cfg(not(target_arch = "wasm32"))]
-    fn serve(answers: Vec<String>) -> String {
+    pub(super) fn serve(answers: Vec<String>) -> String {
         serve_bytes(answers.into_iter().map(String::into_bytes).collect())
     }
 
@@ -3789,6 +3974,169 @@ mod tests {
             assert!(native::get(&agent, "http://blocked.example/", &[]).unwrap_err().contains("resolves to"));
         }
         assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    /// Draws the actual raster selection path against seeded cache entries, without I/O.
+    fn draw_cached_raster(url: &str, from: crate::address::Origin) -> (Pixmap, crate::Drawn) {
+        let mut style = crate::style::Style::parse(&serde_json::json!({"version":8,
+            "sources":{"s":{"type":"raster","tiles":[url],"maxzoom":0}},
+            "layers":[{"id":"r","type":"raster","source":"s"}]}))
+        .unwrap();
+        if let Some((_, crate::style::Source::Raster { from: origin, .. })) = style.sources.first_mut() {
+            *origin = Some(from.clone());
+        }
+        let resolved = crate::source::Resolved {
+            style,
+            from: Some(from),
+            sprites: Vec::new(),
+            attribution: Vec::new(),
+            left_out: Vec::new(),
+            made: Mutex::new(Instant::now()),
+            waiting: false,
+        };
+        let frame = crate::draw::tests::world_frame();
+        let mut image = Pixmap::new(64, 64).unwrap();
+        let mut drawn = crate::Drawn::default();
+        crate::draw::draw_layers(Some(&mut image), (64, 64), &frame.extent(64, 64), &resolved, &frame, crate::draw::Pass::All, &mut drawn);
+        (image, drawn)
+    }
+
+    /// Browser-normalized metadata reaches the document consumer atomically with its bytes.
+    /// Descendants carry Public through the real tile queue to the replacement transport,
+    /// which refuses a normalized local address before its simulated send.
+    #[test]
+    fn replacement_transport_destinations_keep_normalized_origins_and_ceiling() {
+        let _turn = turn();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let observed = sent.clone();
+        set_fetcher_with_origin(move |url, ceiling, done, _| {
+            let normalized = if url == "https://public.example\\@localhost/style.json" {
+                "https://public.example/@localhost/style.json"
+            } else if url == "http://%31%32%37.0.0.1/tile.png" {
+                "http://127.0.0.1/tile.png"
+            } else {
+                &url
+            };
+            let check = crate::address::check_reach(normalized, ceiling);
+            done(check.map(|_| {
+                observed.lock().unwrap().push((normalized.to_string(), ceiling));
+                Fetched { bytes: b"{}".to_vec(), origin: crate::address::Origin::named(normalized) }
+            }));
+        });
+        let root = "https://public.example\\@localhost/style.json";
+        document(root, None);
+        wait(std::time::Duration::from_secs(2));
+        let (state, origin) = document(root, None);
+        assert!(matches!(state, State::Ready(_)));
+        let origin = origin.unwrap();
+        assert_eq!(origin.url, "https://public.example/@localhost/style.json");
+        assert_eq!(origin.reach, crate::address::Reach::Public);
+        let child = "http://%31%32%37.0.0.1/tile.png";
+        get_tile_from(child, Want::Image, Some(&origin));
+        wait(std::time::Duration::from_secs(2));
+        assert!(matches!(get_tile_from(child, Want::Image, Some(&origin)), State::Failed(_)));
+        assert_eq!(sent.lock().unwrap().len(), 1, "normalized local child never reaches send");
+        assert!(origin.check("http://127.0.0.1/tile.png").is_err());
+    }
+
+    /// The native response's effective origin keeps the selected saved S3 account for
+    /// relative documents, without transferring that binding to another server.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_destination_origins_keep_saved_s3_selection() {
+        let _turn = turn();
+        let base = serve(vec!["HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into()]);
+        let binding = "0123456789abcdef";
+        let name = "destination-origin-binding";
+        crate::s3::connect_saved(
+            crate::s3::Connection {
+                name: name.into(),
+                endpoint: Some(base.clone()),
+                region: "us-east-1".into(),
+                buckets: vec!["bucket".into()],
+                credentials: None,
+            },
+            binding,
+            "destination-account",
+        )
+        .unwrap();
+        let bound = rustgis_data::s3_address::bind(binding, &base, "s3://bucket/styles/style.json").unwrap();
+        let got = native::fetch_answer(&native::agent(), &bound, crate::address::Reach::Local, false, &[]).unwrap();
+        let child = crate::template::join(&got.origin.url, "tiles.json");
+        let selected = rustgis_data::s3_address::parse(&child).unwrap();
+        assert!(selected.is_some(), "a relative document must retain the selected S3 binding");
+        assert_eq!(selected.unwrap().binding, binding);
+        assert_eq!(crate::s3::prepare(&child).unwrap().url, format!("{base}/bucket/styles/tiles.json"));
+        let external = crate::template::join(&got.origin.url, "https://other-origin.example/tiles.json");
+        assert!(rustgis_data::s3_address::parse(&external).unwrap().is_none());
+        crate::s3::disconnect(name);
+    }
+
+    /// A cached DNS refusal reaches the drawing, while ordinary missing tiles stay quiet.
+    #[test]
+    fn cached_destination_failures_reach_raster_drawing() {
+        let _turn = turn();
+        let from = crate::address::Origin::named("https://public-document.example/style.json");
+        for (case, reach) in
+            [("local", crate::address::Reach::Local), ("public", crate::address::Reach::Public), ("missing", crate::address::Reach::Public)]
+        {
+            let url = format!("http://cached-draw.example/{case}");
+            let entry = if case == "missing" {
+                Entry::Failed("http status: 404".into(), Instant::now())
+            } else {
+                let mut image = Pixmap::new(1, 1).unwrap();
+                image.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+                Entry::Ready(Arc::new(Payload::Image(image)), 4, Some(crate::address::Origin { url: url.clone(), reach }))
+            };
+            store(&url, entry);
+            let (image, drawn) = draw_cached_raster(&url, from.clone());
+            assert_eq!(drawn.error.is_some(), case == "local", "{case}: {:?}", drawn.error);
+            assert_eq!(image.pixel(32, 32).unwrap().alpha() > 0, case == "public");
+        }
+    }
+
+    /// Partial WMTS composites retain both their useful pixels and the refused-component
+    /// warning, including the short-lived composite cache hit.
+    #[test]
+    fn partial_warp_destinations_report_refused_components() {
+        use rustgis_data::ogc::warp::{Grid, Matrix, Warp};
+        let _turn = turn();
+        let warp = Warp {
+            epsg: 4326,
+            grid: Grid::Tiles(vec![Matrix {
+                id: "m".into(),
+                left: -180.0,
+                top: 90.0,
+                cell: 180.0 / 256.0,
+                tile_w: 256,
+                tile_h: 256,
+                cols: 2,
+                rows: 1,
+            }]),
+            area: None,
+            systems: Vec::new(),
+        };
+        let template = warp.address("http://partial-warp.example/{nm}/{ncol}/{nrow}");
+        let url = crate::template::expand(&template, crate::template::TileId { z: 0, x: 0, y: 0 }, 256, false, &[]);
+        let (base, _, spec) = Warp::parse(&url).unwrap();
+        let half = crate::template::HALF_WORLD;
+        let plan = spec.plan(base, [-half, -half, half, half], 256, &crate::warp::transformer(4326).unwrap());
+        assert_eq!(plan.parts.len(), 2);
+        for (i, part) in plan.parts.iter().enumerate() {
+            let mut image = Pixmap::new(1, 1).unwrap();
+            image.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+            let reach = if i == 0 { crate::address::Reach::Public } else { crate::address::Reach::Local };
+            store(
+                &part.url,
+                Entry::Ready(Arc::new(Payload::Image(image)), 4, Some(crate::address::Origin { url: part.url.clone(), reach })),
+            );
+        }
+        let from = crate::address::Origin::named("https://public-document.example/style.json");
+        for _ in 0..2 {
+            let (image, drawn) = draw_cached_raster(&url, from.clone());
+            assert!(image.pixels().iter().any(|p| p.alpha() > 0), "valid component still draws");
+            assert!(drawn.error.as_deref().is_some_and(|e| e.contains("cached local-network")), "{:?}", drawn.error);
+        }
     }
 
     /// A previously explicit local tile cannot silently stand in for a public document's

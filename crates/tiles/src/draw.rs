@@ -81,7 +81,7 @@ pub(crate) fn left_out(r: &Resolved, frame: &Frame, mesh: bool) -> Option<String
     let shown = |draws: fn(&StyleLayer) -> bool| r.style.layers.iter().any(|l| l.visible_at(zoom) && draws(l));
     let hi_dpi = frame.ppp >= 1.5;
     let unread = sprite_notes(shown(StyleLayer::draws_icons), shown(StyleLayer::draws_patterns), hi_dpi, hi_dpi && !mesh, |hi, what| {
-        sprite::unread_note(&r.sprites, r.style.sprites_listed, &sprite::load_from(&r.sprites, hi, r.from.as_ref()), what)
+        sprite::unread_note(&r.sprites, r.style.sprites_listed, &r.load_sprites(hi), what)
     });
     let all: Vec<&str> = r.left_out.iter().map(String::as_str).chain(unread.iter().map(String::as_str)).collect();
     (!all.is_empty()).then(|| all.join("; "))
@@ -181,7 +181,7 @@ pub(crate) fn draw_layers(
     let mut sprite_state: Option<Option<Arc<Sprite>>> = None;
     let mut sprite = |pending: &mut bool| -> Option<Arc<Sprite>> {
         sprite_state
-            .get_or_insert_with(|| match sprite::load_from(&r.sprites, frame.ppp >= 1.5, r.from.as_ref()) {
+            .get_or_insert_with(|| match r.load_sprites(frame.ppp >= 1.5) {
                 Load::Ready(s) => Some(s),
                 Load::Pending => {
                     *pending = true;
@@ -220,14 +220,14 @@ pub(crate) fn draw_layers(
             // Hillshade reads the heights a pixel past the view's edges: those tiles too.
             let pad = 2.0 * frame.m_per_px;
             let reach = Extent::new(view.min_x - pad, view.min_y - pad, view.max_x + pad, view.max_y + pad);
-            let list =
-                match tiles_for(src, if matches!(src, Source::RasterDem { .. }) { &reach } else { view }, frame, zoom, &mut out.pending) {
-                    Ok(list) => list,
-                    Err(e) => {
-                        add_error(&mut out.error, e);
-                        Vec::new()
-                    }
-                };
+            let list = tiles_for(
+                src,
+                if matches!(src, Source::RasterDem { .. }) { &reach } else { view },
+                frame,
+                zoom,
+                &mut out.pending,
+                &mut out.error,
+            );
             items.insert(src_id.to_string(), list);
         }
         let Some(list) = items.get(src_id) else { continue };
@@ -387,13 +387,7 @@ fn place_as(
         let Some(src_id) = layer.source.as_deref() else { continue };
         if !items.contains_key(src_id) {
             let Some(src) = r.style.sources.iter().find(|s| s.0 == src_id).map(|s| &s.1) else { continue };
-            let list = match tiles_in(src, view, Some(reach), frame, zoom, &mut out.pending) {
-                Ok(list) => list,
-                Err(e) => {
-                    add_error(&mut out.error, e);
-                    Vec::new()
-                }
-            };
+            let list = tiles_in(src, view, Some(reach), frame, zoom, &mut out.pending, &mut out.error);
             items.insert(src_id, list);
         }
         let o = (layer.raster_opacity(zoom) * opacity).clamp(0.0, 1.0);
@@ -460,7 +454,7 @@ pub fn pick(spec: &Spec, x: f64, y: f64, m_per_px: f64, tol_px: f32, limit: usiz
             if !matches!(src, Source::Vector { .. }) {
                 continue;
             }
-            items.insert(src_id.to_string(), tiles_for(src, &view, &frame, zoom, &mut pending).unwrap_or_default());
+            items.insert(src_id.to_string(), tiles_for(src, &view, &frame, zoom, &mut pending, &mut None));
         }
         let Some(list) = items.get(src_id) else { continue };
         // Every tile within reach (a feature near a tile's edge may be in its neighbour), the real
@@ -554,13 +548,14 @@ fn hits(f: &crate::mvt::Feature, kind: LayerKind, p: [f32; 2], reach: f32) -> bo
 }
 
 /// The tiles of a source in view, with stand-ins for those not here yet.
-fn tiles_for(src: &Source, view: &Extent, frame: &Frame, zoom: f32, pending: &mut bool) -> Result<Vec<Item>, String> {
-    tiles_in(src, view, None, frame, zoom, pending)
+fn tiles_for(src: &Source, view: &Extent, frame: &Frame, zoom: f32, pending: &mut bool, error: &mut Option<String>) -> Vec<Item> {
+    tiles_in(src, view, None, frame, zoom, pending, error)
 }
 
 /// The tiles of a source in view and out to `reach` (those in the cache only), with stand-ins
 /// for those not here yet. Expanded destinations retain the supplying document's reach;
-/// a refusal is reported by the drawing, without touching the shared cache or fetcher.
+/// refused tiles are counted in `error` without touching the shared cache or fetcher. Valid
+/// tiles still draw, even when another shard of the same source is refused.
 pub(crate) fn tiles_in(
     src: &Source,
     view: &Extent,
@@ -568,7 +563,8 @@ pub(crate) fn tiles_in(
     frame: &Frame,
     zoom: f32,
     pending: &mut bool,
-) -> Result<Vec<Item>, String> {
+    error: &mut Option<String>,
+) -> Vec<Item> {
     let (tiles, from, min_z, max_z, want, z) = match src {
         Source::Raster { tiles, from, tile_size, min_zoom, max_zoom, .. }
         | Source::RasterDem { tiles, from, tile_size, min_zoom, max_zoom, .. } => {
@@ -578,10 +574,10 @@ pub(crate) fn tiles_in(
         Source::Vector { tiles, from, min_zoom, max_zoom, .. } => {
             (tiles, from, *min_zoom, *max_zoom, Want::Vector, (zoom.floor() as u8).min(*max_zoom))
         }
-        Source::Other => return Ok(Vec::new()),
+        Source::Other => return Vec::new(),
     };
     if tiles.is_empty() || z < min_z || zoom + 0.5 < f32::from(min_z) {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     // A mosaic over half the world wide (the globe's, a world projection's) takes the zoom whose
     // tiles all fit, as its far edges are in view; a flat view keeps those nearest its centre.
@@ -606,6 +602,10 @@ pub(crate) fn tiles_in(
     let cached_url = |t| url(t).ok().flatten();
     let mut exact = Vec::new();
     let mut stand_ins = Vec::new();
+    let mut omitted = 0;
+    let mut first_error = None;
+    let mut partial = 0;
+    let mut first_partial = None;
     // A missing tile is stood in for by its nearest ancestor in the cache and, for raster tiles,
     // by its children in the cache, the ancestor only in the quarters they leave: zooming in, the
     // tiles of the zoom being passed through are often missing while those of the zoom it ends
@@ -630,10 +630,23 @@ pub(crate) fn tiles_in(
         placed = template::covering(view, z);
     }
     for p in placed {
-        let Some(u) = url(p.id)? else { continue };
+        let u = match url(p.id) {
+            Ok(Some(u)) => u,
+            Ok(None) => continue,
+            Err(e) => {
+                omitted += 1;
+                first_error.get_or_insert(e);
+                continue;
+            }
+        };
         // Past the view, only what the cache already has.
         let state = if p.extent().intersects(view) {
-            cache::get_tile_from(&u, want, from.as_ref())
+            let (state, note) = cache::tile_noted(&u, want, from.as_ref());
+            if let Some(note) = note {
+                partial += 1;
+                first_partial.get_or_insert(note);
+            }
+            state
         } else {
             match cache::peek_from(&u, from.as_ref()) {
                 Some(payload) => State::Ready(payload),
@@ -645,7 +658,12 @@ pub(crate) fn tiles_in(
         };
         match state {
             State::Ready(payload) => exact.push(Item { payload, at: p.extent(), z: p.id.z, clip: p.extent() }),
-            State::Failed(_) => {}
+            State::Failed(e) => {
+                if !cache::routine_tile_failure(&e) {
+                    omitted += 1;
+                    first_error.get_or_insert(e);
+                }
+            }
             State::Pending => {
                 *pending = true;
                 stand_in(&mut stand_ins, &p);
@@ -654,7 +672,13 @@ pub(crate) fn tiles_in(
     }
     // Stand-ins first, so the real tiles draw over their edges.
     stand_ins.extend(exact);
-    Ok(stand_ins)
+    if let Some(reason) = first_error {
+        add_error(error, format!("{omitted} tiles left out: {reason}"));
+    }
+    if let Some(reason) = first_partial {
+        add_error(error, format!("{partial} tiles are partial (first: {reason})"));
+    }
+    stand_ins
 }
 
 /// The nearest ancestor of a missing tile already in the cache, clipped to the missing tile.

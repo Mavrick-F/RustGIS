@@ -597,6 +597,20 @@ async fn fetch_bytes(
     still: Option<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Still>,
     omit: &'static [u16],
 ) -> Result<Vec<u8>, String> {
+    fetch_reached(url, rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::address::Reach::Local, capture, still, omit)
+        .await
+        .map(|fetched| fetched.bytes)
+}
+
+/// GET carries its inherited reach into final URL preparation and returns the normalized
+/// credential-free destination with its bytes. Fetch never follows an opaque redirect.
+async fn fetch_reached(
+    url: &str,
+    ceiling: rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::address::Reach,
+    capture: Capture,
+    still: Option<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Still>,
+    omit: &'static [u16],
+) -> Result<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Fetched, String> {
     use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache::RequestDiagnostics, failure::Failure};
     let mut diagnostics = RequestDiagnostics::with_capture(url, "GET", capture);
     diagnostics.omit_statuses(omit);
@@ -618,6 +632,8 @@ async fn fetch_bytes(
                 let prepared = rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::s3::prepare(logins::inner(url))?;
                 let url = prepared.url.as_str();
                 check_destination(url)?;
+                let destination = web_sys::Url::new(url).map_err(|_| "not a valid request address")?.href();
+                address::check_reach(&destination, ceiling)?;
                 // An ArcGIS sign-in's token, for the portal and the servers it covers, renewed first when it
                 // is about to expire. It goes as the request's `token` parameter, not a header: ArcGIS's
                 // query endpoints answer the header's CORS preflight with an error.
@@ -635,7 +651,7 @@ async fn fetch_bytes(
                 // URL parsing in a browser can normalize a numeric or escaped hostname. Judge
                 // that actual destination against the already checked, prepared address.
                 let normalized = web_sys::Url::new(request).map_err(|_| "not a valid request address")?;
-                address::check(&normalized.href(), Some(url))?;
+                address::check_reach(&normalized.href(), ceiling)?;
                 let authenticated = prepared.signed || arcgis.is_some() || login.is_some();
                 let err = |e: wasm_bindgen::JsValue| {
                     if authenticated { "the browser couldn't process the authenticated request".to_string() } else { format!("{e:?}") }
@@ -675,7 +691,7 @@ async fn fetch_bytes(
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
                     init.set_credentials(web_sys::RequestCredentials::Omit);
                 }
-                Ok((window, request.to_string(), init, abort, range, tail, max, prepared.url, bound.to_string(), authenticated))
+                Ok((window, normalized.href(), init, abort, range, tail, max, destination, bound.to_string(), authenticated))
             },
             |(window, request, init, abort, range, tail, max, url, bound, authenticated)| {
                 (window.fetch_with_str_and_init(&request, &init), abort, range, tail, max, url, bound, authenticated)
@@ -776,7 +792,7 @@ async fn fetch_bytes(
             if whole_tail.is_some_and(|n| bytes.len() as u64 > n) {
                 return Err(format!("{url}: {}", cache::NO_RANGES));
             }
-            Ok(bytes)
+            Ok(cache::Fetched { bytes, origin: address::Origin::named(&url) })
         }
         .await;
         cache::check_still(&still)?;
@@ -1048,9 +1064,9 @@ fn clipboard() -> Option<web_sys::Clipboard> {
 /// the app must not read what the user saved on the site.
 fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, embedded: bool) -> Services {
     // Map tiles come through the browser's fetch (the app repaints when they arrive).
-    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_fetcher_omitting(|url, done, omit| {
+    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_fetcher_with_origin(|url, ceiling, done, omit| {
         wasm_bindgen_futures::spawn_local(crate::request::handoff(
-            move |capture, still| async move { fetch_bytes(&url, capture, still, omit).await },
+            move |capture, still| async move { fetch_reached(&url, ceiling, capture, still, omit).await },
             done,
         ));
     });
