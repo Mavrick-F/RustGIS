@@ -403,6 +403,14 @@ fn blocked_plugins_are_unloaded_and_refused() {
     assert!(crate::get("unit-blocked").is_none());
     let pkg = Package::from_zip(&testing::package("unit-blocked", &[])).unwrap();
     assert!(crate::load(pkg, "t").unwrap_err().contains("malware"));
+    // A refresh of the wrong shape is refused and leaves the withdrawal in place.
+    for text in ["{}", r#"{"blocked": {}}"#, r#"{"blocked": null}"#, "1", r#"[{"reason": "no id"}]"#, "[1]"] {
+        assert!(crate::store::save_blocklist(registry::DEFAULT_URL, text).is_err(), "{text}");
+        assert!(crate::blocked("unit-blocked", "any").is_some(), "{text} cleared the blocklist");
+    }
+    // Only an explicitly empty list clears it.
+    assert_eq!(registry::parse_blocklist(r#"{"blocked": []}"#).unwrap(), Vec::new());
+    assert_eq!(registry::parse_blocklist("[]").unwrap(), Vec::new());
     crate::set_blocklist(Vec::new());
     // Another registry's blocklist only adds: it can't bring back what the hosted one withdrew.
     load("unit-blocked", &[]);

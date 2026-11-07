@@ -154,8 +154,8 @@ fn fetch_registry(url: &str) -> Result<Vec<rustgis_plugins::registry::Entry>, St
     use rustgis_plugins::registry;
     let text = registry::fetch(url, registry::MAX_REGISTRY_BYTES)?;
     let entries = registry::parse(&String::from_utf8_lossy(&text), url)?;
-    // A registry without a blocklist blocks nothing; one that can't be fetched leaves the
-    // cached list in place.
+    // A registry without a blocklist blocks nothing; one that can't be fetched or read leaves
+    // the cached list in place.
     if let Ok(b) = registry::fetch(&registry::blocklist_url(url), 4 * 1024 * 1024) {
         let _ = rustgis_plugins::store::save_blocklist(url, &String::from_utf8_lossy(&b));
     }

@@ -192,15 +192,24 @@ pub fn blocklist_url(registry: &str) -> String {
     resolve(registry, "blocklist.json")
 }
 
-/// Reads a blocklist (an object with a `blocked` array, or a bare array).
+/// Reads a blocklist (an object with a `blocked` array, or a bare array). Any other shape, or an
+/// entry without an `id`, is an error rather than an empty list, so a malformed refresh leaves
+/// the last good list in place: only `[]` or `{"blocked": []}` clears it.
 pub fn parse_blocklist(text: &str) -> Result<Vec<Blocked>, String> {
     let root: Value = serde_json::from_str(text).map_err(|e| format!("the blocklist isn't valid JSON: {e}"))?;
-    let list = match &root {
-        Value::Array(a) => a.clone(),
-        Value::Object(o) => o.get("blocked").and_then(Value::as_array).cloned().unwrap_or_default(),
-        _ => Vec::new(),
+    let list = match root {
+        Value::Array(a) => a,
+        Value::Object(mut o) => match o.remove("blocked") {
+            Some(Value::Array(a)) => a,
+            _ => return Err("the blocklist has no `blocked` list".into()),
+        },
+        _ => return Err("the blocklist isn't a list or an object with a `blocked` list".into()),
     };
-    Ok(list.into_iter().take(MAX_ENTRIES).filter_map(|v| serde_json::from_value::<Blocked>(v).ok()).collect())
+    list.into_iter()
+        .take(MAX_ENTRIES)
+        .enumerate()
+        .map(|(i, v)| serde_json::from_value::<Blocked>(v).map_err(|e| format!("blocklist entry {}: {e}", i + 1)))
+        .collect()
 }
 
 /// Why a package is blocked, if it is.
