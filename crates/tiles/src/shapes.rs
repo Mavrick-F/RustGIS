@@ -77,13 +77,17 @@ pub fn vector_tiles(spec: &Spec, frame: &Frame, view: &Extent, reach: Option<&Ex
     let src = r.style.sources.iter().find(|(id, _)| *id == source).map(|(_, s)| s)?;
     let mut pending = false;
     let mut error = crate::draw::left_out(&r, frame, true);
-    let items = tiles_in(src, view, reach, frame, zoom, &mut pending, &mut error);
+    let mut selection_error = None;
+    let items = tiles_in(src, view, reach, frame, zoom, &mut pending, &mut selection_error);
     // Mesh backgrounds cover only returned data squares. When selection leaves holes,
     // ordinary drawing paints the whole background and the remaining geometry together.
-    if error.is_some()
+    if selection_error.is_some()
         && r.style.layers.iter().any(|l| l.kind == LayerKind::Background && shown_in(l, f32::from(level), f32::from(level) + 1.0))
     {
         return None;
+    }
+    if let Some(note) = selection_error {
+        crate::draw::add_error(&mut error, note);
     }
     let tiles = items.into_iter().map(|it| DataTile { payload: it.payload, at: it.at, z: it.z, clip: it.clip }).collect();
     let mut d = Drawn::default();

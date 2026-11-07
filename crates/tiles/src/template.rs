@@ -202,7 +202,15 @@ pub fn expand(template: &str, t: TileId, tile_size: u32, tms: bool, subdomains: 
 pub fn join(base: &str, href: &str) -> String {
     let href = crate::logins::inner(href);
     match rustgis_data::s3_address::parse(base) {
-        Ok(Some(bound)) => return crate::address::inherit(base, &join(bound.url, href)).unwrap_or_else(|_| base.to_string()),
+        Ok(Some(bound)) => {
+            let joined = join(bound.url, href);
+            return crate::address::inherit(base, &joined).unwrap_or_else(|_| {
+                // As for bound service logins, keep the actual derived address even when
+                // it exceeds the parser's limit. Request validation then refuses it; never
+                // substitute the parent document or drop the selected account.
+                format!("{}{}:{}:{}:{joined}", rustgis_data::s3_address::PREFIX, bound.binding, bound.endpoint.len(), bound.endpoint)
+            });
+        }
         Err(_) => return base.to_string(),
         Ok(None) => {}
     }

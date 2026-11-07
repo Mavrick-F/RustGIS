@@ -634,8 +634,10 @@ pub(crate) fn tiles_in(
             Ok(Some(u)) => u,
             Ok(None) => continue,
             Err(e) => {
-                omitted += 1;
-                first_error.get_or_insert(e);
+                if p.extent().intersects(view) {
+                    omitted += 1;
+                    first_error.get_or_insert(e);
+                }
                 continue;
             }
         };

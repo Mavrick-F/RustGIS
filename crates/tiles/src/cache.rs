@@ -180,20 +180,21 @@ pub fn set_fetcher_omitting(f: impl Fn(String, Done, &'static [u16]) + Send + Sy
 /// Installs a trusted transport that checks normalized URLs, redirects and (when available)
 /// actual peers against the supplied ceiling BEFORE sending. Completion reports final
 /// provenance atomically with the bytes. Browser transports use Origin::named on a normalized
-/// destination; native transports use Origin::connected with the socket's actual peer.
+/// destination; replacement native transports can use Origin::connected with their actual
+/// socket peer. The built-in native connector records its peer reach separately.
+/// The reported origin also owns login provenance: use Origin::retain_binding only if every
+/// hop retained the selected login. Completion never restores a binding the transport dropped.
 pub fn set_fetcher_with_origin(f: impl Fn(String, crate::address::Reach, FetchedDone, &'static [u16]) + Send + Sync + 'static) {
     *fetcher().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Box::new(move |url, ceiling, done, omit| {
-        let original = url.clone();
         f(
             url,
             ceiling,
             Box::new(move |result| {
-                done(result.and_then(|mut fetched| {
+                done(result.and_then(|fetched| {
                     crate::address::check_reach(&fetched.origin.url, ceiling)?;
                     if fetched.origin.reach > ceiling {
                         return Err("the fetched answer exceeds its request's network reach".into());
                     }
-                    fetched.origin.url = crate::address::inherit(&original, &fetched.origin.url)?;
                     Ok(fetched)
                 }));
             }),
@@ -495,15 +496,14 @@ fn request(
         slot.asked = now;
         match &slot.entry {
             Entry::Ready(p, _, origin) => {
-                if origin.as_ref().is_some_and(|o| o.reach > ceiling) {
-                    let message = format!("{url}: a document on the web can't read a cached local-network answer");
-                    drop(c);
-                    return refused_request(url, message);
+                if origin.as_ref().is_none_or(|o| o.reach <= ceiling) {
+                    return (State::Ready(p.clone()), origin.clone(), None);
                 }
-                return (State::Ready(p.clone()), origin.clone(), None);
+                // The same name can resolve both locally and publicly. Retry through the
+                // restrictive pool rather than reusing local bytes or hiding the public answer.
             }
             Entry::Pending => return (State::Pending, None, None),
-            Entry::Failed(e, at) if ceiling <= slot.ceiling && at.elapsed() < retry_wait(e, RETRY) => {
+            Entry::Failed(e, at) if ceiling == slot.ceiling && at.elapsed() < retry_wait(e, RETRY) => {
                 // A server that said when to come back (429 or 503 with `Retry-After`) is asked
                 // again then: the map draws again at that time, though nothing else draws it.
                 // One that didn't is asked again by the next draw after a minute, as before.
@@ -546,7 +546,10 @@ fn request(
         );
     }
     let asked_at = crate::mbtiles::epoch();
-    c.slots.insert(url.to_string(), Slot { entry: Entry::Pending, ceiling, used: tick, asked: now });
+    let old = c.slots.insert(url.to_string(), Slot { entry: Entry::Pending, ceiling, used: tick, asked: now });
+    if let Some(Slot { entry: Entry::Ready(_, n, _), .. }) = old {
+        c.bytes = c.bytes.saturating_sub(n);
+    }
     drop(c);
     start(url.to_string(), want, omit, asked_at, ceiling);
     (State::Pending, None, None)
@@ -2077,8 +2080,8 @@ mod native {
         });
     }
 
-    /// Asks for `url`'s headers, following up to 5 redirects, each checked as [`get`] checks
-    /// them.
+    /// Asks for a caller-selected archive's headers, following up to 5 redirects, each checked
+    /// as [`get`] checks them. Document-derived reads use the GET queue's inherited ceiling.
     pub(super) fn head_with(agent: &ureq::Agent, url: &str) -> Result<super::Head, String> {
         let mut diagnostics = super::RequestDiagnostics::new(url, "HEAD");
         let mut carried_login = false;
@@ -2348,7 +2351,8 @@ mod native {
     /// as tiles a server doesn't have are routine and only their status is read. A status in
     /// `omit` is an expected answer: its failure isn't recorded, only noted once per server. A
     /// request carrying a login is recorded by its plain address and scrubbed text only
-    /// ([`RequestDiagnostics::failed`]).
+    /// ([`RequestDiagnostics::failed`]). `agent` must already enforce `initial` in its resolver;
+    /// the worker selects that pool before dispatch. Redirects can only narrow it further.
     pub(super) fn fetch_answer(
         agent: &ureq::Agent,
         url: &str,
@@ -4039,6 +4043,72 @@ mod tests {
         assert!(origin.check("http://127.0.0.1/tile.png").is_err());
     }
 
+    /// The replacement transport, which sees every redirect, owns the retained binding.
+    /// Returning anonymously to the original server must not restore a dropped login.
+    #[test]
+    fn replacement_destinations_do_not_restore_dropped_logins() {
+        let _turn = turn();
+        let plain = "https://redirect-binding.example/style.json";
+        let binding = crate::logins::activate(
+            "https://redirect-binding.example",
+            "redirect-fixture",
+            crate::logins::Method::Header("X-Key".into()),
+            "fixture",
+            false,
+        )
+        .unwrap();
+        let bound = crate::logins::bind(&binding, plain).unwrap();
+        for retained in [false, true] {
+            let origin = crate::address::Origin::named(plain);
+            let origin = if retained { origin.retain_binding(&bound).unwrap() } else { origin };
+            set_fetcher_with_origin(move |_, _, done, _| {
+                done(Ok(Fetched { bytes: Vec::new(), origin: origin.clone() }));
+            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            fetch_reached(bound.clone(), crate::address::Reach::Local, Box::new(move |r| tx.send(r).unwrap()), &[]);
+            let fetched = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap().unwrap();
+            let child = crate::template::join(&fetched.origin.url, "tile.json");
+            assert_eq!(rustgis_data::login_address::parse(&child).unwrap().is_some(), retained);
+        }
+        crate::logins::deactivate(&binding);
+    }
+
+    /// Local bytes and local failures cannot prevent a public-ceiling fetch of the same name.
+    #[test]
+    fn cached_destinations_refetch_under_the_requested_reach() {
+        use crate::address::{Origin, Reach};
+        let _turn = turn();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sent = calls.clone();
+        set_fetcher_with_origin(move |_, ceiling, done, _| {
+            sent.lock().unwrap().push(ceiling);
+            done(Err("fixture destination refused".into()));
+        });
+        let from = Origin::named("https://public-document.example/style.json");
+        for ready in [true, false] {
+            let url = format!("https://split-cache.example/{ready}");
+            let entry = if ready {
+                Entry::Ready(Arc::new(Payload::Empty), 64, Some(Origin { url: url.clone(), reach: Reach::Local }))
+            } else {
+                Entry::Failed("http status: 404".into(), Instant::now())
+            };
+            store(&url, entry);
+            assert!(matches!(get_tile_from(&url, Want::Image, Some(&from)), State::Pending), "a restricted fetch must start");
+            wait(std::time::Duration::from_secs(2));
+            assert!(matches!(get_tile_from(&url, Want::Image, Some(&from)), State::Failed(e) if e == "fixture destination refused"));
+        }
+        assert_eq!(*calls.lock().unwrap(), [Reach::Public, Reach::Public]);
+        let url = "https://split-cache.example/reverse";
+        store_from(url, Entry::Failed("restricted refusal".into(), Instant::now()), Reach::Public);
+        assert!(matches!(get_tile(url, Want::Image), State::Pending), "explicit requests retry restrictive failures too");
+        wait(std::time::Duration::from_secs(2));
+        assert_eq!(calls.lock().unwrap().last(), Some(&Reach::Local));
+        let url = "https://split-cache.example/reusable";
+        store(url, Entry::Ready(Arc::new(Payload::Empty), 0, Some(Origin::named(url))));
+        assert!(matches!(get_tile_from(url, Want::Image, Some(&from)), State::Ready(_)));
+        assert_eq!(calls.lock().unwrap().len(), 3, "a permitted ready answer is reused");
+    }
+
     /// The native response's effective origin keeps the selected saved S3 account for
     /// relative documents, without transferring that binding to another server.
     #[cfg(not(target_arch = "wasm32"))]
@@ -4062,6 +4132,8 @@ mod tests {
         .unwrap();
         let bound = rustgis_data::s3_address::bind(binding, &base, "s3://bucket/styles/style.json").unwrap();
         let got = native::fetch_answer(&native::agent(), &bound, crate::address::Reach::Local, false, &[]).unwrap();
+        let reported = crate::address::Origin::named(&crate::s3::prepare(&bound).unwrap().url).retain_binding(&bound).unwrap();
+        assert_eq!(reported, got.origin, "the no-redirect replacement adapter retains the same S3 selection");
         let child = crate::template::join(&got.origin.url, "tiles.json");
         let selected = rustgis_data::s3_address::parse(&child).unwrap();
         assert!(selected.is_some(), "a relative document must retain the selected S3 binding");
@@ -4070,6 +4142,10 @@ mod tests {
         let external = crate::template::join(&got.origin.url, "https://other-origin.example/tiles.json");
         assert!(rustgis_data::s3_address::parse(&external).unwrap().is_none());
         crate::s3::disconnect(name);
+        // Joining is independent of the live login registry. A removed selection keeps the
+        // child's address and fails preparation, rather than substituting the parent.
+        assert_eq!(crate::template::join(&got.origin.url, "tiles.json"), child);
+        assert!(crate::s3::prepare(&child).is_err());
     }
 
     /// A cached DNS refusal reaches the drawing, while ordinary missing tiles stay quiet.
@@ -4077,6 +4153,7 @@ mod tests {
     fn cached_destination_failures_reach_raster_drawing() {
         let _turn = turn();
         let from = crate::address::Origin::named("https://public-document.example/style.json");
+        set_fetcher_with_origin(|_, _, done, _| done(Err("fixture resolves to the local network".into())));
         for (case, reach) in
             [("local", crate::address::Reach::Local), ("public", crate::address::Reach::Public), ("missing", crate::address::Reach::Public)]
         {
@@ -4088,7 +4165,10 @@ mod tests {
                 image.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
                 Entry::Ready(Arc::new(Payload::Image(image)), 4, Some(crate::address::Origin { url: url.clone(), reach }))
             };
-            store(&url, entry);
+            let ceiling = if case == "local" { crate::address::Reach::Local } else { crate::address::Reach::Public };
+            store_from(&url, entry, ceiling);
+            draw_cached_raster(&url, from.clone());
+            wait(std::time::Duration::from_secs(2));
             let (image, drawn) = draw_cached_raster(&url, from.clone());
             assert_eq!(drawn.error.is_some(), case == "local", "{case}: {:?}", drawn.error);
             assert_eq!(image.pixel(32, 32).unwrap().alpha() > 0, case == "public");
@@ -4101,6 +4181,7 @@ mod tests {
     fn partial_warp_destinations_report_refused_components() {
         use rustgis_data::ogc::warp::{Grid, Matrix, Warp};
         let _turn = turn();
+        set_fetcher_with_origin(|_, _, done, _| done(Err("fixture resolves to the local network".into())));
         let warp = Warp {
             epsg: 4326,
             grid: Grid::Tiles(vec![Matrix {
@@ -4132,26 +4213,13 @@ mod tests {
             );
         }
         let from = crate::address::Origin::named("https://public-document.example/style.json");
+        draw_cached_raster(&url, from.clone());
+        wait(std::time::Duration::from_secs(2));
         for _ in 0..2 {
             let (image, drawn) = draw_cached_raster(&url, from.clone());
             assert!(image.pixels().iter().any(|p| p.alpha() > 0), "valid component still draws");
-            assert!(drawn.error.as_deref().is_some_and(|e| e.contains("cached local-network")), "{:?}", drawn.error);
+            assert!(drawn.error.as_deref().is_some_and(|e| e.contains("local network")), "{:?}", drawn.error);
         }
-    }
-
-    /// A previously explicit local tile cannot silently stand in for a public document's
-    /// request for the same hostname. The denial is retained in the session diagnostics.
-    #[test]
-    fn cached_destinations_report_a_local_answer_refusal() {
-        let _turn = turn();
-        let url = "http://cached-local-destination.example/tile.png";
-        let origin = crate::address::Origin { url: url.into(), reach: crate::address::Reach::Local };
-        store(url, Entry::Ready(Arc::new(Payload::Empty), 64, Some(origin)));
-        let from = crate::address::Origin::named("https://public-document.example/style.json");
-        let history = rustgis_data::diagnostics::History::default();
-        let _scope = history.enter();
-        assert!(matches!(get_tile_from(url, Want::Image, Some(&from)), State::Failed(_)));
-        assert_eq!(network_records(&history, url).len(), 1, "cached destination refusal must be reported");
     }
 
     /// A public style's WMS composite must not regain a local allowance for its parts or
@@ -4170,9 +4238,17 @@ mod tests {
             store(&part.url, Entry::Ready(Arc::new(Payload::Image(Pixmap::new(1, 1).unwrap())), 4, Some(origin)));
         }
         let from = crate::address::Origin::named("https://public-document.example/style.json");
-        assert!(matches!(get_tile_from(url, Want::Image, Some(&from)), State::Failed(_)), "composition must inherit public reach");
+        set_fetcher_with_origin(|_, ceiling, done, _| {
+            assert_eq!(ceiling, crate::address::Reach::Public);
+            done(Err("fixture resolves to the local network".into()));
+        });
         assert!(matches!(get_tile(url, Want::Image), State::Ready(_)), "explicit local composition still works");
-        assert!(matches!(get_tile_from(url, Want::Image, Some(&from)), State::Failed(_)), "a cached local composite stays local");
+        assert!(matches!(get_tile_from(url, Want::Image, Some(&from)), State::Pending), "a cached local composite needs restricted parts");
+        wait(std::time::Duration::from_secs(2));
+        assert!(
+            matches!(get_tile_from(url, Want::Image, Some(&from)), State::Failed(e) if e.contains("local network")),
+            "composition must inherit public reach and report its failed restricted fetch"
+        );
     }
 
     /// Replaces only the fixture's public DNS names; all connections, if a check regresses,

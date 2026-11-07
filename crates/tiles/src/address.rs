@@ -45,11 +45,19 @@ impl Origin {
     /// Forbidden peers and non-web destinations are rejected before their bytes are accepted.
     pub fn connected(url: &str, peer: IpAddr) -> Result<Self, String> {
         let observed = ip_reach(peer);
-        check_reach(url, observed)?;
+        check_reach(url, Reach::Local)?;
         if observed == Reach::Forbidden {
             return Err("that peer address is never fetched".into());
         }
         Ok(Self { url: url.into(), reach: observed })
+    }
+
+    /// Retains a selected binding after the transport verifies it remained authorized through
+    /// every redirect. Omit this when a hop dropped the login, even on returning to its server.
+    /// The normalized destination and observed network reach remain unchanged.
+    pub fn retain_binding(mut self, selected: &str) -> Result<Self, String> {
+        self.url = inherit(selected, &self.url)?;
+        Ok(self)
     }
 
     /// Checks a descendant without replacing the document's observed reach with host spelling.
@@ -210,6 +218,15 @@ pub fn check_reach(url: &str, ceiling: Reach) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_destinations_separate_names_from_observed_peers() {
+        let origin = Origin::connected("https://selected.internal/style.json", "203.0.113.1".parse().unwrap()).unwrap();
+        assert_eq!(origin.reach, Reach::Public);
+        assert!(origin.check("http://127.0.0.1/tile").is_err());
+        assert!(Origin::connected("http://metadata.google.internal/", "203.0.113.1".parse().unwrap()).is_err());
+        assert!(Origin::connected("https://selected.internal/", "169.254.169.254".parse().unwrap()).is_err());
+    }
 
     #[test]
     fn judges_addresses() {

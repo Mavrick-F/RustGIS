@@ -926,6 +926,34 @@ mod tests {
         assert!(sent.lock().unwrap().iter().all(|url| url.starts_with("http://partial-tiles.example/")));
     }
 
+    /// Refused cache-only shards outside the view do not count as visible holes.
+    #[test]
+    fn cache_only_destinations_do_not_report_visible_omissions() {
+        let _turn = cache::turn();
+        cache::set_fetcher(|_, done| done(Ok(Vec::new())));
+        let mut style = Style::parse(&json!({"version":8,"sources":{"s":{"type":"vector","tiles":[
+            "http://{switch:127.0.0.1}/{z}/{x}/{y}", "https://cache-only.example/{z}/{x}/{y}"]}},"layers":[]}))
+        .unwrap();
+        let (_, src) = style.sources.first_mut().unwrap();
+        if let Source::Vector { from, .. } = src {
+            *from = Some(address::Origin::named("https://cache-only.example/style.json"));
+        }
+        let frame = crate::draw::tests::world_frame();
+        let reach = crate::template::TileId { z: 0, x: 0, y: 0 }.extent();
+        for (x, refused) in [(1, false), (0, true)] {
+            let mut view = crate::template::TileId { z: 1, x, y: 0 }.extent();
+            view.min_x += 1.0;
+            view.max_x -= 1.0;
+            view.min_y += 1.0;
+            view.max_y -= 1.0;
+            let mut pending = false;
+            let mut error = None;
+            crate::draw::tiles_in(src, &view, Some(&reach), &frame, 1.0, &mut pending, &mut error);
+            assert_eq!(error.is_some(), refused, "{error:?}");
+        }
+        cache::wait(std::time::Duration::from_secs(2));
+    }
+
     /// A refused vector shard must not remove the style background over that square.
     /// Falling back to the ordinary drawing path covers both all-refused and mixed shards.
     #[test]
@@ -964,6 +992,46 @@ mod tests {
             assert_eq!(image.pixel(16, 16).unwrap().red(), 255);
             assert!(drawn.error.is_some());
         }
+    }
+
+    /// A sprite notice does not remove otherwise usable vector tiles from the mesh path.
+    #[test]
+    fn sprite_notices_do_not_disable_vector_meshes() {
+        let _turn = cache::turn();
+        let document = json!({"version":8,"sprite":"unsupported://sheet",
+            "sources":{"s":{"type":"vector","tiles":["https://notice-tiles.example/{z}/{x}/{y}"],"maxzoom":0}},
+            "layers":[{"id":"bg","type":"background"},{"id":"fill","type":"fill","source":"s","source-layer":"l"},
+                {"id":"icons","type":"symbol","source":"s","source-layer":"l","layout":{"icon-image":"pin"}}]});
+        cache::set_fetcher(move |url, done| {
+            done(Ok(if url.ends_with("style.json") { document.to_string().into_bytes() } else { Vec::new() }))
+        });
+        let spec = spec(Kind::Style, "https://notice-style.example/style.json");
+        resolve(&spec);
+        cache::wait(std::time::Duration::from_secs(2));
+        let Resolve::Ready(ready) = resolve(&spec) else { panic!("the style must be ready") };
+        assert!(!ready.left_out.is_empty());
+        let frame = crate::draw::tests::world_frame();
+        let tiles = crate::shapes::vector_tiles(&spec, &frame, &frame.extent(64, 64), None, None)
+            .expect("a sprite notice must not force otherwise usable geometry through CPU drawing");
+        assert!(tiles.error.is_some(), "the sprite notice is retained");
+    }
+
+    /// Resolving a child beyond the saved-address limit must report that child as unusable,
+    /// rather than asking the cache for the supplying document as though it were a sprite.
+    #[test]
+    fn oversized_saved_s3_children_do_not_reuse_the_document() {
+        let href = "x".repeat(rustgis_data::s3_address::MAX_ADDRESS);
+        let style = Style::parse(&json!({"version":8,"sources":{},"sprite":href,
+            "layers":[{"id":"icons","type":"symbol","layout":{"icon-image":"pin"}}]}))
+        .unwrap();
+        let url =
+            rustgis_data::s3_address::bind("0123456789abcdef", "https://s3-join.example", "https://s3-join.example/bucket/style.json")
+                .unwrap();
+        let base = address::Origin { url, reach: address::Reach::Public };
+        let (sprites, notes) = resolve_sprites(&style, &base);
+        assert!(sprites.is_empty(), "the document is not its own sprite: {sprites:?}");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("won't fetch"), "{notes:?}");
     }
 
     /// Label-only sources are checked too, even when the GPU or prepared pictures draw
@@ -1273,6 +1341,10 @@ mod tests {
         let mut moved = made(&["dem: gone"], Instant::now());
         Arc::get_mut(&mut moved).unwrap().from = Some(address::Origin::named("https://refreshed-style.example/style.json"));
         assert!(Arc::ptr_eq(&kept(old.clone(), moved.clone()), &moved));
+        let mut local = made(&["dem: gone"], Instant::now());
+        Arc::get_mut(&mut local).unwrap().from =
+            Some(address::Origin { url: "https://refreshed-style.example/style.json".into(), reach: address::Reach::Local });
+        assert!(Arc::ptr_eq(&kept(local, moved.clone()), &moved), "a public refresh of the same URL drops local authority");
         // Something else (or nothing) left out, or another style: the new one.
         let new = made(&[], Instant::now());
         assert!(Arc::ptr_eq(&kept(old.clone(), new.clone()), &new));

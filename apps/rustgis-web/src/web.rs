@@ -792,7 +792,7 @@ async fn fetch_reached(
             if whole_tail.is_some_and(|n| bytes.len() as u64 > n) {
                 return Err(format!("{url}: {}", cache::NO_RANGES));
             }
-            Ok(cache::Fetched { bytes, origin: address::Origin::named(&url) })
+            Ok(cache::Fetched { bytes, origin: address::Origin::named(&url).retain_binding(&bound)? })
         }
         .await;
         cache::check_still(&still)?;
