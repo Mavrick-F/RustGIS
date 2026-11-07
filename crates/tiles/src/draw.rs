@@ -73,6 +73,13 @@ pub(crate) struct Item {
     pub(crate) clip: Extent,
 }
 
+/// Selected tiles and whether their vector data leaves part of the view without a mesh.
+/// A visible style background needs ordinary drawing when mesh squares cannot cover it.
+pub(crate) struct TileSelection {
+    pub(crate) items: Vec<Item>,
+    pub(crate) mesh_gaps: bool,
+}
+
 /// What of a resolved style was left out, as a drawing's error (the style still draws): what
 /// resolving it left out, and any sprites that couldn't be read, for the images shown at `frame`.
 /// A drawing takes its images at the frame's density; a mesh (`mesh`) its pattern fills at 1×.
@@ -388,7 +395,7 @@ fn place_as(
         if !items.contains_key(src_id) {
             let Some(src) = r.style.sources.iter().find(|s| s.0 == src_id).map(|s| &s.1) else { continue };
             let list = tiles_in(src, view, Some(reach), frame, zoom, &mut out.pending, &mut out.error);
-            items.insert(src_id, list);
+            items.insert(src_id, list.items);
         }
         let o = (layer.raster_opacity(zoom) * opacity).clamp(0.0, 1.0);
         for it in items.get(src_id).into_iter().flatten() {
@@ -549,7 +556,7 @@ fn hits(f: &crate::mvt::Feature, kind: LayerKind, p: [f32; 2], reach: f32) -> bo
 
 /// The tiles of a source in view, with stand-ins for those not here yet.
 fn tiles_for(src: &Source, view: &Extent, frame: &Frame, zoom: f32, pending: &mut bool, error: &mut Option<String>) -> Vec<Item> {
-    tiles_in(src, view, None, frame, zoom, pending, error)
+    tiles_in(src, view, None, frame, zoom, pending, error).items
 }
 
 /// The tiles of a source in view and out to `reach` (those in the cache only), with stand-ins
@@ -564,7 +571,7 @@ pub(crate) fn tiles_in(
     zoom: f32,
     pending: &mut bool,
     error: &mut Option<String>,
-) -> Vec<Item> {
+) -> TileSelection {
     let (tiles, from, min_z, max_z, want, z) = match src {
         Source::Raster { tiles, from, tile_size, min_zoom, max_zoom, .. }
         | Source::RasterDem { tiles, from, tile_size, min_zoom, max_zoom, .. } => {
@@ -574,10 +581,10 @@ pub(crate) fn tiles_in(
         Source::Vector { tiles, from, min_zoom, max_zoom, .. } => {
             (tiles, from, *min_zoom, *max_zoom, Want::Vector, (zoom.floor() as u8).min(*max_zoom))
         }
-        Source::Other => return Vec::new(),
+        Source::Other => return TileSelection { items: Vec::new(), mesh_gaps: true },
     };
     if tiles.is_empty() || z < min_z || zoom + 0.5 < f32::from(min_z) {
-        return Vec::new();
+        return TileSelection { items: Vec::new(), mesh_gaps: true };
     }
     // A mosaic over half the world wide (the globe's, a world projection's) takes the zoom whose
     // tiles all fit, as its far edges are in view; a flat view keeps those nearest its centre.
@@ -602,6 +609,9 @@ pub(crate) fn tiles_in(
     let cached_url = |t| url(t).ok().flatten();
     let mut exact = Vec::new();
     let mut stand_ins = Vec::new();
+    // Like prepared pictures, a mesh cannot cover a view larger than selection's tile cap.
+    let span = TileId::span(z);
+    let mut mesh_gaps = ((view.width() / span).ceil() + 1.0) * ((view.height() / span).ceil() + 1.0) > template::MAX_TILES as f64;
     let mut omitted = 0;
     let mut first_error = None;
     let mut partial = 0;
@@ -626,15 +636,20 @@ pub(crate) fn tiles_in(
         }
     };
     let mut placed = reach.map(|e| template::covering(e, z)).unwrap_or_default();
-    if placed.is_empty() {
+    if placed.is_empty() || placed.len() >= template::MAX_TILES {
         placed = template::covering(view, z);
     }
+    mesh_gaps |= placed.is_empty();
     for p in placed {
+        let area = p.extent();
+        // A tile merely touching the view's edge has no visible pixels.
+        let visible = area.min_x < view.max_x && area.max_x > view.min_x && area.min_y < view.max_y && area.max_y > view.min_y;
         let u = match url(p.id) {
             Ok(Some(u)) => u,
             Ok(None) => continue,
             Err(e) => {
-                if p.extent().intersects(view) {
+                if visible {
+                    mesh_gaps = true;
                     omitted += 1;
                     first_error.get_or_insert(e);
                 }
@@ -642,7 +657,7 @@ pub(crate) fn tiles_in(
             }
         };
         // Past the view, only what the cache already has.
-        let state = if p.extent().intersects(view) {
+        let state = if visible {
             let (state, note) = cache::tile_noted(&u, want, from.as_ref());
             if let Some(note) = note {
                 partial += 1;
@@ -659,8 +674,12 @@ pub(crate) fn tiles_in(
             }
         };
         match state {
-            State::Ready(payload) => exact.push(Item { payload, at: p.extent(), z: p.id.z, clip: p.extent() }),
+            State::Ready(payload) => {
+                mesh_gaps |= visible && !matches!(payload.as_ref(), Payload::Vector(_));
+                exact.push(Item { payload, at: area, z: p.id.z, clip: area });
+            }
             State::Failed(e) => {
+                mesh_gaps |= visible;
                 if !cache::routine_tile_failure(&e) {
                     omitted += 1;
                     first_error.get_or_insert(e);
@@ -668,7 +687,10 @@ pub(crate) fn tiles_in(
             }
             State::Pending => {
                 *pending = true;
+                let first = stand_ins.len();
                 stand_in(&mut stand_ins, &p);
+                // Vector stand-ins are a single ancestor covering this tile's whole square.
+                mesh_gaps |= visible && !stand_ins.get(first).is_some_and(|it| matches!(it.payload.as_ref(), Payload::Vector(_)));
             }
         }
     }
@@ -680,7 +702,7 @@ pub(crate) fn tiles_in(
     if let Some(reason) = first_partial {
         add_error(error, format!("{partial} tiles are partial (first: {reason})"));
     }
-    stand_ins
+    TileSelection { items: stand_ins, mesh_gaps }
 }
 
 /// The nearest ancestor of a missing tile already in the cache, clipped to the missing tile.

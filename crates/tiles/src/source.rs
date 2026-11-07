@@ -940,12 +940,12 @@ mod tests {
         }
         let frame = crate::draw::tests::world_frame();
         let reach = crate::template::TileId { z: 0, x: 0, y: 0 }.extent();
-        for (x, refused) in [(1, false), (0, true)] {
+        for (x, refused, padding) in [(1, false, 1.0), (1, false, 0.0), (1, true, -1.0), (0, true, 1.0)] {
             let mut view = crate::template::TileId { z: 1, x, y: 0 }.extent();
-            view.min_x += 1.0;
-            view.max_x -= 1.0;
-            view.min_y += 1.0;
-            view.max_y -= 1.0;
+            view.min_x += padding;
+            view.max_x -= padding;
+            view.min_y += padding;
+            view.max_y -= padding;
             let mut pending = false;
             let mut error = None;
             crate::draw::tiles_in(src, &view, Some(&reach), &frame, 1.0, &mut pending, &mut error);
@@ -994,6 +994,94 @@ mod tests {
         }
     }
 
+    /// Pending vector tiles, including a partly cached view, leave the full background
+    /// visible without using a disallowed stand-in. Completed tiles can use meshes again.
+    #[test]
+    fn pending_vector_tiles_keep_the_style_background() {
+        let _turn = cache::turn();
+        let frame = crate::draw::Frame { left: -100_000.0, top: 100_000.0, m_per_px: crate::template::HALF_WORLD / 512.0, ppp: 1.0 };
+        let tile = crate::mvt::encode(&crate::mvt::Tile {
+            layers: vec![crate::mvt::Layer { name: "l".into(), extent: 4096, features: Vec::new() }],
+        });
+        for (partial, ancestor) in [(false, false), (true, false), (false, true)] {
+            let host = format!("https://pending-background-{partial}-{ancestor}.example");
+            let doc = json!({"version":8,"sources":{"s":{"type":"vector","tiles":[format!("{host}/{{z}}/{{x}}/{{y}}")],"maxzoom":1}},
+                "layers":[{"id":"bg","type":"background","paint":{"background-color":"#f00"}},
+                    {"id":"fill","type":"fill","source":"s","source-layer":"l"}]});
+            let mut style = Style::parse(&doc).unwrap();
+            let spec = spec(Kind::Style, &format!("{host}/style.json"));
+            let from = address::Origin::named(&spec.url);
+            resolve_sources(&mut style, &spec, &from).unwrap().unwrap();
+            resolved().lock().unwrap().insert(
+                spec.key(),
+                Arc::new(Resolved {
+                    style,
+                    from: Some(from),
+                    sprites: Vec::new(),
+                    attribution: Vec::new(),
+                    left_out: Vec::new(),
+                    made: Mutex::new(Instant::now()),
+                    waiting: false,
+                }),
+            );
+            if partial || ancestor {
+                let ready = tile.clone();
+                cache::set_fetcher(move |_, done| done(Ok(ready.clone())));
+                let key = if ancestor { "0/0/0" } else { "1/1/1" };
+                cache::get_tile(&format!("{host}/{key}"), cache::Want::Vector);
+                cache::wait(std::time::Duration::from_secs(2));
+            }
+            let held = Arc::new(Mutex::new(Vec::new()));
+            let hold = held.clone();
+            cache::set_fetcher(move |_, done| hold.lock().unwrap().push(done));
+            let view = frame.extent(200, 200);
+            assert_eq!(
+                crate::shapes::vector_tiles(&spec, &frame, &view, None, None).is_some(),
+                ancestor,
+                "only a complete permitted stand-in can cover the background while pending"
+            );
+            let mut image = tiny_skia::Pixmap::new(200, 200).unwrap();
+            let drawn = crate::draw::draw(&mut image, &spec, 1.0, &frame, false);
+            assert_eq!(image.pixel(16, 16).unwrap().red(), 255);
+            assert!(drawn.pending && drawn.error.is_none());
+            for done in std::mem::take(&mut *held.lock().unwrap()) {
+                done(Ok(tile.clone()));
+            }
+            cache::wait(std::time::Duration::from_secs(2));
+            assert!(crate::shapes::vector_tiles(&spec, &frame, &view, None, None).is_some());
+        }
+    }
+
+    /// Bounded tile selection cannot turn a large view into a partial background mesh.
+    /// No pixmap or real network is needed to exercise the selection limit.
+    #[test]
+    fn oversized_vector_views_keep_the_style_background() {
+        let _turn = cache::turn();
+        let tile = crate::mvt::encode(&crate::mvt::Tile {
+            layers: vec![crate::mvt::Layer { name: "l".into(), extent: 4096, features: Vec::new() }],
+        });
+        for (w, h) in [(20_000.0, 10_000.0), (40_000.0, 20_000.0)] {
+            let host = format!("https://oversized-background-{w}.example");
+            let document = json!({"version":8,"sources":{"s":{"type":"vector","tiles":[format!("{host}/{{z}}/{{x}}/{{y}}")]}},
+                "layers":[{"id":"bg","type":"background"},{"id":"fill","type":"fill","source":"s","source-layer":"l"}]});
+            let ready = tile.clone();
+            cache::set_fetcher(move |url, done| {
+                done(Ok(if url.ends_with("style.json") { document.to_string().into_bytes() } else { ready.clone() }))
+            });
+            let spec = spec(Kind::Style, &format!("{host}/style.json"));
+            resolve(&spec);
+            cache::wait(std::time::Duration::from_secs(2));
+            let frame = crate::draw::Frame { left: 0.0, top: h, m_per_px: 1.0, ppp: 1.0 };
+            let view = frame.extent(w as u32, h as u32);
+            crate::shapes::vector_tiles(&spec, &frame, &view, None, None);
+            cache::wait(std::time::Duration::from_secs(2));
+            assert!(
+                crate::shapes::vector_tiles(&spec, &frame, &view, None, None).is_none(),
+                "bounded selection must not leave background holes in a {w} by {h} view"
+            );
+        }
+    }
+
     /// A sprite notice does not remove otherwise usable vector tiles from the mesh path.
     #[test]
     fn sprite_notices_do_not_disable_vector_meshes() {
@@ -1002,8 +1090,11 @@ mod tests {
             "sources":{"s":{"type":"vector","tiles":["https://notice-tiles.example/{z}/{x}/{y}"],"maxzoom":0}},
             "layers":[{"id":"bg","type":"background"},{"id":"fill","type":"fill","source":"s","source-layer":"l"},
                 {"id":"icons","type":"symbol","source":"s","source-layer":"l","layout":{"icon-image":"pin"}}]});
+        let tile = crate::mvt::encode(&crate::mvt::Tile {
+            layers: vec![crate::mvt::Layer { name: "l".into(), extent: 4096, features: Vec::new() }],
+        });
         cache::set_fetcher(move |url, done| {
-            done(Ok(if url.ends_with("style.json") { document.to_string().into_bytes() } else { Vec::new() }))
+            done(Ok(if url.ends_with("style.json") { document.to_string().into_bytes() } else { tile.clone() }))
         });
         let spec = spec(Kind::Style, "https://notice-style.example/style.json");
         resolve(&spec);
@@ -1011,6 +1102,8 @@ mod tests {
         let Resolve::Ready(ready) = resolve(&spec) else { panic!("the style must be ready") };
         assert!(!ready.left_out.is_empty());
         let frame = crate::draw::tests::world_frame();
+        crate::shapes::vector_tiles(&spec, &frame, &frame.extent(64, 64), None, None);
+        cache::wait(std::time::Duration::from_secs(2));
         let tiles = crate::shapes::vector_tiles(&spec, &frame, &frame.extent(64, 64), None, None)
             .expect("a sprite notice must not force otherwise usable geometry through CPU drawing");
         assert!(tiles.error.is_some(), "the sprite notice is retained");

@@ -627,7 +627,12 @@ On desktop and the command line, web tiles, service documents and file downloads
 app's IP checks. There is no proxy override for these requests. If your network requires a
 proxy, download a file with a trusted external tool and open the local copy in RustGIS.
 Live tile and service access requires direct connectivity. The web app uses the browser's
-network settings; its [tile request limits](maps.md) differ.
+network settings. Browser GET requests refuse redirects, including HTTP-to-HTTPS upgrades
+and CDN hops, because the app cannot inspect their destinations. This includes **From URL…**
+file downloads, fonts, service documents, tiles and sprites, and PMTiles/COG archive range
+reads. Supply the final address; for a redirecting file download, download it with a trusted
+external tool and open the local copy. The browser also controls DNS and local-network access;
+see [tile request limits](maps.md).
 
 ### HTTPS certificates
 

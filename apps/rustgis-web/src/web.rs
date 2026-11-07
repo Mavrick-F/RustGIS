@@ -597,9 +597,8 @@ async fn fetch_bytes(
     still: Option<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Still>,
     omit: &'static [u16],
 ) -> Result<Vec<u8>, String> {
-    fetch_reached(url, rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::address::Reach::Local, capture, still, omit)
-        .await
-        .map(|fetched| fetched.bytes)
+    use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::address::Reach;
+    fetch_reached(url, Reach::Local, capture, still, omit).await.map(|fetched| fetched.bytes)
 }
 
 /// GET carries its inherited reach into final URL preparation and returns the normalized

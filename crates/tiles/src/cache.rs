@@ -117,9 +117,32 @@ struct Slot {
     entry: Entry,
     /// A restrictive request's refusal must not poison a later explicit local request.
     ceiling: crate::address::Reach,
+    /// Completed Public and Local outcomes coexist; only one fetch per URL runs at a time.
+    other: Option<(crate::address::Reach, Entry)>,
     used: u64,
     /// When the map last asked for it ([`get`]): a waiting tile not asked for lately is dropped.
     asked: Instant,
+}
+
+impl Slot {
+    /// Prefer this caller's completed outcome; otherwise a narrower ready answer can be shared.
+    fn for_reach(&self, ceiling: crate::address::Reach) -> (&Entry, crate::address::Reach) {
+        if let Some((reach, entry)) = &self.other
+            && *reach == ceiling
+        {
+            return (entry, *reach);
+        }
+        (&self.entry, self.ceiling)
+    }
+
+    /// Both resident outcomes count towards the cache's single memory budget.
+    fn bytes(&self) -> usize {
+        let bytes = |entry: &Entry| match entry {
+            Entry::Ready(_, n, _) => *n,
+            _ => 0,
+        };
+        bytes(&self.entry) + self.other.as_ref().map_or(0, |(_, entry)| bytes(entry))
+    }
 }
 
 #[derive(Default)]
@@ -494,7 +517,8 @@ fn request(
     if let Some(slot) = c.slots.get_mut(url) {
         slot.used = tick;
         slot.asked = now;
-        match &slot.entry {
+        let (entry, stored_ceiling) = slot.for_reach(ceiling);
+        match entry {
             Entry::Ready(p, _, origin) => {
                 if origin.as_ref().is_none_or(|o| o.reach <= ceiling) {
                     return (State::Ready(p.clone()), origin.clone(), None);
@@ -503,7 +527,7 @@ fn request(
                 // restrictive pool rather than reusing local bytes or hiding the public answer.
             }
             Entry::Pending => return (State::Pending, None, None),
-            Entry::Failed(e, at) if ceiling == slot.ceiling && at.elapsed() < retry_wait(e, RETRY) => {
+            Entry::Failed(e, at) if ceiling == stored_ceiling && at.elapsed() < retry_wait(e, RETRY) => {
                 // A server that said when to come back (429 or 503 with `Retry-After`) is asked
                 // again then: the map draws again at that time, though nothing else draws it.
                 // One that didn't is asked again by the next draw after a minute, as before.
@@ -513,6 +537,11 @@ fn request(
                 return (State::Failed(e.clone()), None, None);
             }
             Entry::Failed(..) => {}
+        }
+        // Another reach is fetching this URL. Its completion leaves this caller's retained
+        // outcome intact; wait before retrying an expired or absent outcome of our own.
+        if matches!(slot.entry, Entry::Pending) {
+            return (State::Pending, None, None);
         }
     }
     if crate::warp::is_warp(url) {
@@ -546,10 +575,7 @@ fn request(
         );
     }
     let asked_at = crate::mbtiles::epoch();
-    let old = c.slots.insert(url.to_string(), Slot { entry: Entry::Pending, ceiling, used: tick, asked: now });
-    if let Some(Slot { entry: Entry::Ready(_, n, _), .. }) = old {
-        c.bytes = c.bytes.saturating_sub(n);
-    }
+    keep_for(&mut c, url, Entry::Pending, ceiling);
     drop(c);
     start(url.to_string(), want, omit, asked_at, ceiling);
     (State::Pending, None, None)
@@ -577,13 +603,15 @@ pub(crate) fn peek_from(url: &str, from: Option<&crate::address::Origin>) -> Opt
     c.tick += 1;
     let tick = c.tick;
     let slot = c.slots.get_mut(url)?;
-    match &slot.entry {
+    let ceiling = from.map_or(crate::address::Reach::Local, |o| o.reach);
+    match slot.for_reach(ceiling).0 {
         Entry::Ready(p, _, origin) => {
             if from.is_some_and(|f| f.check(url).is_err() || origin.as_ref().is_some_and(|o| o.reach > f.reach)) {
                 return None;
             }
+            let payload = p.clone();
             slot.used = tick;
-            Some(p.clone())
+            Some(payload)
         }
         _ => None,
     }
@@ -592,7 +620,10 @@ pub(crate) fn peek_from(url: &str, from: Option<&crate::address::Origin>) -> Opt
 /// Forgets everything (and failures, so they are tried again).
 pub fn clear() {
     let mut c = lock();
-    c.slots.retain(|_, s| matches!(s.entry, Entry::Pending));
+    c.slots.retain(|_, s| {
+        s.other = None;
+        matches!(s.entry, Entry::Pending)
+    });
     c.bytes = 0;
     drop(c);
     // Styles, TileJSON documents and PMTiles archives are read again too.
@@ -636,17 +667,14 @@ pub fn forget(url: &str) {
     // First: a tile answered from here on is dropped, and one answered before goes with the rest.
     crate::mbtiles::forget_archive(url);
     let mut c = lock();
-    let dropped: usize = c
-        .slots
-        .iter()
-        .filter(|(k, s)| !matches!(s.entry, Entry::Pending) && resource_of(k) == url)
-        .map(|(_, s)| match &s.entry {
-            Entry::Ready(_, n, _) => *n,
-            _ => 0,
-        })
-        .sum();
-    c.slots.retain(|k, s| resource_of(k) != url || (matches!(s.entry, Entry::Pending) && !crate::mbtiles::is_tile(k)));
-    c.bytes = c.bytes.saturating_sub(dropped);
+    c.slots.retain(|k, s| {
+        if resource_of(k) != url {
+            return true;
+        }
+        s.other = None;
+        matches!(s.entry, Entry::Pending) && !crate::mbtiles::is_tile(k)
+    });
+    c.bytes = c.slots.values().map(Slot::bytes).sum();
     drop(c);
     crate::pmtiles::forget_archive(url);
     crate::cog::forget_file(url);
@@ -754,9 +782,7 @@ fn release(host: &str) {
 /// Called holding the cache's lock taken to choose them, so a tile can't be asked for between.
 fn forget_dropped(c: &mut Cache, dropped: &[Waiting<Job>]) {
     for w in dropped {
-        if matches!(c.slots.get(&w.url), Some(Slot { entry: Entry::Pending, .. })) {
-            c.slots.remove(&w.url);
-        }
+        forget_pending(c, &w.url);
     }
     IN_FLIGHT.fetch_sub(dropped.len(), Ordering::Release);
 }
@@ -842,9 +868,7 @@ fn land(key: &str, entry: Option<Entry>, asked_at: u64) {
         Some(entry) => keep(&mut c, key, entry),
         // Never answered (or dropped by the fetcher): forgotten, fetched again when asked for.
         None => {
-            if matches!(c.slots.get(key), Some(Slot { entry: Entry::Pending, .. })) {
-                c.slots.remove(key);
-            }
+            forget_pending(&mut c, key);
         }
     }
 }
@@ -1475,10 +1499,7 @@ fn store_from(url: &str, entry: Entry, ceiling: crate::address::Reach) {
         return;
     }
     let mut c = lock();
-    keep(&mut c, url, entry);
-    if let Some(slot) = c.slots.get_mut(url) {
-        slot.ceiling = ceiling;
-    }
+    keep_for(&mut c, url, entry, ceiling);
 }
 
 /// Whether the login `url` was fetched with is gone, in which case nothing of it is kept.
@@ -1487,26 +1508,45 @@ fn login_gone(url: &str) -> bool {
         return false;
     }
     let mut c = lock();
-    if let Some(Slot { entry: Entry::Ready(_, n, _), .. }) = c.slots.remove(url) {
-        c.bytes = c.bytes.saturating_sub(n);
+    if let Some(slot) = c.slots.remove(url) {
+        c.bytes = c.bytes.saturating_sub(slot.bytes());
     }
     true
 }
 
-/// [`store`], holding the cache's lock.
+/// Keeps a transport completion under the ceiling of its still-pending slot.
 fn keep(c: &mut Cache, url: &str, entry: Entry) {
-    let added = if let Entry::Ready(_, n, _) = &entry { *n } else { 0 };
-    // Dropped while it was fetched (cleared, or evicted): kept anyway, it was asked for.
-    let tick = c.tick;
-    let asked = c.slots.get(url).map_or_else(Instant::now, |s| s.asked);
     let ceiling = c.slots.get(url).map_or(crate::address::Reach::Local, |s| s.ceiling);
-    let old = c.slots.insert(url.to_string(), Slot { entry, ceiling, used: tick, asked });
-    if let Some(Slot { entry: Entry::Ready(_, n, _), .. }) = old {
-        c.bytes = c.bytes.saturating_sub(n);
-    }
-    c.bytes += added;
+    keep_for(c, url, entry, ceiling);
+}
+
+/// Replaces one reach's outcome without evicting the other's completed answer or retry time.
+fn keep_for(c: &mut Cache, url: &str, entry: Entry, ceiling: crate::address::Reach) {
+    let old = c.slots.remove(url);
+    let asked = old.as_ref().map_or_else(Instant::now, |s| s.asked);
+    let other = old.and_then(|slot| {
+        c.bytes = c.bytes.saturating_sub(slot.bytes());
+        if slot.ceiling != ceiling && !matches!(slot.entry, Entry::Pending) { Some((slot.ceiling, slot.entry)) } else { slot.other }
+    });
+    let slot = Slot { entry, ceiling, other, used: c.tick, asked };
+    c.bytes += slot.bytes();
+    c.slots.insert(url.to_string(), slot);
     if c.bytes > BUDGET {
         evict(c);
+    }
+}
+
+/// Dropping a fetch leaves any completed result for the other reach available.
+fn forget_pending(c: &mut Cache, url: &str) {
+    if !matches!(c.slots.get(url), Some(Slot { entry: Entry::Pending, .. })) {
+        return;
+    }
+    if let Some(mut slot) = c.slots.remove(url)
+        && let Some((reach, entry)) = slot.other.take()
+    {
+        slot.entry = entry;
+        slot.ceiling = reach;
+        c.slots.insert(url.to_string(), slot);
     }
 }
 
@@ -1515,18 +1555,21 @@ fn evict(c: &mut Cache) {
     let mut ready: Vec<(u64, String, usize)> = c
         .slots
         .iter()
-        .filter_map(|(k, s)| match s.entry {
-            Entry::Ready(_, n, _) => Some((s.used, k.clone(), n)),
-            Entry::Failed(..) => Some((s.used, k.clone(), 0)),
-            Entry::Pending => None,
-        })
+        .filter(|(_, s)| !matches!(s.entry, Entry::Pending) || s.other.is_some())
+        .map(|(k, s)| (s.used, k.clone(), s.bytes()))
         .collect();
     ready.sort_unstable_by_key(|r| r.0);
     for (_, k, n) in ready {
         if c.bytes <= BUDGET / 4 * 3 {
             break;
         }
-        c.slots.remove(&k);
+        if let Some(slot) = c.slots.get_mut(&k)
+            && matches!(slot.entry, Entry::Pending)
+        {
+            slot.other = None;
+        } else {
+            c.slots.remove(&k);
+        }
         c.bytes = c.bytes.saturating_sub(n);
     }
 }
@@ -2650,9 +2693,10 @@ mod tests {
         let key = crate::mbtiles::template(&archive(0)).replace("{z}", "0").replace("{x}", "0").replace("{y}", "0");
         let failed = |why: &str| Some(Entry::Failed(why.into(), Instant::now()));
         let old = crate::mbtiles::epoch();
-        lock()
-            .slots
-            .insert(key.clone(), Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, used: 0, asked: Instant::now() });
+        lock().slots.insert(
+            key.clone(),
+            Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, other: None, used: 0, asked: Instant::now() },
+        );
         for i in 0..=crate::mbtiles::MAX_FORGOTTEN {
             crate::mbtiles::forget_archive(&archive(i));
         }
@@ -2681,6 +2725,7 @@ mod tests {
             Slot {
                 entry: Entry::Failed("old file".into(), Instant::now()),
                 ceiling: crate::address::Reach::Local,
+                other: None,
                 used: 0,
                 asked: Instant::now(),
             },
@@ -2707,9 +2752,10 @@ mod tests {
         };
 
         let old = crate::mbtiles::epoch();
-        lock()
-            .slots
-            .insert(key.clone(), Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, used: 0, asked: Instant::now() });
+        lock().slots.insert(
+            key.clone(),
+            Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, other: None, used: 0, asked: Instant::now() },
+        );
         forget(archive);
         land(&key, failed("old file"), old);
         assert_eq!(kept(), None);
@@ -2723,9 +2769,10 @@ mod tests {
 
         // Or the old one lands while the new one is pending: the new one's answer is what stays.
         let new = crate::mbtiles::epoch();
-        lock()
-            .slots
-            .insert(key.clone(), Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, used: 0, asked: Instant::now() });
+        lock().slots.insert(
+            key.clone(),
+            Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, other: None, used: 0, asked: Instant::now() },
+        );
         land(&key, failed("old file"), old);
         assert!(matches!(lock().slots.get(&key), Some(Slot { entry: Entry::Pending, .. })), "the new read's slot stays");
         land(&key, None, old);
@@ -4107,6 +4154,102 @@ mod tests {
         store(url, Entry::Ready(Arc::new(Payload::Empty), 0, Some(Origin::named(url))));
         assert!(matches!(get_tile_from(url, Want::Image, Some(&from)), State::Ready(_)));
         assert_eq!(calls.lock().unwrap().len(), 3, "a permitted ready answer is reused");
+    }
+
+    /// Concurrent layers with different reach must not evict each other's ready answer or
+    /// retry failure on every frame. The transport spy never sends a network request.
+    #[test]
+    fn shared_destination_reaches_do_not_refetch_each_other() {
+        use crate::address::{Origin, Reach};
+        let _turn = turn();
+        let _alarm = alarm_turn();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sent = calls.clone();
+        set_fetcher_with_origin(move |url, ceiling, done, _| {
+            sent.lock().unwrap().push((url.clone(), ceiling));
+            done(if url.ends_with("/public") || ceiling == Reach::Local && url.ends_with("/ready") {
+                let bytes: &[u8] = if ceiling == Reach::Public { br#"{"reach":"public"}"# } else { br#"{"reach":"local"}"# };
+                Ok(Fetched { bytes: bytes.to_vec(), origin: Origin { url, reach: ceiling } })
+            } else if url.ends_with("/retry") {
+                let seconds = if ceiling == Reach::Local { "120" } else { "30" };
+                Err(crate::failure::with_retry_after("http status: 429".into(), 429, Some(seconds)))
+            } else {
+                Err("fixture destination refused".into())
+            });
+        });
+        let from = Origin::named("https://public-style.example/style.json");
+        for case in ["ready", "failures", "retry", "public"] {
+            let url = format!("https://shared-reach.example/{case}");
+            get(&url, Want::Json);
+            wait(std::time::Duration::from_secs(2));
+            for _ in 0..3 {
+                get_from(&url, Want::Json, Some(&from));
+                wait(std::time::Duration::from_secs(2));
+                let local = get(&url, Want::Json);
+                wait(std::time::Duration::from_secs(2));
+                assert_eq!(matches!(local, State::Ready(_)), matches!(case, "ready" | "public"), "the explicit layer keeps its answer");
+                let (public, origin) = document(&url, Some(&from));
+                if case == "public" {
+                    assert_eq!(origin.unwrap().reach, Reach::Public);
+                    assert!(matches!(public, State::Ready(p) if matches!(p.as_ref(), Payload::Json(v) if v["reach"] == "public")));
+                    let (local, origin) = document(&url, None);
+                    assert_eq!(origin.unwrap().reach, Reach::Local);
+                    assert!(matches!(local, State::Ready(p) if matches!(p.as_ref(), Payload::Json(v) if v["reach"] == "local")));
+                } else {
+                    let State::Failed(error) = public else { panic!("the public style must retain its refusal") };
+                    if case == "retry" {
+                        assert_eq!(retry_after(&error), Some(Duration::from_secs(30)));
+                        let State::Failed(error) = get(&url, Want::Json) else { panic!("the explicit layer keeps its cooldown") };
+                        assert_eq!(retry_after(&error), Some(Duration::from_secs(120)));
+                    }
+                }
+            }
+            let sent = calls.lock().unwrap();
+            assert_eq!(sent.iter().filter(|(u, _)| u == &url).count(), 2, "one fetch under each reach, not one per frame: {sent:?}");
+        }
+    }
+
+    /// A pending or dropped restricted fetch cannot blank a completed explicit layer.
+    /// Forgetting a resource or clearing the cache removes both retained outcomes.
+    #[test]
+    fn a_restricted_read_preserves_the_explicit_answer_while_pending_or_dropped() {
+        use crate::address::{Origin, Reach};
+        let _turn = turn();
+        let (tx, rx) = std::sync::mpsc::channel();
+        set_fetcher_with_origin(move |url, ceiling, done, _| {
+            if ceiling == Reach::Public {
+                tx.send(done).unwrap();
+            } else {
+                done(Ok(Fetched { bytes: b"{}".to_vec(), origin: Origin { url, reach: Reach::Local } }));
+            }
+        });
+        let from = Origin::named("https://public-style.example/style.json");
+        for clear_all in [false, true] {
+            let url = format!("https://pending-reach.example/{clear_all}");
+            get(&url, Want::Json);
+            wait(std::time::Duration::from_secs(2));
+            assert!(matches!(get_from(&url, Want::Json, Some(&from)), State::Pending));
+            let pending = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            assert!(matches!(get(&url, Want::Json), State::Ready(_)));
+            assert!(peek(&url).is_some());
+            assert!(peek_from(&url, Some(&from)).is_none(), "public readers cannot see retained local bytes");
+            drop(pending);
+            wait(std::time::Duration::from_secs(2));
+            assert!(matches!(get(&url, Want::Json), State::Ready(_)), "dropping the public fetch preserves the local layer");
+            assert!(matches!(get_from(&url, Want::Json, Some(&from)), State::Pending));
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()(Err("fixture destination refused".into()));
+            wait(std::time::Duration::from_secs(2));
+            assert!(matches!(get_from(&url, Want::Json, Some(&from)), State::Failed(_)));
+            if clear_all {
+                clear();
+            } else {
+                forget(&url);
+            }
+            assert!(peek(&url).is_none(), "the retained local answer was forgotten");
+            assert!(matches!(get_from(&url, Want::Json, Some(&from)), State::Pending), "the retained public failure was forgotten");
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()(Err("fixture destination refused".into()));
+            wait(std::time::Duration::from_secs(2));
+        }
     }
 
     /// The native response's effective origin keeps the selected saved S3 account for

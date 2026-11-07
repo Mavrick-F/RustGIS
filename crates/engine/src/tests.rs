@@ -8278,6 +8278,25 @@ fn analysis_workflows_models_scripts_and_raster_functions() {
         .run("analysis.neighborhood", &json!({"lon": 2.35, "lat": 48.85, "radius": 300000, "layers": ["Cities"], "select": true}))
         .unwrap();
     assert!(n["layers"][0]["count"].as_u64().unwrap() >= 2);
+    // A center that's no place is refused, not taken as a pole (#1033).
+    assert!(s.run("analysis.neighborhood", &json!({"lon": 2.35, "lat": 1000, "radius": 300000})).is_err());
+    // Lines near a pole with more vertices than one search measures: those past its steps are
+    // counted at the least distance they could be, and it says how many (#1033); a search that
+    // measures every one says nothing.
+    let mut ds = rustgis_data::Dataset::new("Spirals", rustgis_data::GeometryType::Polyline, vec![]);
+    for _ in 0..300 {
+        let line = (0..=348).map(|i| rustgis_data::Coord::new(if i % 2 == 0 { -179.5 } else { 179.5 }, 89.95)).collect();
+        ds.push(Some(rustgis_data::Geometry::Line(vec![line])), vec![]);
+    }
+    s.map_mut().add_dataset(ds);
+    let mark = s.notice_mark();
+    let n = s.run("analysis.neighborhood", &json!({"lon": 0, "lat": 89.9, "radius": 10000, "layers": ["Spirals"]})).unwrap();
+    assert_eq!(n["layers"][0]["count"], 300);
+    let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert!(said.iter().any(|t| t.starts_with("299 feature(s) near a pole (Spirals 299)") && t.contains("beyond the radius")), "{said:?}");
+    let mark = s.notice_mark();
+    s.run("analysis.neighborhood", &json!({"lon": 0, "lat": 89.9, "radius": 10000, "layers": ["Cities"]})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("near a pole")), "{:?}", s.notices_since(mark));
     s.run("select.byAttributes", &json!({"layer": "Countries", "where": "name = 'France'"})).unwrap();
     let sim = s.run("analysis.simulate", &json!({"layer": "Countries", "count": 20, "seed": 3})).unwrap();
     assert_eq!(sim["points"], 20);
@@ -30656,6 +30675,59 @@ fn background_runs_follow_a_renamed_map_a_moved_window_and_a_loaded_layer() {
 }
 
 #[test]
+fn validate_topology_says_which_checks_are_incomplete() {
+    // A line 11 m from the North Pole winding round it some 19,000 times is measured coarsely, so
+    // Must Not Have Dangles is incomplete and the validation says so; a plain line, nothing (#1033).
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    let c = Coord::new;
+    for (to, warned) in [(7_000_000.0, true), (1.0, false)] {
+        let mut s = Session::new(Project::default());
+        let mut paths = Dataset::new("Paths", GeometryType::Polyline, vec![]);
+        paths.push(Some(Geometry::Line(vec![vec![c(0.0, 89.9999), c(to, 89.9999)]])), vec![]);
+        s.map_mut().add_dataset(paths);
+        s.run("topology.rules", &json!({"add": {"rule": "mustNotHaveDangles", "layer": "Paths"}})).unwrap();
+        let mark = s.notice_mark();
+        let v = s.run("topology.validate", &Value::Null).unwrap();
+        assert_eq!(v["incomplete"].as_array().map(Vec::len), Some(usize::from(warned)), "{v}");
+        let said = s
+            .notices_since(mark)
+            .iter()
+            .any(|n| n.text.contains("topology rule(s) weren't checked completely") && n.text.contains("Must Not Have Dangles"));
+        assert_eq!(said, warned, "{:?}", s.notices_since(mark));
+    }
+}
+
+#[test]
+fn must_be_covered_by_says_which_polygons_it_left_out_at_a_pole() {
+    // Around the South Pole, a cap from 20°E round to 10°E and the 10° between written a
+    // billion degrees on: the check at the pole can't use that one, reports the point there and
+    // warns why; with a whole cap it says nothing of the kind (#1033).
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    let c = Coord::new;
+    let ring = |w: f64, e: f64| Geometry::Polygon(vec![vec![vec![c(w, -85.0), c(e, -85.0), c(e, -90.0), c(w, -90.0), c(w, -85.0)]]]);
+    for (caps, warned) in [(vec![ring(20.0, 370.0), ring(1e9 + 90.0, 1e9 + 100.0)], true), (vec![ring(-180.0, 180.0)], false)] {
+        let mut s = Session::new(Project::default());
+        let mut by = Dataset::new("Caps", GeometryType::Polygon, vec![]);
+        for g in caps {
+            by.push(Some(g), vec![]);
+        }
+        let mut pts = Dataset::new("Pole", GeometryType::Point, vec![]);
+        pts.push(Some(Geometry::Point(c(0.0, -90.0))), vec![]);
+        s.map_mut().add_dataset(by);
+        s.map_mut().add_dataset(pts);
+        s.run("topology.rules", &json!({"add": {"rule": "mustBeCoveredBy", "layer": "Pole", "by": "Caps"}})).unwrap();
+        let mark = s.notice_mark();
+        let v = s.run("topology.validate", &Value::Null).unwrap();
+        assert_eq!(v["errors"], u64::from(warned));
+        assert_eq!(v["incomplete"].as_array().map(Vec::len), Some(usize::from(warned)));
+        let said = s.notices_since(mark).iter().any(|n| {
+            n.text.contains("left out of the check at a pole") && n.text.contains("Must Be Covered By on 'Pole': 1 feature(s) of 'Caps'")
+        });
+        assert_eq!(said, warned, "{:?}", s.notices_since(mark));
+    }
+}
+
+#[test]
 fn a_pdf_says_which_frames_and_pages_it_draws_as_pictures() {
     let mut s = Session::new(Project::default());
     let mark = s.notice_mark();
@@ -31686,6 +31758,79 @@ fn raster_classes_run_on_another_thread() {
     assert_eq!(s.project.dl_models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["scene_model", "scene_model 2"]);
 }
 
+#[test]
+fn rgbi_mosaics_keep_nir_without_alpha_and_reject_mixed_band_roles() {
+    isolate_plugins();
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    use rustgis_map::raster::RasterLayer;
+    let mut s = Session::new(Project::default());
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
+    for (name, color, count) in [
+        ("nir", ColorHint::Rgb { alpha: false }, 4),
+        ("nir2", ColorHint::Rgb { alpha: false }, 4),
+        ("rgba", ColorHint::Rgb { alpha: true }, 4),
+        ("rgb", ColorHint::Rgb { alpha: false }, 3),
+        ("multispectral", ColorHint::Gray, 4),
+    ] {
+        let mut bands = vec![vec![200.0; 4], vec![100.0; 4], vec![50.0; 4], vec![0.0; 4]];
+        bands.truncate(count);
+        let r = Raster::new(name, 2, 2, bands, gt, Crs::LonLat, None, color, "UInt8").unwrap();
+        let bytes = geotiff::write(&r, 0).unwrap();
+        s.map_mut().add_raster(name, RasterLayer::from_bytes(r, format!("{name}.tif"), bytes));
+    }
+    for (name, images, alpha) in [("RGBI", vec!["nir", "nir2"], false), ("RGBA", vec!["rgba"], true)] {
+        s.run("imagery.workspace", &json!({"kind":"ortho", "name":name, "images":images, "cellSize":1})).unwrap();
+        let result = s.run("imagery.mosaic", &json!({"name":name})).unwrap();
+        assert!(result.get("messages").is_none(), "{result}");
+        let layer = s.map().layer(result["layer"].as_u64().unwrap() as u32).unwrap();
+        let rl = layer.raster.as_ref().unwrap();
+        let r = rl.data.as_ref().unwrap();
+        assert_eq!(r.band_count(), 4);
+        assert_eq!(r.color, ColorHint::Rgb { alpha });
+        assert_eq!(r.value(3, 0, 0), Some(0.0));
+        // The embedded file must also keep NIR when a project is reopened.
+        let back = geotiff::read(std::io::Cursor::new(rl.embedded.as_ref().unwrap().as_slice()), "saved").unwrap();
+        assert_eq!((back.band_count(), back.color), (4, ColorHint::Rgb { alpha }));
+    }
+    for (name, images, lost) in [
+        ("RGBI + RGB", vec!["nir", "rgb"], vec!["nir"]),
+        ("two RGBI + RGB", vec!["rgb", "nir", "nir2"], vec!["nir", "nir2"]),
+        ("RGBA + RGB", vec!["rgba", "rgb"], vec!["rgba"]),
+    ] {
+        s.run("imagery.workspace", &json!({"kind":"ortho", "name":name, "images":images, "cellSize":1})).unwrap();
+        let result = s.run("imagery.mosaic", &json!({"name":name})).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "{result}");
+        let message = messages[0].as_str().unwrap();
+        assert!(message.starts_with(&format!("{} image(s)", lost.len())), "{message}");
+        assert!(message.contains("3-band mosaic"), "{message}");
+        for image in lost {
+            assert!(message.contains(&format!("'{image}': band(s) 4")), "{message}");
+        }
+        assert!(!message.contains("'rgb':"), "{message}");
+        let layer = s.map().layer(result["layer"].as_u64().unwrap() as u32).unwrap();
+        let r = layer.raster.as_ref().unwrap().data.as_ref().unwrap();
+        assert_eq!(r.band_count(), 3);
+        assert_eq!(r.color, ColorHint::Rgb { alpha: false });
+    }
+    for (name, images) in [
+        ("mixed", vec!["nir", "rgba"]),
+        ("mixed non-RGB", vec!["multispectral", "rgba"]),
+        ("mixed non-RGB reversed", vec!["rgba", "multispectral"]),
+    ] {
+        s.run("imagery.workspace", &json!({"kind":"ortho", "name":name, "images":images, "cellSize":1})).unwrap();
+        let e = s.run("imagery.mosaic", &json!({"name":name})).unwrap_err().to_string();
+        assert!(e.contains("matching band roles"), "{e}");
+        // Mosaic Rasters refuses the same mix rather than giving one input's role to both.
+        let e = s.run("raster.mosaic", &json!({"inputs": images, "name": format!("{name} raster")})).unwrap_err().to_string();
+        assert!(e.contains("matching band roles"), "{e}");
+    }
+    // Matching roles still mosaic, keeping them.
+    let v = s.run("raster.mosaic", &json!({"inputs": ["nir", "nir2"], "name": "nir raster"})).unwrap();
+    let r = s.map().layer(v["layer"].as_u64().unwrap() as u32).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+    assert_eq!((r.band_count(), r.color.clone()), (4, ColorHint::Rgb { alpha: false }));
+}
+
 /// Add Data's and Load All's reads made before the command runs (the desktop app's, on a thread
 /// of their own) are the ones the command takes: it adds what they read, without reading again.
 #[cfg(not(target_arch = "wasm32"))]
@@ -32180,4 +32325,52 @@ fn topology_validate_says_when_a_polar_check_is_incomplete() {
     let mark = s.notice_mark();
     s.run("topology.validate", &json!({"toleranceM": 20})).unwrap();
     assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("weren't checked completely")));
+}
+
+#[test]
+fn radius_commands_report_invalid_latitudes_and_missing_coordinates() {
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    for command in ["analysis.neighborhood", "select.byRadius"] {
+        for bad in [true, false] {
+            let mut s = Session::new(Project::default());
+            let mut data = Dataset::new("Input", GeometryType::Point, vec![]);
+            data.push(Some(Geometry::Point(Coord::new(0.0, 85.0))), vec![]);
+            if bad {
+                data.push(Some(Geometry::Point(Coord::new(0.0, 95.0))), vec![]);
+                data.push(Some(Geometry::MultiPoint(vec![Coord::new(f64::NAN, 86.0), Coord::new(0.0, 86.0)])), vec![]);
+            }
+            s.map_mut().add_dataset(data);
+            let mark = s.notice_mark();
+            s.run(command, &json!({"lon":0, "lat":84, "radius":50_000})).unwrap();
+            let notices = s.notices_since(mark);
+            assert_eq!(
+                notices.iter().filter(|n| n.text.contains("latitude past ±90°")).count(),
+                usize::from(bad),
+                "{command}: {notices:?}"
+            );
+            assert_eq!(
+                notices.iter().filter(|n| n.text.contains("missing or infinite coordinates")).count(),
+                usize::from(bad),
+                "{command}: {notices:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn topology_refuses_latitudes_past_the_poles() {
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    for latitude in [89.0, 95.0] {
+        let mut s = Session::new(Project::default());
+        let mut data = Dataset::new("Paths", GeometryType::Polyline, vec![]);
+        data.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 88.0), Coord::new(0.0, latitude)]])), vec![]);
+        s.map_mut().add_dataset(data);
+        s.run("topology.rules", &json!({"add":{"rule":"mustNotHaveDangles", "layer":"Paths"}})).unwrap();
+        let result = s.run("topology.validate", &Value::Null);
+        if latitude > 90.0 {
+            assert!(result.unwrap_err().contains("latitude past ±90°"));
+        } else {
+            result.unwrap();
+        }
+    }
 }
