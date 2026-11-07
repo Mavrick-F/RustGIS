@@ -501,15 +501,16 @@ pub fn commands() -> Vec<C> {
             }
             // A source the view can't filter as it reads filters a sample of a crowded view.
             let sampled = match s.map().layer(id) {
-                Some(l) if !q.is_empty() && l.source.as_ref().is_some_and(|src| src.query_filters_a_sample(&q)) => {
-                    Some(l.name.clone())
+                Some(l) if !q.is_empty() => {
+                    l.source.as_ref().and_then(|src| src.query_sample(&q, &l.dataset.fields)).map(|n| (l.name.clone(), n))
                 }
                 _ => None,
             };
-            if let Some(name) = sampled {
+            if let Some((name, (count, most))) = sampled {
+                let count = count.map_or_else(|| "an unknown number of".to_string(), |c| c.to_string());
                 s.notify(
                     format!(
-                        "{name}: the query filters the features each view reads, which are a sample where a view holds too many to read, so some matches may not show (Load All Features filters every one)"
+                        "{name}: the query filters the features each view reads (at most {most} of the layer's {count} features), a sample where a view holds more, so some matches may not show (Load All Features filters every one)"
                     ),
                     false,
                 );

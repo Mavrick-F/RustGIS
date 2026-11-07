@@ -3233,6 +3233,10 @@ mod tests {
         l.definition_query = Some(format!("n = {left_out} or 'x' = '@row_number'"));
         l.sync_source(&view, true);
         assert_eq!(shown(&l), [Value::Int(left_out)]);
+        // However it's quoted or nested, a row number is found in the parsed query.
+        l.definition_query = Some(format!("!n! = {left_out} and (@row_number >= 1 or 'it''s' = '')"));
+        l.sync_source(&view, true);
+        assert!(!l.source.as_ref().unwrap().sampled_matches());
         // A query that doesn't parse leaves the view as read without one, as for loaded layers.
         l.definition_query = Some("n = = 1".into());
         l.sync_source(&view, true);

@@ -65,13 +65,7 @@ pub(super) fn read_mode(
         if full { Ok(whole(source.read(req)?, projection)) } else { read_with_fields(source, req, bytes, projection, estimate, fields) }
     };
     // A query that doesn't parse draws every feature, so the view is read as without one.
-    let info = source.info();
-    let Some((scratch, expr)) = query.filter(|q| walks(source, &q.text)).and_then(|q| {
-        let scratch = Dataset::new(info.name.clone(), info.geometry_type, q.fields.clone());
-        rustgis_data::query::parse(&q.text, &scratch).ok().map(|e| (scratch, e))
-    }) else {
-        return read(source);
-    };
+    let Some((scratch, expr)) = query.and_then(|q| walked(source, q)) else { return read(source) };
     // A view read whole is filtered exactly by the layer. A sampled one would leave matches out
     // (#1456): the source is walked instead, keeping up to the view's limit of the matches.
     // Half the budget holds them; their projection and display levels take the rest.
@@ -86,27 +80,39 @@ pub(super) fn read_mode(
     Ok((batch, cache))
 }
 
-/// Whether a sampled view of `source` is walked with `query`, keeping the matches: the source can
-/// be read a chunk at a time, and the query doesn't use a row number (a row's place in the view,
-/// which a walk of the source can't number the same way).
-pub(super) fn walks(source: &dyn FeatureSource, query: &str) -> bool {
-    // Outside quotes: a text or a quoted field name may hold the words.
-    let mut quote = None;
-    let bare: String = query
-        .chars()
-        .filter(|c| match quote {
-            Some(q) => {
-                quote = (*c != q).then_some(q);
-                false
-            }
-            None if matches!(c, '\'' | '"') => {
-                quote = Some(*c);
-                false
-            }
-            None => true,
-        })
-        .collect();
-    source.visits_chunks() && !bare.to_ascii_lowercase().contains("@row_number")
+/// What a sampled view of `source` is walked with, keeping the matches: the parsed `query` and a
+/// dataset of its fields to hold each chunk. `None` when the source can't be read a chunk at a
+/// time, the query doesn't parse, or it uses a row number (a row's place in the view, which a walk
+/// of the source can't number the same way).
+pub(super) fn walked(source: &dyn FeatureSource, query: &Query) -> Option<(Dataset, Expr)> {
+    if !source.visits_chunks() {
+        return None;
+    }
+    let info = source.info();
+    let scratch = Dataset::new(info.name.clone(), info.geometry_type, query.fields.clone());
+    let expr = rustgis_data::query::parse(&query.text, &scratch).ok()?;
+    (!numbers_rows(&expr)).then_some((scratch, expr))
+}
+
+/// Whether an expression reads `@row_number` anywhere.
+fn numbers_rows(e: &Expr) -> bool {
+    use rustgis_data::query::Var;
+    let any = |es: &[Expr]| es.iter().any(numbers_rows);
+    match e {
+        Expr::Var(v) => *v == Var::RowNumber,
+        Expr::And(es) | Expr::Or(es) | Expr::Concat(es) | Expr::Call(_, es) => any(es),
+        Expr::Not(e) | Expr::IsNullExpr { e, .. } => numbers_rows(e),
+        Expr::Compare(_, a, b) | Expr::LikeExpr { e: a, pattern: b, .. } => numbers_rows(a) || numbers_rows(b),
+        Expr::InExpr { e, list, .. } => numbers_rows(e) || any(list),
+        Expr::Between { e, lo, hi, .. } => numbers_rows(e) || numbers_rows(lo) || numbers_rows(hi),
+        Expr::Chain(first, rest) => numbers_rows(first) || rest.iter().any(|(_, e)| numbers_rows(e)),
+        Expr::Case { subject, arms, otherwise } => {
+            subject.as_deref().is_some_and(numbers_rows)
+                || arms.iter().any(|(w, t)| numbers_rows(w) || numbers_rows(t))
+                || otherwise.as_deref().is_some_and(numbers_rows)
+        }
+        Expr::Cmp { .. } | Expr::Like { .. } | Expr::IsNull { .. } | Expr::In { .. } | Expr::Lit(_) | Expr::Field(_) => false,
+    }
 }
 
 /// The features of `req` that `expr` keeps, walking every feature of its extent: an evenly

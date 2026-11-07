@@ -21975,8 +21975,13 @@ fn definition_query_on_a_streamed_layer_says_when_it_filters_a_sample() {
         l.source.as_mut().unwrap().limit = limit;
         let mark = s.notice_mark();
         s.run("layer.definitionQuery", &json!({"where": query})).unwrap();
-        let said = s.notices_since(mark).iter().any(|n| n.text.contains("are a sample"));
+        let said = s.notices_since(mark).iter().any(|n| n.text.contains("a sample where a view holds more"));
         assert_eq!(said, sampled, "{} reading {limit}, {query}: {:?}", path.display(), s.notices_since(mark));
+        // How much: the most a view reads of the layer's features.
+        if sampled {
+            let most = if limit == 0 { rustgis_map::source::VIEW_LIMIT } else { limit };
+            assert!(s.notices_since(mark).iter().any(|n| n.text.contains(&format!("at most {most} of the layer's 2 features"))));
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

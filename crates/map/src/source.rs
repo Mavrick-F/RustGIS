@@ -879,18 +879,23 @@ impl SourceLayer {
         self.handle.is_some()
     }
 
-    /// Whether `query` can filter only a sample of a view: the view isn't walked with it (a
-    /// database, GeoJSON or LiDAR read in place, a file by its web address, or a query using a
-    /// row number), and the source holds more features than a view reads, doesn't say how many,
-    /// or the view read now is already a sample (of more bytes than a view holds). False until open.
-    pub fn query_filters_a_sample(&self, query: &str) -> bool {
-        let Some(h) = &self.handle else { return false };
+    /// When `query` (on a layer of `fields`) can filter only a sample of a view, the source's
+    /// feature count (`None` when it doesn't say) and the most a view reads. That is when the view
+    /// isn't walked with it (a database, GeoJSON or LiDAR read in place, a file by its web address,
+    /// or a query using a row number), and the source holds more features than a view reads,
+    /// doesn't say how many, or the view read now is already a sample (of more bytes than a view
+    /// holds). `None` until open.
+    pub fn query_sample(&self, query: &str, fields: &[rustgis_data::Field]) -> Option<(Option<u64>, usize)> {
+        let h = self.handle.as_ref()?;
         let most = match self.limit {
             0 if h.remote().is_some() => REMOTE_VIEW_LIMIT,
             0 => VIEW_LIMIT,
             n => n,
         };
-        !window::walks(h.as_ref(), query) && (h.info().count.is_none_or(|c| c > most as u64) || self.sampled().is_some())
+        let count = h.info().count;
+        let query = Query { text: query.to_string(), fields: fields.to_vec() };
+        let crowded = count.is_none_or(|c| c > most as u64) || self.sampled().is_some();
+        (window::walked(h.as_ref(), &query).is_none() && crowded).then_some((count, most))
     }
 
     pub fn info(&self) -> Option<&SourceInfo> {
