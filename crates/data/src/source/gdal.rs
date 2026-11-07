@@ -25,9 +25,47 @@ const MAX_LAYERS: usize = 64;
 
 /// Whether a file name is read through GDAL.
 pub fn is_gdal_name(name: &str) -> bool {
+    EXTENSIONS.contains(&extension(name).as_str())
+}
+
+fn extension(name: &str) -> String {
     let n = name.trim_end_matches(['/', '\\']);
-    let ext = Path::new(n).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    EXTENSIONS.contains(&ext.as_str())
+    Path::new(n).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
+}
+
+/// The GDAL drivers that may open a file, by its type (`-if`). GDAL picks a driver from a file's
+/// contents, so without them a VRT renamed `.tab` would open whatever files or addresses it names.
+/// A driver GDAL wasn't built with is only warned about. Other types are refused (a project's
+/// saved GDAL source could name any file).
+fn drivers(src: &Path) -> Result<&'static [&'static str]> {
+    Ok(match extension(&src.to_string_lossy()).as_str() {
+        "dwg" => &["CAD", "DWG"],
+        "gdb" => &["OpenFileGDB", "FileGDB"],
+        "tab" | "mif" => &["MapInfo File"],
+        // A large OpenStreetMap extract is read through GDAL too (`.osm.pbf`).
+        "osm" | "pbf" => &["OSM"],
+        "geojsonl" | "geojsons" => &["GeoJSONSeq"],
+        "gmt" => &["OGR_GMT"],
+        // Read natively now, but a project saved when GDAL read them converts them again. (Not
+        // GML, which fetches the schemas and links it names.)
+        "kml" | "kmz" => &["LIBKML", "KML"],
+        "gpx" => &["GPX"],
+        "dxf" => &["DXF"],
+        // A test fixture: CSV can mix surfaces, curves and points in one layer, which none of the
+        // types above can.
+        #[cfg(test)]
+        "csv" => &["CSV"],
+        _ => return Err(DataError::Unsupported(format!("{}: not a file type read through GDAL", src.display()))),
+    })
+}
+
+/// A GDAL program that may open its input with `drivers` only.
+pub(crate) fn command(program: PathBuf, drivers: &[&str]) -> Command {
+    let mut c = Command::new(program);
+    for d in drivers {
+        c.arg("-if").arg(d);
+    }
+    c
 }
 
 pub use super::Family;
@@ -84,7 +122,9 @@ struct LayerInfo {
 fn list(src: &Path) -> Result<Vec<LayerInfo>> {
     let ogrinfo = program("ogrinfo").ok_or_else(missing)?;
     let src = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
-    let mut c = Command::new(ogrinfo);
+    // A file or folder on this computer: GDAL would fetch a `/vsicurl/` address.
+    std::fs::metadata(&src)?;
+    let mut c = command(ogrinfo, drivers(&src)?);
     c.arg("-json").arg("-ro").arg("-so").arg("-nomd").arg(&src);
     let out = output(c, LIST_TIMEOUT, "GDAL")?;
     if !out.status.success() {
@@ -254,7 +294,7 @@ fn convert_one_in(
     // Reprojected to WGS 84 from its own coordinate system, or from the one given; a layer with
     // neither is taken as it is.
     let unprojected = crs.is_none() && !has_srs;
-    let mut c = Command::new(&ogr2ogr);
+    let mut c = command(ogr2ogr, drivers(&full)?);
     c.args(["-f", "FlatGeobuf", "-skipfailures", "-nlt", nlt, "-dim", "XY", "-lco", "SPATIAL_INDEX=YES"]);
     if let Some(crs) = crs {
         c.args(["-s_srs", crs]);
@@ -338,6 +378,10 @@ mod tests {
         // A layer named like an option never reaches GDAL.
         let e = convert_one_in(&std::env::temp_dir(), Path::new("x.kml"), "-overwrite", None, None, None, true).unwrap_err();
         assert!(e.to_string().contains("starting with '-'"), "{e}");
+        // Every type read through GDAL has its drivers; a reference file (a project's saved source
+        // could name one) has none.
+        assert!(EXTENSIONS.iter().all(|e| drivers(Path::new(&format!("a.{e}"))).is_ok()) && drivers(Path::new("/x/a.gdb/")).is_ok());
+        assert!(drivers(Path::new("a.vrt")).is_err() && drivers(Path::new("a.gml")).is_err() && drivers(Path::new("noext")).is_err());
         // Pruning touches only the cache's own files.
         assert!(ours("0123456789abcdef.fgb") && ours("0123456789abcdef.key") && ours("0123456789abcdef.empty"));
         assert!(ours("0123456789abcdef.4242.tmp.fgb"));
@@ -345,6 +389,27 @@ mod tests {
         // The cache key's hash is stable.
         assert_eq!(fnv1a(b"rustgis"), fnv1a(b"rustgis"));
         assert_ne!(fnv1a(b"a"), fnv1a(b"b"));
+    }
+
+    /// A VRT renamed `.tab` isn't opened as a VRT, so the file it names isn't read.
+    #[test]
+    fn a_renamed_vrt_isnt_read_when_gdal_is_installed() {
+        if !available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("private.csv");
+        std::fs::write(&csv, "WKT,name\n\"POINT (1 2)\",secret\n").unwrap();
+        let tab = dir.path().join("audit.tab");
+        let vrt = format!(
+            "<OGRVRTDataSource><OGRVRTLayer name=\"private\"><SrcDataSource>{}</SrcDataSource></OGRVRTLayer></OGRVRTDataSource>",
+            csv.display()
+        );
+        std::fs::write(&tab, vrt).unwrap();
+        assert!(layers(&tab).is_err());
+        // Nor is an address read in place of a file.
+        assert!(layers(Path::new("/vsicurl/http://127.0.0.1:9/a.osm")).is_err());
+        assert!(convert_one_in(&dir.path().join("cache"), &tab, "private", None, None, None, true).is_err());
     }
 
     #[test]
