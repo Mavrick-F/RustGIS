@@ -76,16 +76,23 @@ pub fn vector_tiles(spec: &Spec, frame: &Frame, view: &Extent, reach: Option<&Ex
     let source = drawn_source(&r, level)?;
     let src = r.style.sources.iter().find(|(id, _)| *id == source).map(|(_, s)| s)?;
     let mut pending = false;
-    let tiles = tiles_in(src, view, reach, frame, zoom, &mut pending)
-        .into_iter()
-        .map(|it| DataTile { payload: it.payload, at: it.at, z: it.z, clip: it.clip })
-        .collect();
+    let mut error = crate::draw::left_out(&r, frame, true);
+    let items = match tiles_in(src, view, reach, frame, zoom, &mut pending) {
+        Ok(items) => items,
+        Err(e) => {
+            crate::draw::add_error(&mut error, e);
+            Vec::new()
+        }
+    };
+    let tiles = items.into_iter().map(|it| DataTile { payload: it.payload, at: it.at, z: it.z, clip: it.clip }).collect();
     let mut d = Drawn::default();
     if let Some(size) = labels {
         draw_layers(None, size, &frame.extent(size.0, size.1), &r, frame, Pass::Labels, &mut d);
     }
+    if let Some(refused) = d.error {
+        crate::draw::add_error(&mut error, refused);
+    }
     let attribution = r.attribution.clone();
-    let error = crate::draw::left_out(&r, frame, true);
     Some(VectorTiles { style: r, source, tiles, level, labels: d.labels, attribution, pending: pending || d.pending, error })
 }
 
@@ -226,7 +233,7 @@ fn average(img: &tiny_skia::Pixmap) -> Option<[f32; 4]> {
 /// the next level, in its order. Its background, when it has one, is the first run, filling the
 /// square.
 pub fn shapes(style: &Resolved, source: &str, tile: &Tile, level: u8) -> TileShapes {
-    shapes_with(style, source, tile, level, &|| sprite::load(&style.sprites, false))
+    shapes_with(style, source, tile, level, &|| sprite::load_from(&style.sprites, false, style.from.as_ref()))
 }
 
 /// [`shapes`], with `load` to load the style's sprites.

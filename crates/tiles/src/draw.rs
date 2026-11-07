@@ -52,6 +52,18 @@ pub struct Drawn {
     pub error: Option<String>,
 }
 
+/// Retains each distinct refusal alongside any earlier source or sprite warning.
+pub(crate) fn add_error(to: &mut Option<String>, error: String) {
+    match to {
+        Some(previous) if !previous.contains(&error) => {
+            previous.push_str("; ");
+            previous.push_str(&error);
+        }
+        None => *to = Some(error),
+        _ => {}
+    }
+}
+
 /// One tile's worth of drawing: the tile data, where that tile is, and the square it stands in for.
 #[derive(Clone)]
 pub(crate) struct Item {
@@ -69,7 +81,7 @@ pub(crate) fn left_out(r: &Resolved, frame: &Frame, mesh: bool) -> Option<String
     let shown = |draws: fn(&StyleLayer) -> bool| r.style.layers.iter().any(|l| l.visible_at(zoom) && draws(l));
     let hi_dpi = frame.ppp >= 1.5;
     let unread = sprite_notes(shown(StyleLayer::draws_icons), shown(StyleLayer::draws_patterns), hi_dpi, hi_dpi && !mesh, |hi, what| {
-        sprite::unread_note(&r.sprites, r.style.sprites_listed, &sprite::load(&r.sprites, hi), what)
+        sprite::unread_note(&r.sprites, r.style.sprites_listed, &sprite::load_from(&r.sprites, hi, r.from.as_ref()), what)
     });
     let all: Vec<&str> = r.left_out.iter().map(String::as_str).chain(unread.iter().map(String::as_str)).collect();
     (!all.is_empty()).then(|| all.join("; "))
@@ -117,7 +129,7 @@ pub fn draw(pm: &mut Pixmap, spec: &Spec, opacity: f32, frame: &Frame, labels: b
     let (w, h) = (pm.width(), pm.height());
     // A style drawing vector shapes draws them from tile pictures drawn once (see `picture`):
     // a map moving across them only puts them in place.
-    if let Some(pictures) = crate::picture::cover(&r, frame, &frame.extent(w, h), None, &mut out.pending) {
+    if let Some(pictures) = crate::picture::cover(&r, frame, &frame.extent(w, h), None, &mut out.pending, &mut out.error) {
         for it in &pictures {
             draw_raster(pm, it, frame, opacity);
         }
@@ -169,7 +181,7 @@ pub(crate) fn draw_layers(
     let mut sprite_state: Option<Option<Arc<Sprite>>> = None;
     let mut sprite = |pending: &mut bool| -> Option<Arc<Sprite>> {
         sprite_state
-            .get_or_insert_with(|| match sprite::load(&r.sprites, frame.ppp >= 1.5) {
+            .get_or_insert_with(|| match sprite::load_from(&r.sprites, frame.ppp >= 1.5, r.from.as_ref()) {
                 Load::Ready(s) => Some(s),
                 Load::Pending => {
                     *pending = true;
@@ -208,7 +220,14 @@ pub(crate) fn draw_layers(
             // Hillshade reads the heights a pixel past the view's edges: those tiles too.
             let pad = 2.0 * frame.m_per_px;
             let reach = Extent::new(view.min_x - pad, view.min_y - pad, view.max_x + pad, view.max_y + pad);
-            let list = tiles_for(src, if matches!(src, Source::RasterDem { .. }) { &reach } else { view }, frame, zoom, &mut out.pending);
+            let list =
+                match tiles_for(src, if matches!(src, Source::RasterDem { .. }) { &reach } else { view }, frame, zoom, &mut out.pending) {
+                    Ok(list) => list,
+                    Err(e) => {
+                        add_error(&mut out.error, e);
+                        Vec::new()
+                    }
+                };
             items.insert(src_id.to_string(), list);
         }
         let Some(list) = items.get(src_id) else { continue };
@@ -310,6 +329,7 @@ pub fn place_raster(spec: &Spec, opacity: f32, frame: &Frame, view: &Extent, rea
     place_as(spec, opacity, frame, view, reach, None, false)
 }
 
+/// Places raster or prepared vector pictures and retains both shape and label refusals.
 fn place_as(
     spec: &Spec,
     opacity: f32,
@@ -340,12 +360,17 @@ fn place_as(
         return Some(out);
     }
     // Without pictures, a style drawing shapes is left to the check below (no raster layers only).
-    if let Some(pictures) = pictures.then(|| crate::picture::cover(&r, frame, view, Some(reach), &mut out.pending)).flatten() {
+    if let Some(pictures) =
+        pictures.then(|| crate::picture::cover(&r, frame, view, Some(reach), &mut out.pending, &mut out.error)).flatten()
+    {
         let opacity = opacity.clamp(0.0, 1.0);
         out.tiles = pictures.into_iter().map(|it| Placement { picture: it.payload, at: it.at, clip: it.clip, opacity }).collect();
         if let Some(size) = labels {
             let mut d = Drawn::default();
             draw_layers(None, size, &frame.extent(size.0, size.1), &r, frame, Pass::Labels, &mut d);
+            if let Some(refused) = d.error {
+                add_error(&mut out.error, refused);
+            }
             out.labels = d.labels;
             out.pending |= d.pending;
         }
@@ -362,7 +387,14 @@ fn place_as(
         let Some(src_id) = layer.source.as_deref() else { continue };
         if !items.contains_key(src_id) {
             let Some(src) = r.style.sources.iter().find(|s| s.0 == src_id).map(|s| &s.1) else { continue };
-            items.insert(src_id, tiles_in(src, view, Some(reach), frame, zoom, &mut out.pending));
+            let list = match tiles_in(src, view, Some(reach), frame, zoom, &mut out.pending) {
+                Ok(list) => list,
+                Err(e) => {
+                    add_error(&mut out.error, e);
+                    Vec::new()
+                }
+            };
+            items.insert(src_id, list);
         }
         let o = (layer.raster_opacity(zoom) * opacity).clamp(0.0, 1.0);
         for it in items.get(src_id).into_iter().flatten() {
@@ -428,7 +460,7 @@ pub fn pick(spec: &Spec, x: f64, y: f64, m_per_px: f64, tol_px: f32, limit: usiz
             if !matches!(src, Source::Vector { .. }) {
                 continue;
             }
-            items.insert(src_id.to_string(), tiles_for(src, &view, &frame, zoom, &mut pending));
+            items.insert(src_id.to_string(), tiles_for(src, &view, &frame, zoom, &mut pending).unwrap_or_default());
         }
         let Some(list) = items.get(src_id) else { continue };
         // Every tile within reach (a feature near a tile's edge may be in its neighbour), the real
@@ -522,33 +554,56 @@ fn hits(f: &crate::mvt::Feature, kind: LayerKind, p: [f32; 2], reach: f32) -> bo
 }
 
 /// The tiles of a source in view, with stand-ins for those not here yet.
-fn tiles_for(src: &Source, view: &Extent, frame: &Frame, zoom: f32, pending: &mut bool) -> Vec<Item> {
+fn tiles_for(src: &Source, view: &Extent, frame: &Frame, zoom: f32, pending: &mut bool) -> Result<Vec<Item>, String> {
     tiles_in(src, view, None, frame, zoom, pending)
 }
 
 /// The tiles of a source in view and out to `reach` (those in the cache only), with stand-ins
-/// for those not here yet.
-pub(crate) fn tiles_in(src: &Source, view: &Extent, reach: Option<&Extent>, frame: &Frame, zoom: f32, pending: &mut bool) -> Vec<Item> {
-    let (tiles, min_z, max_z, want, z) = match src {
-        Source::Raster { tiles, tile_size, min_zoom, max_zoom, .. } | Source::RasterDem { tiles, tile_size, min_zoom, max_zoom, .. } => {
+/// for those not here yet. Expanded destinations retain the supplying document's reach;
+/// a refusal is reported by the drawing, without touching the shared cache or fetcher.
+pub(crate) fn tiles_in(
+    src: &Source,
+    view: &Extent,
+    reach: Option<&Extent>,
+    frame: &Frame,
+    zoom: f32,
+    pending: &mut bool,
+) -> Result<Vec<Item>, String> {
+    let (tiles, from, min_z, max_z, want, z) = match src {
+        Source::Raster { tiles, from, tile_size, min_zoom, max_zoom, .. }
+        | Source::RasterDem { tiles, from, tile_size, min_zoom, max_zoom, .. } => {
             let z = template::zoom_for(frame.m_per_px * f64::from(frame.ppp), *tile_size, *max_zoom);
-            (tiles, *min_zoom, *max_zoom, Want::Image, z)
+            (tiles, from, *min_zoom, *max_zoom, Want::Image, z)
         }
-        Source::Vector { tiles, min_zoom, max_zoom, .. } => {
-            (tiles, *min_zoom, *max_zoom, Want::Vector, (zoom.floor() as u8).min(*max_zoom))
+        Source::Vector { tiles, from, min_zoom, max_zoom, .. } => {
+            (tiles, from, *min_zoom, *max_zoom, Want::Vector, (zoom.floor() as u8).min(*max_zoom))
         }
-        Source::Other => return Vec::new(),
+        Source::Other => return Ok(Vec::new()),
     };
     if tiles.is_empty() || z < min_z || zoom + 0.5 < f32::from(min_z) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // A mosaic over half the world wide (the globe's, a world projection's) takes the zoom whose
     // tiles all fit, as its far edges are in view; a flat view keeps those nearest its centre.
     let z = if view.width() > template::HALF_WORLD { template::fitting_zoom(view, z, min_z) } else { z };
-    let url = |t: TileId| {
+    let url = |t: TileId| -> Result<Option<String>, String> {
         let i = (t.x as usize).wrapping_add(t.y as usize) % tiles.len();
-        tiles.get(i).map(|tpl| template::expand(tpl, t, 256, false, &[]))
+        let Some(tpl) = tiles.get(i) else { return Ok(None) };
+        let expanded = template::expand(tpl, t, 256, false, &[]);
+        // Archive tile keys are made here from the archive the layer explicitly names. They
+        // aren't network destinations; their HTTP range reads pass the transport checks.
+        if !crate::pmtiles::is_tile(&expanded) && !crate::mbtiles::is_tile(&expanded) && !crate::cog::is_tile(&expanded) {
+            if let Some(from) = from {
+                from.check(&expanded)?;
+            } else {
+                crate::address::check(&expanded, None)?;
+            }
+        }
+        Ok(Some(expanded))
     };
+    // Ancestors and children are cache-only, but an invalid destination must not read a tile
+    // previously cached by an explicitly local layer either.
+    let cached_url = |t| url(t).ok().flatten();
     let mut exact = Vec::new();
     let mut stand_ins = Vec::new();
     // A missing tile is stood in for by its nearest ancestor in the cache and, for raster tiles,
@@ -557,14 +612,14 @@ pub(crate) fn tiles_in(src: &Source, view: &Extent, reach: Option<&Extent>, fram
     // at are already here, and they are sharper. Nothing is drawn twice, so a see-through layer
     // stays even.
     let stand_in = |out: &mut Vec<Item>, p: &Placed| {
-        let parent = ancestor(p, min_z, &url);
+        let parent = ancestor(p, min_z, &cached_url, from.as_ref());
         if want != Want::Image || p.id.z >= max_z {
             out.extend(parent);
             return;
         }
         for c in p.id.children() {
             let cp = Placed { id: c, wx: p.wx * 2 + i64::from(c.x & 1) };
-            match url(c).and_then(|u| cache::peek(&u)) {
+            match cached_url(c).and_then(|u| cache::peek_from(&u, from.as_ref())) {
                 Some(payload) => out.push(Item { payload, at: cp.extent(), z: c.z, clip: cp.extent() }),
                 None => out.extend(parent.as_ref().map(|a| Item { clip: cp.extent(), ..a.clone() })),
             }
@@ -575,12 +630,12 @@ pub(crate) fn tiles_in(src: &Source, view: &Extent, reach: Option<&Extent>, fram
         placed = template::covering(view, z);
     }
     for p in placed {
-        let Some(u) = url(p.id) else { continue };
+        let Some(u) = url(p.id)? else { continue };
         // Past the view, only what the cache already has.
         let state = if p.extent().intersects(view) {
-            cache::get_tile(&u, want)
+            cache::get_tile_from(&u, want, from.as_ref())
         } else {
-            match cache::peek(&u) {
+            match cache::peek_from(&u, from.as_ref()) {
                 Some(payload) => State::Ready(payload),
                 None => {
                     stand_in(&mut stand_ins, &p);
@@ -599,14 +654,14 @@ pub(crate) fn tiles_in(src: &Source, view: &Extent, reach: Option<&Extent>, fram
     }
     // Stand-ins first, so the real tiles draw over their edges.
     stand_ins.extend(exact);
-    stand_ins
+    Ok(stand_ins)
 }
 
 /// The nearest ancestor of a missing tile already in the cache, clipped to the missing tile.
-fn ancestor(p: &Placed, min_z: u8, url: &dyn Fn(TileId) -> Option<String>) -> Option<Item> {
+fn ancestor(p: &Placed, min_z: u8, url: &dyn Fn(TileId) -> Option<String>, from: Option<&crate::address::Origin>) -> Option<Item> {
     for lv in 1..=p.id.z.saturating_sub(min_z).min(8) {
         let a = p.id.ancestor(lv)?;
-        if let Some(payload) = url(a).and_then(|u| cache::peek(&u)) {
+        if let Some(payload) = url(a).and_then(|u| cache::peek_from(&u, from)) {
             let ap = Placed { id: a, wx: p.wx.div_euclid(1 << lv) };
             return Some(Item { payload, at: ap.extent(), z: a.z, clip: p.extent() });
         }

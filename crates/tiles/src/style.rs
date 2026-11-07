@@ -1213,6 +1213,8 @@ impl StyleView {
 pub enum Source {
     Vector {
         tiles: Vec<String>,
+        /// Runtime provenance of the tile templates; `None` for a user-selected template.
+        from: Option<crate::address::Origin>,
         url: Option<String>,
         min_zoom: u8,
         max_zoom: u8,
@@ -1220,6 +1222,8 @@ pub enum Source {
     },
     Raster {
         tiles: Vec<String>,
+        /// Runtime provenance of the tile templates; `None` for a user-selected template.
+        from: Option<crate::address::Origin>,
         url: Option<String>,
         tile_size: u32,
         min_zoom: u8,
@@ -1229,6 +1233,8 @@ pub enum Source {
     /// Elevation tiles, for `hillshade` and `color-relief` layers.
     RasterDem {
         tiles: Vec<String>,
+        /// Runtime provenance of the tile templates; `None` for a user-selected template.
+        from: Option<crate::address::Origin>,
         url: Option<String>,
         tile_size: u32,
         min_zoom: u8,
@@ -1310,14 +1316,14 @@ impl Source {
         let (tiles, url, attribution) = (strings(get("tiles")), str_of(get("url")), str_of(get("attribution")).unwrap_or_default());
         let (min_zoom, max_zoom) = (zoom_u8(get("minzoom"), 0), zoom_u8(get("maxzoom"), 22));
         match get("type").and_then(Json::as_str) {
-            Some("vector") => Source::Vector { tiles, url, min_zoom, max_zoom, attribution },
+            Some("vector") => Source::Vector { tiles, from: None, url, min_zoom, max_zoom, attribution },
             Some("raster") => {
                 let tile_size = get("tileSize").and_then(Json::as_u64).map_or(512, |t| t.clamp(1, 4096) as u32);
-                Source::Raster { tiles, url, tile_size, min_zoom, max_zoom, attribution }
+                Source::Raster { tiles, from: None, url, tile_size, min_zoom, max_zoom, attribution }
             }
             Some("raster-dem") => {
                 let tile_size = get("tileSize").and_then(Json::as_u64).map_or(512, |t| t.clamp(1, 4096) as u32);
-                Source::RasterDem { tiles, url, tile_size, min_zoom, max_zoom, attribution, encoding: DemEncoding::parse(j) }
+                Source::RasterDem { tiles, from: None, url, tile_size, min_zoom, max_zoom, attribution, encoding: DemEncoding::parse(j) }
             }
             _ => Source::Other,
         }
@@ -2310,6 +2316,7 @@ mod tests {
             st.source("r"),
             Some(&Source::Raster {
                 tiles: vec!["https://r/{z}/{x}/{y}.png".into()],
+                from: None,
                 url: None,
                 tile_size: 256,
                 min_zoom: 0,
@@ -2324,6 +2331,7 @@ mod tests {
             v,
             Source::Vector {
                 tiles: vec!["https://x/{z}/{x}/{y}.pbf".into()],
+                from: None,
                 url: Some("https://x/tiles.json".into()),
                 min_zoom: 0,
                 max_zoom: 14,

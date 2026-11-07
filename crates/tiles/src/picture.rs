@@ -68,6 +68,8 @@ struct Entry {
     /// Drawn while some of it was on its way, at this cache generation: drawn again once the
     /// cache has more.
     waiting: Option<u64>,
+    /// Destination refusals remain visible when the prepared picture is reused.
+    error: Option<String>,
     /// For a style with pattern fills, the ids of the sprites it was drawn from.
     sheets: Option<Vec<String>>,
 }
@@ -78,7 +80,7 @@ fn sprites_read(r: &Resolved, zoom: f32, ppp: f32) -> (bool, Option<Vec<String>>
     if !r.style.layers.iter().any(|l| l.visible_at(zoom) && l.draws_patterns()) {
         return (false, None);
     }
-    match sprite::load(&r.sprites, ppp >= 1.5) {
+    match sprite::load_from(&r.sprites, ppp >= 1.5, r.from.as_ref()) {
         Load::Pending => (true, None),
         Load::Ready(s) => (false, Some(s.sheet_ids())),
         Load::Failed => (false, Some(Vec::new())),
@@ -212,7 +214,14 @@ fn draws_shapes(r: &Resolved, zoom: f32) -> bool {
 /// The pictures of `r`'s shapes over `view`, drawing those missing, and out to `reach` (only
 /// those already drawn), bottom first; `None` when the style draws no vector shapes here, or the
 /// view is too wide for pictures (the whole world on the globe). `frame` gives the scale.
-pub(crate) fn cover(r: &Arc<Resolved>, frame: &Frame, view: &Extent, reach: Option<&Extent>, pending: &mut bool) -> Option<Vec<Item>> {
+pub(crate) fn cover(
+    r: &Arc<Resolved>,
+    frame: &Frame,
+    view: &Extent,
+    reach: Option<&Extent>,
+    pending: &mut bool,
+    error: &mut Option<String>,
+) -> Option<Vec<Item>> {
     let ppp = frame.ppp;
     if !(ppp.is_finite() && ppp > 0.0 && frame.m_per_px.is_finite() && frame.m_per_px > 0.0) || view.width() > template::HALF_WORLD {
         return None;
@@ -261,6 +270,9 @@ pub(crate) fn cover(r: &Arc<Resolved>, frame: &Frame, view: &Extent, reach: Opti
                     e.used = tick;
                     // (A sprite on its way may add to it: an export waits.)
                     *pending |= in_view && (e.waiting.is_some() || sprites_pending);
+                    if let Some(e) = e.error.as_ref().filter(|_| in_view) {
+                        crate::draw::add_error(error, e.clone());
+                    }
                     found.push((p, Some(e.picture.clone())));
                 }
                 _ if in_view => {
@@ -311,8 +323,12 @@ pub(crate) fn cover(r: &Arc<Resolved>, frame: &Frame, view: &Extent, reach: Opti
         let tick = s.tick;
         let mut added = false;
         for (&i, d) in todo.iter().zip(drawn) {
-            let (Some(slot), Some((pm, waiting))) = (found.get_mut(i), d) else { continue };
+            let (Some(slot), Some(d)) = (found.get_mut(i), d) else { continue };
+            let DrawnPicture { image: pm, pending: waiting, error: refused } = d;
             *pending |= waiting;
+            if let Some(refused) = &refused {
+                crate::draw::add_error(error, refused.clone());
+            }
             let bytes = pm.data().len();
             let picture = Arc::new(Payload::Image(pm));
             let entry = Entry {
@@ -321,6 +337,7 @@ pub(crate) fn cover(r: &Arc<Resolved>, frame: &Frame, view: &Extent, reach: Opti
                 bytes,
                 used: tick,
                 waiting: waiting.then_some(generation),
+                error: refused,
                 sheets: read.clone(),
             };
             s.bytes += bytes;
@@ -340,6 +357,9 @@ pub(crate) fn cover(r: &Arc<Resolved>, frame: &Frame, view: &Extent, reach: Opti
             for &(k, at, z, clip) in covers.get(&i).into_iter().flatten() {
                 if let Some(e) = s.entries.get_mut(&k) {
                     e.used = tick;
+                    if let Some(refused) = &e.error {
+                        crate::draw::add_error(error, refused.clone());
+                    }
                     stood_in.push(Item { payload: e.picture.clone(), at, z, clip });
                 }
             }
@@ -426,6 +446,13 @@ fn evict(s: &mut Store) {
     }
 }
 
+/// One prepared picture and the pending/refused reads that produced it.
+struct DrawnPicture {
+    image: Pixmap,
+    pending: bool,
+    error: Option<String>,
+}
+
 /// Draws the pictures of `squares`: each a `side`-pixel pixmap and whether some of it is still
 /// on its way, `None` for those not drawn. Natively the squares are shared among threads. With
 /// `until`, drawing stops once it has passed, after a picture (a round of them natively).
@@ -437,7 +464,7 @@ fn draw_all(
     ppp: f32,
     reach: f64,
     until: Option<Instant>,
-) -> Vec<Option<(Pixmap, bool)>> {
+) -> Vec<Option<DrawnPicture>> {
     let Some(until) = until else { return draw_some(r, squares, side, m_per_px, ppp, reach) };
     let round = if cfg!(target_arch = "wasm32") { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get()).min(16) };
     let mut out = Vec::with_capacity(squares.len());
@@ -452,14 +479,14 @@ fn draw_all(
 }
 
 /// Draws the pictures of all of `squares` (see [`draw_all`]).
-fn draw_some(r: &Resolved, squares: &[Placed], side: u32, m_per_px: f64, ppp: f32, reach: f64) -> Vec<Option<(Pixmap, bool)>> {
+fn draw_some(r: &Resolved, squares: &[Placed], side: u32, m_per_px: f64, ppp: f32, reach: f64) -> Vec<Option<DrawnPicture>> {
     let one = |p: &Placed| draw_one(r, p, side, m_per_px, ppp, reach);
     #[cfg(not(target_arch = "wasm32"))]
     {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(squares.len()).min(16);
         if threads > 1 {
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let out: Mutex<Vec<Option<(Pixmap, bool)>>> = Mutex::new((0..squares.len()).map(|_| None).collect());
+            let out: Mutex<Vec<Option<DrawnPicture>>> = Mutex::new((0..squares.len()).map(|_| None).collect());
             std::thread::scope(|scope| {
                 for _ in 0..threads {
                     scope.spawn(|| {
@@ -481,7 +508,7 @@ fn draw_some(r: &Resolved, squares: &[Placed], side: u32, m_per_px: f64, ppp: f3
 }
 
 /// Draws the shapes of one square, with those of the tiles around it out to `reach` points.
-fn draw_one(r: &Resolved, p: &Placed, side: u32, m_per_px: f64, ppp: f32, reach: f64) -> Option<(Pixmap, bool)> {
+fn draw_one(r: &Resolved, p: &Placed, side: u32, m_per_px: f64, ppp: f32, reach: f64) -> Option<DrawnPicture> {
     let mut pm = Pixmap::new(side, side)?;
     let e = p.extent();
     let frame = Frame { left: e.min_x, top: e.max_y, m_per_px, ppp };
@@ -490,7 +517,7 @@ fn draw_one(r: &Resolved, p: &Placed, side: u32, m_per_px: f64, ppp: f32, reach:
     let view = Extent::new(e.min_x - pad, e.min_y - pad, e.max_x + pad, e.max_y + pad);
     let mut d = Drawn::default();
     draw_layers(Some(&mut pm), (side, side), &view, r, &frame, Pass::Shapes, &mut d);
-    Some((pm, d.pending))
+    Some(DrawnPicture { image: pm, pending: d.pending, error: d.error })
 }
 
 #[cfg(test)]
@@ -662,33 +689,34 @@ mod tests {
         drawn(&spec, &f, 1.0);
         let view = f.extent(300, 200);
         let mut pending = false;
-        let held: Vec<Arc<Payload>> = cover(&r, &f, &view, None, &mut pending).unwrap().into_iter().map(|i| i.payload).collect();
+        let held: Vec<Arc<Payload>> = cover(&r, &f, &view, None, &mut pending, &mut None).unwrap().into_iter().map(|i| i.payload).collect();
         let theirs = |items: &[Item]| items.iter().all(|i| held.iter().any(|h| Arc::ptr_eq(h, &i.payload)));
         // A little further in, or coarser (as frames drawn mid-motion are): those drawn stand in.
         // Over the same ground: the view's squares are those drawn, or above or below them.
         for g in [frame(2.3, 1.0), frame(2.9, 1.0), frame(2.2, 0.6), frame(1.6, 1.0)] {
-            let (items, lacks) = paced(Pace::Moving, || cover(&r, &g, &view, None, &mut pending).unwrap());
+            let (items, lacks) = paced(Pace::Moving, || cover(&r, &g, &view, None, &mut pending, &mut None).unwrap());
             assert!(lacks == Some(Unfinished::Later) && !items.is_empty() && theirs(&items), "stood in at {}", g.m_per_px);
             // Each covering the view's squares, where it is.
             assert!(items.iter().all(|i| i.at.intersects(&i.clip) && i.clip.width() > 0.0));
         }
         // Still, or over two levels away: drawn.
         let g = frame(2.3, 1.0);
-        let still = cover(&r, &g, &view, None, &mut pending).unwrap();
+        let still = cover(&r, &g, &view, None, &mut pending, &mut None).unwrap();
         assert!(!theirs(&still));
         let far = frame(5.5, 1.0);
-        let (items, lacks) = paced(Pace::Moving, || cover(&r, &far, &view, None, &mut pending).unwrap());
+        let (items, lacks) = paced(Pace::Moving, || cover(&r, &far, &view, None, &mut pending, &mut None).unwrap());
         // Nothing stands in that far away (a slow machine may leave some for the next frame).
         assert!(lacks != Some(Unfinished::Later) && !theirs(&items));
         // Settling, the exact pictures are drawn while there's time (a round at least).
         let g = frame(2.35, 1.0);
-        let (items, lacks) = paced(Pace::Settling, || cover(&r, &g, &view, None, &mut pending).unwrap());
+        let (items, lacks) = paced(Pace::Settling, || cover(&r, &g, &view, None, &mut pending, &mut None).unwrap());
         // A round at least is new; complete, nothing held stands in.
         let held_in = |i: &Item| held.iter().any(|h| Arc::ptr_eq(h, &i.payload));
         assert!(lacks != Some(Unfinished::Later) && items.iter().any(|i| !held_in(i)));
         assert!(lacks.is_some() || !items.iter().any(held_in));
         // Inside nested calls, the outer one hears of pictures standing in.
-        let ((_, inner), outer) = paced(Pace::Settling, || paced(Pace::Moving, || cover(&r, &frame(2.25, 1.0), &view, None, &mut pending)));
+        let ((_, inner), outer) =
+            paced(Pace::Settling, || paced(Pace::Moving, || cover(&r, &frame(2.25, 1.0), &view, None, &mut pending, &mut None)));
         assert!(inner == Some(Unfinished::Later) && outer == inner);
         assert!(PACE.with(|p| p.get()).is_none());
         // One deadline for the frame, whoever asks; an inner call keeps within it.
@@ -742,16 +770,16 @@ mod tests {
         let r = resolved(&spec);
         let mut pending = false;
         let world = Extent::new(-template::HALF_WORLD * 1.5, -1e6, template::HALF_WORLD * 1.5, 1e6);
-        assert!(cover(&r, &f, &world, None, &mut pending).is_none());
+        assert!(cover(&r, &f, &world, None, &mut pending, &mut None).is_none());
         // More squares than a covering holds: drawn straight too, not left blank.
         let near = frame(12.0, 1.0);
         let huge = near.extent(20_000, 10_000);
         assert!(huge.width() < template::HALF_WORLD);
-        assert!(cover(&r, &near, &huge, None, &mut pending).is_none());
+        assert!(cover(&r, &near, &huge, None, &mut pending, &mut None).is_none());
         for m_per_px in [0.0, f64::NAN, f64::INFINITY] {
-            assert!(cover(&r, &Frame { m_per_px, ..f }, &view, None, &mut pending).is_none());
+            assert!(cover(&r, &Frame { m_per_px, ..f }, &view, None, &mut pending, &mut None).is_none());
         }
-        assert!(cover(&r, &Frame { ppp: f32::NAN, ..f }, &view, None, &mut pending).is_none());
+        assert!(cover(&r, &Frame { ppp: f32::NAN, ..f }, &view, None, &mut pending, &mut None).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

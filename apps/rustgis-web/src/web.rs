@@ -601,7 +601,7 @@ async fn fetch_bytes(
     let mut diagnostics = RequestDiagnostics::with_capture(url, "GET", capture);
     diagnostics.omit_statuses(omit);
     let answer = async {
-        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache, logins};
+        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{address, cache, logins};
         let (promise, abort, range, tail, max, url, bound, authenticated) = crate::request::prepare_and_send(
             &still,
             || async {
@@ -617,6 +617,7 @@ async fn fetch_bytes(
                 let bound = url;
                 let prepared = rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::s3::prepare(logins::inner(url))?;
                 let url = prepared.url.as_str();
+                check_destination(url)?;
                 // An ArcGIS sign-in's token, for the portal and the servers it covers, renewed first when it
                 // is about to expire. It goes as the request's `token` parameter, not a header: ArcGIS's
                 // query endpoints answer the header's CORS preflight with an error.
@@ -631,6 +632,10 @@ async fn fetch_bytes(
                     if prepared.signed { None } else { rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_auth::with_token(login_url) };
                 // Only the request carries credentials: messages and cache keys keep the original address.
                 let request = arcgis.as_deref().unwrap_or(login_url);
+                // URL parsing in a browser can normalize a numeric or escaped hostname. Judge
+                // that actual destination against the already checked, prepared address.
+                let normalized = web_sys::Url::new(request).map_err(|_| "not a valid request address")?;
+                address::check(&normalized.href(), Some(url))?;
                 let authenticated = prepared.signed || arcgis.is_some() || login.is_some();
                 let err = |e: wasm_bindgen::JsValue| {
                     if authenticated { "the browser couldn't process the authenticated request".to_string() } else { format!("{e:?}") }
@@ -662,10 +667,9 @@ async fn fetch_bytes(
                     }
                     init.set_headers(&headers);
                 }
-                // A signed or authorized request goes only where its credentials are for.
-                if authenticated {
-                    init.set_redirect(web_sys::RequestRedirect::Error);
-                }
+                // Fetch hides a manual redirect's Location, so the app cannot check its next
+                // destination. Refuse it instead of letting the browser follow it unchecked.
+                init.set_redirect(if authenticated { web_sys::RequestRedirect::Error } else { web_sys::RequestRedirect::Manual });
                 // A credential-bearing address goes nowhere else: no referrer from it, no cookies with it.
                 if arcgis.is_some() || login.is_some() {
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
@@ -704,6 +708,7 @@ async fn fetch_bytes(
                 .dyn_into()
                 .map_err(err)?;
             diagnostics.answered(resp.status());
+            check_redirect(&resp)?;
             if !resp.ok() {
                 return Err(refused(&resp));
             }
@@ -807,6 +812,7 @@ async fn post_json(
                 let target = logins::inherit(url, &prepared.url);
                 let login = logins::apply(&target).map_err(str::to_string)?;
                 let request = prepared.url.as_str();
+                check_destination(request)?;
                 let err = |e: wasm_bindgen::JsValue| {
                     if login.is_some() { "the browser couldn't process the authenticated request".to_string() } else { format!("{e:?}") }
                 };
@@ -887,6 +893,7 @@ async fn head(
                     return Ok(None);
                 }
                 let url = prepared.url.as_str();
+                check_destination(url)?;
                 let target = logins::inherit(bound, url);
                 let login = logins::apply(&target).map_err(str::to_string)?;
                 let request = login.as_ref().map_or(url, |applied| applied.url.as_str());
@@ -895,6 +902,7 @@ async fn head(
                 };
                 let init = web_sys::RequestInit::new();
                 init.set_method("HEAD");
+                init.set_redirect(if login.is_some() { web_sys::RequestRedirect::Error } else { web_sys::RequestRedirect::Manual });
                 let login_header = login.as_ref().and_then(|applied| applied.header.as_ref());
                 if !prepared.headers.is_empty() || login_header.is_some() {
                     let headers = web_sys::Headers::new().map_err(err)?;
@@ -909,7 +917,6 @@ async fn head(
                     init.set_headers(&headers);
                 }
                 if login.is_some() {
-                    init.set_redirect(web_sys::RequestRedirect::Error);
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
                     init.set_credentials(web_sys::RequestCredentials::Omit);
                 }
@@ -933,6 +940,7 @@ async fn head(
                 .dyn_into()
                 .map_err(err)?;
             diagnostics.answered(resp.status());
+            check_redirect(&resp)?;
             if !resp.ok() {
                 return Err(refused(&resp));
             }
@@ -951,6 +959,23 @@ async fn head(
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)
+}
+
+/// Checks the URL as the browser parses it, before any request or login renewal is sent.
+fn check_destination(url: &str) -> Result<(), String> {
+    use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::address;
+    let normalized = web_sys::Url::new(url).map_err(|_| "not a valid request address")?;
+    address::check(&normalized.href(), Some(url))
+}
+
+/// A manual redirect is an opaque, zero-status response: Fetch exposes no Location to check.
+/// Other zero-status responses are unusable too; none is treated as a successful download.
+fn check_redirect(response: &web_sys::Response) -> Result<(), String> {
+    if response.status() == 0 {
+        Err("The browser cannot verify this redirect's destination. Use the final service address.".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Makes an HTTP request (the AI assistant's calls to its model), returning the response of any

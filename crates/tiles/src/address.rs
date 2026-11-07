@@ -7,8 +7,11 @@
 //! can't make the app probe local services. Link-local addresses, where cloud metadata services
 //! answer, are never fetched.
 //!
-//! Hosts are judged by name or literal address; names are not resolved, so a public name that
-//! resolves to a local address is not caught here.
+//! These spelling checks also run after template expansion. Native fetchers additionally
+//! filter the resolved IPs before connecting: a public document cannot select a local
+//! connection, and no request can connect to a forbidden address. The browser controls its
+//! own DNS and connections; its adapter checks the normalized URL and refuses redirects whose
+//! destinations it cannot inspect.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -21,6 +24,26 @@ pub enum Reach {
     Local,
     /// Never fetched: link-local and unspecified addresses, cloud metadata hosts.
     Forbidden,
+}
+
+/// Where a fetched document actually came from. Runtime only: a document cannot grant
+/// itself a local-network allowance by including a field in its JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Origin {
+    pub(crate) url: String,
+    pub(crate) reach: Reach,
+}
+
+impl Origin {
+    /// Origin for transports without redirects or DNS visibility, such as the browser.
+    pub(crate) fn named(url: &str) -> Self {
+        Self { url: url.to_owned(), reach: reach(crate::logins::inner(url)) }
+    }
+
+    /// Checks a descendant without replacing the document's observed reach with host spelling.
+    pub(crate) fn check(&self, url: &str) -> Result<(), String> {
+        check_reach(url, self.reach)
+    }
 }
 
 /// The host of an HTTP(S) address, without user info, port or IPv6 brackets.
@@ -113,15 +136,19 @@ fn inet_aton(h: &str) -> Option<Ipv4Addr> {
 /// Whether `url` may be fetched. `from` is where it was found (a document, or the address that
 /// redirected to it), or `None` when the user gave it.
 pub fn check(url: &str, from: Option<&str>) -> Result<(), String> {
+    check_reach(url, from.map_or(Reach::Local, |u| reach(crate::logins::inner(u))))
+}
+
+/// Unwraps runtime addresses and applies one inherited reach ceiling through every wrapper.
+fn check_reach(url: &str, ceiling: Reach) -> Result<(), String> {
     crate::logins::check(url).map_err(str::to_string)?;
     if let Some(bound) = rustgis_data::login_address::parse(url).map_err(str::to_string)? {
-        return check(bound.url, from.map(crate::logins::inner));
+        return check_reach(bound.url, ceiling);
     }
-    let from = from.map(crate::logins::inner);
     // An address read through a saved S3 connection is judged by where it is fetched, which its
     // own endpoint decides (no login is needed to keep it).
     if let Some(destination) = crate::s3::bound_destination(url)? {
-        return check(&destination, from);
+        return check_reach(&destination, ceiling);
     }
     // An `s3://` address is judged by the web address it is fetched from.
     // An address read anonymously is judged as the address it marks.
@@ -129,10 +156,10 @@ pub fn check(url: &str, from: Option<&str>) -> Result<(), String> {
         if rustgis_data::s3_address::is_wrapper(inner) {
             return Err("not a saved S3 address".into());
         }
-        return if crate::s3::is_s3(inner) { check(&crate::s3::https_url(url)?, from) } else { check(inner, from) };
+        return if crate::s3::is_s3(inner) { check_reach(&crate::s3::https_url(url)?, ceiling) } else { check_reach(inner, ceiling) };
     }
     if crate::s3::is_s3(url) {
-        return check(&crate::s3::https_url(url)?, from);
+        return check_reach(&crate::s3::https_url(url)?, ceiling);
     }
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("https://") || lower.starts_with("http://")) {
@@ -141,11 +168,9 @@ pub fn check(url: &str, from: Option<&str>) -> Result<(), String> {
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(format!("{url}: the address has spaces in it"));
     }
-    match (reach(url), from) {
-        (Reach::Forbidden, _) => Err(format!("{url}: that address is never fetched")),
-        (Reach::Local, Some(origin)) if reach(origin) == Reach::Public => {
-            Err(format!("{url}: a document on the web can't point into the local network"))
-        }
+    match reach(url) {
+        Reach::Forbidden => Err(format!("{url}: that address is never fetched")),
+        Reach::Local if ceiling == Reach::Public => Err(format!("{url}: a document on the web can't point into the local network")),
         _ => Ok(()),
     }
 }

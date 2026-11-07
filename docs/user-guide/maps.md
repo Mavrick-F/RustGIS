@@ -225,6 +225,18 @@ Ocean, Atlas, Blank), which need no network, and web tile layers over them:
 HTTPS tiles use [platform certificate trust](data.md#https-certificates) on desktop and the
 command line, including private CAs trusted by the operating system. The web app uses the browser.
 
+Tile addresses are checked after filling their placeholders, as well as when a style or
+TileJSON document supplies them. A document on the internet cannot direct tiles into the local
+network. Explicitly selected self-hosted servers remain supported, including ordinary
+hostnames resolved by local DNS. Native fetchers filter the resolved IPs before connecting,
+using the supplying document's actual connection reach. Link-local and unspecified addresses
+are always refused. Document redirects also change the base for relative references.
+Native redirects are checked at each hop. In the web app, use the final service address:
+redirect destinations are hidden from the app and are refused instead of followed unchecked.
+The browser controls DNS resolution and local-network access; the app cannot inspect its
+resolved IPs. Native tile and document requests connect directly, without an environment
+HTTP proxy, so a proxy cannot resolve destinations beyond these checks.
+
 The gallery's **Web Basemaps** need no API key: the OpenFreeMap vector maps (Liberty, Bright,
 Positron, Dark, Fiord) and USGS Imagery. Choosing one replaces the other web basemaps; tick
 **Stack on the current basemaps** above them to add it over the others instead (clicking one

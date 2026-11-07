@@ -52,6 +52,13 @@ pub enum State {
 
 /// Called once with a fetch's bytes or error.
 pub type Done = Box<dyn FnOnce(Result<Vec<u8>, String>) + Send>;
+
+#[derive(Debug)]
+struct Fetched {
+    bytes: Vec<u8>,
+    origin: crate::address::Origin,
+}
+type FetchedDone = Box<dyn FnOnce(Result<Fetched, String>) + Send>;
 /// Called once with a download's bytes or what is known of its failure (#509).
 pub type DoneDetailed = Box<dyn FnOnce(Result<Vec<u8>, Failure>) + Send>;
 // The carrier lives with source I/O so lower-layer workers inherit the same context.
@@ -99,13 +106,15 @@ pub const DROPPED: &str = "dropped: the view moved on";
 pub const NO_RANGES: &str = "the server doesn't answer byte-range requests";
 
 enum Entry {
-    Ready(Arc<Payload>, usize),
+    Ready(Arc<Payload>, usize, Option<crate::address::Origin>),
     Pending,
     Failed(String, Instant),
 }
 
 struct Slot {
     entry: Entry,
+    /// A restrictive request's refusal must not poison a later explicit local request.
+    ceiling: crate::address::Reach,
     used: u64,
     /// When the map last asked for it ([`get`]): a waiting tile not asked for lately is dropped.
     asked: Instant,
@@ -379,7 +388,7 @@ pub fn in_flight() -> usize {
 /// to try again). Every failed fetch is recorded in the asking session's diagnostics: use
 /// [`get_tile`] for a map tile, whose 404 is routine.
 pub fn get(url: &str, want: Want) -> State {
-    request(url, want, &[])
+    request(url, want, &[], None).0
 }
 
 /// Like [`get`], for a map tile: a server's 404 (no tile there) or 410 (no longer there) for it
@@ -389,22 +398,43 @@ pub fn get(url: &str, want: Want) -> State {
 /// a tile (a single-image layer, a layout's picture, a style's sprite sheet) goes through
 /// [`get`], so its 404 is recorded.
 pub fn get_tile(url: &str, want: Want) -> State {
-    request(url, want, TILE_OMIT)
+    get_tile_from(url, want, None)
+}
+
+/// Requests a tile under its supplying document's reach, with routine missing-tile statuses.
+pub(crate) fn get_tile_from(url: &str, want: Want, from: Option<&crate::address::Origin>) -> State {
+    request(url, want, TILE_OMIT, from).0
+}
+
+/// Requests a document-selected asset without granting it an explicit local allowance.
+pub(crate) fn get_from(url: &str, want: Want, from: Option<&crate::address::Origin>) -> State {
+    request(url, want, &[], from).0
+}
+
+/// Returns JSON and its effective origin from the same cache entry and lock acquisition.
+pub(crate) fn document(url: &str, from: Option<&crate::address::Origin>) -> (State, Option<crate::address::Origin>) {
+    request(url, Want::Json, &[], from)
 }
 
 /// The statuses a map tile's request omits ([`get_tile`]).
 const TILE_OMIT: &[u16] = &[404, 410];
 
 /// [`get`] with the statuses that are expected answers for this fetch.
-fn request(url: &str, want: Want, omit: &'static [u16]) -> State {
+fn request(url: &str, want: Want, omit: &'static [u16], from: Option<&crate::address::Origin>) -> (State, Option<crate::address::Origin>) {
     if let Err(e) = crate::logins::check(resource_of(url)) {
-        return State::Failed(e.to_string());
+        return (State::Failed(e.to_string()), None);
     }
     // A map tile of a layer in another system: its service's picture as it comes, or made from
     // its pictures (#769).
     if let Some(base) = crate::warp::direct(url) {
-        return request(base, want, omit);
+        return request(base, want, omit, from);
     }
+    if let Some(from) = from
+        && let Err(e) = from.check(url)
+    {
+        return refused_request(url, e);
+    }
+    let ceiling = from.map_or(crate::address::Reach::Local, |o| o.reach);
     let now = Instant::now();
     let mut c = lock();
     c.tick += 1;
@@ -414,16 +444,23 @@ fn request(url: &str, want: Want, omit: &'static [u16]) -> State {
         slot.used = tick;
         slot.asked = now;
         match &slot.entry {
-            Entry::Ready(p, _) => return State::Ready(p.clone()),
-            Entry::Pending => return State::Pending,
-            Entry::Failed(e, at) if at.elapsed() < retry_wait(e, RETRY) => {
+            Entry::Ready(p, _, origin) => {
+                if origin.as_ref().is_some_and(|o| o.reach > ceiling) {
+                    let message = format!("{url}: a document on the web can't read a cached local-network answer");
+                    drop(c);
+                    return refused_request(url, message);
+                }
+                return (State::Ready(p.clone()), origin.clone());
+            }
+            Entry::Pending => return (State::Pending, None),
+            Entry::Failed(e, at) if ceiling <= slot.ceiling && at.elapsed() < retry_wait(e, RETRY) => {
                 // A server that said when to come back (429 or 503 with `Retry-After`) is asked
                 // again then: the map draws again at that time, though nothing else draws it.
                 // One that didn't is asked again by the next draw after a minute, as before.
                 if let Some(wait) = retry_after(e) {
                     notify_at(*at + wait);
                 }
-                return State::Failed(e.clone());
+                return (State::Failed(e.clone()), None);
             }
             Entry::Failed(..) => {}
         }
@@ -431,40 +468,62 @@ fn request(url: &str, want: Want, omit: &'static [u16]) -> State {
     if crate::warp::is_warp(url) {
         drop(c);
         // Made once its pictures are here; asked again (as the map draws) until then.
-        return match crate::warp::make(url) {
-            crate::warp::Made::Waiting => State::Pending,
-            crate::warp::Made::Done(payload) => {
-                let payload = Arc::new(payload);
-                let n = payload_bytes(&payload);
-                store(url, Entry::Ready(payload.clone(), n));
-                State::Ready(payload)
-            }
-            crate::warp::Made::ForNow(payload) => State::Ready(payload),
-            crate::warp::Made::Failed(e) => {
-                store(url, Entry::Failed(e.clone(), Instant::now()));
-                State::Failed(e)
-            }
-        };
+        return (
+            match crate::warp::make(url, from) {
+                crate::warp::Made::Waiting => State::Pending,
+                crate::warp::Made::Done(payload) => {
+                    let payload = Arc::new(payload);
+                    let n = payload_bytes(&payload);
+                    store_from(
+                        url,
+                        Entry::Ready(payload.clone(), n, Some(crate::address::Origin { url: url.into(), reach: ceiling })),
+                        ceiling,
+                    );
+                    State::Ready(payload)
+                }
+                crate::warp::Made::ForNow(payload) => State::Ready(payload),
+                crate::warp::Made::Failed(e) => {
+                    store_from(url, Entry::Failed(e.clone(), Instant::now()), ceiling);
+                    State::Failed(e)
+                }
+            },
+            None,
+        );
     }
     let asked_at = crate::mbtiles::epoch();
-    c.slots.insert(url.to_string(), Slot { entry: Entry::Pending, used: tick, asked: now });
+    c.slots.insert(url.to_string(), Slot { entry: Entry::Pending, ceiling, used: tick, asked: now });
     drop(c);
-    start(url.to_string(), want, omit, asked_at);
-    State::Pending
+    start(url.to_string(), want, omit, asked_at, ceiling);
+    (State::Pending, None)
+}
+
+/// A cache-policy refusal is a failed request too: record it like a transport refusal,
+/// after releasing the cache lock, so it cannot become unexplained missing tiles.
+fn refused_request(url: &str, message: String) -> (State, Option<crate::address::Origin>) {
+    RequestDiagnostics::new(url, "GET").failed(&Failure::from(message.clone()));
+    (State::Failed(message), None)
 }
 
 /// What the cache holds for `url`, without fetching it.
 pub fn peek(url: &str) -> Option<Arc<Payload>> {
+    peek_from(url, None)
+}
+
+/// A cache-only lookup cannot reuse a local answer for a public document.
+pub(crate) fn peek_from(url: &str, from: Option<&crate::address::Origin>) -> Option<Arc<Payload>> {
     crate::logins::check(resource_of(url)).ok()?;
     if let Some(base) = crate::warp::direct(url) {
-        return peek(base);
+        return peek_from(base, from);
     }
     let mut c = lock();
     c.tick += 1;
     let tick = c.tick;
     let slot = c.slots.get_mut(url)?;
     match &slot.entry {
-        Entry::Ready(p, _) => {
+        Entry::Ready(p, _, origin) => {
+            if from.is_some_and(|f| f.check(url).is_err() || origin.as_ref().is_some_and(|o| o.reach > f.reach)) {
+                return None;
+            }
             slot.used = tick;
             Some(p.clone())
         }
@@ -524,7 +583,7 @@ pub fn forget(url: &str) {
         .iter()
         .filter(|(k, s)| !matches!(s.entry, Entry::Pending) && resource_of(k) == url)
         .map(|(_, s)| match &s.entry {
-            Entry::Ready(_, n) => *n,
+            Entry::Ready(_, n, _) => *n,
             _ => 0,
         })
         .sum();
@@ -594,7 +653,7 @@ pub fn wait_for_news_unless(since: u64, timeout: Duration, stop: impl Fn() -> bo
 
 /// A waiting fetch: its decode kind, diagnostics owner, expected statuses, when it was asked for
 /// ([`land`]) and initiating context.
-type Job = (Want, Capture, &'static [u16], u64, Option<Still>);
+type Job = (Want, Capture, &'static [u16], u64, Option<Still>, crate::address::Reach);
 
 fn queue() -> &'static Mutex<Queue<Job>> {
     static Q: OnceLock<Mutex<Queue<Job>>> = OnceLock::new();
@@ -602,7 +661,7 @@ fn queue() -> &'static Mutex<Queue<Job>> {
 }
 
 /// Asks for a tile: fetched now when its server has room, else it waits its turn.
-fn start(url: String, want: Want, omit: &'static [u16], asked_at: u64) {
+fn start(url: String, want: Want, omit: &'static [u16], asked_at: u64, ceiling: crate::address::Reach) {
     let capture = Capture::current();
     let still = current_still();
     IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
@@ -611,7 +670,7 @@ fn start(url: String, want: Want, omit: &'static [u16], asked_at: u64) {
         let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
         let mut c = lock();
         let latest = c.latest.unwrap_or_else(Instant::now);
-        let now = q.push(url, (want, capture, omit, asked_at, still), |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept);
+        let now = q.push(url, (want, capture, omit, asked_at, still, ceiling), |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept);
         // Under the same lock as the choice: a tile asked for again meanwhile isn't forgotten.
         forget_dropped(&mut c, &swept);
         now
@@ -670,9 +729,9 @@ fn launch(jobs: Vec<Waiting<Job>>) {
             }
             let _lower = Lower;
             while let Some(w) = pop() {
-                let (want, capture, omit, asked_at, still) = w.job;
+                let (want, capture, omit, asked_at, still, ceiling) = w.job;
                 let _scope = capture.enter();
-                with_optional_still(still, || fetch_tile(w.url, w.host, want, omit, asked_at));
+                with_optional_still(still, || fetch_tile(w.url, w.host, want, omit, asked_at, ceiling));
             }
         }
         // A tile queued after the last `pop` and before the flag went down is started here.
@@ -734,10 +793,15 @@ fn land(key: &str, entry: Option<Entry>, asked_at: u64) {
 
 /// Retains the initiating lifetime through deferred decoding. Retired results are forgotten;
 /// only live successes and resource failures are shared with later callers.
-fn fetch_tile(url: String, host: String, want: Want, omit: &'static [u16], asked_at: u64) {
+fn fetch_tile(url: String, host: String, want: Want, omit: &'static [u16], asked_at: u64, ceiling: crate::address::Reach) {
     let owner = current_still();
+    let local = crate::pmtiles::is_tile(&url) || crate::cog::is_tile(&url) || crate::mbtiles::is_tile(&url);
     let answer = Answer { key: url.clone(), host, entry: None, asked_at };
-    let done: Done = Box::new(move |bytes| {
+    let done: FetchedDone = Box::new(move |fetched| {
+        let (bytes, origin) = match fetched {
+            Ok(f) => (Ok(f.bytes), (!local).then_some(f.origin)),
+            Err(e) => (Err(e), None),
+        };
         // Shared archive reads can answer under another loader's narrower lifetime. Retain
         // that floor with this tile's owner before a browser decoder suspends completion.
         let still = with_optional_still(owner, current_still);
@@ -752,7 +816,7 @@ fn fetch_tile(url: String, host: String, want: Want, omit: &'static [u16], asked
                 Ok(_) if check_still(&still).is_err() => return,
                 Ok(p) => {
                     let size = payload_bytes(&p);
-                    Entry::Ready(Arc::new(p), size)
+                    Entry::Ready(Arc::new(p), size, origin)
                 }
                 // The browser's decoder may answer after the initiating owner was retired.
                 Err(e) if !keep_failure(&e, &still) => return,
@@ -769,6 +833,12 @@ fn fetch_tile(url: String, host: String, want: Want, omit: &'static [u16], asked
         let decoder = image_decoder().lock().unwrap_or_else(|e| e.into_inner()).clone();
         decode_with(bytes, want, decoder.as_deref(), settle);
     });
+    if !local {
+        fetch_reached(url, ceiling, done, omit);
+        return;
+    }
+    let origin = crate::address::Origin::named(&url);
+    let done: Done = Box::new(move |r| done(r.map(|bytes| Fetched { bytes, origin })));
     // A tile from a PMTiles archive is read from the archive, by range.
     if crate::pmtiles::is_tile(&url) {
         crate::pmtiles::fetch(&url, done);
@@ -1253,22 +1323,32 @@ pub fn head(url: &str, done: HeadDone) {
 /// A status in `omit` is an expected answer: its failure isn't recorded, only noted once per
 /// server (a tile past a map's edge).
 pub(crate) fn fetch_bytes(url: String, done: Done, omit: &'static [u16]) {
+    fetch_reached(url, crate::address::Reach::Local, Box::new(move |r| done(r.map(|f| f.bytes))), omit);
+}
+
+/// Carries destination policy into the transport and returns provenance with the bytes.
+fn fetch_reached(url: String, ceiling: crate::address::Reach, done: FetchedDone, omit: &'static [u16]) {
     if let Err(e) = check_current() {
         done(Err(e));
         return;
     }
     let still = current_still();
-    let done: Done = Box::new(move |r| with_optional_still(still, || done(r)));
+    let done: FetchedDone = Box::new(move |r| with_optional_still(still, || done(r)));
     if let Err(e) = crate::logins::check(resource_of(&url)) {
         done(Err(e.to_string()));
         return;
     }
     let key = url.clone();
-    let done: Done = Box::new(move |r| done(crate::logins::check(resource_of(&key)).map_err(str::to_string).and(r)));
+    let done: FetchedDone = Box::new(move |r| done(crate::logins::check(resource_of(&key)).map_err(str::to_string).and(r)));
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
     match f {
-        Some(f) => f(url, done, omit),
-        None => native::fetch(url, done, omit),
+        Some(f) => {
+            // Browser redirects are refused; the adapter checks the actual normalized URL.
+            // Custom fetchers must enforce the same destination boundary.
+            let origin = crate::address::Origin::named(&crate::s3::bound_destination(&url).ok().flatten().unwrap_or_else(|| url.clone()));
+            f(url, Box::new(move |r| done(r.map(|bytes| Fetched { bytes, origin }))), omit)
+        }
+        None => native::fetch_reached(url, ceiling, done, omit),
     }
 }
 
@@ -1325,11 +1405,22 @@ fn finished() {
     }
 }
 
+/// Stores an explicitly fetched answer; composed answers use their inherited ceiling.
+#[cfg(test)]
 fn store(url: &str, entry: Entry) {
+    store_from(url, entry, crate::address::Reach::Local);
+}
+
+/// Composed cache entries retain the ceiling their constituent requests used.
+fn store_from(url: &str, entry: Entry, ceiling: crate::address::Reach) {
     if login_gone(url) {
         return;
     }
-    keep(&mut lock(), url, entry);
+    let mut c = lock();
+    keep(&mut c, url, entry);
+    if let Some(slot) = c.slots.get_mut(url) {
+        slot.ceiling = ceiling;
+    }
 }
 
 /// Whether the login `url` was fetched with is gone, in which case nothing of it is kept.
@@ -1338,7 +1429,7 @@ fn login_gone(url: &str) -> bool {
         return false;
     }
     let mut c = lock();
-    if let Some(Slot { entry: Entry::Ready(_, n), .. }) = c.slots.remove(url) {
+    if let Some(Slot { entry: Entry::Ready(_, n, _), .. }) = c.slots.remove(url) {
         c.bytes = c.bytes.saturating_sub(n);
     }
     true
@@ -1346,12 +1437,13 @@ fn login_gone(url: &str) -> bool {
 
 /// [`store`], holding the cache's lock.
 fn keep(c: &mut Cache, url: &str, entry: Entry) {
-    let added = if let Entry::Ready(_, n) = &entry { *n } else { 0 };
+    let added = if let Entry::Ready(_, n, _) = &entry { *n } else { 0 };
     // Dropped while it was fetched (cleared, or evicted): kept anyway, it was asked for.
     let tick = c.tick;
     let asked = c.slots.get(url).map_or_else(Instant::now, |s| s.asked);
-    let old = c.slots.insert(url.to_string(), Slot { entry, used: tick, asked });
-    if let Some(Slot { entry: Entry::Ready(_, n), .. }) = old {
+    let ceiling = c.slots.get(url).map_or(crate::address::Reach::Local, |s| s.ceiling);
+    let old = c.slots.insert(url.to_string(), Slot { entry, ceiling, used: tick, asked });
+    if let Some(Slot { entry: Entry::Ready(_, n, _), .. }) = old {
         c.bytes = c.bytes.saturating_sub(n);
     }
     c.bytes += added;
@@ -1366,7 +1458,7 @@ fn evict(c: &mut Cache) {
         .slots
         .iter()
         .filter_map(|(k, s)| match s.entry {
-            Entry::Ready(_, n) => Some((s.used, k.clone(), n)),
+            Entry::Ready(_, n, _) => Some((s.used, k.clone(), n)),
             Entry::Failed(..) => Some((s.used, k.clone(), 0)),
             Entry::Pending => None,
         })
@@ -1466,7 +1558,8 @@ mod native {
     use std::collections::HashMap;
     use std::sync::{Condvar, Mutex, OnceLock};
 
-    use super::{Capture, DROPPED, Done, DoneDetailed, MAX_BYTES};
+    use super::{Capture, DROPPED, Done, DoneDetailed, Fetched, FetchedDone, MAX_BYTES};
+    use crate::address::{Origin, Reach};
     use crate::failure::{Failure, Reason};
 
     /// Fetches under way at once, over all servers: two servers at their cap.
@@ -1482,7 +1575,7 @@ mod native {
     struct Jobs {
         /// Waiting, oldest first: the address, its server, callback, initiating owner, and the statuses
         /// whose failures the caller expects.
-        waiting: Vec<(String, String, Done, Capture, &'static [u16], Option<super::Still>)>,
+        waiting: Vec<(String, String, FetchedDone, Capture, &'static [u16], Option<super::Still>, Reach)>,
         /// Fetches under way, by server.
         active: HashMap<String, usize>,
     }
@@ -1545,19 +1638,25 @@ mod native {
     /// Marks a queued job as a local file read.
     const LOCAL: &str = "local-file:";
 
+    /// Queues an explicitly selected address, keeping the byte-only public callback stable.
     pub(super) fn fetch(url: String, done: Done, omit: &'static [u16]) {
+        fetch_reached(url, Reach::Local, Box::new(move |r| done(r.map(|f| f.bytes))), omit);
+    }
+
+    /// Keeps the destination ceiling with queued work; the web build requires its own fetcher.
+    pub(super) fn fetch_reached(url: String, ceiling: Reach, done: FetchedDone, omit: &'static [u16]) {
         let capture = Capture::current();
         let q = queue();
         let dropped = {
             let mut jobs = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
             let host = host(&url);
-            jobs.waiting.push((url, host, done, capture, omit, super::current_still()));
+            jobs.waiting.push((url, host, done, capture, omit, super::current_still(), ceiling));
             (jobs.waiting.len() > QUEUE).then(|| jobs.waiting.remove(0))
         };
         // Every worker may be waiting for a server at its cap, and only some can take this one.
         q.ready.notify_all();
         // Answered once the queue is unlocked: `done` takes the cache's lock and wakes the app.
-        if let Some((_, _, done, _, _, _)) = dropped {
+        if let Some((_, _, done, _, _, _, _)) = dropped {
             done(Err(DROPPED.into()));
         }
     }
@@ -1571,18 +1670,21 @@ mod native {
             .http_status_as_error(false)
             .timeout_global(Some(timeout))
             .user_agent(USER_AGENT)
+            // A proxy could resolve the target itself, past the checked resolver.
+            .proxy(None)
             // Redirects are followed by `get`, which checks where each one leads.
             .max_redirects(0)
     }
 
+    /// Workers share this agent's checked connections and bounded idle pool.
     pub(super) fn agent() -> ureq::Agent {
-        config_builder(std::time::Duration::from_secs(30))
+        let config = config_builder(std::time::Duration::from_secs(30))
             // The workers share the agent: keep a connection open for each fetch a server
             // may have under way, so the next tile doesn't connect again.
             .max_idle_connections_per_host(PER_HOST)
             .max_idle_connections(WORKERS)
-            .build()
-            .into()
+            .build();
+        checked_agent(config, ureq::unversioned::resolver::DefaultResolver::default(), false)
     }
 
     /// The agent the workers share, and with it their open connections.
@@ -1593,42 +1695,185 @@ mod native {
 
     /// An agent for downloads, which may take minutes.
     pub(super) fn download_agent(timeout: std::time::Duration) -> ureq::Agent {
-        config_builder(timeout).build().into()
+        checked_agent(config_builder(timeout).build(), ureq::unversioned::resolver::DefaultResolver::default(), false)
     }
 
-    /// Resolves names as ureq does, keeping only the internet addresses (checked where the
-    /// connection is made, so a name that resolves elsewhere on another lookup is caught too).
-    #[derive(Debug, Default)]
-    struct PublicOnly(ureq::unversioned::resolver::DefaultResolver);
+    /// Applies the same IP boundary to every native connection, including a new lookup after
+    /// DNS changes. Document requests keep their inherited public or local ceiling,
+    /// and forbidden addresses never leave the resolver. Plugin/POST agents narrow
+    /// this further to internet addresses only.
+    #[derive(Debug)]
+    struct CheckedResolver<R> {
+        inner: R,
+        public_only: bool,
+    }
 
-    impl ureq::unversioned::resolver::Resolver for PublicOnly {
+    impl<R: ureq::unversioned::resolver::Resolver> ureq::unversioned::resolver::Resolver for CheckedResolver<R> {
+        /// Filters the exact socket addresses passed to the connector, without a second lookup.
         fn resolve(
             &self,
             uri: &ureq::http::Uri,
             config: &ureq::config::Config,
             timeout: ureq::unversioned::transport::NextTimeout,
         ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
-            let all = self.0.resolve(uri, config, timeout)?;
+            let url = uri.to_string();
+            crate::address::check(&url, None).map_err(|e| ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)))?;
+            let ceiling = if self.public_only { Reach::Public } else { Reach::Local };
+            let all = self.inner.resolve(uri, config, timeout)?;
+            let ceiling = if all.iter().any(|a| crate::address::ip_reach(a.ip()) == Reach::Public) { Reach::Public } else { ceiling };
             let mut kept = self.empty();
-            for a in all.iter().filter(|a| crate::address::ip_reach(a.ip()) == crate::address::Reach::Public) {
+            for a in all.iter().filter(|a| {
+                let reach = crate::address::ip_reach(a.ip());
+                reach != crate::address::Reach::Forbidden && ceiling != crate::address::Reach::Forbidden && reach <= ceiling
+            }) {
                 kept.push(*a);
             }
             if kept.is_empty() {
                 let host = uri.host().unwrap_or_default();
-                let msg = format!("{host} resolves to this computer or the local network, which isn't fetched from here");
+                let msg =
+                    format!("{host} resolves to this computer or the local network, or a forbidden address, which isn't fetched from here");
                 return Err(ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg)));
             }
             Ok(kept)
         }
     }
 
+    thread_local! {
+        static SENT_TO: std::cell::Cell<Option<Reach>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Reads the reach of this synchronous request, including a pooled connection. This is
+    /// observed provenance, never an ambient permission; each agent has a fixed IP ceiling.
+    fn connected<T>(f: impl FnOnce() -> Result<T, ureq::Error>) -> Result<(T, Reach), ureq::Error> {
+        struct Restore(Option<Reach>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SENT_TO.with(|r| r.set(self.0));
+            }
+        }
+        let _restore = Restore(SENT_TO.with(|r| r.replace(None)));
+        f().map(|v| (v, SENT_TO.with(|r| r.get()).unwrap_or(Reach::Public)))
+    }
+
+    #[derive(Debug, Default)]
+    struct ReachConnector<C = ureq::unversioned::transport::DefaultConnector>(C);
+
+    impl<C: ureq::unversioned::transport::Connector<(), Out = Box<dyn ureq::unversioned::transport::Transport>>>
+        ureq::unversioned::transport::Connector<()> for ReachConnector<C>
+    {
+        type Out = Box<dyn ureq::unversioned::transport::Transport>;
+        fn connect(
+            &self,
+            details: &ureq::unversioned::transport::ConnectionDetails,
+            chained: Option<()>,
+        ) -> Result<Option<Self::Out>, ureq::Error> {
+            let reach = details.addrs.first().map_or(Reach::Public, |a| crate::address::ip_reach(a.ip()));
+            Ok(self.0.connect(details, chained)?.map(|inner| Box::new(ReachedTransport { inner, reach }) as Self::Out))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReachedTransport {
+        inner: Box<dyn ureq::unversioned::transport::Transport>,
+        reach: Reach,
+    }
+
+    impl ureq::unversioned::transport::Transport for ReachedTransport {
+        fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+            self.inner.buffers()
+        }
+        fn transmit_output(&mut self, amount: usize, timeout: ureq::unversioned::transport::NextTimeout) -> Result<(), ureq::Error> {
+            self.inner.transmit_output(amount, timeout)?;
+            SENT_TO.with(|r| r.set(Some(self.reach)));
+            Ok(())
+        }
+        fn await_input(&mut self, timeout: ureq::unversioned::transport::NextTimeout) -> Result<bool, ureq::Error> {
+            self.inner.await_input(timeout)
+        }
+        fn is_open(&mut self) -> bool {
+            self.inner.is_open()
+        }
+        fn is_tls(&self) -> bool {
+            self.inner.is_tls()
+        }
+    }
+
+    /// Public-document requests cannot reuse an explicitly local connection from another pool.
+    fn shared_public_agent() -> &'static ureq::Agent {
+        static A: OnceLock<ureq::Agent> = OnceLock::new();
+        A.get_or_init(|| public_agent(std::time::Duration::from_secs(30)))
+    }
+
+    /// Builds the ordinary and internet-only agents through one connection boundary. The
+    /// supplied resolver also lets controlled fixtures exercise DNS changes without network DNS.
+    pub(super) fn checked_agent(
+        config: ureq::config::Config,
+        resolver: impl ureq::unversioned::resolver::Resolver,
+        public_only: bool,
+    ) -> ureq::Agent {
+        ureq::Agent::with_parts(
+            config,
+            ReachConnector::<ureq::unversioned::transport::DefaultConnector>::default(),
+            CheckedResolver { inner: resolver, public_only },
+        )
+    }
+
+    #[cfg(test)]
+    /// Exercises classified DNS and real HTTP while routing every connection to an owned listener.
+    pub(super) fn fixture_agent(answer: std::net::SocketAddr, listener: std::net::SocketAddr, public_only: bool) -> ureq::Agent {
+        use ureq::unversioned::{
+            resolver::Resolver,
+            transport::{ConnectionDetails, Connector, DefaultConnector, Transport},
+        };
+        #[derive(Debug)]
+        struct Dns(std::net::SocketAddr);
+        impl Resolver for Dns {
+            fn resolve(
+                &self,
+                uri: &ureq::http::Uri,
+                _: &ureq::config::Config,
+                _: ureq::unversioned::transport::NextTimeout,
+            ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+                let mut addresses = self.empty();
+                let literal = uri.host().and_then(|h| h.parse::<std::net::IpAddr>().ok());
+                addresses.push(literal.map_or(self.0, |ip| std::net::SocketAddr::new(ip, uri.port_u16().unwrap_or(80))));
+                Ok(addresses)
+            }
+        }
+        #[derive(Debug)]
+        struct Route(std::net::SocketAddr);
+        impl Connector<()> for Route {
+            type Out = Box<dyn Transport>;
+            fn connect(&self, d: &ConnectionDetails, _: Option<()>) -> Result<Option<Self::Out>, ureq::Error> {
+                let mut addrs = d.addrs.clone();
+                for address in addrs.iter_mut() {
+                    *address = self.0;
+                }
+                let fixture = ConnectionDetails {
+                    uri: d.uri,
+                    addrs,
+                    config: d.config,
+                    request_level: d.request_level,
+                    resolver: d.resolver,
+                    now: d.now,
+                    timeout: d.timeout,
+                    current_time: d.current_time.clone(),
+                    run_connector: d.run_connector.clone(),
+                    register_shutdown: d.register_shutdown.clone(),
+                };
+                DefaultConnector::default().connect(&fixture, None)
+            }
+        }
+        ureq::Agent::with_parts(
+            config_builder(std::time::Duration::from_secs(2)).build(),
+            ReachConnector(Route(listener)),
+            CheckedResolver { inner: Dns(answer), public_only },
+        )
+    }
+
     /// A download agent that connects only to internet addresses.
     pub(super) fn public_agent(timeout: std::time::Duration) -> ureq::Agent {
-        let config = config_builder(timeout)
-            // A proxy would resolve the address itself, past `PublicOnly`.
-            .proxy(None)
-            .build();
-        ureq::Agent::with_parts(config, ureq::unversioned::transport::DefaultConnector::default(), PublicOnly::default())
+        checked_agent(config_builder(timeout).build(), ureq::unversioned::resolver::DefaultResolver::default(), true)
     }
 
     /// Asks for an address's headers on a thread of its own.
@@ -1664,18 +1909,21 @@ mod native {
         let answer = (|| -> Result<super::Head, Failure> {
             crate::logins::check(url).map_err(str::to_string)?;
             let prepared = crate::s3::prepare(crate::logins::inner(url))?;
+            crate::address::check(&prepared.url, None)?;
             if prepared.signed {
                 return Ok(super::Head::default());
             }
             let mut at = prepared.url.clone();
             let first_origin = crate::logins::origin(&at);
             let mut same_origin = true;
+            let mut ceiling = Reach::Local;
             for redirects in 0..=5 {
                 // The login goes to its own origin only: once a redirect leaves it, never again.
                 let bound = crate::logins::inherit(url, &at);
                 let login = if same_origin { crate::logins::apply(&bound)? } else { None };
                 carried_login |= login.is_some();
-                let mut req = agent.head(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
+                let sending = if ceiling == Reach::Public { shared_public_agent() } else { agent };
+                let mut req = sending.head(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
                 if let Some((name, value)) = login.as_ref().and_then(|a| a.header.as_ref()) {
                     req = req.header(name.as_str(), value.as_str());
                 }
@@ -1686,12 +1934,14 @@ mod native {
                 }
                 diagnostics.sending();
                 super::check_current()?;
-                let resp = req.call().map_err(unanswered)?;
+                let req = req.config().timeout_global(agent.config().timeouts().global).build();
+                let (resp, reached) = connected(|| req.call()).map_err(unanswered)?;
+                ceiling = ceiling.min(reached);
                 diagnostics.answered(resp.status().as_u16());
                 let header = |k: &str| resp.headers().get(k).and_then(|v| v.to_str().ok());
                 if resp.status().is_redirection() {
                     let next = crate::template::join(&at, header("location").ok_or("a redirect with no Location")?);
-                    crate::address::check(&next, Some(&at))?;
+                    Origin { url: at.clone(), reach: ceiling }.check(&next)?;
                     if at.starts_with("https://") && !next.starts_with("https://") {
                         return Err(format!("{next}: a redirect from https to http").into());
                     }
@@ -1811,18 +2061,19 @@ mod native {
         });
     }
 
+    /// Dispatches each queued read through the pool matching its inherited IP ceiling.
     fn work() {
         let agent = shared_agent();
         let q = queue();
         loop {
-            let (url, done, host, capture, omit, still) = {
+            let (url, done, host, capture, omit, still, ceiling) = {
                 let mut jobs = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
-                    let hosts: Vec<&str> = jobs.waiting.iter().map(|(_, h, _, _, _, _)| h.as_str()).collect();
+                    let hosts: Vec<&str> = jobs.waiting.iter().map(|(_, h, _, _, _, _, _)| h.as_str()).collect();
                     if let Some(i) = pick(&hosts, &jobs.active) {
-                        let (url, host, done, capture, omit, still) = jobs.waiting.remove(i);
+                        let (url, host, done, capture, omit, still, ceiling) = jobs.waiting.remove(i);
                         *jobs.active.entry(host.clone()).or_insert(0) += 1;
-                        break (url, done, host, capture, omit, still);
+                        break (url, done, host, capture, omit, still, ceiling);
                     }
                     jobs = q.ready.wait(jobs).unwrap_or_else(|e| e.into_inner());
                 }
@@ -1830,7 +2081,8 @@ mod native {
             let _scope = capture.enter();
             let result = super::with_optional_still(still.clone(), || {
                 super::check_current()?;
-                get(agent, &url, omit)
+                fetch_answer(if ceiling == Reach::Public { shared_public_agent() } else { agent }, &url, ceiling, false, omit)
+                    .map_err(|f| f.message)
             });
             {
                 let mut jobs = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1847,11 +2099,11 @@ mod native {
         }
     }
 
-    /// Fetches `url`, following up to 5 redirects. `url` itself passed `address::check` when
-    /// it was made (the layer's address, or one its style or TileJSON chose, checked in
-    /// `source::resolve`); each redirect is checked here.
+    /// Fetches `url`, following up to 5 redirects. Checks the final network destination here,
+    /// even when the address was already checked before expansion or signing; every redirect
+    /// and every resolved connection is checked too.
     pub(super) fn get(agent: &ureq::Agent, url: &str, omit: &'static [u16]) -> Result<Vec<u8>, String> {
-        fetch_answer(agent, url, false, omit).map_err(|f| f.message)
+        fetch_answer(agent, url, Reach::Local, false, omit).map(|f| f.bytes).map_err(|f| f.message)
     }
 
     /// The User-Agent every request goes with.
@@ -1899,7 +2151,7 @@ mod native {
 
     /// [`get_detailed`], a status in `omit` not recorded as a failure.
     pub(super) fn get_detailed_omitting(agent: &ureq::Agent, url: &str, omit: &'static [u16]) -> Result<Vec<u8>, Failure> {
-        fetch_answer(agent, url, true, omit).map_err(|f| Failure {
+        fetch_answer(agent, url, Reach::Local, true, omit).map(|f| f.bytes).map_err(|f| Failure {
             url: if url.contains(rustgis_data::login_address::PREFIX) { crate::logins::scrub_error(url) } else { url.to_string() },
             ..f
         })
@@ -1917,22 +2169,30 @@ mod native {
     /// `omit` is an expected answer: its failure isn't recorded, only noted once per server. A
     /// request carrying a login is recorded by its plain address and scrubbed text only
     /// ([`RequestDiagnostics::failed`]).
-    fn fetch_answer(agent: &ureq::Agent, url: &str, detail: bool, omit: &'static [u16]) -> Result<Vec<u8>, Failure> {
+    pub(super) fn fetch_answer(
+        agent: &ureq::Agent,
+        url: &str,
+        initial: Reach,
+        detail: bool,
+        omit: &'static [u16],
+    ) -> Result<Fetched, Failure> {
         use std::io::Read;
         let mut carried_login = false;
         // Local file failures are not network traffic.
         let local = crate::mbtiles::is_tile(url) || url.starts_with(LOCAL);
         let mut diagnostics = super::RequestDiagnostics::new(url, "GET");
         diagnostics.omit_statuses(omit);
-        let answer = (|| -> Result<Vec<u8>, Failure> {
+        let answer = (|| -> Result<Fetched, Failure> {
             super::check_current()?;
             if crate::mbtiles::is_tile(url) {
-                return crate::mbtiles::read_local(url).map_err(Failure::from);
+                return crate::mbtiles::read_local(url).map(|bytes| Fetched { bytes, origin: Origin::named(url) }).map_err(Failure::from);
             }
             if let Some(local) = url.strip_prefix(LOCAL) {
                 let (path, range) = super::split_range(local);
                 let (a, b) = range.ok_or("a local read without a range")?;
-                return crate::pmtiles::read_file(path, a, b - a + 1).map_err(Failure::from);
+                return crate::pmtiles::read_file(path, a, b - a + 1)
+                    .map(|bytes| Fetched { bytes, origin: Origin::named(url) })
+                    .map_err(Failure::from);
             }
             let (url, limit) = super::split_download_limit(url);
             let max = limit.unwrap_or(MAX_BYTES);
@@ -1944,7 +2204,9 @@ mod native {
             // endpoint is signed.
             crate::logins::check(url)?;
             let prepared = crate::s3::prepare(crate::logins::inner(url))?;
+            Origin { url: prepared.url.clone(), reach: initial }.check(&prepared.url)?;
             let mut at = prepared.url.clone();
+            let mut ceiling = initial;
             let first_origin = crate::logins::origin(&at);
             let mut same_origin = true;
             let mut redirects = 0;
@@ -1953,7 +2215,8 @@ mod native {
                 let bound = crate::logins::inherit(url, &at);
                 let login = if !prepared.signed && same_origin { crate::logins::apply(&bound)? } else { None };
                 carried_login |= login.is_some();
-                let mut req = agent.get(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
+                let sending = if ceiling == Reach::Public && initial != Reach::Public { shared_public_agent() } else { agent };
+                let mut req = sending.get(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
                 if let Some((name, value)) = login.as_ref().and_then(|a| a.header.as_ref()) {
                     req = req.header(name.as_str(), value.as_str());
                 }
@@ -1988,7 +2251,10 @@ mod native {
                 }
                 diagnostics.sending();
                 super::check_current()?;
-                let mut resp = req.call().map_err(unanswered)?;
+                // Narrowing the connection pool must retain the caller's download timeout.
+                let req = req.config().timeout_global(agent.config().timeouts().global).build();
+                let (mut resp, reached) = connected(|| req.call()).map_err(unanswered)?;
+                ceiling = ceiling.min(reached);
                 let status = resp.status().as_u16();
                 diagnostics.answered(status);
                 // A data host refusing the request (or the token): say what to do.
@@ -2050,7 +2316,7 @@ mod native {
                     return Err(Failure::without_answer("", crate::earthdata::refused_message(url), Reason::Status(401)));
                 }
                 // Where a redirect leads is the server's choice, not the user's.
-                crate::address::check(&next, Some(&at))?;
+                Origin { url: at.clone(), reach: ceiling }.check(&next)?;
                 // Never from HTTPS down to plain HTTP.
                 if at.starts_with("https://") && !next.starts_with("https://") {
                     return Err(format!("{next}: a redirect from https to http").into());
@@ -2062,8 +2328,9 @@ mod native {
                 same_origin &= crate::logins::origin(&next) == first_origin;
                 at = next;
             };
+            let origin = Origin { url: if same_origin { crate::logins::inherit(url, &at) } else { at }, reach: ceiling };
             if resp.status().as_u16() == 204 {
-                return Ok(Vec::new());
+                return Ok(Fetched { bytes: Vec::new(), origin });
             }
             // A range asked for and the whole file answered (200): fine for a range from the start
             // that holds the whole file (a small archive's header read), cut to the range; otherwise
@@ -2096,7 +2363,7 @@ mod native {
                 if buf.len() > max {
                     return Err(format!("larger than {max} bytes").into());
                 }
-                return Ok(buf);
+                return Ok(Fetched { bytes: buf, origin });
             }
             // ureq limits the wire bytes; `take` also caps the decoded bytes when gzip expands them.
             resp.body_mut()
@@ -2115,7 +2382,7 @@ mod native {
                 }
                 buf.truncate(usize::try_from(b - a + 1).unwrap_or(usize::MAX));
             }
-            Ok(buf)
+            Ok(Fetched { bytes: buf, origin })
         })();
         let result = if local { answer } else { diagnostics.record(answer) };
         let result = crate::logins::check(super::resource_of(url)).map_err(Failure::from).and(result);
@@ -2132,6 +2399,11 @@ mod native {
 #[cfg(target_arch = "wasm32")]
 mod native {
     use super::{Done, DoneDetailed};
+
+    /// Keeps the destination ceiling with queued work; the web build requires its own fetcher.
+    pub(super) fn fetch_reached(url: String, _ceiling: crate::address::Reach, done: super::FetchedDone, _omit: &'static [u16]) {
+        done(Err(format!("{url}: this build has no way to fetch tiles")));
+    }
 
     pub(super) fn fetch(url: String, done: Done, _omit: &'static [u16]) {
         done(Err(format!("{url}: this build has no way to fetch tiles")));
@@ -2189,7 +2461,9 @@ mod tests {
         let key = crate::mbtiles::template(&archive(0)).replace("{z}", "0").replace("{x}", "0").replace("{y}", "0");
         let failed = |why: &str| Some(Entry::Failed(why.into(), Instant::now()));
         let old = crate::mbtiles::epoch();
-        lock().slots.insert(key.clone(), Slot { entry: Entry::Pending, used: 0, asked: Instant::now() });
+        lock()
+            .slots
+            .insert(key.clone(), Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, used: 0, asked: Instant::now() });
         for i in 0..=crate::mbtiles::MAX_FORGOTTEN {
             crate::mbtiles::forget_archive(&archive(i));
         }
@@ -2213,7 +2487,15 @@ mod tests {
         let archive = "/maps#cube=1.mbtiles";
         let key = crate::mbtiles::template(archive).replace("{z}", "0").replace("{x}", "0").replace("{y}", "0");
         let old = crate::mbtiles::epoch();
-        lock().slots.insert(key.clone(), Slot { entry: Entry::Failed("old file".into(), Instant::now()), used: 0, asked: Instant::now() });
+        lock().slots.insert(
+            key.clone(),
+            Slot {
+                entry: Entry::Failed("old file".into(), Instant::now()),
+                ceiling: crate::address::Reach::Local,
+                used: 0,
+                asked: Instant::now(),
+            },
+        );
         forget(archive);
         assert!(!lock().slots.contains_key(&key));
         assert!(crate::mbtiles::forgotten_since(&key, old), "the file is recorded under the path its tiles name");
@@ -2236,7 +2518,9 @@ mod tests {
         };
 
         let old = crate::mbtiles::epoch();
-        lock().slots.insert(key.clone(), Slot { entry: Entry::Pending, used: 0, asked: Instant::now() });
+        lock()
+            .slots
+            .insert(key.clone(), Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, used: 0, asked: Instant::now() });
         forget(archive);
         land(&key, failed("old file"), old);
         assert_eq!(kept(), None);
@@ -2250,7 +2534,9 @@ mod tests {
 
         // Or the old one lands while the new one is pending: the new one's answer is what stays.
         let new = crate::mbtiles::epoch();
-        lock().slots.insert(key.clone(), Slot { entry: Entry::Pending, used: 0, asked: Instant::now() });
+        lock()
+            .slots
+            .insert(key.clone(), Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, used: 0, asked: Instant::now() });
         land(&key, failed("old file"), old);
         assert!(matches!(lock().slots.get(&key), Some(Slot { entry: Entry::Pending, .. })), "the new read's slot stays");
         land(&key, None, old);
@@ -3163,7 +3449,7 @@ mod tests {
         assert!(requests[0].contains("x-key: a\r\n"));
         assert!(requests[1].contains("x-key: b\r\n"));
         assert!(!requests[2].contains("x-key:"));
-        store(&ua, Entry::Ready(Arc::new(Payload::Json(serde_json::json!({"a": 1}))), 64));
+        store(&ua, Entry::Ready(Arc::new(Payload::Json(serde_json::json!({"a": 1}))), 64, None));
         assert!(peek(&ua).is_some());
         assert!(peek(&ub).is_none() && peek(&raw).is_none());
         assert!(logins::deactivate(&a));
@@ -3208,7 +3494,7 @@ mod tests {
         assert_ne!(url, replacement_url);
         release_tx.send(()).unwrap();
         assert!(worker.join().unwrap().is_err());
-        store(&url, Entry::Ready(Arc::new(Payload::Json(serde_json::json!({"old": true}))), 64));
+        store(&url, Entry::Ready(Arc::new(Payload::Json(serde_json::json!({"old": true}))), 64, None));
         assert!(peek(&url).is_none());
         assert!(matches!(get(&url, Want::Json), State::Failed(_)));
         assert!(peek(&replacement_url).is_none());
@@ -3275,7 +3561,7 @@ mod tests {
         let mut resolved = None;
         for _ in 0..200 {
             for (address, json, len) in &documents {
-                store(address, Entry::Ready(Arc::new(Payload::Json(json.clone())), *len));
+                store(address, Entry::Ready(Arc::new(Payload::Json(json.clone())), *len, None));
             }
             if let source::Resolve::Ready(r) = source::resolve(&spec) {
                 resolved = Some(r);
@@ -3428,6 +3714,176 @@ mod tests {
         // Too many.
         let base = serve((0..7).map(|_| redirect("/again")).collect());
         assert!(native::get(&agent, &format!("{base}/x"), &[]).unwrap_err().contains("too many"));
+    }
+
+    /// A redirected style/TileJSON must use its effective public origin, including from
+    /// cache. The fixture routes synthetic public IPs only to its own loopback listener.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn redirected_documents_cannot_keep_a_local_allowance() {
+        let _turn = turn();
+        use crate::{
+            address::Reach,
+            source::{Kind, Resolve, Spec},
+        };
+        for kind in [Kind::Style, Kind::Vector] {
+            let tiles = "http://{switch:127.0.0.1}/redirected-document/{z}/{x}/{y}";
+            let doc = if kind == Kind::Style {
+                serde_json::json!({"version": 8, "sources": {
+                    "bad": {"type":"vector", "tiles":[tiles]},
+                    "relative": {"type":"vector", "tiles":["tiles/{z}/{x}/{y}"]}
+                }, "layers":[{"id":"bad", "type":"fill", "source":"bad", "source-layer":"l"}]})
+            } else {
+                serde_json::json!({"tiles":[tiles]})
+            };
+            let destination = "http://document.public.example/final/style.json";
+            let base = serve(vec![
+                format!("HTTP/1.1 302 Found\r\nLocation: {destination}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{doc}", doc.to_string().len()),
+            ]);
+            let listener = base.strip_prefix("http://").unwrap().parse().unwrap();
+            let agent = native::fixture_agent("203.0.113.1:80".parse().unwrap(), listener, false);
+            let asked = format!("{base}/original.json");
+            let fetched = native::fetch_answer(&agent, &asked, Reach::Local, false, &[]).unwrap();
+            assert_eq!((&*fetched.origin.url, fetched.origin.reach), (destination, Reach::Public));
+            let payload = decode(&fetched.bytes, Want::Json).unwrap();
+            store(&asked, Entry::Ready(Arc::new(payload), 1024, Some(fetched.origin)));
+            let spec = Spec {
+                kind,
+                url: asked,
+                subdomains: Vec::new(),
+                min_zoom: 0,
+                max_zoom: 14,
+                tile_size: 256,
+                tms: false,
+                attribution: String::new(),
+                layers: Vec::new(),
+                style_layers: String::new(),
+                hidden_layers: Vec::new(),
+            };
+            let Resolve::Ready(resolved) = crate::source::resolve(&spec) else { panic!("the cached document must resolve") };
+            if kind == Kind::Style {
+                let relative = resolved.style.sources.iter().find(|(id, _)| id == "relative").unwrap();
+                assert!(
+                    matches!(&relative.1, crate::style::Source::Vector { tiles, .. } if tiles == &["http://document.public.example/final/tiles/{z}/{x}/{y}"])
+                );
+            }
+            let sent = Arc::new(AtomicUsize::new(0));
+            let observed = sent.clone();
+            set_fetcher(move |_, done| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                done(Ok(Vec::new()));
+            });
+            let mut picture = Pixmap::new(64, 64).unwrap();
+            let drawn = crate::draw::draw(&mut picture, &spec, 1.0, &crate::draw::tests::world_frame(), true);
+            assert!(drawn.error.as_deref().is_some_and(|e| e.contains("local network")), "{:?}", drawn.error);
+            assert_eq!(sent.load(Ordering::SeqCst), 0, "the redirected document must send no local tiles");
+            clear_fetcher();
+        }
+        // Resolved forbidden IPs never reach even the fixture connector. A regression can
+        // only contact this test's own listener, not a real metadata or local service.
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        for ip in ["169.254.169.254:80", "0.0.0.0:80", "[fe80::1]:80", "[::]:80"] {
+            let agent = native::fixture_agent(ip.parse().unwrap(), target.local_addr().unwrap(), false);
+            assert!(native::get(&agent, "http://blocked.example/", &[]).unwrap_err().contains("resolves to"));
+        }
+        assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    /// A previously explicit local tile cannot silently stand in for a public document's
+    /// request for the same hostname. The denial is retained in the session diagnostics.
+    #[test]
+    fn cached_destinations_report_a_local_answer_refusal() {
+        let _turn = turn();
+        let url = "http://cached-local-destination.example/tile.png";
+        let origin = crate::address::Origin { url: url.into(), reach: crate::address::Reach::Local };
+        store(url, Entry::Ready(Arc::new(Payload::Empty), 64, Some(origin)));
+        let from = crate::address::Origin::named("https://public-document.example/style.json");
+        let history = rustgis_data::diagnostics::History::default();
+        let _scope = history.enter();
+        assert!(matches!(get_tile_from(url, Want::Image, Some(&from)), State::Failed(_)));
+        assert_eq!(network_records(&history, url).len(), 1, "cached destination refusal must be reported");
+    }
+
+    /// A public style's WMS composite must not regain a local allowance for its parts or
+    /// reuse a composite made explicitly from local answers. Cache seeding performs no I/O.
+    #[test]
+    fn warped_destinations_keep_the_document_boundary() {
+        let _turn = turn();
+        let url = "http://warped-local-destination.example/wms#rustgis-warp=0/0/0;crs=4326;map=east";
+        let (base, (z, x, y), warp) = rustgis_data::ogc::warp::Warp::parse(url).unwrap();
+        let extent = crate::template::TileId { z, x, y }.extent();
+        let transformer = crate::warp::transformer(warp.epsg).unwrap();
+        let plan = warp.plan(base, [extent.min_x, extent.min_y, extent.max_x, extent.max_y], 256, &transformer);
+        assert!(!plan.parts.is_empty(), "the fixture must require source pictures");
+        for part in plan.parts {
+            let origin = crate::address::Origin { url: part.url.clone(), reach: crate::address::Reach::Local };
+            store(&part.url, Entry::Ready(Arc::new(Payload::Image(Pixmap::new(1, 1).unwrap())), 4, Some(origin)));
+        }
+        let from = crate::address::Origin::named("https://public-document.example/style.json");
+        assert!(matches!(get_tile_from(url, Want::Image, Some(&from)), State::Failed(_)), "composition must inherit public reach");
+        assert!(matches!(get_tile(url, Want::Image), State::Ready(_)), "explicit local composition still works");
+        assert!(matches!(get_tile_from(url, Want::Image, Some(&from)), State::Failed(_)), "a cached local composite stays local");
+    }
+
+    /// Replaces only the fixture's public DNS names; all connections, if a check regresses,
+    /// can reach only the listener this test just created.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[derive(Debug)]
+    struct LocalAnswer(std::net::SocketAddr);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl ureq::unversioned::resolver::Resolver for LocalAnswer {
+        fn resolve(
+            &self,
+            uri: &ureq::http::Uri,
+            config: &ureq::config::Config,
+            timeout: ureq::unversioned::transport::NextTimeout,
+        ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+            if uri.host().is_some_and(|host| host.ends_with(".example")) {
+                let mut answer = self.empty();
+                answer.push(self.0);
+                Ok(answer)
+            } else {
+                ureq::unversioned::resolver::DefaultResolver::default().resolve(uri, config, timeout)
+            }
+        }
+    }
+
+    /// GET, HEAD and downloads use the same checked resolver and recheck redirected names.
+    /// A refusal must occur before connecting, not after a response or timeout.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_destinations_filter_dns_before_connecting() {
+        let _turn = turn();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let answer = target.local_addr().unwrap();
+        let public = format!("http://destinations.example:{}/tile", answer.port());
+        for config in [native::agent().config().clone(), native::download_agent(std::time::Duration::from_secs(1)).config().clone()] {
+            assert!(config.proxy().is_none(), "a proxy must not bypass checked DNS");
+            let agent = native::checked_agent(config, LocalAnswer(answer), true);
+            assert!(native::get(&agent, &public, &[]).unwrap_err().contains("resolves to"));
+            assert!(native::head_with(&agent, &public).unwrap_err().contains("resolves to"));
+        }
+        assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "no forbidden connection was attempted");
+
+        let split = serve(vec!["HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".into()]);
+        let listener: std::net::SocketAddr = split.strip_prefix("http://").unwrap().parse().unwrap();
+        let explicit = format!("http://self-hosted.example:{}/tiles", listener.port());
+        let agent = native::checked_agent(native::agent().config().clone(), LocalAnswer(listener), false);
+        let fetched = native::fetch_answer(&agent, &explicit, crate::address::Reach::Local, false, &[]).unwrap();
+        assert_eq!(fetched.bytes, b"tile");
+        assert_eq!(fetched.origin.url, explicit, "preserve the hostname used for TLS and relative references");
+        assert_eq!(fetched.origin.reach, crate::address::Reach::Local);
+
+        // Explicit local services still work, including a checked same-origin redirect.
+        let local = serve(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".into(),
+        ]);
+        assert_eq!(download_blocking_limited(&local, 4).unwrap(), b"tile");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -683,6 +683,7 @@ mod tests {
             let layer = serde_json::json!({"id": "p", "type": "fill", "source": "s", "source-layer": "l", "paint": paint});
             let sprites = vec![("default".to_owned(), address.clone())];
             Arc::new(Resolved {
+                from: None,
                 style: Style {
                     name: String::new(),
                     sources: vec![("s".into(), Source::parse(&serde_json::json!({"type": "vector", "tiles": ["x/{z}/{x}/{y}"]})))],
@@ -713,6 +714,7 @@ mod tests {
         use rustgis_tiles::style::{Source, Style, StyleLayer};
         let layer = serde_json::json!({"id": "p", "type": "fill", "source": "s", "source-layer": "parks", "paint": {"fill-color": "#f00"}});
         let style = Arc::new(Resolved {
+            from: None,
             style: Style {
                 name: String::new(),
                 sources: vec![("s".into(), Source::parse(&serde_json::json!({"type": "vector", "tiles": ["x/{z}/{x}/{y}"]})))],
