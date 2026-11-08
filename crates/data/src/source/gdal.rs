@@ -46,11 +46,15 @@ fn drivers(src: &Path) -> Result<&'static [&'static str]> {
         "osm" | "pbf" => &["OSM"],
         "geojsonl" | "geojsons" => &["GeoJSONSeq"],
         "gmt" => &["OGR_GMT"],
-        // Read natively now, but a project saved when GDAL read them converts them again. (Not
-        // GML, which fetches the schemas and links it names.)
+        // Read natively now, but a project saved when GDAL read them converts them again.
         "kml" | "kmz" => &["LIBKML", "KML"],
         "gpx" => &["GPX"],
         "dxf" => &["DXF"],
+        // GDAL's GML driver fetches the schemas a file names; the built-in reader doesn't (a
+        // project saved when GDAL read GML adds it again instead).
+        "gml" => {
+            return Err(DataError::Unsupported(format!("{}: GML is read without GDAL now: add the file again", src.display())));
+        }
         // A test fixture: CSV can mix surfaces, curves and points in one layer, which none of the
         // types above can.
         #[cfg(test)]
@@ -405,7 +409,9 @@ mod tests {
         // Every type read through GDAL has its drivers; a reference file (a project's saved source
         // could name one) has none.
         assert!(EXTENSIONS.iter().all(|e| drivers(Path::new(&format!("a.{e}"))).is_ok()) && drivers(Path::new("/x/a.gdb/")).is_ok());
-        assert!(drivers(Path::new("a.vrt")).is_err() && drivers(Path::new("a.gml")).is_err() && drivers(Path::new("noext")).is_err());
+        assert!(drivers(Path::new("a.vrt")).is_err() && drivers(Path::new("noext")).is_err());
+        // A project saved when GDAL read GML is told to add it again.
+        assert!(drivers(Path::new("a.gml")).is_err_and(|e| e.to_string().contains("add the file again")));
         // An address is never handed to GDAL in place of a file, installed or not.
         assert!(matches!(layers(Path::new("/vsicurl/http://127.0.0.1:9/a.osm")), Err(DataError::Io(_))));
         // GDAL before 3.8 doesn't hold `ogrinfo` to the drivers given.
