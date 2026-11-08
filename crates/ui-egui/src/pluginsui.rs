@@ -621,7 +621,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                     // One that can't be read leaves the list in force as it was.
                     let pulled = pulled.unwrap_or_else(|e| {
                         app.session.warn(crate::i18n::fmt(
-                            "The plugin blocklist couldn't be read ({error}); the plugins withdrawn before stay blocked.",
+                            "The plugin blocklist couldn't be read ({error}); the last one read, if any, stays in force.",
                             &[("error", &e)],
                         ));
                         Vec::new()
@@ -638,7 +638,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                 Some(Err(e)) => {
                     if rp::registry::is_default(&registry) {
                         app.session.warn(crate::i18n::fmt(
-                            "The plugin blocklist couldn't be downloaded ({error}); the plugins withdrawn before stay blocked.",
+                            "The plugin blocklist couldn't be downloaded ({error}); the last one read, if any, stays in force.",
                             &[("error", &e)],
                         ));
                     }

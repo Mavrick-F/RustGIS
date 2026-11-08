@@ -162,7 +162,7 @@ fn fetch_registry(s: &mut Session, url: &str) -> Result<Vec<rustgis_plugins::reg
         Err(e) => registry::is_default(url).then_some(e),
     };
     if let Some(e) = refused {
-        s.warn(format!("{blocklist}: {e}; the plugins withdrawn before stay blocked"));
+        s.warn(format!("{blocklist}: {e}; the last blocklist read, if any, stays in force"));
     }
     Ok(entries)
 }

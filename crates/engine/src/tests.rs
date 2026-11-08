@@ -12680,7 +12680,7 @@ fn serve_files(files: Vec<(String, Vec<u8>)>) -> (String, std::sync::Arc<std::sy
     (base, asked)
 }
 
-/// A registry whose blocklist can't be read warns that the plugins withdrawn before stay blocked;
+/// A registry whose blocklist can't be read warns that the last blocklist read stays in force;
 /// one with a readable blocklist says nothing.
 #[test]
 fn unreadable_plugin_blocklist_warns() {
@@ -12690,7 +12690,7 @@ fn unreadable_plugin_blocklist_warns() {
         let mut s = Session::new(Project::default());
         let mark = s.notices_given();
         s.run("plugin.registry", &json!({"url": format!("{base}/registry.json")})).unwrap();
-        let said: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("withdrawn before stay blocked")).collect();
+        let said: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("stays in force")).collect();
         assert!(said.iter().all(|n| n.severity == rustgis_data::diagnostics::Severity::Warning), "{said:?}");
         said.len()
     };

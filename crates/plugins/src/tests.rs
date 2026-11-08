@@ -1212,6 +1212,27 @@ fn process_manifests_are_checked() {
     assert!(crate::prepare(pkg, "test").unwrap_err().contains("doesn't run on this platform"));
 }
 
+/// A refused refresh leaves the cached hosted blocklist byte for byte, and a cache that can't be
+/// read at start is reported rather than ignored.
+#[test]
+fn cached_blocklist_survives_refused_refreshes() {
+    let plugins = std::env::temp_dir().join(format!("rustgis-test-blocklist-cache-{}", std::process::id()));
+    let _store = store_lock();
+    crate::store::set_dir(Some(plugins.clone()));
+    std::fs::create_dir_all(&plugins).unwrap();
+    let cache = plugins.join("blocklist.json");
+    let good = r#"{"blocked": [{"id": "cached-withdrawal"}]}"#;
+    std::fs::write(&cache, good).unwrap();
+    for text in ["{}", r#"{"blocked": {}}"#, r#"[{"id": "ok"}, {"reason": "no id"}]"#] {
+        assert!(crate::store::save_blocklist(registry::DEFAULT_URL, text).is_err(), "{text}");
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), good, "{text} overwrote the cache");
+    }
+    std::fs::write(&cache, r#"[{"id": "a"}, {"reason": "no id"}]"#).unwrap();
+    let errors = crate::store::load_installed();
+    assert!(errors.iter().any(|e| e.contains("blocklist.json") && e.contains("entry 2")), "{errors:?}");
+    let _ = std::fs::remove_dir_all(&plugins);
+}
+
 #[test]
 fn process_packages_unpack_safely() {
     use std::io::Write;
