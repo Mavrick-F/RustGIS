@@ -215,6 +215,9 @@ struct Kind {
     rows: Vec<(Option<Geometry>, BTreeMap<String, String>)>,
     /// Features whose Z or M values were dropped.
     zm: usize,
+    /// Properties not read (holding nested values): how many, and the first few names.
+    unread: usize,
+    unread_names: Vec<String>,
 }
 
 /// Reads a GML file into a layer per feature type (those with features).
@@ -241,9 +244,6 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
     let (mut skipped, mut file_srs): (usize, Option<(Crs, bool)>) = (0, None);
     let mut unknown_srs: Option<String> = None;
     let mut over = 0usize;
-    // Properties holding other elements (a nested record), which aren't attributes: how many,
-    // and the first few names.
-    let (mut nested, mut nested_names) = (0usize, Vec::<String>::new());
     for f in members {
         let name = local(&f).to_string();
         if !kinds.contains_key(&name) {
@@ -259,6 +259,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         let mut bad = false;
         // Whether the geometry kept had Z or M values.
         let mut zm = false;
+        // Properties not read, and those holding GML of a kind not read (another kind of
+        // geometry): the feature's unreadable shape when it has none, else not read.
+        let (mut unread, mut other_gml) = (Vec::new(), Vec::new());
         for p in f.children().filter(|c| c.is_element()) {
             // A property holding a geometry, or a simple value.
             // A feature's bounding box (gml:boundedBy) is neither its shape nor an attribute.
@@ -267,6 +270,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             }
             if let Some(g) = p.children().find(|c| c.is_element() && is_gml(c) && GEOMETRIES.contains(&local(c))) {
                 if geom.is_some() {
+                    unread.push(local(&p).to_string());
                     continue;
                 }
                 let s = g.attribute("srsName").or_else(|| g.descendants().find_map(|d| d.attribute("srsName")));
@@ -286,23 +290,30 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                     }
                     None => bad = true,
                 }
-            } else if p.children().any(|c| c.is_element() && is_gml(&c)) {
-                // A geometry of a kind not read (a CompositeCurve, a Solid…): said as unreadable.
-                if geom.is_none() {
-                    bad = true;
-                }
+            } else if let Some(c) = p.children().find(|c| c.is_element() && is_gml(c)) {
+                // A time (gml:TimeInstant…) is no shape; a geometry of a kind not read (a
+                // CompositeCurve, a Solid…) may be the feature's only one.
+                if local(&c).starts_with("Time") { &mut unread } else { &mut other_gml }.push(local(&p).to_string());
             } else if p.children().any(|c| c.is_element()) {
-                nested += 1;
-                let key = local(&p).to_string();
-                if nested_names.len() < 3 && !nested_names.contains(&key) {
-                    nested_names.push(key);
-                }
+                // A nested record isn't an attribute.
+                unread.push(local(&p).to_string());
             } else if !(is_gml(&p) && local(&p) == "boundedBy") {
                 let key = local(&p).to_string();
                 if !kind.columns.contains(&key) && kind.columns.len() < 500 {
                     kind.columns.push(key.clone());
                 }
                 attrs.insert(key, text_of(&p).trim().to_string());
+            }
+        }
+        if geom.is_none() && !other_gml.is_empty() {
+            bad = true;
+        } else {
+            unread.append(&mut other_gml);
+        }
+        for p in unread {
+            kind.unread += 1;
+            if kind.unread_names.len() < 3 && !kind.unread_names.contains(&p) {
+                kind.unread_names.push(p);
             }
         }
         // A gml:id is a feature's id when it has no other.
@@ -324,9 +335,6 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
     if over > 0 {
         report.messages.push(format!("{over} features of more than {MAX_LAYERS} feature types were left out"));
     }
-    if nested > 0 {
-        report.messages.push(format!("{nested} nested properties weren't read ({})", nested_names.join(", ")));
-    }
     if let Some(s) = &unknown_srs {
         report.messages.push(format!("unknown coordinate system '{s}': coordinates are read as they are"));
     }
@@ -345,7 +353,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             .collect();
         let title = if single { stem.clone() } else { format!("{stem} {name}") };
         let mut ds = Dataset::new(title, GeometryType::None, fields);
-        let zm = kind.zm;
+        let (zm, unread, unread_names) = (kind.zm, kind.unread, kind.unread_names.join(", "));
         let mut outside = false;
         for (g, attrs) in kind.rows {
             let g = g.map(|g| match &transform {
@@ -374,6 +382,10 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         if zm > 0 {
             ds.zm_dropped = true;
             rep.messages.push(format!("{}: {}", ds.name, crate::zm_note(Some(zm as u64))));
+        }
+        if unread > 0 {
+            let what = if unread == 1 { "property" } else { "properties" };
+            rep.messages.push(format!("{}: {unread} {what} holding nested values not read ({unread_names})", ds.name));
         }
         out.push((ds, rep));
     }
@@ -413,7 +425,7 @@ mod tests {
         );
         assert!(matches!(&layers[1].0.features[0].geometry, Some(Geometry::Polygon(p)) if p[0].len() == 2));
         assert_eq!(layers[0].1.skipped, 0, "a feature's boundedBy is no failed geometry");
-        assert!(!layers[0].1.messages.iter().any(|m| m.contains("nested")), "{:?}", layers[0].1.messages);
+        assert!(layers.iter().all(|(_, r)| !r.messages.iter().any(|m| m.contains("nested"))), "{layers:?}");
     }
 
     #[test]
@@ -451,7 +463,7 @@ mod tests {
         assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(10.0, 48.0))));
         // Its height is dropped, and said; so is the nested `member` property, not an attribute.
         assert!(ds.zm_dropped && rep.messages.iter().any(|m| m.contains("Z or M values")), "{:?}", rep.messages);
-        assert!(rep.messages.iter().any(|m| m == "1 nested properties weren't read (member)"), "{:?}", rep.messages);
+        assert!(rep.messages.iter().any(|m| m == "n: 1 property holding nested values not read (member)"), "{:?}", rep.messages);
 
         // A one-point 3D part is left out, and its height with it: the 2D line kept says nothing.
         let gml = r#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:app="http://example.com/app">
@@ -472,6 +484,26 @@ mod tests {
         let layers = read("p.gml", gml.as_bytes()).unwrap();
         assert!(!layers[0].0.zm_dropped, "{:?}", layers[0].1.messages);
         assert!(matches!(&layers[0].0.features[0].geometry, Some(Geometry::Polygon(p)) if p.len() == 1 && p[0].len() == 1));
+    }
+
+    /// Properties that aren't attributes (a nested record, a time, a second shape) are said on
+    /// their own feature type's layer, counted.
+    #[test]
+    fn unread_properties_are_said_on_their_layer() {
+        let gml = r#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:app="http://example.com/app">
+<wfs:member><app:roads gml:id="r.1"><app:name>A</app:name><app:geom><gml:LineString><gml:posList>10 48 11 49</gml:posList></gml:LineString></app:geom></app:roads></wfs:member>
+<wfs:member><app:parks gml:id="p.1"><app:owner><app:who>Ann</app:who></app:owner><app:built><gml:TimeInstant><gml:timePosition>2020</gml:timePosition></gml:TimeInstant></app:built>
+  <app:geom><gml:Point><gml:pos>10 48</gml:pos></gml:Point></app:geom><app:entrance><gml:Point><gml:pos>10 49</gml:pos></gml:Point></app:entrance></app:parks></wfs:member>
+</wfs:FeatureCollection>"#;
+        let layers = read("t.gml", gml.as_bytes()).unwrap();
+        assert!(!layers[0].1.messages.iter().any(|m| m.contains("not read")), "{:?}", layers[0].1.messages);
+        let (ds, rep) = &layers[1];
+        assert_eq!((ds.features.len(), rep.skipped), (1, 0));
+        assert!(
+            rep.messages.iter().any(|m| m == "t parks: 3 properties holding nested values not read (owner, built, entrance)"),
+            "{:?}",
+            rep.messages
+        );
     }
 
     #[test]
