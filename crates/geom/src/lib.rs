@@ -36,8 +36,9 @@ pub const MERCATOR_R: f64 = 6_378_137.0;
 /// Latitude limit of Web Mercator.
 pub const MAX_LAT: f64 = 85.051_128_78;
 /// How near ±90° (degrees) a latitude counts as the pole: about a centimeter, more than geometry
-/// operations' rounding moves a pole vertex (around 1e-8°). For the polar edits and the features
-/// meeting at a pole that build on this (#1033); here only the tests use it.
+/// operations' rounding moves a pole vertex (around 1e-8°). The engine's polar edits
+/// (`cmd/design.rs`) and analysis's topology, conversion and network code use it to find the
+/// features meeting at a pole (#1033).
 pub const POLE_TOLERANCE: f64 = 1e-7;
 /// Screen pixel size assumed when converting resolution to a map scale (0.28 mm, OGC).
 pub const PIXEL_M: f64 = 0.000_28;
@@ -679,7 +680,13 @@ pub fn format_area(m2: f64) -> String {
     if !m2.is_finite() {
         return "—".to_string();
     }
-    if m2.abs().round() < 1.0e6 { format!("{m2:.0} m²") } else { format!("{:.1} km²", m2 / 1.0e6) }
+    if m2.abs().round() < 1.0e6 {
+        // A tiny negative area rounds to `-0`; it reads `0 m²`.
+        let whole = format!("{m2:.0}");
+        format!("{} m²", if whole == "-0" { "0" } else { &whole })
+    } else {
+        format!("{:.1} km²", m2 / 1.0e6)
+    }
 }
 
 /// Formats a lon/lat pair in decimal degrees with hemispheres: `12.345° E 45.678° N`.
@@ -1234,6 +1241,9 @@ mod tests {
         assert_eq!(format_distance(-12_500.0), "-12.5 km");
         assert_eq!(format_distance(-99_949.0), "-99.9 km");
         assert_eq!(format_distance(-99_960.0), "-100 km");
+        assert_eq!(format_area(-0.3), "0 m²");
+        assert_eq!(format_area(-0.0), "0 m²");
+        assert_eq!(format_area(-0.6), "-1 m²");
         assert_eq!(format_area(-999_999.4), "-999999 m²");
         assert_eq!(format_area(-999_999.6), "-1.0 km²");
         assert_eq!(format_area(-1.0e6), "-1.0 km²");

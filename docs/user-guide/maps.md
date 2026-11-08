@@ -138,10 +138,13 @@ and **View In Google Earth** open the place in your browser at about the same zo
 
 ### Coordinate readouts
 
-The status bar shows the pointer's coordinates. Click them to step through four formats; the
-choice is remembered and also sets the right-click menu's first row. The same place in each:
+The status bar shows the pointer's coordinates while it is over the map, and keeps the last
+position (dimmed) when it leaves, so you can move to the status bar and click it. It reads `—`
+until the pointer has been over the map, and again after you switch to another map or open another
+project. Click the coordinates to step through four formats; the choice is remembered and also
+sets the right-click menu's first row. The same place in each:
 
-| Format | Example | |
+| Format | Example | Notes |
 | --- | --- | --- |
 | Decimal degrees | `15.3000° E  49.8500° N` | four decimal places |
 | DMS | `15°18′00.0″ E  49°51′00.0″ N` | degrees, minutes and seconds |
@@ -419,8 +422,8 @@ System** dialog, which also takes a projected EPSG code (such as `3035`, `32633`
 code whose projection method or datum grid RustGIS can't use (Laborde such as `8441`, or a NAD27
 code that needs a grid) is refused with the reason, rather than drawn in another projection.
 RustGIS supports a subset of Esri's projected systems, checked against
-PROJ at representative points; unsupported codes such as World Miller (`ESRI:54003`) are refused
-as unknown codes. The presets:
+PROJ at representative points; unsupported codes such as World Miller (`ESRI:54003`) and the
+two-point oblique Mercators (`ESRI:53025`, `ESRI:54025`) are refused as unknown codes. The presets:
 
 | Preset | Kind |
 | --- | --- |
