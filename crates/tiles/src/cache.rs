@@ -200,9 +200,11 @@ pub fn set_fetcher_omitting(f: impl Fn(String, Done, &'static [u16]) + Send + Sy
     })));
 }
 
-/// Installs a trusted transport that checks normalized URLs, redirects and (when available)
-/// actual peers against the supplied ceiling BEFORE sending. Completion reports final
-/// provenance atomically with the bytes. Browser transports use Origin::named on a normalized
+/// Installs a trusted replacement transport. The transport must check normalized URLs,
+/// redirects and (when available) actual peers against the supplied ceiling before sending.
+/// This wrapper validates the reported final origin before accepting bytes; it cannot undo
+/// a request already sent. Completion reports provenance atomically with the bytes.
+/// Browser transports use Origin::named on a normalized
 /// destination; replacement native transports can use Origin::connected with their actual
 /// socket peer. The built-in native connector records its peer reach separately.
 /// The reported origin also owns login provenance: use Origin::retain_binding only if every
@@ -503,6 +505,8 @@ fn request(
     if let Some(base) = crate::warp::direct(url) {
         return request(base, want, omit, from);
     }
+    // This shared entry point also serves documents, sprites and archive readers without
+    // drawing. Drawing checks separately so it can report refusals in unfetched margin tiles.
     if let Some(from) = from
         && let Err(e) = from.check(url)
     {
@@ -584,8 +588,15 @@ fn request(
 /// A cache-policy refusal is a failed request too: record it like a transport refusal,
 /// after releasing the cache lock, so it cannot become unexplained missing tiles.
 fn refused_request(url: &str, message: String) -> (State, Option<crate::address::Origin>, Option<String>) {
-    RequestDiagnostics::new(url, "GET").failed(&Failure::from(message.clone()));
+    note_refusal(url, &message);
     (State::Failed(message), None, None)
+}
+
+/// A policy refusal is retried by drawing each frame; keep its network facts once per history.
+pub(crate) fn note_refusal(url: &str, message: &str) {
+    let mut diagnostics = RequestDiagnostics::new(url, "GET");
+    diagnostics.once = true;
+    diagnostics.failed(&Failure::new(url, message));
 }
 
 /// What the cache holds for `url`, without fetching it.
@@ -1035,6 +1046,8 @@ pub struct RequestDiagnostics<'a> {
     started: Instant,
     status: Option<u16>,
     timed_out: bool,
+    /// Unsent policy refusals are repeated by redraw, not distinct transport attempts.
+    once: bool,
     /// Statuses the caller expects (a tile past a map's edge, a store's absent chunk): their
     /// failures aren't recorded one by one, as each would flood the history. One note per server
     /// says that they're omitted ([`rustgis_data::diagnostics::Capture::note_absence`]).
@@ -1048,7 +1061,7 @@ impl<'a> RequestDiagnostics<'a> {
 
     /// Keeps the request's initiating owner across a queue hop or an async browser task.
     pub fn with_capture(url: &'a str, method: &'static str, capture: rustgis_data::diagnostics::Capture) -> Self {
-        Self { url, method, capture, started: Instant::now(), status: None, timed_out: false, omit: &[] }
+        Self { url, method, capture, started: Instant::now(), status: None, timed_out: false, once: false, omit: &[] }
     }
 
     /// Statuses whose failures are expected answers, noted once per server, not recorded each
@@ -1130,18 +1143,18 @@ impl<'a> RequestDiagnostics<'a> {
                 _ => NetworkKind::Other,
             }
         };
-        self.capture.network_failure(
-            "Network",
-            &clean(&failure.message),
-            &clean(&details),
-            Network {
-                url: url.to_string(),
-                method: self.method.to_string(),
-                status: self.status,
-                duration_ms: Some(self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
-                kind,
-            },
-        );
+        let network = Network {
+            url: url.to_string(),
+            method: self.method.to_string(),
+            status: self.status,
+            duration_ms: (!self.once).then(|| self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            kind,
+        };
+        if self.once {
+            self.capture.network_failure_once("Network", &clean(&failure.message), &clean(&details), network);
+        } else {
+            self.capture.network_failure("Network", &clean(&failure.message), &clean(&details), network);
+        }
     }
 }
 
@@ -1856,6 +1869,7 @@ mod native {
                 let mut all = self.empty();
                 all.push("127.0.0.1:80".parse().unwrap());
                 all.push("169.254.169.254:80".parse().unwrap());
+                all.push("[64:ff9b::a9fe:a9fe]:80".parse().unwrap());
                 if self.0 {
                     all.push("203.0.113.1:80".parse().unwrap());
                 }

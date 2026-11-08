@@ -199,6 +199,7 @@ pub fn expand(template: &str, t: TileId, tile_size: u32, tms: bool, subdomains: 
 }
 
 /// Resolves `href` against the document at `base` (for addresses inside a style or TileJSON).
+/// An invalid bound base stays refused by request validation rather than resolving anonymously.
 pub fn join(base: &str, href: &str) -> String {
     let href = crate::logins::inner(href);
     match rustgis_data::s3_address::parse(base) {

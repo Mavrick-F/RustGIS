@@ -83,6 +83,11 @@ pub fn ip_reach(ip: IpAddr) -> Reach {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return v4_reach(v4);
             }
+            // RFC 6052's well-known /96 translates to this IPv4 destination. Its IPv6
+            // spelling must not widen a local or forbidden peer's network reach.
+            if let [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] = v6.segments() {
+                return v4_reach(Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo)));
+            }
             let seg0 = v6.segments().first().copied().unwrap_or(0);
             if v6.is_unspecified() || (seg0 & 0xffc0) == 0xfe80 {
                 Reach::Forbidden
@@ -226,6 +231,31 @@ mod tests {
         assert!(origin.check("http://127.0.0.1/tile").is_err());
         assert!(Origin::connected("http://metadata.google.internal/", "203.0.113.1".parse().unwrap()).is_err());
         assert!(Origin::connected("https://selected.internal/", "169.254.169.254".parse().unwrap()).is_err());
+    }
+
+    /// Translation addresses retain the IPv4 destination's policy, including on native peers.
+    #[test]
+    fn nat64_destinations_keep_the_embedded_ipv4_reach() {
+        for (v4, expected) in [
+            ("169.254.169.254", Reach::Forbidden),
+            ("0.0.0.0", Reach::Forbidden),
+            ("127.0.0.1", Reach::Local),
+            ("10.0.0.1", Reach::Local),
+            ("203.0.113.1", Reach::Public),
+        ] {
+            let peer: IpAddr = format!("64:ff9b::{v4}").parse().unwrap();
+            let url = format!("http://[{peer}]/tile");
+            assert_eq!(ip_reach(peer), expected, "translated {v4}");
+            assert_eq!(reach(&url), expected);
+            assert_eq!(check(&url, None).is_ok(), expected != Reach::Forbidden);
+            assert_eq!(check(&url, Some("https://public.example/style.json")).is_ok(), expected == Reach::Public);
+            let observed = Origin::connected("https://dns.example/tile", peer);
+            if expected == Reach::Forbidden {
+                assert!(observed.is_err(), "DNS cannot hide a forbidden translated peer");
+            } else {
+                assert_eq!(observed.unwrap().reach, expected);
+            }
+        }
     }
 
     #[test]

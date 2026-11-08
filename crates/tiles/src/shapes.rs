@@ -671,6 +671,28 @@ mod tests {
         }
     }
 
+    /// Fully loaded geometry reaches the entry point for eligible styles only; no missing tile
+    /// or background gap can make an unsupported style pass this rejection test accidentally.
+    #[test]
+    fn unsupported_styles_stay_out_of_the_mesh_entrypoint() {
+        let _turn = crate::cache::turn();
+        let (spec, dir) = archive("entrypoint", STYLE);
+        let loaded = tile(&spec, 2.5);
+        assert!(!loaded.pending && !loaded.tiles.is_empty());
+        let frame = frame(2.5);
+        let view = frame.extent(300, 200);
+        assert!(vector_tiles(&spec, &frame, &view, None, None).is_some());
+        for style in [
+            STYLE.replacen('[', r#"[{"id":"r","type":"raster","source":"x"},"#, 1),
+            STYLE.replace(r#""line-cap": "round""#, r#""line-cap": ["step", ["zoom"], "butt", 2.5, "round"]"#),
+        ] {
+            let unsupported = Spec { style_layers: style, ..spec.clone() };
+            assert!(drawn_source(&ready(&unsupported), 2).is_none());
+            assert!(vector_tiles(&unsupported, &frame, &view, None, None).is_none());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn styles_with_long_dash_patterns_are_declined() {
         let _turn = crate::cache::turn();

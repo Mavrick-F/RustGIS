@@ -796,7 +796,7 @@ async fn fetch_reached(
         .await;
         cache::check_still(&still)?;
         logins::check(&bound).map_err(str::to_string)?;
-        result.map_err(|error| if authenticated { logins::scrub_error(&format!("{url}: {error}")) } else { error })
+        result.map_err(|error| crate::request::fetch_error(&url, error, authenticated))
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)
@@ -878,7 +878,7 @@ async fn post_json(
         .await;
         cache::check_still(&still)?;
         logins::check(url).map_err(str::to_string)?;
-        result.map_err(|error| if authenticated { logins::scrub_error(&format!("{url}: {error}")) } else { error })
+        result.map_err(|error| crate::request::fetch_error(url, error, authenticated))
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)
@@ -970,7 +970,7 @@ async fn head(
         .await;
         cache::check_still(&still)?;
         logins::check(url).map_err(str::to_string)?;
-        result.map_err(|error| if authenticated { logins::scrub_error(&format!("{reached}: {error}")) } else { error })
+        result.map_err(|error| crate::request::fetch_error(&reached, error, authenticated))
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)

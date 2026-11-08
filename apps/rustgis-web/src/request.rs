@@ -35,6 +35,12 @@ pub(crate) async fn prepare_and_send<T, R, F: Future<Output = Result<T, String>>
     Ok(send(prepared))
 }
 
+/// Formats a fetch failure without exposing the authenticated request's credentials.
+pub(crate) fn fetch_error(url: &str, error: String, authenticated: bool) -> String {
+    use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::logins;
+    if authenticated && cache::http_status(&error).is_none() { logins::scrub_error(&format!("{url}: {error}")) } else { error }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,6 +54,19 @@ mod tests {
         },
         task::{Context, Poll, Waker},
     };
+
+    /// Status-only authenticated failures retain their machine-readable routine gap/backoff signal.
+    #[test]
+    fn authenticated_fetch_errors_preserve_http_statuses() {
+        for authenticated in [false, true] {
+            for error in ["HTTP 404", "HTTP 410", "HTTP 429 (retry after 30 s)"] {
+                assert_eq!(fetch_error("https://status.example/tile", error.into(), authenticated), error);
+            }
+        }
+        let error = fetch_error("https://status.example/tile?token=synthetic", "couldn't reach it".into(), true);
+        assert!(!error.contains("synthetic"));
+        assert!(cache::http_status(&error).is_none());
+    }
 
     fn poll<F: Future + ?Sized>(f: Pin<&mut F>) -> Poll<F::Output> {
         f.poll(&mut Context::from_waker(Waker::noop()))

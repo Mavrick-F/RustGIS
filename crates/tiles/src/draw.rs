@@ -561,7 +561,7 @@ fn tiles_for(src: &Source, view: &Extent, frame: &Frame, zoom: f32, pending: &mu
 
 /// The tiles of a source in view and out to `reach` (those in the cache only), with stand-ins
 /// for those not here yet. Expanded destinations retain the supplying document's reach;
-/// refused tiles are counted in `error` without touching the shared cache or fetcher. Valid
+/// refused tiles are counted in `error` and network history without requesting or reusing bytes. Valid
 /// tiles still draw, even when another shard of the same source is refused.
 pub(crate) fn tiles_in(
     src: &Source,
@@ -589,19 +589,21 @@ pub(crate) fn tiles_in(
     // A mosaic over half the world wide (the globe's, a world projection's) takes the zoom whose
     // tiles all fit, as its far edges are in view; a flat view keeps those nearest its centre.
     let z = if view.width() > template::HALF_WORLD { template::fitting_zoom(view, z, min_z) } else { z };
-    let url = |t: TileId| -> Result<Option<String>, String> {
+    let url = |t: TileId| -> Result<Option<String>, (String, String)> {
         let i = (t.x as usize).wrapping_add(t.y as usize) % tiles.len();
         let Some(tpl) = tiles.get(i) else { return Ok(None) };
         let expanded = template::expand(tpl, t, 256, false, &[]);
         // Archive tile keys are made here from the archive the layer explicitly names. They
         // aren't network destinations; their HTTP range reads pass the transport checks.
-        if !crate::pmtiles::is_tile(&expanded) && !crate::mbtiles::is_tile(&expanded) && !crate::cog::is_tile(&expanded) {
-            if let Some(from) = from {
-                from.check(&expanded)?;
-            } else {
-                crate::address::check(&expanded, None)?;
-            }
-        }
+        let checked = if let Some(from) = from {
+            // A document cannot supply internal archive keys, even with local reach.
+            from.check(&expanded)
+        } else if !crate::pmtiles::is_tile(&expanded) && !crate::mbtiles::is_tile(&expanded) && !crate::cog::is_tile(&expanded) {
+            crate::address::check(&expanded, None)
+        } else {
+            Ok(())
+        };
+        checked.map_err(|e| (expanded.clone(), e))?;
         Ok(Some(expanded))
     };
     // Ancestors and children are cache-only, but an invalid destination must not read a tile
@@ -647,8 +649,9 @@ pub(crate) fn tiles_in(
         let u = match url(p.id) {
             Ok(Some(u)) => u,
             Ok(None) => continue,
-            Err(e) => {
+            Err((url, e)) => {
                 if visible {
+                    cache::note_refusal(&url, &e);
                     mesh_gaps = true;
                     omitted += 1;
                     first_error.get_or_insert(e);

@@ -632,7 +632,7 @@ and CDN hops, because the app cannot inspect their destinations. This includes *
 file downloads, fonts, service documents, tiles and sprites, and PMTiles/COG archive range
 reads. Supply the final address; for a redirecting file download, download it with a trusted
 external tool and open the local copy. The browser also controls DNS and local-network access;
-see [tile request limits](maps.md).
+see [tile request limits](maps.md#basemaps).
 
 ### HTTPS certificates
 

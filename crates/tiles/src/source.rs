@@ -399,7 +399,8 @@ fn resolve_sources(style: &mut Style, spec: &Spec, base: &address::Origin) -> Re
 }
 
 /// Fills in a style source's tile addresses: from its TileJSON address when it gives no tiles
-/// (`Ok(true)` while that is on its way), resolved against `base` and checked.
+/// (`Ok(true)` while that is on its way), resolved against `base`. Tile selection checks each
+/// expanded address, preserving shard positions when one is refused.
 fn resolve_source(src: &mut Source, spec: &Spec, base: &address::Origin) -> Result<bool, String> {
     let (tiles, url, from) = match src {
         Source::Vector { tiles, url, from, .. } | Source::Raster { tiles, url, from, .. } | Source::RasterDem { tiles, url, from, .. } => {
@@ -450,7 +451,6 @@ fn resolve_source(src: &mut Source, spec: &Spec, base: &address::Origin) -> Resu
                     *from = Some(reached.clone());
                     for t in tiles.iter_mut() {
                         *t = template::join(&reached.url, t);
-                        reached.check(t)?;
                     }
                 }
             }
@@ -466,13 +466,6 @@ fn resolve_source(src: &mut Source, spec: &Spec, base: &address::Origin) -> Resu
                 continue;
             }
             *t = template::join(&base.url, t);
-            // A style's tile addresses are the style's choice; a raster or vector layer's
-            // template is the user's.
-            if spec.kind == Kind::Style {
-                base.check(t)?;
-            } else {
-                address::check(t, None)?;
-            }
         }
     }
     Ok(false)
@@ -892,6 +885,8 @@ mod tests {
         }
         cache::wait(std::time::Duration::from_secs(2));
         for tiles in [
+            vec!["http://127.0.0.1/{z}/{x}/{y}", public],
+            vec!["pmtiles:{z}/{x}/{y}@https://archive-key.example/fixture.pmtiles", public],
             vec!["http://{switch:127.0.0.1}/{z}/{x}/{y}", public],
             vec!["http://{switch:127.0.0.1,partial-tiles.example}/{z}/{x}/{y}"],
             vec![public],
@@ -919,11 +914,49 @@ mod tests {
             assert_eq!(pm.pixel(16, 16).unwrap().alpha(), if clean { 255 } else { 0 });
             assert_eq!(drawn.error.is_none(), clean, "{:?}", drawn.error);
             if let Some(error) = drawn.error {
-                assert_eq!(error.matches("local network").count(), 1);
+                assert!(error.contains("tiles left out"), "{error}");
+                assert!(error.contains("local network") || error.contains("http://"), "{error}");
             }
             assert!(!drawn.pending);
         }
         assert!(sent.lock().unwrap().iter().all(|url| url.starts_with("http://partial-tiles.example/")));
+    }
+
+    /// Refused expanded destinations enter network history once until cleared, with clean controls.
+    #[test]
+    fn expanded_refusals_enter_network_history_once() {
+        let _turn = cache::turn();
+        cache::set_fetcher(|_, done| done(Ok(Vec::new())));
+        for bad in [true, false] {
+            let history = rustgis_data::diagnostics::History::default();
+            let _capture = history.enter();
+            let host = if bad { "{switch:127.0.0.1}" } else { "diagnostic-public.example" };
+            let mut style = Style::parse(
+                &json!({"version":8,"sources":{"s":{"type":"vector","tiles":[format!("http://{host}/{{z}}/{{x}}/{{y}}")]}},"layers":[]}),
+            )
+            .unwrap();
+            let from = address::Origin::named("https://diagnostic-style.example/style.json");
+            let spec = spec(Kind::Style, &from.url);
+            resolve_sources(&mut style, &spec, &from).unwrap().unwrap();
+            let src = &style.sources[0].1;
+            let frame = crate::draw::tests::world_frame();
+            let view = frame.extent(64, 64);
+            for _ in 0..3 {
+                let (mut pending, mut error) = (false, None);
+                crate::draw::tiles_in(src, &view, None, &frame, 0.0, &mut pending, &mut error);
+                assert_eq!(error.is_some(), bad);
+            }
+            assert_eq!(history.records().iter().filter(|r| r.network.is_some()).count(), usize::from(bad));
+            history.clear();
+            let (mut pending, mut error) = (false, None);
+            crate::draw::tiles_in(src, &view, None, &frame, 0.0, &mut pending, &mut error);
+            assert_eq!(
+                history.records().iter().filter(|r| r.network.is_some()).count(),
+                usize::from(bad),
+                "clear allows the refusal to be reported again"
+            );
+        }
+        cache::wait(std::time::Duration::from_secs(2));
     }
 
     /// Refused cache-only shards outside the view do not count as visible holes.
@@ -959,22 +992,50 @@ mod tests {
     #[test]
     fn refused_vector_destinations_keep_the_style_background() {
         let _turn = cache::turn();
-        cache::set_fetcher(|_, done| done(Ok(Vec::new())));
-        let frame = crate::draw::Frame { left: -100.0, top: 100.0, m_per_px: 1.0, ppp: 1.0 };
-        for tiles in [
+        let tile = crate::mvt::encode(&crate::mvt::Tile {
+            layers: vec![crate::mvt::Layer {
+                name: "l".into(),
+                extent: 4096,
+                features: vec![crate::mvt::Feature {
+                    id: None,
+                    kind: crate::mvt::GeomKind::Polygon,
+                    props: Vec::new(),
+                    geometry: vec![vec![[0.0, 0.0], [4096.0, 0.0], [4096.0, 4096.0], [0.0, 4096.0], [0.0, 0.0]]],
+                }],
+            }],
+        });
+        cache::set_fetcher(move |url, done| {
+            assert!(url.starts_with("http://background-public.example/"), "refused destinations never reach transport");
+            done(Ok(tile.clone()));
+        });
+        let scale = crate::template::HALF_WORLD / 512.0;
+        let frame = crate::draw::Frame { left: -100.0 * scale, top: 100.0 * scale, m_per_px: scale, ppp: 1.0 };
+        let public = "http://background-public.example/{z}/{x}/{y}";
+        let from = address::Origin::named("https://background-style.example/style.json");
+        for x in 0..2 {
+            for y in 0..2 {
+                cache::get_tile_from(&format!("http://background-public.example/1/{x}/{y}"), cache::Want::Vector, Some(&from));
+            }
+        }
+        cache::wait(std::time::Duration::from_secs(2));
+        for (case, tiles) in [
             vec!["http://{switch:127.0.0.1}/{z}/{x}/{y}"],
-            vec!["http://{switch:127.0.0.1}/{z}/{x}/{y}", "http://background-public.example/{z}/{x}/{y}"],
-        ] {
-            let doc = json!({"version":8,"sources":{"s":{"type":"vector","tiles":tiles}},"layers":[
+            vec!["http://{switch:127.0.0.1}/{z}/{x}/{y}", public],
+            vec!["http://127.0.0.1/{z}/{x}/{y}", public],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mixed = tiles.len() > 1;
+            let doc = json!({"version":8,"sources":{"s":{"type":"vector","maxzoom":1,"tiles":tiles}},"layers":[
                 {"id":"bg","type":"background","paint":{"background-color":"#f00"}},
-                {"id":"fill","type":"fill","source":"s","source-layer":"l"}]});
+                {"id":"fill","type":"fill","source":"s","source-layer":"l","paint":{"fill-color":"#0f0"}}]});
             let mut style = Style::parse(&doc).unwrap();
-            let spec = spec(Kind::Style, &format!("https://background-style.example/{}", tiles.len()));
-            let from = address::Origin::named(&spec.url);
+            let spec = spec(Kind::Style, &format!("https://background-style.example/{case}"));
             let sources = resolve_sources(&mut style, &spec, &from).unwrap().unwrap();
             let ready = Arc::new(Resolved {
                 style,
-                from: Some(from),
+                from: Some(from.clone()),
                 sprites: Vec::new(),
                 attribution: Vec::new(),
                 left_out: sources.left_out,
@@ -983,13 +1044,13 @@ mod tests {
             });
             resolved().lock().unwrap().insert(spec.key(), ready);
             let view = frame.extent(200, 200);
-            assert!(
-                crate::shapes::vector_tiles(&spec, &frame, &view, None, None).is_none(),
-                "background needs the complete fallback drawing"
-            );
+            assert!(crate::shapes::vector_tiles(&spec, &frame, &view, None, None).is_none(), "background needs complete fallback drawing");
             let mut image = tiny_skia::Pixmap::new(200, 200).unwrap();
             let drawn = crate::draw::draw(&mut image, &spec, 1.0, &frame, false);
             assert_eq!(image.pixel(16, 16).unwrap().red(), 255);
+            if mixed {
+                assert_eq!(image.pixel(150, 16).unwrap().green(), 255, "permitted vector geometry still draws");
+            }
             assert!(drawn.error.is_some());
         }
     }
