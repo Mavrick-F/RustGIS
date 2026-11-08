@@ -54,13 +54,15 @@ pub struct Drawn {
 
 /// Retains each distinct refusal alongside any earlier source or sprite warning.
 pub(crate) fn add_error(to: &mut Option<String>, error: String) {
-    match to {
-        Some(previous) if !previous.contains(&error) => {
-            previous.push_str("; ");
-            previous.push_str(&error);
+    for message in error.split("; ") {
+        match to {
+            Some(previous) if !previous.split("; ").any(|kept| kept == message) => {
+                previous.push_str("; ");
+                previous.push_str(message);
+            }
+            None => *to = Some(message.to_string()),
+            _ => {}
         }
-        None => *to = Some(error),
-        _ => {}
     }
 }
 
@@ -1258,6 +1260,17 @@ fn area(r: &[(f32, f32)]) -> f32 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn refusal_counts_are_not_substring_duplicates() {
+        let mut error = Some("12 tiles left out: refused".to_string());
+        super::add_error(&mut error, "2 tiles left out: refused".into());
+        assert_eq!(error.as_deref(), Some("12 tiles left out: refused; 2 tiles left out: refused"));
+        let combined = error.unwrap();
+        let mut error = Some("sprite left out".to_string());
+        super::add_error(&mut error, combined.clone());
+        super::add_error(&mut error, combined);
+        assert_eq!(error.as_deref(), Some("sprite left out; 12 tiles left out: refused; 2 tiles left out: refused"));
+    }
     use super::*;
 
     #[test]

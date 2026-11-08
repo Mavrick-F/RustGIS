@@ -285,8 +285,9 @@ destination IP. Explicitly selected self-hosted servers remain supported, includ
 hostnames resolved by local DNS, with local fallback when the same hostname also returns
 public addresses. Native fetchers filter the resolved IPs before connecting,
 using the supplying document's actual connection reach. Native requests refuse
-link-local and unspecified addresses, including the well-known NAT64 translation of IPv4
-addresses. Document redirects also change the base for relative references.
+link-local and unspecified addresses, including those represented by IPv4-mapped IPv6
+addresses or the well-known NAT64 prefix. Public IPv4 destinations under that prefix can pass.
+Document redirects also change the base for relative references.
 IPv4 decoding covers mapped addresses and the well-known `64:ff9b::/96` prefix. It does not
 inspect destinations behind 6to4 tunnels or custom translation gateways, including the
 [RFC 8215](https://www.rfc-editor.org/rfc/rfc8215#section-5) `64:ff9b:1::/48` prefix, whose
@@ -295,7 +296,8 @@ behind a public-looking IPv6 address; restrictions on those routes require netwo
 Native redirects are checked at each hop. In the web app, use the final service address:
 tile, style, TileJSON and sprite redirects, including HTTP-to-HTTPS upgrades and CDN hops,
 are refused because the browser hides their destinations from the app. The same browser
-transport refuses redirects for downloads, fonts and archive range reads; see
+transport refuses redirects for downloads, fonts, archive range reads and HEAD requests for
+file metadata; see
 [network downloads](data.md#network-downloads).
 The web app checks the URL's spelling and normalized address, but cannot inspect resolved IPs.
 A public-looking hostname can reach a private or link-local server if the browser permits it;

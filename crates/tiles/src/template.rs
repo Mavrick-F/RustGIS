@@ -201,6 +201,16 @@ pub fn expand(template: &str, t: TileId, tile_size: u32, tms: bool, subdomains: 
 /// Resolves `href` against the document at `base` (for addresses inside a style or TileJSON).
 /// An invalid bound base stays refused by request validation rather than resolving anonymously.
 pub fn join(base: &str, href: &str) -> String {
+    let (plain_base, anonymous_base) = crate::s3::split_anonymous(base);
+    let (plain_href, anonymous_href) = crate::s3::split_anonymous(href);
+    if anonymous_base || anonymous_href {
+        if crate::s3::split_anonymous(plain_base).1 || crate::s3::split_anonymous(plain_href).1 {
+            return if anonymous_base { base } else { href }.to_string();
+        }
+        // An anonymous child narrows authority, including when its parent chose an account.
+        let base = crate::logins::inner(rustgis_data::s3_address::inner(plain_base));
+        return crate::s3::anonymous(&join(base, plain_href));
+    }
     // Only the supplying document's base carries authority. A link may name a resource,
     // but neither a service-login nor an S3 selector in it can choose an account.
     let href = match rustgis_data::login_address::parse(href) {
@@ -226,10 +236,6 @@ pub fn join(base: &str, href: &str) -> String {
         Err(_) => return base.to_string(),
         Ok(None) => {}
     }
-    let (plain, anonymous) = crate::s3::split_anonymous(base);
-    if anonymous {
-        return crate::s3::anonymous(&join(plain, href));
-    }
     match rustgis_data::login_address::parse(base) {
         Ok(Some(bound)) => return crate::logins::inherit(base, &join(bound.url, href)),
         Err(_) => return base.to_string(),
@@ -239,7 +245,7 @@ pub fn join(base: &str, href: &str) -> String {
         return href.to_string();
     }
     let Some((scheme, rest)) = base.split_once("://") else { return href.to_string() };
-    let host_end = rest.find('/').unwrap_or(rest.len());
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let host = rest.get(..host_end).unwrap_or(rest);
     if let Some(path) = href.strip_prefix("//") {
         return format!("{scheme}://{path}");
@@ -397,5 +403,15 @@ mod tests {
         assert_eq!(join("https://a.com/styles/x", "/planet"), "https://a.com/planet");
         assert_eq!(join("https://a.com/x", "//b.com/y"), "https://b.com/y");
         assert_eq!(join("https://a.com/x", "https://c.com/z"), "https://c.com/z");
+        assert_eq!(join("https://tiles.example?token=x", "/tile/0"), "https://tiles.example/tile/0");
+        assert_eq!(join("https://tiles.example#view", "tile/0"), "https://tiles.example/tile/0");
+    }
+
+    #[test]
+    fn direct_anonymous_sources_keep_one_marker() {
+        let anonymous = crate::s3::anonymous("https://tiles.example/{z}/{x}/{y}");
+        assert_eq!(join(&anonymous, &anonymous), anonymous);
+        assert_eq!(join("https://tiles.example/style.json", &anonymous), anonymous);
+        assert_eq!(join(&anonymous, "tile/0"), crate::s3::anonymous("https://tiles.example/{z}/{x}/tile/0"));
     }
 }

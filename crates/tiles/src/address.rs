@@ -62,6 +62,21 @@ impl Origin {
 
     /// Checks a descendant without replacing the document's observed reach with host spelling.
     pub(crate) fn check(&self, url: &str) -> Result<(), String> {
+        // Expansion can introduce a selector that was hidden from document joining.
+        // Only the supplying document's own selection may survive that boundary.
+        let (plain, _) = crate::s3::split_anonymous(url);
+        if let Some(child) = rustgis_data::login_address::parse(plain).map_err(str::to_string)? {
+            let parent = rustgis_data::login_address::parse(&self.url).map_err(str::to_string)?;
+            if parent.is_none_or(|p| p.binding != child.binding || p.origin != child.origin) {
+                return Err("a document cannot select another service login".into());
+            }
+        }
+        if let Some(child) = rustgis_data::s3_address::parse(plain).map_err(str::to_string)? {
+            let parent = rustgis_data::s3_address::parse(&self.url).map_err(str::to_string)?;
+            if parent.is_none_or(|p| p.binding != child.binding || p.endpoint != child.endpoint) {
+                return Err("a document cannot select another S3 account".into());
+            }
+        }
         check_reach(url, self.reach)
     }
 }
@@ -192,6 +207,9 @@ pub(crate) fn inherit(from: &str, to: &str) -> Result<String, String> {
 /// Checks a transport's normalized destination under its inherited runtime ceiling, unwrapping
 /// account markers without widening it. Call before sending; Forbidden is always refused.
 pub fn check_reach(url: &str, ceiling: Reach) -> Result<(), String> {
+    if ceiling == Reach::Forbidden {
+        return Err("a forbidden document cannot supply request destinations".into());
+    }
     crate::logins::check(url).map_err(str::to_string)?;
     if let Some(bound) = rustgis_data::login_address::parse(url).map_err(str::to_string)? {
         return check_reach(bound.url, ceiling);
@@ -204,7 +222,7 @@ pub fn check_reach(url: &str, ceiling: Reach) -> Result<(), String> {
     // An `s3://` address is judged by the web address it is fetched from.
     // An address read anonymously is judged as the address it marks.
     if let (inner, true) = crate::s3::split_anonymous(url) {
-        if rustgis_data::s3_address::is_wrapper(inner) {
+        if rustgis_data::s3_address::is_wrapper(inner) || crate::s3::split_anonymous(inner).1 {
             return Err("not a saved S3 address".into());
         }
         return if crate::s3::is_s3(inner) { check_reach(&crate::s3::https_url(url)?, ceiling) } else { check_reach(inner, ceiling) };

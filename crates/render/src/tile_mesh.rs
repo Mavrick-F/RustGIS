@@ -710,7 +710,16 @@ mod tests {
         let style = Arc::get_mut(&mut private).unwrap();
         style.from = Some(rustgis_tiles::address::Origin::named("https://mesh-style.example/style.json"));
         style.sprites = vec![("default".into(), "http://127.0.0.1/mesh-private-only".into())];
-        assert!(!meshes(&private, "s", &[], 3, None).1, "a refused sprite must never become a pending fetch");
+        let id = TileId { z: 3, x: 0, y: 0 };
+        let tiles = [DataTile { payload: Arc::new(Payload::Vector(tile())), at: id.extent(), z: id.z, clip: id.extent() }];
+        let (made, waiting) = meshes(&private, "s", &tiles, 3, None);
+        assert!(!waiting, "a refused sprite must never become a pending fetch");
+        assert!(made.first().and_then(Option::as_ref).is_some_and(|m| !m.waiting));
+        assert_eq!(
+            crate::tiles::tests::PRIVATE_SPRITE_REQUESTS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "neither sprite JSON nor PNG may reach the fetcher"
+        );
     }
 
     #[test]

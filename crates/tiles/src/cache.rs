@@ -601,7 +601,9 @@ fn refused_request(url: &str, message: String) -> (State, Option<crate::address:
 pub(crate) fn note_refusal(url: &str, message: &str) {
     let mut diagnostics = RequestDiagnostics::new(url, "GET");
     diagnostics.once = true;
-    diagnostics.failed(&Failure::new(url, message));
+    // Keep the reason independent of expanded tile paths; the history groups by server.
+    let reason = message.strip_prefix(url).and_then(|s| s.strip_prefix(": ")).unwrap_or(message);
+    diagnostics.failed(&Failure::new(url, reason));
 }
 
 /// What the cache holds for `url`, without fetching it.
@@ -2130,6 +2132,30 @@ mod native {
         assert_eq!(got.origin.reach, Reach::Local);
     }
 
+    /// A public hop narrows both GET and HEAD before redirected local DNS can connect.
+    #[cfg(test)]
+    #[test]
+    fn public_redirects_filter_the_next_hosts_dns() {
+        let _turn = super::turn();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let address = target.local_addr().unwrap();
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://redirect-local.example:{}/tile\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            address.port()
+        );
+        let first = super::tests::serve(vec![redirect.clone(), redirect]);
+        let listener = first.strip_prefix("http://").unwrap().parse().unwrap();
+        let selected = fixture_agent("203.0.113.1:80".parse().unwrap(), listener, false);
+        let public = checked_agent(config_builder(std::time::Duration::from_secs(2)).build(), super::tests::LocalAnswer(address), true);
+        let url = "http://first-public.example/style.json";
+        assert!(
+            fetch_answer_with_public(&selected, &public, url, Reach::Local, false, &[]).unwrap_err().to_string().contains("resolves to")
+        );
+        assert!(head_with_public(&selected, &public, url).unwrap_err().contains("resolves to"));
+        assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
     /// A download agent that connects only to internet addresses.
     pub(super) fn public_agent(timeout: std::time::Duration) -> ureq::Agent {
         checked_agent(config_builder(timeout).build(), ureq::unversioned::resolver::DefaultResolver::default(), true)
@@ -2163,6 +2189,11 @@ mod native {
     /// Asks for a caller-selected archive's headers, following up to 5 redirects, each checked
     /// as [`get`] checks them. Document-derived reads use the GET queue's inherited ceiling.
     pub(super) fn head_with(agent: &ureq::Agent, url: &str) -> Result<super::Head, String> {
+        head_with_public(agent, shared_public_agent(), url)
+    }
+
+    /// Uses a separate internet-only pool after a public hop; fixtures supply both pools.
+    fn head_with_public(agent: &ureq::Agent, public: &ureq::Agent, url: &str) -> Result<super::Head, String> {
         let mut diagnostics = super::RequestDiagnostics::new(url, "HEAD");
         let mut carried_login = false;
         let answer = (|| -> Result<super::Head, Failure> {
@@ -2181,7 +2212,7 @@ mod native {
                 let bound = crate::logins::inherit(url, &at);
                 let login = if same_origin { crate::logins::apply(&bound)? } else { None };
                 carried_login |= login.is_some();
-                let sending = if ceiling == Reach::Public { shared_public_agent() } else { agent };
+                let sending = if ceiling == Reach::Public { public } else { agent };
                 let mut req = sending.head(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
                 if let Some((name, value)) = login.as_ref().and_then(|a| a.header.as_ref()) {
                     req = req.header(name.as_str(), value.as_str());
@@ -2440,6 +2471,18 @@ mod native {
         detail: bool,
         omit: &'static [u16],
     ) -> Result<Fetched, Failure> {
+        fetch_answer_with_public(agent, shared_public_agent(), url, initial, detail, omit)
+    }
+
+    /// The request path with both pools explicit, so redirect DNS is tested without live DNS.
+    fn fetch_answer_with_public(
+        agent: &ureq::Agent,
+        public: &ureq::Agent,
+        url: &str,
+        initial: Reach,
+        detail: bool,
+        omit: &'static [u16],
+    ) -> Result<Fetched, Failure> {
         use std::io::Read;
         let mut carried_login = false;
         // Local file failures are not network traffic.
@@ -2479,7 +2522,7 @@ mod native {
                 let bound = crate::logins::inherit(url, &at);
                 let login = if !prepared.signed && same_origin { crate::logins::apply(&bound)? } else { None };
                 carried_login |= login.is_some();
-                let sending = if ceiling == Reach::Public && initial != Reach::Public { shared_public_agent() } else { agent };
+                let sending = if ceiling == Reach::Public && initial != Reach::Public { public } else { agent };
                 let mut req = sending.get(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
                 if let Some((name, value)) = login.as_ref().and_then(|a| a.header.as_ref()) {
                     req = req.header(name.as_str(), value.as_str());
@@ -2699,6 +2742,22 @@ mod native {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn policy_refusals_group_paths_without_evicting_other_diagnostics() {
+        let history = rustgis_data::diagnostics::History::default();
+        let _capture = history.enter();
+        for i in 0..20 {
+            let url = format!("http://127.0.0.1/{i}/0/0");
+            note_refusal(&url, &format!("{url}: a document on the web can't point into the local network"));
+        }
+        assert_eq!(history.records().len(), 1, "expanded paths must share a policy diagnostic");
+        note_refusal("http://127.0.0.1/other", "different refusal");
+        note_refusal("http://127.0.0.2/0", "different refusal");
+        assert_eq!(history.records().len(), 3);
+        history.clear();
+        note_refusal("http://127.0.0.1/0", "different refusal");
+        assert_eq!(history.records().len(), 1);
+    }
     /// Runs a fixture that needs stable process-wide cache entries without unrelated login
     /// revocation clearing them. The exact named child must execute its existing assertions.
     #[cfg(not(target_arch = "wasm32"))]
@@ -4096,11 +4155,14 @@ mod tests {
     fn replacement_transport_destinations_keep_normalized_origins_and_ceiling() {
         let _turn = turn();
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let attempted = attempts.clone();
         let observed = sent.clone();
         set_fetcher_with_origin(move |url, ceiling, done, _| {
+            attempted.lock().unwrap().push((url.clone(), ceiling));
             let normalized = if url == "https://public.example\\@localhost/style.json" {
                 "https://public.example/@localhost/style.json"
-            } else if url == "http://%31%32%37.0.0.1/tile.png" {
+            } else if url == "http://local%68ost/tile.png" {
                 "http://127.0.0.1/tile.png"
             } else {
                 &url
@@ -4119,10 +4181,12 @@ mod tests {
         let origin = origin.unwrap();
         assert_eq!(origin.url, "https://public.example/@localhost/style.json");
         assert_eq!(origin.reach, crate::address::Reach::Public);
-        let child = "http://%31%32%37.0.0.1/tile.png";
+        let child = "http://local%68ost/tile.png";
         get_tile_from(child, Want::Image, Some(&origin));
         wait(std::time::Duration::from_secs(2));
         assert!(matches!(get_tile_from(child, Want::Image, Some(&origin)), State::Failed(_)));
+        assert_eq!(attempts.lock().unwrap().last().unwrap(), &(child.to_string(), crate::address::Reach::Public));
+        assert_eq!(attempts.lock().unwrap().len(), 2, "the child reaches the normalization boundary");
         assert_eq!(sent.lock().unwrap().len(), 1, "normalized local child never reaches send");
         assert!(origin.check("http://127.0.0.1/tile.png").is_err());
     }
@@ -4460,7 +4524,7 @@ mod tests {
     /// can reach only the listener this test just created.
     #[cfg(not(target_arch = "wasm32"))]
     #[derive(Debug)]
-    struct LocalAnswer(std::net::SocketAddr);
+    pub(super) struct LocalAnswer(pub(super) std::net::SocketAddr);
 
     #[cfg(not(target_arch = "wasm32"))]
     impl ureq::unversioned::resolver::Resolver for LocalAnswer {

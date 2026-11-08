@@ -677,6 +677,81 @@ pub fn plain_text(html: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An expanded selector must not let a public style choose another saved account.
+    #[test]
+    fn expanded_selectors_cannot_choose_a_documents_account() {
+        let _turn = cache::turn();
+        let endpoint = "https://expanded-account.example";
+        let binding = crate::s3::new_binding().unwrap();
+        let name = "expanded-account-fixture";
+        crate::s3::connect_saved(
+            crate::s3::Connection {
+                name: name.into(),
+                endpoint: Some(endpoint.into()),
+                region: "us-east-1".into(),
+                buckets: vec!["bucket".into()],
+                credentials: None,
+            },
+            &binding,
+            "expanded-account",
+        )
+        .unwrap();
+        let selected = rustgis_data::s3_address::bind(&binding, endpoint, &format!("{endpoint}/bucket/tile.pbf")).unwrap();
+        assert!(
+            address::Origin { url: selected.clone(), reach: address::Reach::Public }.check(&selected).is_ok(),
+            "the document may retain its own selected account"
+        );
+        let login = crate::logins::activate(
+            endpoint,
+            "expanded-service-fixture",
+            crate::logins::Method::Header("X-Fixture".into()),
+            "fixture",
+            false,
+        )
+        .unwrap();
+        let service = crate::logins::bind(&login, &format!("{endpoint}/tile.pbf")).unwrap();
+        assert!(address::Origin { url: service.clone(), reach: address::Reach::Public }.check(&service).is_ok());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        cache::set_fetcher(move |url, done| {
+            seen.lock().unwrap().push(url);
+            done(Ok(crate::mvt::encode(&crate::mvt::Tile::default())));
+        });
+        for selected in [selected, service] {
+            let mut style = Style::parse(
+                &json!({"version":8,"sources":{"s":{"type":"vector","tiles":[format!("{{switch:{selected}}}")]}},"layers":[]}),
+            )
+            .unwrap();
+            let base = address::Origin::named("https://expanded-style.example/style.json");
+            let spec = spec(Kind::Style, &base.url);
+            resolve_sources(&mut style, &spec, &base).unwrap();
+            let src = &style.sources.first().unwrap().1;
+            let frame = crate::draw::tests::world_frame();
+            let mut error = None;
+            crate::draw::tiles_in(src, &frame.extent(64, 64), None, &frame, 0.0, &mut false, &mut error);
+            cache::wait(std::time::Duration::from_secs(2));
+            assert!(error.is_some());
+        }
+        crate::logins::deactivate(&login);
+        crate::s3::disconnect(name);
+        assert!(asked.lock().unwrap().is_empty(), "the style selected an account after expansion");
+    }
+
+    #[test]
+    fn forbidden_provenance_cannot_queue_sprites() {
+        let _turn = cache::turn();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        cache::set_fetcher(move |url, done| {
+            seen.lock().unwrap().push(url);
+            done(Err("fixture".into()));
+        });
+        let from = address::Origin::named("http://metadata/style.json");
+        let state = crate::sprite::load_from(&[("default".into(), "http://127.0.0.1/forbidden-sprite".into())], false, Some(&from));
+        cache::wait(std::time::Duration::from_secs(2));
+        assert!(asked.lock().unwrap().is_empty(), "forbidden provenance reached transport");
+        assert!(matches!(state, crate::sprite::Load::Failed));
+    }
     use super::*;
 
     fn spec(kind: Kind, url: &str) -> Spec {
