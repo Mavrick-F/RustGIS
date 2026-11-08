@@ -645,6 +645,23 @@ pub(crate) fn peek_from(url: &str, from: Option<&crate::address::Origin>) -> Opt
     }
 }
 
+/// Why the fetch of `url` failed, when the cache holds a failure for it, without asking for it
+/// again: what a drawing asked for and couldn't have, for a caller that must say so (an export
+/// of a tile layer).
+pub fn peek_failure(url: &str) -> Option<String> {
+    if let Err(e) = crate::logins::check(resource_of(url)) {
+        return Some(e.to_string());
+    }
+    if let Some(base) = crate::warp::direct(url) {
+        return peek_failure(base);
+    }
+    let c = lock();
+    match &c.slots.get(url)?.entry {
+        Entry::Failed(e, _) => Some(e.clone()),
+        _ => None,
+    }
+}
+
 /// Forgets everything (and failures, so they are tried again).
 pub fn clear() {
     let mut c = lock();
@@ -1521,6 +1538,16 @@ fn finished() {
 #[cfg(test)]
 fn store(url: &str, entry: Entry) {
     store_from(url, entry, crate::address::Reach::Local);
+}
+
+/// Moves a cached failure past its original retry deadline without fetching or changing clocks.
+#[cfg(test)]
+pub(crate) fn expire_failure(url: &str) -> bool {
+    let mut c = lock();
+    let Some(slot) = c.slots.get_mut(url) else { return false };
+    let Entry::Failed(error, at) = &mut slot.entry else { return false };
+    *at = Instant::now() - retry_wait(error, RETRY) - Duration::from_secs(1);
+    true
 }
 
 /// Composed cache entries retain the ceiling their constituent requests used.

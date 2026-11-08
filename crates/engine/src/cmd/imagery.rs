@@ -45,7 +45,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": raster, "crs"?: EPSG code or "EPSG:n" of the output (default the layer's), "cellSize"?: number or [x, y] in the output's units (default about the layer's pixel there), "origin"?: [x, y] a cell corner falls on (default [0, 0], so grids of the same cellSize line up), "extent"?: polygon layer (its selected or all features' bounds) | [west, south, east, north] in degrees | "view" (default the layer's footprint), "grid"?: raster layer whose coordinate system, cells and extent are taken exactly (instead of crs, cellSize, origin and extent), "resampling"?: "nearest" (default) | "bilinear" | "cubic" | "average" (the mean of the pixels whose centres fall in a cell) | "mode" (their most frequent value, the least of those tied), "name"?: new layer (default "<layer> projected"), "path"?: GeoTIFF to write it to}"#,
         ),
         C::new("raster.rasterize", "Polygons to Raster", "Analyze › Alignment", rasterize).inputs(rasterize_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer": polygon layer (its selected or all features; a later one over an earlier), "field"?: numeric field (its values) or text field (codes 1 to n in sorted order of its values, listed in a table named after the result with classes), "value"?: number every polygon gives when there is no field (default 1), "nodata"?: number of the cells under no polygon (default 0), "crs"?: EPSG code or "EPSG:n" of the output (default the layer's), "cellSize"?: number or [x, y] in the output's units (required without grid), "origin"?: [x, y] a cell corner falls on (default [0, 0], so grids of the same cellSize line up), "extent"?: polygon layer (its selected or all features' bounds) | [west, south, east, north] in degrees | "view" (default the polygons' bounds), "grid"?: raster layer whose coordinate system, cells and extent are taken exactly (instead of crs, cellSize, origin and extent), "name"?: new layer (default "<layer> raster"), "path"?: GeoTIFF to write it to}"#,
+            r#"{"layer": polygon layer (its selected or all features; a later one over an earlier), "field"?: numeric field (its values) or text field (codes 1 to n in sorted order of its values, listed in a table named after the result with classes), "value"?: number every polygon gives when there is no field (default 1), "nodata"?: number of the cells under no polygon (default 0), "crs"?: EPSG code or "EPSG:n" of the output (default the layer's), "cellSize"?: number or [x, y] in the output's units (required without grid), "origin"?: [x, y] a cell corner falls on (default [0, 0], so grids of the same cellSize line up), "extent"?: polygon layer (its selected or all features' bounds) | [west, south, east, north] in degrees | "view"; default the polygons' bounds, "grid"?: raster layer whose coordinate system, cells and extent are taken exactly (instead of crs, cellSize, origin and extent), "name"?: new layer (default "<layer> raster"), "path"?: GeoTIFF to write it to}"#,
         ),
         // A fit is a measurement of the points, not a project change: no undo step.
         C::new("raster.gcpFit", "Control Point Fit", "Analyze › Alignment", gcp_fit).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
@@ -278,6 +278,7 @@ fn georeference(s: &mut Session, p: &Value) -> CmdResult {
     let mut out = rebuild(&r, gt, Crs::LonLat, copied(&r)?)?;
     // The same pixels, so the same values rounded when the file was read.
     out.rounded = r.rounded.clone();
+    out.rounded_some = r.rounded_some.clone();
     let e = out.extent();
     let v = replace(s, &layer, out)?;
     Ok(json!({"layer": v["layer"], "extent": [e.min_x, e.min_y, e.max_x, e.max_y]}))
@@ -321,7 +322,9 @@ fn warp_to_fit(s: &mut Session, p: &Value, layer: &str, r: &Raster) -> CmdResult
     };
     let new_layer = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(200).collect::<String>());
     let out_name = new_layer.clone().unwrap_or_else(|| r.name.clone());
-    let out = warp::warp(r, &fit, &warp::Options { crs, points_crs, resampling, cell, name: out_name })?;
+    let mut out = warp::warp(r, &fit, &warp::Options { crs, points_crs, resampling, cell, name: out_name })?;
+    // Resampled from values rounded when the file was read, some or all of them.
+    out.keep_rounded_mark(r);
     if let Some((fw, fh)) = r.overview {
         let note =
             format!("{}: warped at reduced resolution, from its {} × {} overview of the {fw} × {fh} raster", r.name, r.width, r.height);
@@ -1129,7 +1132,9 @@ pub(crate) fn process_work(s: &Session, p: &Value) -> Result<super::workflows::W
                 };
                 let nodata = r.nodata.or(Some(NODATA as f64));
                 let color = if matches!(r.color, ColorHint::Palette(_)) { ColorHint::Gray } else { r.color.clone() };
-                let out = Raster::new(out, w, h, bands, gt, r.crs, nodata, color, r.data_type.clone()).map_err(|e| e.to_string())?;
+                let mut out = Raster::new(out, w, h, bands, gt, r.crs, nodata, color, r.data_type.clone()).map_err(|e| e.to_string())?;
+                // The blocks average values rounded when the file was read, some or all of them.
+                out.keep_rounded_mark(&r);
                 super::workflows::made(out, None)
             }))
         }
@@ -1282,6 +1287,8 @@ fn raster_mosaic(s: &mut Session, p: &Value) -> CmdResult {
         o.name = i.name.clone();
         o.classes = i.classes.clone();
     });
+    // Cells rounded when an input was read may be among those the mosaic keeps.
+    out.keep_rounded_marks(rs.iter().map(|r| &**r));
     let other: Vec<&str> = rs
         .iter()
         .skip(1)
@@ -1380,6 +1387,8 @@ fn clip_window(
     let gt = GeoTransform { origin_x: o.x, origin_y: o.y, ..r.transform };
     let mut out = Raster::new(name, w, h, bands, gt, r.crs, nodata, r.color.clone(), r.data_type.clone()).map_err(|e| e.to_string())?;
     out.bands.iter_mut().zip(&r.bands).for_each(|(o, i)| o.name = i.name.clone());
+    // Some of the values rounded when the file was read may be in the window: how many isn't known.
+    out.keep_rounded_mark(r);
     Ok(out)
 }
 
@@ -1470,6 +1479,8 @@ fn edit_pixels(s: &mut Session, p: &Value) -> CmdResult {
     let mut out = Raster::new(r.name.clone(), r.width, r.height, bands, r.transform, r.crs, nodata, r.color.clone(), r.data_type.clone())
         .map_err(|e| e.to_string())?;
     out.bands.iter_mut().zip(&r.bands).for_each(|(o, i)| o.name = i.name.clone());
+    // The edit may have overwritten some of the values rounded when the file was read.
+    out.keep_rounded_mark(&r);
     replace(s, &layer, out)?;
     Ok(json!({"pixels": n}))
 }
@@ -1518,7 +1529,7 @@ fn measure(s: &mut Session, p: &Value) -> CmdResult {
             if let Some(first) = pts.first() {
                 ring.push(*first);
             }
-            json!({"kind": "area", "squareMetres": body.area(rustgis_geom::geodesic_ring_area_m2(&ring)), "perimeterMetres": body.length(rustgis_geom::geodesic_length_m(&ring))})
+            json!({"kind": "area", "squareMetres": body.area(rustgis_geom::geodesic_ring_area_m2(&ring)), "perimeterMetres": body.length(rustgis_geom::geodesic_ring_perimeter_m(&ring))})
         }
         "height" => {
             let (Some(a), Some(c)) = (pts.first(), pts.get(1)) else { return Err("a height needs two points (base, top)".into()) };

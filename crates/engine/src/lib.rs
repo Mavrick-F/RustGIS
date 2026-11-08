@@ -700,6 +700,8 @@ pub struct Session {
     /// Runtime-only: never in Project, undo or PutAside, so replacement cannot erase them.
     loss_notices: Vec<LossNotice>,
     loss_notice_overflow: u32,
+    /// Whether this session has said that native HTTPS trusts the bundled CA roots (#1591).
+    bundled_roots_said: bool,
     /// Troubleshooting history, independent of the active pane, project files and undo.
     pub diagnostics: rustgis_data::diagnostics::History,
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
@@ -888,6 +890,10 @@ pub struct Session {
     /// ([`cmd::gp::Ahead::Taking`]), or which that copy records ([`cmd::gp::Ahead::Recording`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) tools_ahead: Option<cmd::gp::Ahead>,
+    /// The files a batch read on that copy, which the batch's run here takes
+    /// ([`cmd::gp::FilesAhead`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) files_ahead: Option<cmd::gp::FilesAhead>,
     /// Where the requests a copy of the session makes for a model's run ahead go
     /// ([`cmd::workflows::ahead_on_copy`]): the session's own Diagnostics, as when they're made
     /// there. Its notices stay its own: the run there says them.
@@ -1069,7 +1075,7 @@ impl Session {
         rustgis_data::diagnostics::set_clock(|| {
             web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
         });
-        let label_notices = std::mem::take(&mut project.label_read_notices);
+        let label_notices = project.take_read_notices(&crate::project::ALL_PARTS);
         let mut session = Session {
             project,
             path: None,
@@ -1101,6 +1107,7 @@ impl Session {
             notices: Vec::new(),
             loss_notices: Vec::new(),
             loss_notice_overflow: 0,
+            bundled_roots_said: false,
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
             table_layer: None,
@@ -1181,6 +1188,8 @@ impl Session {
             read_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
             tools_ahead: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            files_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
             requests_into: None,
             #[cfg(test)]
@@ -1467,7 +1476,7 @@ impl Session {
             let (at, start) = (project_log::now_ms(), web_time::Instant::now());
             #[cfg(not(target_arch = "wasm32"))]
             let files_before: Vec<String> = self.mbtiles_files().map(str::to_string).collect();
-            let res = run(self);
+            let res = self.with_unread_bools(source, run);
             // Whichever command took its last layer away (removed, undone, the project closed):
             // the file can now be moved or replaced, so what was read of it is forgotten too.
             #[cfg(not(target_arch = "wasm32"))]
@@ -1496,11 +1505,13 @@ impl Session {
                 // command's result as it was, without an entry, and says so in the app's log.
                 let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if project_log::is_logged(self, id, params) {
-                        let params = match step {
-                            Some(label) => serde_json::json!({"step": label}),
-                            None => project_log::kept_params(params),
+                        // The step's label isn't a parameter: the command, run again, takes none.
+                        let (params, partial) = match step {
+                            Some(label) => (serde_json::json!({"step": label}), false),
+                            None => project_log::kept_and_partial(params),
                         };
-                        let e = project_log::entry(id, params, &res, at, start.elapsed());
+                        let project = (project_log::kept_name(&self.title()), self.opened);
+                        let e = project_log::entry(project, id, params, partial, &res, at, start.elapsed());
                         if joins && res.is_ok() { self.log.join_last(e) } else { self.log.push(e) }
                     }
                 }));
@@ -1973,6 +1984,9 @@ impl Session {
         }
         // What a header left out, as adding the layer says it (one notice a kind, with counts).
         cmd::raster::say_losses(self, lost);
+        // The browser uses its own trust; only native clients can fall back.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.notice_trust();
         if !dropped.is_empty() {
             let mut kinds: Vec<&str> = dropped.iter().flat_map(|(_, k)| k.iter().copied()).collect();
             kinds.sort_unstable();
@@ -2010,6 +2024,28 @@ impl Session {
                     false,
                 )
             }
+        }
+    }
+
+    /// Says once a session that native HTTPS trusts the bundled Mozilla roots, as a Linux or BSD
+    /// system with no CA certificates and no `SSL_CERT_FILE` or `SSL_CERT_DIR` makes it
+    /// ([`rustgis_data::http::bundled_roots`]): the trust source was assumed, not the system's.
+    /// Checked after each command and each frame, as the clients are first made when a request is.
+    /// Says, once a session, that native HTTPS fell back to the bundled CA roots, if it did. Run
+    /// with [`Session::notice_landed_rasters`]; a reader of the notices that runs no command (the
+    /// Python package) calls it first, as a client made on a background thread chooses the trust.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn notice_trust(&mut self) {
+        self.say_bundled_roots(rustgis_data::http::bundled_roots());
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn say_bundled_roots(&mut self, bundled: bool) {
+        if bundled && !self.bundled_roots_said {
+            self.bundled_roots_said = true;
+            self.warn(
+                "This system has no CA certificates, so HTTPS servers are checked against the Mozilla roots bundled with RustGIS: install the system's CA certificates (or set SSL_CERT_FILE or SSL_CERT_DIR) to use its trust instead",
+            );
         }
     }
 
@@ -2076,6 +2112,21 @@ impl Session {
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
         use rustgis_data::diagnostics::Severity;
         self.notice(text.into(), if error { Severity::Error } else { Severity::Info });
+    }
+
+    /// Runs `f`, then says the true/false parameters it could not read: text taken as false,
+    /// other values ignored (#1600), as `source`'s notice. Inside another such run (a command's
+    /// script, a command run by a command) they are left for the outer one to say.
+    pub(crate) fn with_unread_bools<T>(&mut self, source: Option<&'static str>, f: impl FnOnce(&mut Self) -> T) -> T {
+        let scope = cmd::UnreadBoolsScope::open();
+        let r = f(self);
+        if let Some(text) = scope.close() {
+            let said_by = source.or(self.diagnostic_source);
+            let previous = std::mem::replace(&mut self.diagnostic_source, said_by);
+            self.warn(text);
+            self.diagnostic_source = previous;
+        }
+        r
     }
 
     /// A nonfatal problem: existing notice consumers still see it as a non-error, while

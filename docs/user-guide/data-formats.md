@@ -24,7 +24,7 @@ not every EPSG code; azimuthal equidistant systems such as Equi7 need the deskto
 | GeoRSS | `.rss`, `.atom`, `.georss`, or `.xml` | Add Data, drop the file, upload, or From URL… | RSS 2.0, RSS 1.0 and Atom feeds with GeoRSS Simple, GeoRSS GML or W3C Basic Geo places: points, lines and polygons layers with each item's title, link, description, date, id and category. |
 | LandXML | `.landxml`, or `.xml` | Add Data, drop the file, or upload | Coordinate geometry points, parcels (polygons), alignments (lines; curves as chords) and TIN surfaces (a triangle per face, with its mean elevation), converted from the file's `epsgCode` or `"crs"`. |
 | Encoded polylines | text | `layer.addEncodedPolyline` with `"polyline"` (one or a list) | Google's encoding, precision 5, or 6 (`"precision"`) as OSRM and Valhalla can give: a line layer. |
-| GML | `.gml` | Add Data, drop the file, or upload | Simple features in GML 2 and 3 (WFS answers, OGR's GML): a layer per feature type, its simple elements as fields. Converted from the `srsName` (EPSG codes, URNs and URLs; the URN and URL forms of geographic systems are latitude first). |
+| GML | `.gml` | Add Data, drop the file, or upload | Simple features in GML 2 and 3 (WFS answers, OGR's GML): a layer per feature type, its simple elements as fields (a property holding nested values, another GML value or a second shape isn't read, and is said). Converted from the `srsName` (EPSG codes, URNs and URLs; the URN and URL forms of geographic systems are latitude first). |
 | MapInfo Interchange | `.mif` with its `.mid` (or both zipped) | Add Data, drop the file, or upload the zip | Points, lines, polylines, regions (holes found by nesting), rectangles and ellipses; text and arcs are rows without geometry. Converted from the `CoordSys`: longitude/latitude, Transverse Mercator, Lambert Conformal Conic, Albers or Mercator. A loose `.mif` upload has no `.mid` attributes; zip both files to keep them in the web app. |
 | OpenStreetMap PBF | `.osm.pbf`, or `.pbf` containing OSM data | Add Data, drop the file, or upload | Points (tagged nodes), lines and multipolygons (closed ways that are areas, and multipolygon and boundary relations), with common tags as fields and the rest in `other_tags`, as GDAL gives them. Up to 40 million nodes (4 million in the web app); on the desktop, extracts over 256 MiB open through GDAL when it is installed. Vector-tile `.pbf` files use Add Tile Layer instead. |
 | ArcGIS feature-service answers (protocol buffer) | `.pbf` holding an answer to an ArcGIS query with `f=pbf`, or the query's address | Add Data, drop the file, upload, or From URL… with the query's address (`…/FeatureServer/0/query?…&f=pbf`) | One page of the layer: the fields and values the same query gives as GeoJSON, with the fields' aliases as their display names (dates as milliseconds since 1970, date-only and time values as text), points, lines or polygons converted to longitude/latitude from the answer's coordinate system. Z and M values, geometry, blob and raster fields are left out, with a notice. A page that stopped at the service's record limit keeps its features, with a notice that the rest aren't in it. A query the service refuses (an empty answer), a count, ids or an extent, curves, multipatches and envelopes give an error. Told from OpenStreetMap data by its content. |
@@ -58,7 +58,7 @@ identify and run through tools like any layer; **Load All Features** loads one t
 
 ## Formats read through GDAL
 
-With [GDAL](https://gdal.org) installed (its `ogr2ogr` and `ogrinfo` on the `PATH`, GDAL 3.7 or
+With [GDAL](https://gdal.org) installed (its `ogr2ogr` and `ogrinfo` on the `PATH`, GDAL 3.8 or
 later), the desktop app also reads the vector formats below. Each layer is converted once into a
 cached, indexed FlatGeobuf, so large ones stream too: see [Formats through
 GDAL](data.md#formats-through-gdal).
@@ -580,7 +580,7 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 | FlatGeobuf | Data › Export to `.fgb` | In the layer's coordinate system (see below), with a spatial index; features without geometry are left out (and reported). Desktop only: the writer needs a temporary file, which the browser doesn't have. |
 | KML, KMZ, GPX | Data › Export to `.kml`, `.kmz` or `.gpx` | Placemarks named by a `name` field, if there is one; features without geometry are left out. |
 | GeoJSON, KML, GPX, CSV, CSV with WKT | Analyze › Workflows › Data Interop (`data.convert`; `"format": "geojson"`, `"kml"`, `"gpx"`, `"csv"` or `"wkt"`) | Returns text when `"path"` is omitted; writes a file on desktop when it is given. |
-| GeoTIFF / Cloud-optimised GeoTIFF | Data › Export Raster (`share.exportRaster`) | Untiled GeoTIFF by default; `"cog": true` writes 512-pixel tiles, Deflate compression and overviews. Writes the loaded raster's resolution (an overview when that is what was opened), the selected band or its colour bands. The web app's Export Raster downloads an ordinary GeoTIFF. |
+| GeoTIFF / Cloud-optimised GeoTIFF | Data › Export Raster (`share.exportRaster`) | Untiled GeoTIFF by default; `"cog": true` writes 512-pixel tiles, Deflate compression and overviews. Writes the loaded raster's resolution (an overview when that is what was opened), the selected band or its colour bands. A WMS, WMTS or XYZ tile layer (`"tiles"`) is written as its tiles at one zoom, RGBA in Web Mercator (see [Sharing](sharing.md#exporting)). The web app's Export Raster downloads an ordinary GeoTIFF. |
 | PNG | Publish › Export Map (`share.exportMap`) | Configurable DPI, with labels, scale bar and tile credits. |
 | GeoTIFF of the map view | Publish › Export Map to `.tif` (`share.exportMap`) | The view as an RGB GeoTIFF in the map's projection, with labels but no scale bar; tile credits in the Copyright tag; `"cog": true` for a cloud-optimised one. Flat, untilted maps of the Earth only (see [Exporting](sharing.md#exporting)). |
 | PDF | Layouts, reports, presentations and the map view (Print Map), as vectors | |
@@ -599,9 +599,9 @@ RustGIS keeps x and y only. When a source has Z or M values (heights or measures
 they were dropped, and exporting or converting the layer (or exporting a standalone table that
 holds geometry), or sharing it as a web map, web layer or OGC API Features, says what's written
 lacks them.
-Shapefile, GeoPackage, GeoParquet, FlatGeobuf, PostGIS, File Geodatabase, GeoJSON, KML (altitudes
-other than 0), GML and CSV WKT columns are checked; sources read through GDAL or DuckDB, and SQL
-Server tables, aren't yet. GPX elevations and LiDAR heights are kept as fields, and a File
+Shapefile, GeoPackage, GeoParquet, FlatGeobuf, PostGIS, SQL Server, File Geodatabase, GeoJSON, KML
+(altitudes other than 0), GML and CSV WKT columns are checked; sources read through GDAL or DuckDB
+aren't yet. GPX elevations and LiDAR heights are kept as fields, and a File
 Geodatabase multipatch's heights as `z_min` and `z_max`. Where a source doesn't declare its
 dimensions, only a sample is checked: the first 16 rows of a GeoParquet file without geometry types
 (in its first row group), and the first 16 rows with a geometry of a GeoPackage table with optional

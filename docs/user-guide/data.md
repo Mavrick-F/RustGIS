@@ -117,7 +117,8 @@ fields, calculates field [expressions](expressions.md) and opens **Calculate Geo
 The geometry calculator fills a new double field or an existing numeric field with area,
 perimeter, length or point X/Y, for all or selected features. Point coordinates can be WGS 84
 degrees or a supported projected EPSG system's units. Areas, perimeters and lengths measure on
-the WGS 84 ellipsoid, with the exceptions for full-turn and polar rings listed under
+the WGS 84 ellipsoid; how full-turn rings (globe-wide bands) and rings split at the antimeridian
+are measured, and the exception for polar rings, are under
 [Geoprocessing](analysis.md#geoprocessing-tools).
 See [Editing](editing.md) for field
 calculations and data-design rules. Streamed layers must first be loaded with **Load All
@@ -126,7 +127,7 @@ Features**.
 ## Formats through GDAL
 
 When [GDAL](https://gdal.org) is installed (its `ogr2ogr` and `ogrinfo` programs on the `PATH`,
-or the folder holding them in `RUSTGIS_GDAL_BIN`; GDAL 3.7 or later), the desktop app also opens
+or the folder holding them in `RUSTGIS_GDAL_BIN`; GDAL 3.8 or later), the desktop app also opens
 the vector formats GDAL reads: DWG, MapInfo TAB, OpenStreetMap XML, File Geodatabases RustGIS
 can't read itself (compressed ones, or ones with raster fields)
 and more. RustGIS doesn't link to GDAL: each layer is converted once, by `ogr2ogr`, into a
@@ -657,7 +658,8 @@ inspection proxy's) must be trusted by the operating system for the account runn
   variables select the trust sources instead of the default system locations (an empty
   `SSL_CERT_DIR` counts as unset).
   If no default system roots are found and neither variable is set, this client falls back to
-  its bundled Mozilla roots, so public HTTPS still works in minimal containers. It does not
+  its bundled Mozilla roots, so public HTTPS still works in minimal containers, and says so
+  once a session (in the status bar and the troubleshooting history). It does not
   add Mozilla roots to an existing CA store (even one it can't read) or an explicitly configured one.
 
 `SSL_CERT_FILE` and `SSL_CERT_DIR` do **not** override Windows or macOS trust for this client.
@@ -878,6 +880,9 @@ Relative links, including parent paths, resolve against the document's address w
 template placeholders or query values, including proxy parameters containing `https://` URLs.
 KVP requests replace capabilities operation parameters, keeping unrelated parameters such as
 MapServer's `map=`.
+A same-origin link whose path or query holds a space, backslash or control character keeps the
+login: tabs, line breaks and trailing spaces are dropped, a backslash in the path becomes `/` and
+other spaces, control characters and backslashes are percent-encoded (a space as `%20`).
 If a service supplies a same-origin link too long to carry its login, the request is refused
 instead of being fetched anonymously. Addresses that cannot be rebound to a login are left
 unchanged and reported.

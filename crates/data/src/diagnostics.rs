@@ -350,10 +350,7 @@ impl Capture {
 
     /// Keeps repeated policy refusals once while their sanitized facts remain in this bounded
     /// history. Clearing or evicting the record permits it to be reported again.
-    pub fn network_failure_once(&self, source: &str, message: &str, details: &str, mut network: Network) {
-        // Rejected tile paths on one server are one policy refusal, not distinct attempts.
-        let clean = clean_address(&network.url);
-        network.url = url::Url::parse(&clean).ok().filter(|u| u.origin().is_tuple()).map_or(clean, |u| u.origin().ascii_serialization());
+    pub fn network_failure_once(&self, source: &str, message: &str, details: &str, network: Network) {
         self.keep_network_failure(source, message, details, network, true);
     }
 
@@ -361,6 +358,13 @@ impl Capture {
     fn keep_network_failure(&self, source: &str, message: &str, details: &str, mut network: Network, once: bool) {
         let Some(state) = self.0.upgrade() else { return };
         network.url = clean_address(&network.url);
+        if once {
+            // Rejected tile paths on one server are one policy refusal, not distinct attempts.
+            network.url = url::Url::parse(&network.url)
+                .ok()
+                .filter(|u| u.origin().is_tuple())
+                .map_or(network.url, |u| u.origin().ascii_serialization());
+        }
         network.method = known_method(&network.method);
         let record = Record {
             id: 0,

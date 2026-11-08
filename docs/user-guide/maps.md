@@ -50,7 +50,7 @@ files, and exported maps are drawn turned and tilted. A tilted map keeps the sca
 of the view: nearer ground is larger, farther ground smaller and drawn coarser, fading into fog
 and, past about 72 degrees, a sky above the horizon. Labels stay upright, and those too far away
 to read are left out. Point markers stand upright, facing you, as MapLibre's circles do, smaller
-with distance (aggregated, masked or blended point layers, and layers of more than 50,000 points,
+with distance (aggregated, masked, blended or diagrammed point layers, and layers of more than 50,000 points,
 keep their markers on the ground). Extruded layers (Style › Extrusion) stand up in perspective on a tilted
 map, as in MapLibre: walls lit by the way they face and darker toward their foot, roofs at their
 height, with the labels of extruded features on their roofs. While a tilted map moves, the
@@ -263,7 +263,7 @@ Ocean, Atlas, Blank), which need no network, and web tile layers over them:
   layers (each `hillshade-method`, lit as the map is drawn, north up; slopes are steepened at
   small scales so relief stays visible). Its shading follows the style's colours, exaggeration
   and light rather than matching MapLibre's pixel for pixel. Other `color-relief-color`
-  expressions aren't drawn. If a style's elevation source can't be read, its relief and
+  expressions aren't drawn, and a notice names the layers skipped. If a style's elevation source can't be read, its relief and
   hillshade layers are left out with a notice saying why, and the rest is drawn. Labels are placed
   as MapLibre places them: at points,
   in the middle of areas, and along lines (street names every `symbol-spacing`, turned to the

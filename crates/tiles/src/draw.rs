@@ -94,8 +94,30 @@ pub(crate) fn left_out(r: &Resolved, frame: &Frame, mesh: bool) -> Option<String
     let unread = sprite_notes(shown(StyleLayer::draws_icons), shown(StyleLayer::draws_patterns), hi_dpi, hi_dpi && !mesh, |hi, what| {
         sprite::unread_note(&r.sprites, r.style.sprites_listed, &r.load_sprites(hi), what)
     });
-    let all: Vec<&str> = r.left_out.iter().map(String::as_str).chain(unread.iter().map(String::as_str)).collect();
+    let relief = relief_note(&r.style.layers, zoom);
+    let all: Vec<&str> = r.left_out.iter().map(String::as_str).chain(unread.iter().map(String::as_str)).chain(relief.as_deref()).collect();
     (!all.is_empty()).then(|| all.join("; "))
+}
+
+/// What to say of the `color-relief` layers [`draw_layers`] skips where their
+/// `color-relief-color` isn't a ramp on the height: one note naming those that can't be coloured
+/// at some zoom they show at, the same at every zoom (a map notes each different text once), and
+/// any skipped at `zoom` all the same.
+fn relief_note(layers: &[StyleLayer], zoom: f32) -> Option<String> {
+    let ids: Vec<&str> = layers
+        .iter()
+        .filter(|l| {
+            l.kind == LayerKind::ColorRelief && (l.color_relief_undrawable() || (l.visible_at(zoom) && l.color_relief_ramp(zoom).is_none()))
+        })
+        .map(|l| l.id.as_str())
+        .collect();
+    (!ids.is_empty()).then(|| {
+        format!(
+            "{} color-relief layer(s) skipped where their color-relief-color isn't a ramp on [\"elevation\"] RustGIS can draw: {}",
+            ids.len(),
+            ids.join(", ")
+        )
+    })
 }
 
 /// What to say of sprites that couldn't be read (`note`, at a density), for what is shown: a style's
@@ -173,7 +195,8 @@ pub(crate) enum Pass {
 }
 
 /// Draws the layers of a resolved style for `pass` into `target` (a `w × h` pixmap at `frame`)
-/// from the tiles over `view`, collecting labels into `out`.
+/// from the tiles over `view`, collecting labels into `out`. Shape-only selection without a
+/// target includes neighbouring vector tiles whose paint can reach the viewport.
 /// Returns whether a failed or partial tile read could add pixels when the cache changes.
 pub(crate) fn draw_layers(
     mut target: Option<&mut Pixmap>,
@@ -230,18 +253,26 @@ pub(crate) fn draw_layers(
         }
         if !items.contains_key(src_id) {
             let Some(src) = r.style.sources.iter().find(|s| s.0 == src_id).map(|s| &s.1) else { continue };
-            // Hillshade reads the heights a pixel past the view's edges: those tiles too.
-            let pad = 2.0 * frame.m_per_px;
+            // Hillshade needs neighbouring heights. Picture diagnostics also need vector
+            // neighbours whose wide shapes can reach the current viewport, not all of a
+            // prepared picture's padding. Raster layers keep the exact viewport.
+            let pixels = if target.is_none() && pass == Pass::Shapes && matches!(src, Source::Vector { .. }) {
+                r.style
+                    .layers
+                    .iter()
+                    .filter(|l| l.source.as_deref() == Some(src_id) && l.visible_at(zoom) && drawable(l))
+                    .map(|l| match l.kind {
+                        LayerKind::Line | LayerKind::Circle => overhang(l, zoom) * frame.ppp,
+                        LayerKind::Fill | LayerKind::FillExtrusion => 2.0 * frame.ppp.max(1.0),
+                        _ => 0.0,
+                    })
+                    .fold(0.0f32, f32::max)
+            } else {
+                0.0
+            };
+            let pad = if matches!(src, Source::RasterDem { .. }) { 2.0 * frame.m_per_px } else { f64::from(pixels) * frame.m_per_px };
             let reach = Extent::new(view.min_x - pad, view.min_y - pad, view.max_x + pad, view.max_y + pad);
-            let selected = tiles_in(
-                src,
-                if matches!(src, Source::RasterDem { .. }) { &reach } else { view },
-                None,
-                frame,
-                zoom,
-                &mut out.pending,
-                &mut out.error,
-            );
+            let selected = tiles_in(src, &reach, None, frame, zoom, &mut out.pending, &mut out.error);
             retry |= selected.retry;
             items.insert(src_id.to_string(), selected.items);
         }
@@ -1281,6 +1312,57 @@ pub(crate) mod tests {
         super::add_error(&mut error, combined);
         assert_eq!(error.as_deref(), Some("sprite left out; 12 tiles left out: refused; 2 tiles left out: refused"));
     }
+
+    #[test]
+    fn a_relief_layer_rustgis_cant_colour_is_said_the_same_at_every_zoom() {
+        let layer = |id: &str, extra: serde_json::Value| {
+            let mut j = serde_json::json!({"id": id, "type": "color-relief", "source": "dem"});
+            if let (Some(o), Some(e)) = (j.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            StyleLayer::parse(&j).unwrap()
+        };
+        let colour = |c: serde_json::Value| serde_json::json!({"paint": {"color-relief-color": c}});
+        let ramp = colour(serde_json::json!(["interpolate", ["linear"], ["elevation"], 0, "#00f", 1000, "#fff"]));
+        let on_zoom = colour(serde_json::json!(["interpolate", ["linear"], ["zoom"], 0, "#00f", 10, "#fff"]));
+        let note = |layers: &[StyleLayer]| {
+            let at = [0.0, 5.0, 8.4, 8.6, 9.0, 24.0].map(|z| relief_note(layers, z));
+            assert!(at.iter().all(|n| n == &at[0]), "{at:?}");
+            at[0].clone()
+        };
+        // A ramp on the height, or one colour, says nothing.
+        assert_eq!(note(&[layer("a", ramp.clone()), layer("b", colour(serde_json::json!("#336699")))]), None);
+        // Not on the height: one note naming each skipped layer.
+        let said = note(&[layer("r0", on_zoom.clone()), layer("r1", ramp), layer("r2", on_zoom)]).unwrap();
+        assert!(said.starts_with("2 color-relief layer(s) skipped where"), "{said}");
+        assert!(said.ends_with(": r0, r2"), "{said}");
+        // A colour that fails only from a zoom between whole ones, worked out from the zoom, or at
+        // 24 past a larger maxzoom is said at every zoom...
+        let late = |at: f64, max: f64| {
+            let mut l = colour(serde_json::json!([
+                "interpolate",
+                ["linear"],
+                ["elevation"],
+                0,
+                ["step", ["zoom"], "#00f", at, "nope"],
+                1000,
+                "#fff"
+            ]));
+            l["maxzoom"] = max.into();
+            l
+        };
+        let odd = colour(serde_json::json!(["case", [">", ["*", ["zoom"], 3], 25.53], "nope", "#00f"]));
+        for l in [late(8.5, 9.0), late(24.0, 30.0), odd] {
+            assert!(note(&[layer("l", l.clone())]).is_some_and(|s| s.ends_with(": l")), "{l}");
+        }
+        // ...but not one shown only below that zoom, or hidden.
+        assert_eq!(note(&[layer("l", late(8.0, 8.0))]), None);
+        assert_eq!(
+            note(&[layer("h", serde_json::json!({"layout": {"visibility": "none"}, "paint": {"color-relief-color": "nope"}}))]),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

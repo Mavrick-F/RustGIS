@@ -15,8 +15,17 @@ use super::{b, f, need_feature_layer, need_layer, ps};
 use crate::project::{StyleItem, Task, TaskStep};
 use crate::{CmdResult, CommandSpec as C, Project, Session};
 
-/// Largest item file read (512 MiB, like projects).
-const MAX_FILE: u64 = 512 << 20;
+/// Largest item file read: a project's ([`crate::project::max_bytes`]), for every kind of item
+/// (maps, layers, styles, tasks, packages), as each was bounded like a project before and an
+/// item file may be a whole project (Import Maps reads `.rgis` files).
+fn max_file() -> u64 {
+    crate::project::max_bytes()
+}
+
+/// What an item past [`max_file`] is told.
+fn too_large() -> String {
+    format!("the file is too large (maximum {})", crate::project::limit_said(max_file()))
+}
 
 pub fn commands() -> Vec<C> {
     vec![
@@ -368,10 +377,10 @@ pub(crate) fn read_text(p: &Value) -> Result<String, String> {
         return Ok(text);
     }
     match (ps(p, "text"), ps(p, "path")) {
-        (Some(t), _) if t.len() as u64 <= MAX_FILE => Ok(t.to_string()),
-        (Some(_), _) => Err("the file is too large".into()),
+        (Some(t), _) if t.len() as u64 <= max_file() => Ok(t.to_string()),
+        (Some(_), _) => Err(too_large()),
         (None, Some(path)) => {
-            let bytes = crate::project::read_file(Path::new(path), MAX_FILE)?;
+            let bytes = crate::project::read_file(Path::new(path), max_file())?;
             // Packages are zip archives holding the project.
             if bytes.starts_with(b"PK") {
                 return package_text(&bytes);
@@ -419,10 +428,13 @@ fn embedded_map(m: &Map, budget: &mut u64) -> Map {
     m
 }
 
+/// The most maps one `map.import` adds.
+const MAX_IMPORTED_MAPS: usize = 100;
+
 /// Adds maps from a map file, project or package.
 fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
     let text = read_text(p)?;
-    crate::project::check_format(&text, "map file or project")?;
+    crate::project::check_format(&text, "map file, project or package")?;
     let dir = ps(p, "path").and_then(|path| std::path::absolute(path).ok()).and_then(|p| p.parent().map(Path::to_path_buf));
     super::connections::clear_active();
     let maps: Vec<Map> = match serde_json::from_str::<Map>(&text) {
@@ -437,26 +449,31 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
             // An older map file's plain COG tile layers open as raster layers read in place, as a
             // project's do (a project imported had them opened as it was read).
             super::tiles::cog_tiles_to_rasters(&mut m);
-            for notice in crate::project::label_losses::map_notices(&text, &m) {
+            for notice in crate::project::label_losses::map_notices(&text, &m, true) {
                 s.notify(notice, false);
             }
             vec![m]
         }
         Err(_) => match Project::from_import_json(&text, dir.as_deref()) {
             Ok(mut project) => {
-                for notice in std::mem::take(&mut project.label_read_notices) {
+                for notice in project.take_read_notices(&[crate::project::ReadPart::Labels, crate::project::ReadPart::Diagrams]) {
+                    s.notify(notice, false);
+                }
+                // Hidden diagrams of the maps imported only.
+                let imported = project.maps.iter().take(MAX_IMPORTED_MAPS).flat_map(|m| &m.layers);
+                for (_, notice) in crate::project::label_losses::hidden(imported) {
                     s.notify(notice, false);
                 }
                 project.maps
             }
             Err(error) => {
                 super::connections::restore_active(s);
-                return Err(error);
+                return Err(not_a(error, "map file, project or package"));
             }
         },
     };
     let mut names = Vec::new();
-    for mut m in maps.into_iter().take(100) {
+    for mut m in maps.into_iter().take(MAX_IMPORTED_MAPS) {
         // A binding in a file is no authority to use a login here.
         crate::s3_connections::clear_bindings(m.addresses_mut());
         crate::project::clear_login_bindings(m.addresses_mut());
@@ -472,7 +489,9 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
     }
     // Repair what was read (rasters reopen, cameras clamp); the sources that read S3 wait for
     // the saved connection that is to read them.
-    s.project.normalize();
+    for notice in s.project.normalize() {
+        s.notify(notice, false);
+    }
     super::connections::restore_active(s);
     super::connections::resolve_project(s);
     crate::s3_connections::resolve_project_s3(s);
@@ -485,6 +504,16 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
         s.active_layer = s.map().layers.first().map(|l| l.id);
     }
     Ok(json!({"maps": names}))
+}
+
+/// A project read's refusal for an import that also takes `kinds`: text that is none of them is
+/// said to be none of them, not only a failed project. Other refusals (such as "Update RustGIS")
+/// are kept as they are.
+fn not_a(error: String, kinds: &str) -> String {
+    match error.strip_prefix("not a RustGIS project: ") {
+        Some(why) => format!("not a RustGIS {kinds}: {why}"),
+        None => error,
+    }
 }
 
 fn add_style(s: &mut Session, mut item: StyleItem) {
@@ -501,12 +530,12 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
     let text = read_text(p)?;
     crate::project::check_format(&text, "layer file, map file or project")?;
     let layers: Vec<Layer> = if let Ok(l) = serde_json::from_str::<Layer>(&text) {
-        for notice in crate::project::label_losses::layer_notices(&text, &l) {
+        for notice in crate::project::label_losses::layer_notices(&text, &l, false) {
             s.notify(notice, false);
         }
         vec![l]
     } else if let Ok(m) = serde_json::from_str::<Map>(&text) {
-        for notice in crate::project::label_losses::map_notices(&text, &m) {
+        for notice in crate::project::label_losses::map_notices(&text, &m, false) {
             s.notify(notice, false);
         }
         m.layers
@@ -515,8 +544,9 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
         super::connections::clear_active();
         let project = Project::from_import_json(&text, None);
         super::connections::restore_active(s);
-        let mut project = project?;
-        for notice in std::mem::take(&mut project.label_read_notices) {
+        let mut project = project.map_err(|e| not_a(e, "layer file, map file or project"))?;
+        // Styles take the layers' renderers and labels, not their diagrams or the layouts.
+        for notice in project.take_read_notices(&[crate::project::ReadPart::Labels]) {
             s.notify(notice, false);
         }
         project.maps.into_iter().flat_map(|m| m.layers).collect()
@@ -647,13 +677,13 @@ fn package_project(s: &mut Session) -> Result<Vec<u8>, String> {
         *m = embedded_map(m, &mut budget);
     }
     let name = p.name.clone();
-    let (text, report) = crate::durable::output_owned(p, |p| serde_json::to_string(p).map_err(|e| e.to_string()))?;
-    crate::durable::notify(s, &report);
-    let limit = crate::project::MAX_BYTES.min(rustgis_data::zip::MAX_TOTAL as u64);
-    if text.len() as u64 > limit {
-        return Err(format!("the project is too large to package (maximum {} MiB)", limit >> 20));
-    }
     let readme = format!("{} — a RustGIS project package.\nOpen it with RustGIS (Project › Open), or unzip it for {}.rgis.\n", name, name);
+    // The package as unzipped, the README with it, within what a zip and a project may hold.
+    let limit = crate::project::max_bytes().min(rustgis_data::zip::MAX_TOTAL as u64);
+    let room = limit.saturating_sub(readme.len() as u64);
+    let package_too_large = || format!("the project is too large to package (maximum {} MiB)", limit >> 20);
+    let (text, report) = crate::durable::output_owned(p, |p| crate::project::json_within(p, room)?.ok_or_else(package_too_large))?;
+    crate::durable::notify(s, &report);
     rustgis_data::zip::write(&[
         (format!("{}.{}", safe(&name), crate::project::EXTENSION), text.into_bytes()),
         ("README.txt".into(), readme.into_bytes()),
@@ -1607,8 +1637,8 @@ fn durable_bytes<T: crate::durable::Durable + serde::Serialize>(s: &mut Session,
 pub(crate) fn inline_text(p: &Value) -> Result<Option<String>, String> {
     if let Some(d) = ps(p, "data") {
         use base64::Engine;
-        if d.len() as u64 > MAX_FILE / 3 * 4 {
-            return Err("the file is too large".into());
+        if d.len() as u64 > max_file() / 3 * 4 {
+            return Err(too_large());
         }
         let bytes = base64::engine::general_purpose::STANDARD.decode(d.trim()).map_err(|_| "data must be base64".to_string())?;
         if bytes.starts_with(b"PK") {
@@ -1617,8 +1647,8 @@ pub(crate) fn inline_text(p: &Value) -> Result<Option<String>, String> {
         return String::from_utf8(bytes).map(Some).map_err(|_| "not a RustGIS file".to_string());
     }
     match ps(p, "text") {
-        Some(t) if t.len() as u64 <= MAX_FILE => Ok(Some(t.to_string())),
-        Some(_) => Err("the file is too large".into()),
+        Some(t) if t.len() as u64 <= max_file() => Ok(Some(t.to_string())),
+        Some(_) => Err(too_large()),
         None => Ok(None),
     }
 }

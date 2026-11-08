@@ -571,6 +571,55 @@ mod tests {
         assert!(kept.iter().zip(&again).all(|(old, new)| Arc::ptr_eq(&old.payload, &new.payload)));
     }
 
+    /// A neighbouring tile can paint a circle into view even when its own square is outside.
+    #[test]
+    fn picture_reports_refused_symbols_reaching_in_from_a_neighbour() {
+        let _turn = cache::turn();
+        let bytes = crate::mvt::encode(&Tile {
+            layers: vec![Layer {
+                name: "l".into(),
+                extent: 4096,
+                features: vec![Feature { id: None, kind: GeomKind::Point, props: Vec::new(), geometry: vec![vec![[4090.0, 1024.0]]] }],
+            }],
+        });
+        cache::set_fetcher(move |_, done| done(Ok(bytes.clone())));
+        let tile = TileId { z: 2, x: 3, y: 2 }.extent();
+        let m_per_px = frame(2.2, 1.0).m_per_px;
+        let f = Frame { left: tile.min_x + 4.0 * m_per_px, top: tile.max_y - tile.height() * 0.25 + 32.0 * m_per_px, m_per_px, ppp: 1.0 };
+        let view = f.extent(64, 64);
+        for restricted in [false, true] {
+            let mut style = crate::style::Style::parse(&serde_json::json!({"version":8,
+                "sources":{"s":{"type":"vector","tiles":["http://127.0.0.1/{z}/{x}/{y}","https://picture-neighbour.example/{z}/{x}/{y}"]}},
+                "layers":[{"id":"point","type":"circle","source":"s","source-layer":"l","paint":{"circle-radius":20,"circle-color":"#ff0000"}}]}))
+            .unwrap();
+            let from = restricted.then(|| crate::address::Origin::named("https://picture-neighbour.example/style.json"));
+            if let Source::Vector { from: selected, .. } = &mut style.sources.first_mut().unwrap().1 {
+                *selected = from.clone();
+            }
+            let r = Arc::new(Resolved {
+                style,
+                from,
+                sprites: Vec::new(),
+                attribution: Vec::new(),
+                left_out: Vec::new(),
+                made: Mutex::new(Instant::now()),
+                waiting: false,
+            });
+            cover(&r, &f, &view, None, &mut false, &mut None);
+            cache::wait(Duration::from_secs(2));
+            let mut error = None;
+            let pictures = cover(&r, &f, &view, None, &mut false, &mut error).unwrap();
+            let painted = pictures.iter().any(|it| {
+                let Payload::Image(pm) = it.payload.as_ref() else { return false };
+                let x = ((view.min_x + 2.0 * m_per_px - it.at.min_x) / it.at.width() * f64::from(pm.width())).floor();
+                let y = ((it.at.max_y - (view.max_y - 32.0 * m_per_px)) / it.at.height() * f64::from(pm.height())).floor();
+                x >= 0.0 && y >= 0.0 && pm.pixel(x as u32, y as u32).is_some_and(|px| px.alpha() > 0)
+            });
+            assert_eq!(painted, !restricted, "the permitted neighbour must paint into the actual viewport");
+            assert_eq!(error.is_some(), restricted, "visible missing neighbour geometry must be reported: {error:?}");
+        }
+    }
+
     /// Routine missing tiles and reported failures both replace their pixels after recovery.
     #[test]
     fn picture_failures_refresh_after_recovery() {
@@ -589,7 +638,16 @@ mod tests {
         };
         let mut stale = Vec::new();
         for status in [503, 404, 410] {
-            cache::set_fetcher(move |_, done| done(Err(format!("http status: {status}"))));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let attempts = calls.clone();
+            let bytes = crate::mvt::encode(&tile);
+            cache::set_fetcher(move |_, done| {
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    done(Err(format!("http status: {status}")));
+                } else {
+                    done(Ok(bytes.clone()));
+                }
+            });
             let url = format!("https://picture-retry.example/{status}");
             let style = crate::style::Style::parse(&serde_json::json!({"version":8,
                 "sources":{"s":{"type":"vector","tiles":[url],"maxzoom":0}},
@@ -615,11 +673,11 @@ mod tests {
             assert_eq!(error.is_some(), status == 503, "routine status {status}: {error:?}");
             assert!(!failed.is_empty());
             assert!(failed.iter().all(|it| matches!(it.payload.as_ref(), Payload::Image(pm) if pm.data().iter().all(|b| *b == 0))));
-            let bytes = crate::mvt::encode(&tile);
-            cache::set_fetcher(move |_, done| done(Ok(bytes.clone())));
-            cache::forget(&url);
-            cache::get_tile(&url, cache::Want::Vector);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(cache::expire_failure(&url));
+            cover(&r, &f, &view, None, &mut false, &mut None);
             cache::wait(Duration::from_secs(2));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "cover must initiate the expired tile's retry");
             assert!(matches!(cache::peek(&url).as_deref(), Some(Payload::Vector(t)) if !t.layers[0].features.is_empty()));
             let mut error = None;
             let recovered = cover(&r, &f, &view, None, &mut false, &mut error).unwrap();

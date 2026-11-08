@@ -16,13 +16,13 @@ use crate::{CmdResult, CommandSpec as C, Session};
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addData", "Add Data", "Home › Add", add_data).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
-            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a CityJSON model, or a GDAL or DuckDB file that doesn't say", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
+            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a CityJSON model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
         C::new("layer.addPhotos", "Add Photos", "Home › Add", add_photos).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"paths"?: [JPEG photo files], "folder"?: "a folder of photos (every JPEG in it)", "name"?: "the layer (default Photos; photos join it when it exists)"}"#,
         ),
         C::new("info.fileLayers", "List Layers in File", "Home › Add › Add Data", file_layers).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
-            .params(r#"{"path": string, "crs"?: "EPSG:… for a .city.json that doesn't say (as layer.addData)"}"#),
+            .params(r#"{"path": string, "crs"?: "EPSG:… for a CityJSON model (.city.json, a .json, or in a zip): it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows (as layer.addData)"}"#),
         C::new("info.fileColumns", "List Columns in File", "Home › Add › Add Data › Delimited Text", file_columns).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"path": "a delimited text file (CSV, TSV, TXT) or a spreadsheet", "delimiter"?: ","|";"|"\\t"|"|", "layer"?: "a spreadsheet's sheet (the first by default)"}"#,
         ),
@@ -1594,7 +1594,7 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
                 .map(|(dataset, report)| rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() })
                 .collect()
         }
-        // A CityJSON model that names no coordinate system, or names one it doesn't have.
+        // A CityJSON model with a coordinate system given, which takes the place of any it names.
         _ if crs.is_some() && rustgis_data::io::is_cityjson(file_name, bytes) => {
             let crs = crs.map(rustgis_data::raster::Crs::parse).transpose()?;
             rustgis_data::cityjson::read(file_name, bytes, crs)
@@ -1763,7 +1763,8 @@ fn ground_overlays(s: &mut Session, file_name: &str, bytes: &[u8]) -> Vec<(Strin
     let dir = Path::new(file_name).parent().filter(|d| d.is_absolute());
     for (g, picture) in found {
         let href = g.href.trim();
-        let picture = picture.or_else(|| {
+        // `Err(None)`: not in the file or beside it; `Err(Some(why))`: beside it but unreadable.
+        let picture = picture.ok_or(None::<String>).or_else(|_| {
             // Beside the document: no web addresses, absolute paths or climbing out of its folder.
             let rel = Path::new(href);
             let safe = !href.contains("://")
@@ -1772,14 +1773,29 @@ fn ground_overlays(s: &mut Session, file_name: &str, bytes: &[u8]) -> Vec<(Strin
                     // Windows too (`C:x`, `\\x`).
                     && rel.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
             if !safe {
-                return None;
+                return Err(None);
             }
-            let p = dir?.join(rel);
-            crate::project::read_file(&p, (256 << 20) - 1).ok()
+            let p = dir.ok_or(None)?.join(rel);
+            // Only a missing picture isn't beside it; one that can't be looked at says why.
+            // (Followed as the read follows it: a link to nothing is missing too.)
+            match std::fs::metadata(&p) {
+                Ok(_) => {}
+                // (A file named as a folder on its way, `a.png/b.png`, isn't beside it either.)
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Err(None),
+                Err(e) => return Err(Some(e.to_string())),
+            }
+            crate::project::read_file(&p, (256 << 20) - 1).map_err(Some)
         });
-        let Some(picture) = picture else {
-            notes.push(format!("{} (its picture {href} isn't in the file or beside it)", g.name));
-            continue;
+        let picture = match picture {
+            Ok(p) => p,
+            Err(None) => {
+                notes.push(format!("{} (its picture {href} isn't in the file or beside it)", g.name));
+                continue;
+            }
+            Err(Some(why)) => {
+                notes.push(format!("{} (its picture {href} can't be read: {why})", g.name));
+                continue;
+            }
         };
         match rustgis_data::raster::from_image(&g.name, &picture, g.bbox, g.rotation) {
             Ok(r) => out.push((g.name.clone(), r)),
@@ -2902,7 +2918,7 @@ pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     if layer.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")) {
         return Err("a layer file cannot contain runtime GeoLibre download reservations".into());
     }
-    for notice in crate::project::label_losses::layer_notices(text, &layer) {
+    for notice in crate::project::label_losses::layer_notices(text, &layer, true) {
         s.notify(notice, false);
     }
     // A binding in a file is no authority to use a login here.
@@ -2917,7 +2933,9 @@ pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     }
     let id = s.map_mut().add_layer(layer);
     super::connections::clear_active();
-    s.project.normalize();
+    for notice in s.project.normalize() {
+        s.notify(notice, false);
+    }
     super::connections::restore_active(s);
     s.wait_in_place_reads();
     // Only the database the added layer reads can change here.
