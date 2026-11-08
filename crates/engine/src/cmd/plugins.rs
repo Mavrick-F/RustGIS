@@ -154,15 +154,24 @@ fn fetch_registry(s: &mut Session, url: &str) -> Result<Vec<rustgis_plugins::reg
     use rustgis_plugins::registry;
     let text = registry::fetch(url, registry::MAX_REGISTRY_BYTES)?;
     let entries = registry::parse(&String::from_utf8_lossy(&text), url)?;
-    // A blocklist that can't be fetched or read leaves the list in force, with a warning. Another
-    // registry may have no blocklist (it blocks nothing); the hosted one always has one.
+    // A blocklist that can't be fetched or read (one that isn't text included: a replaced byte in
+    // an id would match nothing) leaves the list in force, with a warning. Another registry may
+    // have no blocklist (it blocks nothing); the hosted one always has one.
     let blocklist = registry::blocklist_url(url);
-    let refused = match registry::fetch(&blocklist, 4 * 1024 * 1024) {
-        Ok(b) => rustgis_plugins::store::save_blocklist(url, &String::from_utf8_lossy(&b)).err(),
-        Err(e) => registry::is_default(url).then_some(e),
+    let applied = match registry::fetch(&blocklist, 4 * 1024 * 1024) {
+        Ok(b) => {
+            std::str::from_utf8(&b).map_err(|e| format!("it isn't text: {e}")).and_then(|t| rustgis_plugins::store::save_blocklist(url, t))
+        }
+        Err(e) if registry::is_default(url) => Err(e),
+        Err(_) => Ok(Vec::new()),
     };
-    if let Some(e) = refused {
-        s.warn(format!("{blocklist}: {e}; the last blocklist read, if any, stays in force"));
+    match applied {
+        Ok(pulled) if !pulled.is_empty() => s.notify(
+            format!("{} plugin(s) were withdrawn from the plugin registry and turned off: {}", pulled.len(), pulled.join(", ")),
+            true,
+        ),
+        Ok(_) => {}
+        Err(e) => s.warn(format!("{blocklist}: {e}; the last blocklist read, if any, stays in force")),
     }
     Ok(entries)
 }

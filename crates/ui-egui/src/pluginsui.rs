@@ -613,11 +613,12 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             Job::Blocklist { registry, slot } => match take(&slot) {
                 None => waiting.push(Job::Blocklist { registry, slot }),
                 Some(Ok(b)) => {
-                    let text = String::from_utf8_lossy(&b).to_string();
+                    // Not text is refused too: a replaced byte in an id would match nothing.
+                    let text = std::str::from_utf8(&b).map_err(|e| format!("it isn't text: {e}"));
                     #[cfg(not(target_arch = "wasm32"))]
-                    let pulled = rp::store::save_blocklist(&registry, &text);
+                    let pulled = text.and_then(|t| rp::store::save_blocklist(&registry, t));
                     #[cfg(target_arch = "wasm32")]
-                    let pulled = rp::registry::parse_blocklist(&text).map(|l| rp::apply_blocklist(&registry, l));
+                    let pulled = text.and_then(rp::registry::parse_blocklist).map(|l| rp::apply_blocklist(&registry, l));
                     // One that can't be read leaves the list in force as it was.
                     let pulled = pulled.unwrap_or_else(|e| {
                         app.session.warn(crate::i18n::fmt(
