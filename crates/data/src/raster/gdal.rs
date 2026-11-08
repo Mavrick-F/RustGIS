@@ -132,6 +132,36 @@ fn missing() -> DataError {
     )
 }
 
+/// Refuses an ER Mapper header that would open more than its own data: a `Translated` one, whose
+/// data file GDAL opens as any format (a VRT beside it would read whatever it names), or one whose
+/// data file isn't a file beside it (GDAL before 3.12 follows `../`). Other files pass.
+fn plain_ers(src: &Path) -> Result<()> {
+    if !src.extension().is_some_and(|e| e.eq_ignore_ascii_case("ers")) {
+        return Ok(());
+    }
+    // A header is a few kilobytes of text.
+    const MAX_HEADER: u64 = 1 << 20;
+    if std::fs::metadata(src)?.len() > MAX_HEADER {
+        return Err(DataError::Format("too large for an ER Mapper header".into()));
+    }
+    let text = String::from_utf8_lossy(&std::fs::read(src)?).into_owned();
+    // Every line naming a key, so a second one can't hide behind the first.
+    let values = |key: &str| {
+        text.lines()
+            .filter_map(|l| l.split_once('='))
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.trim().trim_matches('"').to_string())
+            .collect::<Vec<_>>()
+    };
+    if values("DataSetType").iter().any(|t| t.eq_ignore_ascii_case("Translated")) {
+        return Err(DataError::Unsupported("an ER Mapper header linking to another file (DataSetType = Translated) isn't read".into()));
+    }
+    if values("DataFile").iter().any(|f| f.contains(['/', '\\', ':']) || f == "..") {
+        return Err(DataError::Unsupported("an ER Mapper header whose data file isn't beside it isn't read".into()));
+    }
+    Ok(())
+}
+
 /// The subdatasets of a file (NetCDF variables, HDF datasets): GDAL's name for each, and its
 /// description. Empty for a file that is one raster.
 pub fn subdatasets(src: &Path) -> Result<Vec<(String, String)>> {
@@ -142,7 +172,9 @@ pub fn subdatasets(src: &Path) -> Result<Vec<(String, String)>> {
 fn subdatasets_with_budget(src: &Path, workspace: Option<(&Path, u64)>) -> Result<Vec<(String, String)>> {
     let gdalinfo = program("gdalinfo").ok_or_else(missing)?;
     let full = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
-    let mut c = command(gdalinfo, drivers(&full)?);
+    let drivers = drivers(&full)?;
+    plain_ers(&full)?;
+    let mut c = command(gdalinfo, drivers);
     // With the metadata (`-nomd` would drop the SUBDATASETS domain too, `-mdd` or not).
     c.arg("-json").arg("-nogcp").arg("-norat").arg("-noct").arg(&full);
     let out = output_with_budget(c, LIST_TIMEOUT, "GDAL", workspace)?;
@@ -518,6 +550,29 @@ mod tests {
     fn every_type_has_its_drivers() {
         assert!(EXTENSIONS.iter().all(|e| drivers(Path::new(&format!("a.{e}"))).is_ok()));
         assert!(drivers(Path::new("a.vrt")).is_err() && drivers(Path::new("a.tif")).is_err());
+    }
+
+    /// An ER Mapper header opens only its own data beside it: one linking to another file, or
+    /// naming data elsewhere, is refused before GDAL runs (GDAL installed or not).
+    #[test]
+    fn er_mapper_headers_open_only_their_own_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = |name: &str, lines: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, format!("DatasetHeader Begin\n{lines}\tDataType\t= Raster\nDatasetHeader End\n")).unwrap();
+            p
+        };
+        let plain = header("plain.ers", "\tDataSetType\t= ERStorage\n\tDataFile\t= \"plain.dat\"\n");
+        assert!(plain_ers(&plain).is_ok());
+        let linked = header("linked.ers", "\tDataSetType\t= ERStorage\n\tdatasettype = Translated\n");
+        assert!(plain_ers(&linked).is_err_and(|e| e.to_string().contains("Translated")));
+        for far in ["../far.dat", "/tmp/far.dat", "C:\\far.dat", ".."] {
+            let p = header("far.ers", &format!("\tDataFile\t= \"{far}\"\n"));
+            assert!(plain_ers(&p).is_err_and(|e| e.to_string().contains("isn't beside it")), "{far}");
+        }
+        assert!(subdatasets(&linked).is_err());
+        // Not an ER Mapper header: nothing to check.
+        assert!(plain_ers(Path::new("/nowhere/a.img")).is_ok());
     }
 
     /// A VRT renamed `.img` isn't opened as a VRT, so the raster it names isn't read.
