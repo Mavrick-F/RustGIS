@@ -12681,7 +12681,7 @@ fn serve_files(files: Vec<(String, Vec<u8>)>) -> (String, std::sync::Arc<std::sy
 }
 
 /// A registry whose blocklist can't be read warns that the last blocklist read stays in force;
-/// one with a readable blocklist says nothing.
+/// one with a readable blocklist says nothing, apart from naming the plugins it turned off.
 #[test]
 fn unreadable_plugin_blocklist_warns() {
     let warned = |blocklist: &[u8]| {
@@ -12701,12 +12701,8 @@ fn unreadable_plugin_blocklist_warns() {
     };
     assert_eq!(warned(br#"{"blocked": {}}"#), 1);
     assert_eq!(warned(br#"{"blocked": []}"#), 0);
-}
-
-/// A registry's blocklist that isn't text is refused with a warning, and one that withdraws a
-/// loaded plugin says it was turned off.
-#[test]
-fn registry_blocklists_say_what_they_refuse_and_turn_off() {
+    // In the same test, as both apply blocklists, which unload plugins process-wide: one that
+    // isn't text is refused with a warning, and one that withdraws a loaded plugin says so.
     let run = |blocklist: &[u8]| {
         let (base, _) =
             serve_files(vec![("/registry.json".into(), br#"{"plugins": []}"#.to_vec()), ("/blocklist.json".into(), blocklist.to_vec())]);
