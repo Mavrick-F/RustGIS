@@ -125,16 +125,22 @@ pub fn unpack(bytes: &[u8], pkg: &mut Package) -> Result<(), String> {
         return Ok(());
     }
     let target = unpacked_dir(&pkg.manifest.id).ok_or("there is no folder for plugins")?;
-    unpack_to(bytes, &pkg.sha256, &target)?;
+    unpack_to(bytes, &pkg.sha256, &target, &pkg.manifest.id)?;
     pkg.dir = Some(target);
     Ok(())
 }
 
 /// Unpacks a package to `target`, the folder a process plugin runs from, unless that copy is
 /// already there.
-fn unpack_to(bytes: &[u8], sha256: &str, target: &Path) -> Result<(), String> {
+fn unpack_to(bytes: &[u8], sha256: &str, target: &Path, id: &str) -> Result<(), String> {
     match stage(bytes, sha256, target)? {
-        Some(staged) => swap_in(&staged, target),
+        Some(staged) => {
+            // A session plugin's program runs from these files (on Windows they can't be
+            // replaced while it does): it stops first.
+            let was_running = crate::session::is_running(id);
+            crate::session::stop(id);
+            swap_in(&staged, target).map_err(|e| if was_running { format!("{e} (its running program was stopped first)") } else { e })
+        }
         None => Ok(()),
     }
 }
@@ -255,6 +261,9 @@ pub fn install_bytes(bytes: &[u8]) -> Result<Arc<Plugin>, String> {
         return Err(format!("{}: {e}", path.display()));
     }
     if let Some((s, target)) = &staged {
+        // A session plugin's program runs from these files (on Windows they can't be replaced
+        // while it does): it stops first.
+        crate::session::stop(&plugin.manifest.id);
         swap_in(s, target)?;
     }
     Ok(crate::register(plugin))
