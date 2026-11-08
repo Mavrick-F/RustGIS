@@ -12690,7 +12690,9 @@ fn unreadable_plugin_blocklist_warns() {
         let mut s = Session::new(Project::default());
         let mark = s.notices_given();
         s.run("plugin.registry", &json!({"url": format!("{base}/registry.json")})).unwrap();
-        s.notices_since(mark).iter().filter(|n| n.text.contains("withdrawn before stay blocked")).count()
+        let said: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("withdrawn before stay blocked")).collect();
+        assert!(said.iter().all(|n| n.severity == rustgis_data::diagnostics::Severity::Warning), "{said:?}");
+        said.len()
     };
     assert_eq!(warned(br#"{"blocked": {}}"#), 1);
     assert_eq!(warned(br#"{"blocked": []}"#), 0);

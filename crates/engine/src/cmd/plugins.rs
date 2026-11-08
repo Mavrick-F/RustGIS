@@ -154,12 +154,14 @@ fn fetch_registry(s: &mut Session, url: &str) -> Result<Vec<rustgis_plugins::reg
     use rustgis_plugins::registry;
     let text = registry::fetch(url, registry::MAX_REGISTRY_BYTES)?;
     let entries = registry::parse(&String::from_utf8_lossy(&text), url)?;
-    // A registry without a blocklist blocks nothing; one that can't be fetched leaves the cached
-    // list in place, and so does one that can't be read, with a warning.
+    // A blocklist that can't be fetched or read leaves the list in force, with a warning. Another
+    // registry may have no blocklist (it blocks nothing); the hosted one always has one.
     let blocklist = registry::blocklist_url(url);
-    if let Ok(b) = registry::fetch(&blocklist, 4 * 1024 * 1024)
-        && let Err(e) = rustgis_plugins::store::save_blocklist(url, &String::from_utf8_lossy(&b))
-    {
+    let refused = match registry::fetch(&blocklist, 4 * 1024 * 1024) {
+        Ok(b) => rustgis_plugins::store::save_blocklist(url, &String::from_utf8_lossy(&b)).err(),
+        Err(e) => registry::is_default(url).then_some(e),
+    };
+    if let Some(e) = refused {
         s.warn(format!("{blocklist}: {e}; the plugins withdrawn before stay blocked"));
     }
     Ok(entries)

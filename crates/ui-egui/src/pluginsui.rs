@@ -633,8 +633,16 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                         );
                     }
                 }
-                // No blocklist: nothing is blocked.
-                Some(Err(_)) => {}
+                // Another registry may have no blocklist (it blocks nothing); the hosted one always
+                // has one, so the list in force may be out of date.
+                Some(Err(e)) => {
+                    if rp::registry::is_default(&registry) {
+                        app.session.warn(crate::i18n::fmt(
+                            "The plugin blocklist couldn't be downloaded ({error}); the plugins withdrawn before stay blocked.",
+                            &[("error", &e)],
+                        ));
+                    }
+                }
             },
             Job::Download { entry, slot } => match take(&slot) {
                 None => waiting.push(Job::Download { entry, slot }),
