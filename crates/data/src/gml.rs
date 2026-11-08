@@ -75,8 +75,8 @@ const GEOMETRIES: &[&str] = &[
 ];
 
 /// Whether a GML element under a property is a shape (read, or of a kind not read). GML's values
-/// that aren't geometry are few: times, definitions, dictionaries and units, metadata and value
-/// objects.
+/// that aren't geometry are few: times, definitions, dictionaries and units, metadata, measures
+/// and value objects.
 fn is_shape(name: &str) -> bool {
     !(name.starts_with("Time")
         || name.ends_with("Definition")
@@ -100,6 +100,14 @@ fn is_shape(name: &str) -> bool {
                 | "QuantityExtent"
                 | "CompositeValue"
                 | "ValueArray"
+                | "ValueExtent"
+                | "Measure"
+                | "Length"
+                | "Angle"
+                | "Scale"
+                | "Area"
+                | "Volume"
+                | "Speed"
         ))
 }
 
@@ -382,15 +390,13 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                 attrs.insert(key, text_of(&p).trim().to_string());
             }
         }
-        // With no shape read, the first one not read is the feature's unreadable shape; any others
-        // are said as not read.
-        if geom.is_none() && !shapes_not_read.is_empty() {
+        // With no shape read, the first one that failed or isn't read is the feature's unreadable
+        // shape; any others are said as not read.
+        failed.append(&mut shapes_not_read);
+        if geom.is_none() && !failed.is_empty() {
             bad = true;
-            unread.extend(shapes_not_read.drain(..).skip(1));
+            unread.extend(failed.drain(..).skip(1));
         } else {
-            unread.append(&mut shapes_not_read);
-        }
-        if geom.is_some() {
             unread.append(&mut failed);
         }
         for p in unread {
@@ -473,7 +479,8 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         }
         if parts > 0 {
             let what = if parts == 1 { "part" } else { "parts" };
-            rep.messages.push(format!("{}: {parts} {what} of multi-geometries not read (a reference, or too short to keep)", ds.name));
+            rep.messages
+                .push(format!("{}: {parts} {what} of multi-geometries not read (a reference, too short, or of a kind not read)", ds.name));
         }
         if unread > 0 {
             let what = if unread == 1 { "property" } else { "properties" };
@@ -573,7 +580,11 @@ mod tests {
         assert!(!layers[0].0.zm_dropped, "{:?}", layers[0].1.messages);
         // The part left out is said.
         assert!(
-            layers[0].1.messages.iter().any(|m| m == "r: 1 part of multi-geometries not read (a reference, or too short to keep)"),
+            layers[0]
+                .1
+                .messages
+                .iter()
+                .any(|m| m == "r: 1 part of multi-geometries not read (a reference, too short, or of a kind not read)"),
             "{:?}",
             layers[0].1.messages
         );
@@ -606,7 +617,7 @@ mod tests {
         assert_eq!((ds.features.len(), rep.skipped), (2, 0));
         assert!(matches!(&ds.features[1].geometry, Some(Geometry::Line(l)) if l.len() == 2));
         let said: Vec<&String> = rep.messages.iter().filter(|m| m.contains("multi-geometries")).collect();
-        assert_eq!(said, ["m: 1 part of multi-geometries not read (a reference, or too short to keep)"]);
+        assert_eq!(said, ["m: 1 part of multi-geometries not read (a reference, too short, or of a kind not read)"]);
     }
 
     /// Properties that aren't attributes (a nested record, a time, a second shape) are said on

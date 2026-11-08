@@ -604,9 +604,8 @@ mod tests {
         #[cfg(unix)]
         {
             let pipe = dir.path().join("pipe.ers");
-            if Command::new("mkfifo").arg(&pipe).status().is_ok_and(|s| s.success()) {
-                assert!(plain_ers(&pipe).is_err_and(|e| e.to_string().contains("not a file")));
-            }
+            assert!(Command::new("mkfifo").arg(&pipe).status().is_ok_and(|s| s.success()));
+            assert!(plain_ers(&pipe).is_err_and(|e| e.to_string().contains("not a file")));
         }
         // Not an ER Mapper header: nothing to check.
         assert!(plain_ers(Path::new("/nowhere/a.img")).is_ok());
