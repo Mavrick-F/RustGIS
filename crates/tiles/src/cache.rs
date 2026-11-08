@@ -272,11 +272,16 @@ fn encoded_picture(bytes: &[u8]) -> bool {
     let known = bytes.starts_with(b"\x89PNG\r\n\x1a\n")
         || bytes.starts_with(&[0xff, 0xd8, 0xff])
         || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"));
+    // Reading the header can allocate (a PNG's colour profile is inflated with it): no more
+    // than decoding the picture here may.
     known
         && image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
             .ok()
-            .and_then(|r| r.into_dimensions().ok())
+            .and_then(|mut r| {
+                r.limits(picture_limits());
+                r.into_dimensions().ok()
+            })
             .is_some_and(|(w, h)| (1..=4096).contains(&w) && (1..=4096).contains(&h))
 }
 
@@ -1635,16 +1640,22 @@ pub fn decode_image(bytes: &[u8]) -> Result<Pixmap, String> {
             .ok_or_else(|| "a picture of the wrong size".into());
     }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string())?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(4096);
-    limits.max_image_height = Some(4096);
-    limits.max_alloc = Some(96 << 20);
-    reader.limits(limits);
+    reader.limits(picture_limits());
     let img = reader.decode().map_err(|e| e.to_string())?.into_rgba8();
     let (w, h) = img.dimensions();
     let mut data = img.into_raw();
     premultiply(&mut data);
     Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(w, h).ok_or("an empty picture")?).ok_or_else(|| "a picture of the wrong size".into())
+}
+
+/// What reading a tile picture may take: at most 4096 pixels a side and 96 MiB, for its header
+/// ([`encoded_picture`]) as for its pixels ([`decode_image`]).
+fn picture_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(96 << 20);
+    limits
 }
 
 /// Straight RGBA to premultiplied, in place.
@@ -2028,6 +2039,18 @@ mod native {
         )
     }
 
+    /// Keeps the normal DNS filtering and peer recording around a controlled test transport.
+    #[cfg(test)]
+    pub(super) fn fixture_transport_agent(
+        connector: impl ureq::unversioned::transport::Connector<(), Out = Box<dyn ureq::unversioned::transport::Transport>>,
+    ) -> ureq::Agent {
+        ureq::Agent::with_parts(
+            config_builder(std::time::Duration::from_secs(10)).build(),
+            ReachConnector(connector),
+            CheckedResolver { inner: ureq::unversioned::resolver::DefaultResolver::default(), public_only: false },
+        )
+    }
+
     #[cfg(test)]
     /// Exercises classified DNS and real HTTP while routing every connection to an owned listener.
     pub(super) fn fixture_agent(answer: std::net::SocketAddr, listener: std::net::SocketAddr, public_only: bool) -> ureq::Agent {
@@ -2182,7 +2205,7 @@ mod native {
                 if resp.status().is_redirection() {
                     let next = crate::template::join(&at, header("location").ok_or("a redirect with no Location")?);
                     Origin { url: at.clone(), reach: ceiling }.check(&next)?;
-                    if at.starts_with("https://") && !next.starts_with("https://") {
+                    if crate::address::is_https(&at) && !crate::address::is_https(&next) {
                         return Err(format!("{next}: a redirect from https to http").into());
                     }
                     same_origin &= crate::logins::origin(&next) == first_origin;
@@ -2562,8 +2585,8 @@ mod native {
                 }
                 // Where a redirect leads is the server's choice, not the user's.
                 Origin { url: at.clone(), reach: ceiling }.check(&next)?;
-                // Never from HTTPS down to plain HTTP.
-                if at.starts_with("https://") && !next.starts_with("https://") {
+                // Never from HTTPS down to plain HTTP, however either scheme is written.
+                if crate::address::is_https(&at) && !crate::address::is_https(&next) {
                     return Err(format!("{next}: a redirect from https to http").into());
                 }
                 redirects += 1;
@@ -4465,6 +4488,71 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".into(),
         ]);
         assert_eq!(download_blocking_limited(&local, 4).unwrap(), b"tile");
+    }
+
+    /// An agent that fetches `https://` addresses over plain TCP, as if TLS were there, so a test
+    /// server on this computer can stand for an HTTPS server.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn plain_tls_agent() -> ureq::Agent {
+        use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, NextTimeout, TcpConnector, Transport};
+        #[derive(Debug)]
+        struct ClaimsTls;
+        #[derive(Debug)]
+        struct Claimed<T>(T);
+        impl<In: Transport> Connector<In> for ClaimsTls {
+            type Out = Box<dyn Transport>;
+            fn connect(&self, _: &ConnectionDetails, chained: Option<In>) -> Result<Option<Self::Out>, ureq::Error> {
+                Ok(chained.map(|transport| Claimed(transport).boxed()))
+            }
+        }
+        impl<T: Transport> Transport for Claimed<T> {
+            fn buffers(&mut self) -> &mut dyn Buffers {
+                self.0.buffers()
+            }
+            fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+                self.0.transmit_output(amount, timeout)
+            }
+            fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+                self.0.await_input(timeout)
+            }
+            fn is_open(&mut self) -> bool {
+                self.0.is_open()
+            }
+            fn is_tls(&self) -> bool {
+                true
+            }
+        }
+        native::fixture_transport_agent(TcpConnector::default().chain(ClaimsTls))
+    }
+
+    /// Never from HTTPS down to plain HTTP, however the scheme is written: the HTTP client reads
+    /// `HTTPS://` as `https://`, so the check must too, for GET and HEAD alike.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_redirect_never_goes_from_https_to_http_in_any_case() {
+        let _turn = turn();
+        let redirect = |to: &str| format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".to_string();
+        let agent = plain_tls_agent();
+        for (from, to) in [("HTTPS", "http"), ("https", "HTTP"), ("HttpS", "Http"), ("https", "http")] {
+            // Where the redirect leads, recording whether anything was asked of it.
+            let (plain, asked) = serve_recorded(vec![ok.clone().into_bytes(), ok.clone().into_bytes()]);
+            let plain = plain.replacen("http", to, 1);
+            for head in [false, true] {
+                let secure = serve(vec![redirect(&format!("{plain}/leak"))]).replacen("http", from, 1);
+                let url = format!("{secure}/x");
+                let err = if head { native::head_with(&agent, &url).map(|_| ()) } else { native::get(&agent, &url, &[]).map(|_| ()) }
+                    .unwrap_err();
+                assert!(err.contains("a redirect from https to http"), "{from} → {to}, head {head}: {err}");
+            }
+            assert!(asked.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "{from} → {to}: the http server was asked");
+        }
+        // HTTPS to HTTPS, in whatever case, is followed.
+        for (from, to) in [("HTTPS", "https"), ("https", "HTTPS"), ("https", "https")] {
+            let next = serve(vec![ok.clone()]).replacen("http", to, 1);
+            let base = serve(vec![redirect(&format!("{next}/tile.png"))]).replacen("http", from, 1);
+            assert_eq!(native::get(&agent, &format!("{base}/old.png"), &[]).unwrap(), b"tile", "{from} → {to}");
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]

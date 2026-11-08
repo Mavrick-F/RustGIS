@@ -16165,6 +16165,100 @@ fn serve_with(
     (format!("http://{addr}"), sent)
 }
 
+/// A static collection laid out by date (JAXA Earth's) as a data cube: no search, the period's
+/// date folders read and each item's own file taken, with the scale and no-data in `je:rasters`,
+/// on the time slider and in a trend; a document missing is told, and clean input tells nothing.
+#[test]
+fn a_static_collection_by_date_as_a_data_cube() {
+    let (cog, _) = serve_ranges(rustgis_data::raster::cog::example(512, 256));
+    let months = ["2023-12", "2024-01", "2024-02", "2024-03", "2024-04", "2024-05", "2024-06"];
+    let item = |m: &str| {
+        format!(
+            r#"{{"type": "Feature", "id": "N00.00-N90.00", "collection": "jaxa.cube", "bbox": [0, 0, 90, 90], "geometry": null,
+               "properties": {{"datetime": null, "start_datetime": "{m}-01T00:00:00.000000Z"}},
+               "assets": {{"V": {{"href": "{cog}/{m}.tiff", "type": "image/tiff; application=geotiff",
+                  "je:rasters": {{"dn2value": {{"slope": 0.5, "offset": 0.0}}, "dn": {{"nodata": 255.0, "error": [5.0]}}}}}}}}}}"#
+        )
+    };
+    let catalog = |rel: &str, href: &str| format!(r#"{{"type": "Catalog", "links": [{{"rel": "{rel}", "href": "{href}"}}]}}"#);
+    let children: Vec<String> = months.iter().map(|m| format!(r#"{{"rel": "child", "href": "./{m}/catalog.json"}}"#)).collect();
+    let leak = |t: String| -> &'static str { Box::leak(t.into_boxed_str()) };
+    let mut routes: Vec<(&'static str, String)> = vec![(
+        "/c/collection.json",
+        format!(
+            r#"{{"type": "Collection", "id": "collection", "links": [{}], "summaries": {{"je:stac_date_format": ["YYYY-MM"], "je:cog_level_max": [1]}}}}"#,
+            children.join(",")
+        ),
+    )];
+    for m in months {
+        routes.push((leak(format!("/c/{m}/catalog.json")), catalog("child", "./1/catalog.json")));
+        routes.push((leak(format!("/c/{m}/1/catalog.json")), catalog("child", "./E000.00-E090.00/catalog.json")));
+        routes.push((leak(format!("/c/{m}/1/E000.00-E090.00/catalog.json")), catalog("item", "./N00.00-N90.00.json")));
+        if m != "2024-03" {
+            routes.push((leak(format!("/c/{m}/1/E000.00-E090.00/N00.00-N90.00.json")), item(m)));
+        }
+    }
+    let collection_doc = routes[0].1.clone();
+    let url = format!("{}/c/collection.json", serve_routes(routes, 200));
+    let cube = |start: &str, end: &str| json!({"url": url, "collection": "jaxa.cube", "asset": "V", "bbox": [10, 45, 11, 46], "start": start, "end": end, "range": [0, 50], "test": "original"});
+    let mut s = Session::new(Project::default());
+    let mark = s.notice_mark();
+    let r = s.run("stac.addCube", &cube("2024-01-01", "2024-02-29")).unwrap();
+    assert_eq!((r["items"].as_u64(), r["tiles"].as_u64(), r["dates"].as_u64()), (Some(2), Some(1), Some(2)), "{r}");
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(!said.iter().any(|t| t.contains("couldn't be read")), "clean input tells no missing document: {said:?}");
+    // Its codes for a failed retrieval draw as values on the map, and that is said.
+    assert!(said.iter().any(|t| t.contains("2 file(s) mark failed retrievals with codes")), "{said:?}");
+    assert!(!said.iter().any(|t| t.contains("left out, as their codes")), "codes read whole leave nothing out: {said:?}");
+    let tile = &s.map().tiles[0];
+    assert_eq!(tile.time_urls.len(), 2);
+    assert!(tile.time_urls[0].1.ends_with("/2024-01.tiff#range=0,100"), "the range through je:rasters' slope: {}", tile.time_urls[0].1);
+    // A document missing: its date is left out, and said.
+    let mut gap = Session::new(Project::default());
+    let mark = gap.notice_mark();
+    let r = gap.run("stac.addCube", &cube("2024-02-01", "2024-04-30")).unwrap();
+    assert_eq!(r["dates"], 2, "{r}");
+    let said: Vec<&str> = gap.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert!(said.iter().any(|t| t.contains("1 document(s) couldn't be read") && t.contains("jaxa.cube")), "{said:?}");
+    // In a trend, a stored value that is a code for a failed retrieval is no value; the rest are
+    // read through the slope. Pixel (x, y) stores (x + y) % 256, the same at every date.
+    let t = s.run("cube.reduce", &json!({"url": url, "collection": "jaxa.cube", "asset": "V", "bbox": [10, 45, 11, 46], "start": "2024-04-01", "end": "2024-06-30", "stat": "mean"})).unwrap();
+    let id = t["layers"][0].as_u64().or(t["layer"].as_u64()).unwrap() as u32;
+    let data = s.map().layer(id).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+    let at = |x: usize, y: usize| data.bands[0].data[y * data.width as usize + x];
+    assert!(at(2, 3).is_nan(), "(2 + 3) is the code: {}", at(2, 3));
+    assert_eq!(at(3, 3), 3.0, "6 through the slope");
+    // Another collection's name, and collections that can't make a cube.
+    let mut wrong = cube("2024-01-01", "2024-02-29");
+    wrong["collection"] = json!("other");
+    let e = Session::new(Project::default()).run("stac.addCube", &wrong).unwrap_err();
+    assert!(e.contains("holds jaxa.cube, not other"), "{e}");
+    let plain = serve_routes(vec![("/s/collection.json", r#"{"type": "Collection", "links": []}"#.to_string())], 2);
+    let mut other = cube("2024-01-01", "2024-02-29");
+    other["url"] = json!(format!("{plain}/s/collection.json"));
+    let e = Session::new(Project::default()).run("stac.addCube", &other).unwrap_err();
+    assert!(e.contains("laid out by date"), "{e}");
+    let normal = serve_routes(
+        vec![("/n/collection.json", r#"{"type": "Collection", "links": [], "summaries": {"je:stac_date_format": ["MM"]}}"#.to_string())],
+        2,
+    );
+    other["url"] = json!(format!("{normal}/n/collection.json"));
+    let e = Session::new(Project::default()).run("stac.addCube", &other).unwrap_err();
+    assert!(e.contains("no year"), "{e}");
+    // Codes for a failed retrieval that can't be read whole: the item is left out, and said.
+    let bad = item("2024-01").replace(r#""error": [5.0]"#, r#""error": [5.0, "x"]"#);
+    let mut odd = vec![("/c/collection.json", collection_doc)];
+    odd.push(("/c/2024-01/catalog.json", catalog("child", "./1/catalog.json")));
+    odd.push(("/c/2024-01/1/catalog.json", catalog("child", "./E000.00-E090.00/catalog.json")));
+    odd.push(("/c/2024-01/1/E000.00-E090.00/catalog.json", catalog("item", "./N00.00-N90.00.json")));
+    odd.push(("/c/2024-01/1/E000.00-E090.00/N00.00-N90.00.json", bad));
+    let odd_url = format!("{}/c/collection.json", serve_routes(odd, 20));
+    let mut p = cube("2024-01-01", "2024-01-31");
+    p["url"] = json!(odd_url);
+    let e = Session::new(Project::default()).run("stac.addCube", &p).unwrap_err();
+    assert!(e.contains("1 item(s) left out, as their codes for a failed retrieval"), "{e}");
+}
+
 /// A STAC collection's band as a data cube on the time slider (#559), from a local API: a tile
 /// layer per grid tile, each a file per date; the slider on over their dates; a fixed range in the
 /// band's own units, through its scale; a tile with no date in the window drawn as nothing.
@@ -16207,6 +16301,7 @@ fn a_stac_data_cube_on_the_time_slider() {
         "{r}"
     );
     assert_eq!(r["duplicates"], 1, "the second item of T2 on 2024-01-01 is left out and counted");
+    assert!(!s.notices.iter().any(|n| n.text.contains("failed retrievals")), "no codes, no notice of them");
     assert!(crate::cmd::tiles::NETWORK.contains(&"stac.addCube"), "a network command: a plugin needs the network permission to run it");
     // An end given as a year or a month takes all of it: "end": "2024-01" reaches 31 January.
     // Read as 1 January, it would be before this start and refused.
@@ -20167,6 +20262,102 @@ fn layer_address_redaction_preserves_templates_and_local_paths() {
         panic!("anonymous address was not redacted")
     };
     assert_eq!(anonymous, format!("{prefix}https://bucket.example/a"));
+}
+
+/// A COG's look isn't a key: it stays in a saved address. The address's keys still go, and so does
+/// any other fragment (OAuth and SAS links carry tokens there), however much it resembles a look.
+#[test]
+fn layer_address_redaction_keeps_a_cogs_look() {
+    let prefix = crate::render::rustgis_tiles::s3::ANONYMOUS;
+    let bound = rustgis_data::login_address::bind("0123456789abcdef", "https://h.example", "https://h.example/a.tif#range=0,1000").unwrap();
+    let cases = [
+        // Nothing to take out: no change at all.
+        ("https://h.example/a.tif#range=0,1000".to_string(), "https://h.example/a.tif#range=0,1000".to_string()),
+        (
+            "s3://bucket/a.tif#bands=2,3,4&range=-0.5,0.5&dequantize=aef".into(),
+            "s3://bucket/a.tif#bands=2,3,4&range=-0.5,0.5&dequantize=aef".into(),
+        ),
+        (format!("{prefix}https://h.example/a.tif#bands=1"), format!("{prefix}https://h.example/a.tif#bands=1")),
+        // Its keys go, its look stays.
+        ("https://u:p@h.example/a.tif?token=s3cret&v=1#range=0,1000".into(), "https://h.example/a.tif?v=1#range=0,1000".into()),
+        ("https://u:p@h.example#range=0,1000".into(), "https://h.example#range=0,1000".into()),
+        (format!("{prefix}https://h.example/a.tif?token=s3cret#bands=1"), format!("{prefix}https://h.example/a.tif#bands=1")),
+        (bound, "https://h.example/a.tif#range=0,1000".into()),
+        // Not a look: it goes as before.
+        ("https://h.example/a.tif#access_token=s3cret".into(), "https://h.example/a.tif".into()),
+        ("https://h.example/a.tif#range=0,1000&token=s3cret".into(), "https://h.example/a.tif".into()),
+        ("https://h.example/a.tif#dequantize=s3cret".into(), "https://h.example/a.tif".into()),
+        ("https://h.example/a.tif#range=0,1000?token=s3cret".into(), "https://h.example/a.tif".into()),
+        ("https://h.example/a.tif#dequantize=aef?token=s3cret".into(), "https://h.example/a.tif".into()),
+        // A word `dequantize` doesn't have: a reader takes it as a look, a saved file doesn't.
+        ("https://h.example/a.tif#range=0,1000&dequantize=s3cret".into(), "https://h.example/a.tif".into()),
+        ("cog:{z}/{x}/{y}@https://h.example/a.tif#dequantize=s3cret".into(), "cog:{z}/{x}/{y}@https://h.example/a.tif".into()),
+        (
+            rustgis_data::s3_address::bind("", "s3.example.org", "https://h.example/a.tif#dequantize=s3cret").unwrap(),
+            rustgis_data::s3_address::bind("", "s3.example.org", "https://h.example/a.tif").unwrap(),
+        ),
+        // Its own words stay.
+        ("https://h.example/a.tif#range=0,1000&dequantize=none".into(), "https://h.example/a.tif#range=0,1000&dequantize=none".into()),
+        ("cog:{z}/{x}/{y}@https://h.example/a.tif#dequantize=aef".into(), "cog:{z}/{x}/{y}@https://h.example/a.tif#dequantize=aef".into()),
+        ("https://h.example/a.tif#range=0,1000&cube=1".into(), "https://h.example/a.tif#range=0,1000&cube=1".into()),
+        ("https://h.example/a.tif#cube=s3cret".into(), "https://h.example/a.tif".into()),
+        // A look after another fragment: only the look stays.
+        ("https://h.example/a.tif#sig=s3cret#range=0,1000".into(), "https://h.example/a.tif#range=0,1000".into()),
+    ];
+    for (given, expected) in &cases {
+        let address = match crate::durable::public_address(given) {
+            crate::durable::Kept::Unchanged => given.clone(),
+            crate::durable::Kept::Changed(address) => address,
+            crate::durable::Kept::Withheld(_) => panic!("valid address was withheld: {given}"),
+        };
+        assert_eq!(&address, expected, "from {given}");
+    }
+}
+
+/// A data cube saved with one range for all its dates opens with that range, and saving it says
+/// nothing about keys. A key among its addresses goes and is counted, and only that one.
+#[test]
+fn saved_cubes_keep_their_look() {
+    let mut s = Session::new(Project::default());
+    let mut cube = rustgis_map::TileLayer::new("Cube", rustgis_map::TileKind::Cog, "https://h.example/2021.tif#range=0,1000");
+    cube.time_urls = vec![(1.0, "https://h.example/2020.tif#range=0,1000".into()), (2.0, "https://h.example/2021.tif#range=0,1000".into())];
+    let expected = (cube.url.clone(), cube.time_urls.clone());
+    s.map_mut().tiles.push(cube);
+    let dir = std::env::temp_dir().join(format!("rustgis-cube-look-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cube.rgis");
+
+    // Clean: nothing was taken out, so nothing is said.
+    let saved = s.run("project.saveAs", &json!({"path": path})).unwrap();
+    assert_eq!(saved["stripped"], 0, "{saved}");
+    assert!(!s.notices.iter().any(|n| n.text.contains("saved without their keys")));
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": path})).unwrap();
+    let opened = &t.map().tiles[0];
+    assert_eq!((opened.url.clone(), opened.time_urls.clone()), expected);
+
+    // Lossy: one date's token goes and is counted; its look stays; the open project keeps it all.
+    let with_key = "https://h.example/2020.tif?token=s3cret#range=0,1000";
+    s.map_mut().tiles[0].time_urls[0].1 = with_key.into();
+    let saved = s.run("project.saveAs", &json!({"path": path})).unwrap();
+    assert_eq!(saved["stripped"], 1, "{saved}");
+    assert!(s.notices.iter().any(|n| n.text.contains("1 layer address(es) were saved without their keys")));
+    assert_eq!(s.map().tiles[0].time_urls[0].1, with_key);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("s3cret") && text.contains("https://h.example/2020.tif#range=0,1000"), "{text}");
+    // Opened again before RustGIS closes, it has its token back, with its look.
+    t.run("project.open", &json!({"path": path})).unwrap();
+    assert_eq!(t.map().tiles[0].time_urls[0].1, with_key);
+
+    // A cube of one file: its address is all that keeps it a tile layer when its project opens.
+    let one_file = "https://h.example/2020.tif#range=0,1000&cube=1";
+    let mut one = Session::new(Project::default());
+    one.map_mut().tiles.push(rustgis_map::TileLayer::new("One date", rustgis_map::TileKind::Cog, one_file));
+    let saved = one.run("project.saveAs", &json!({"path": path})).unwrap();
+    assert_eq!(saved["stripped"], 0, "{saved}");
+    t.run("project.open", &json!({"path": path})).unwrap();
+    assert_eq!(t.map().tiles[0].url, one_file);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -31756,6 +31947,378 @@ fn raster_classes_run_on_another_thread() {
     let r = s.run("dl.classify", &with).unwrap();
     assert_eq!((&r["model"], &r["replaced"]), (&json!("scene_model 2"), &json!(false)), "{r}");
     assert_eq!(s.project.dl_models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["scene_model", "scene_model 2"]);
+}
+
+/// A session with one layer "Mesh" read from GeoJSON features.
+fn mesh_session(features: Value) -> Session {
+    let text = json!({"type": "FeatureCollection", "features": features}).to_string();
+    let (ds, _) = rustgis_data::io::read_geojson(&text, "Mesh").unwrap();
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(ds);
+    s.active_layer = Some(id);
+    s
+}
+
+fn mesh_feature(geometry: Value, h: f64) -> Value {
+    json!({"type": "Feature", "geometry": geometry, "properties": {"h": h}})
+}
+
+/// Every geometry kind the 3D export handles: a polygon with a hole, a clockwise polygon, a line
+/// and two points.
+fn mixed_mesh_session() -> Session {
+    mesh_session(json!([
+        mesh_feature(
+            json!({"type": "Polygon", "coordinates": [
+                [[0.0, 0.0], [0.01, 0.0], [0.01, 0.01], [0.0, 0.01], [0.0, 0.0]],
+                [[0.002, 0.002], [0.002, 0.004], [0.004, 0.004], [0.004, 0.002], [0.002, 0.002]]]}),
+            30.0
+        ),
+        mesh_feature(
+            json!({"type": "Polygon", "coordinates": [[[0.02, 0.0], [0.02, 0.01], [0.03, 0.01], [0.03, 0.0], [0.02, 0.0]]]}),
+            10.0
+        ),
+        mesh_feature(json!({"type": "LineString", "coordinates": [[0.0, 0.02], [0.01, 0.02]]}), 5.0),
+        mesh_feature(json!({"type": "MultiPoint", "coordinates": [[0.03, 0.02], [0.04, 0.02]]}), 20.0),
+    ]))
+}
+
+#[test]
+fn obj_export_is_unchanged() {
+    let mut s = mixed_mesh_session();
+    let (name, bytes) = crate::cmd::items::item_bytes(&mut s, "obj", &json!({"heightField": "h"})).unwrap();
+    assert_eq!(name, "Mesh.obj");
+    // Written by the exporter before the mesh builder was shared with STL.
+    let golden = concat!(
+        "# Mesh exported by RustGIS\n",
+        "o Mesh\n",
+        "v 0.00 0.00 -0.00\n",
+        "v 1113.19 0.00 -0.00\n",
+        "v 1113.19 0.00 -1113.19\n",
+        "v 0.00 0.00 -1113.19\n",
+        "v 222.64 0.00 -222.64\n",
+        "v 222.64 0.00 -445.28\n",
+        "v 445.28 0.00 -445.28\n",
+        "v 445.28 0.00 -222.64\n",
+        "v 0.00 30.00 -0.00\n",
+        "v 1113.19 30.00 -0.00\n",
+        "v 1113.19 30.00 -1113.19\n",
+        "v 0.00 30.00 -1113.19\n",
+        "v 222.64 30.00 -222.64\n",
+        "v 222.64 30.00 -445.28\n",
+        "v 445.28 30.00 -445.28\n",
+        "v 445.28 30.00 -222.64\n",
+        "f 1 2 10 9\n",
+        "f 2 3 11 10\n",
+        "f 3 4 12 11\n",
+        "f 4 1 9 12\n",
+        "f 5 6 14 13\n",
+        "f 6 7 15 14\n",
+        "f 7 8 16 15\n",
+        "f 8 5 13 16\n",
+        "f 9 16 13\n",
+        "f 5 8 1\n",
+        "f 12 9 13\n",
+        "f 5 1 4\n",
+        "f 12 13 14\n",
+        "f 6 5 4\n",
+        "f 12 14 15\n",
+        "f 7 6 4\n",
+        "f 16 9 10\n",
+        "f 2 1 8\n",
+        "f 15 16 10\n",
+        "f 2 8 7\n",
+        "f 12 15 10\n",
+        "f 2 7 4\n",
+        "f 10 11 12\n",
+        "f 4 3 2\n",
+        "v 2226.39 0.00 -0.00\n",
+        "v 2226.39 0.00 -1113.19\n",
+        "v 3339.58 0.00 -1113.19\n",
+        "v 3339.58 0.00 -0.00\n",
+        "v 2226.39 10.00 -0.00\n",
+        "v 2226.39 10.00 -1113.19\n",
+        "v 3339.58 10.00 -1113.19\n",
+        "v 3339.58 10.00 -0.00\n",
+        "f 17 18 22 21\n",
+        "f 18 19 23 22\n",
+        "f 19 20 24 23\n",
+        "f 20 17 21 24\n",
+        "f 21 24 23\n",
+        "f 19 20 17\n",
+        "f 23 22 21\n",
+        "f 17 18 19\n",
+        "v 0.00 5.00 -2226.39\n",
+        "v 1113.19 5.00 -2226.39\n",
+        "l 25 26\n",
+        "v 3338.58 0 -2227.39\n",
+        "v 3340.58 0 -2227.39\n",
+        "v 3340.58 0 -2225.39\n",
+        "v 3338.58 0 -2225.39\n",
+        "v 3338.58 20.00 -2227.39\n",
+        "v 3340.58 20.00 -2227.39\n",
+        "v 3340.58 20.00 -2225.39\n",
+        "v 3338.58 20.00 -2225.39\n",
+        "f 27 28 32 31\n",
+        "f 28 29 33 32\n",
+        "f 29 30 34 33\n",
+        "f 30 27 31 34\n",
+        "f 31 32 33 34\n",
+        "f 30 29 28 27\n",
+        "v 4451.78 0 -2227.39\n",
+        "v 4453.78 0 -2227.39\n",
+        "v 4453.78 0 -2225.39\n",
+        "v 4451.78 0 -2225.39\n",
+        "v 4451.78 20.00 -2227.39\n",
+        "v 4453.78 20.00 -2227.39\n",
+        "v 4453.78 20.00 -2225.39\n",
+        "v 4451.78 20.00 -2225.39\n",
+        "f 35 36 40 39\n",
+        "f 36 37 41 40\n",
+        "f 37 38 42 41\n",
+        "f 38 35 39 42\n",
+        "f 39 40 41 42\n",
+        "f 38 37 36 35\n",
+    );
+    assert_eq!(String::from_utf8(bytes).unwrap(), golden);
+}
+
+/// The triangles of a binary STL: (normal, vertices).
+fn stl_triangles(bytes: &[u8]) -> Vec<([f32; 3], [[f32; 3]; 3])> {
+    let count = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+    assert_eq!(bytes.len(), 84 + 50 * count);
+    let f = |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    (0..count)
+        .map(|i| {
+            let o = 84 + 50 * i;
+            let v = |k: usize| [f(o + 12 * k), f(o + 12 * k + 4), f(o + 12 * k + 8)];
+            assert_eq!(&bytes[o + 48..o + 50], &[0, 0]);
+            (v(0), [v(1), v(2), v(3)])
+        })
+        .collect()
+}
+
+fn square(x0: f64, clockwise: bool) -> Value {
+    let mut ring = vec![[x0, 0.0], [x0 + 0.01, 0.0], [x0 + 0.01, 0.01], [x0, 0.01], [x0, 0.0]];
+    if clockwise {
+        ring.reverse();
+    }
+    json!({"type": "Polygon", "coordinates": [ring]})
+}
+
+#[test]
+fn stl_is_a_listed_item_kind() {
+    assert!(crate::cmd::items::ITEMS.contains(&("stl", "stl", "STL 3D model")));
+}
+
+#[test]
+fn stl_export_has_the_binary_layout_and_closed_outward_solids() {
+    // One extruded square, wound either way: 4 walls x 2 + 2 caps x 2 triangles.
+    for clockwise in [false, true] {
+        let mut s = mesh_session(json!([mesh_feature(square(0.0, clockwise), 30.0)]));
+        let (name, bytes) = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
+        assert_eq!(name, "Mesh.stl");
+        assert!(!bytes.starts_with(b"solid"));
+        let tris = stl_triangles(&bytes);
+        assert_eq!(tris.len(), 12);
+        assert_eq!(bytes.len(), 84 + 50 * 12);
+        // Centre of the solid: (556.6, 556.6, 15) in east, north, up metres.
+        let centre = [1113.19_f32 / 2.0, 1113.19 / 2.0, 15.0];
+        // Z is up, and every vertex is in the all-positive octant.
+        assert!(tris.iter().all(|(_, v)| v.iter().flatten().all(|x| *x >= 0.0)), "positive octant");
+        let mut area_sum = [0.0_f64; 3];
+        for (n, v) in &tris {
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-4, "unit normal {n:?}");
+            // The stored normal agrees with the winding, and points away from the centre.
+            let (a, b, c) = (v[0].map(f64::from), v[1].map(f64::from), v[2].map(f64::from));
+            let (u, w) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+            let cross = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+            let dot: f64 = (0..3).map(|k| cross[k] * f64::from(n[k])).sum();
+            assert!(dot > 0.0, "normal follows the winding");
+            let mid: [f64; 3] = std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0 - f64::from(centre[k]));
+            let out: f64 = (0..3).map(|k| mid[k] * f64::from(n[k])).sum();
+            assert!(out > 0.0, "normal points outward, clockwise={clockwise}: {n:?}");
+            for k in 0..3 {
+                area_sum[k] += cross[k] / 2.0;
+            }
+        }
+        // A closed surface's area vectors cancel.
+        assert!(area_sum.iter().all(|x| x.abs() < 1.0), "closed solid: {area_sum:?}");
+    }
+}
+
+/// A point at the layer's corner becomes a cube reaching past it: the model still starts at zero.
+#[test]
+fn stl_point_cubes_stay_in_the_positive_octant() {
+    let pts = [[0.0, 0.0], [0.01, 0.01]].map(|c| mesh_feature(json!({"type": "Point", "coordinates": c}), 30.0));
+    let mut s = mesh_session(json!(pts));
+    let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
+    let tris = stl_triangles(&bytes);
+    assert_eq!(tris.len(), 24, "two cubes");
+    let low = |k: usize| tris.iter().flat_map(|(_, v)| v.iter().map(move |p| p[k])).fold(f32::INFINITY, f32::min);
+    assert_eq!((low(0), low(1), low(2)), (0.0, 0.0, 0.0));
+}
+
+#[test]
+fn stl_leaves_out_lines_and_skips_flat_triangles_and_says_so() {
+    let mut s = mesh_session(json!([
+        mesh_feature(square(0.0, false), 0.0),
+        mesh_feature(json!({"type": "LineString", "coordinates": [[0.0, 0.02], [0.01, 0.02]]}), 5.0),
+        mesh_feature(json!({"type": "Point", "coordinates": [0.03, 0.02]}), 20.0),
+        mesh_feature(json!({"type": "Point", "coordinates": [0.05, 0.02]}), 0.0),
+        mesh_feature(
+            json!({"type": "Polygon", "coordinates": [[[0.06, 0.0], [0.07, 0.0], [0.070_000_000_01, 0.0], [0.07, 0.01], [0.06, 0.01], [0.06, 0.0]]]}),
+            30.0
+        ),
+    ]));
+    let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
+    // The flat square and the flat point are left out, not written as two coincident caps; the
+    // point of 20 m makes a cube of 12, and the square's 1 µm edge, one point in 32-bit floats,
+    // gives zero-area triangles (4 of its 16) that are skipped.
+    let tris = stl_triangles(&bytes);
+    assert_eq!(tris.len(), 12 + 12);
+    let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
+    assert!(said("Left out 2 polygon(s) and point(s) of zero height"));
+    assert!(said("left out 1 polyline"));
+    assert!(said("zero-area"));
+    assert!(said("no units"));
+    // A layer of squares gives neither the line nor the zero-area notices.
+    let mut clean = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
+    crate::cmd::items::item_bytes(&mut clean, "stl", &json!({"heightField": "h"})).unwrap();
+    assert!(!clean.notices.iter().any(|n| n.text.contains("polyline") || n.text.contains("zero-area") || n.text.contains("zero height")));
+    // OBJ keeps its polylines and says nothing about STL.
+    let (_, obj) = crate::cmd::items::item_bytes(&mut s, "obj", &json!({"heightField": "h"})).unwrap();
+    assert!(String::from_utf8(obj).unwrap().contains("\nl "));
+}
+
+#[test]
+fn stl_export_command_writes_by_extension_and_guards_size() {
+    let dir = std::env::temp_dir().join(format!("rustgis-stl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.stl").to_string_lossy().into_owned();
+    let mut s = mixed_mesh_session();
+    let r = s.run("share.export3d", &json!({"path": path, "heightField": "h"})).unwrap();
+    assert_eq!(r["linesDropped"], 1);
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(written.len() as u64, r["bytes"].as_u64().unwrap());
+    assert_eq!(stl_triangles(&written).len() as u64, r["triangles"].as_u64().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+    // Past the cap it is an error, not a panic or a truncated file.
+    let e = crate::cmd::items::stl_with_cap(&s, &json!({"heightField": "h"}), 5).unwrap_err();
+    assert!(e.contains("too large"), "{e}");
+}
+
+#[test]
+fn stl_solids_below_their_base_still_face_outward() {
+    // A negative field extrudes downward: the square and the point's cube must stay outward.
+    for geometry in [square(0.0, false), square(0.0, true), json!({"type": "Point", "coordinates": [0.0, 0.0]})] {
+        let mut s = mesh_session(json!([mesh_feature(geometry, -30.0)]));
+        let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
+        let tris = stl_triangles(&bytes);
+        // Both shapes are convex, so the mean of the corners is inside.
+        let corners: Vec<[f64; 3]> = tris.iter().flat_map(|(_, v)| v.iter().map(|p| p.map(f64::from))).collect();
+        let centre: [f64; 3] = std::array::from_fn(|k| corners.iter().map(|p| p[k]).sum::<f64>() / corners.len() as f64);
+        assert!(centre[2] < 0.0);
+        for (n, v) in &tris {
+            let (a, b, c) = (v[0].map(f64::from), v[1].map(f64::from), v[2].map(f64::from));
+            let (u, w) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+            let cross = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+            let winding: f64 = (0..3).map(|k| cross[k] * f64::from(n[k])).sum();
+            assert!(winding > 0.0, "normal follows the winding");
+            let out: f64 = (0..3).map(|k| ((a[k] + b[k] + c[k]) / 3.0 - centre[k]) * f64::from(n[k])).sum();
+            assert!(out > 0.0, "normal points outward: {n:?}");
+        }
+    }
+}
+
+#[test]
+fn stl_refuses_coordinates_beyond_f32_and_all_flat_layers() {
+    let mut s = mesh_session(json!([mesh_feature(square(0.0, false), 1e39)]));
+    let e = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap_err();
+    assert!(e.contains("too large for a 32-bit"), "{e}");
+    // A layer whose triangles are all flat says so, not "no polygons".
+    let mut flat = mesh_session(json!([mesh_feature(
+        json!({"type": "Polygon", "coordinates": [[[0.0, 0.0], [0.01, 0.0], [0.02, 0.0], [0.0, 0.0]]]}),
+        0.0
+    )]));
+    let e = crate::cmd::items::item_bytes(&mut flat, "stl", &json!({"heightField": "h"})).unwrap_err();
+    assert!(e.contains("zero height"), "{e}");
+    // So does one of zero-height solids, which STL can't hold as flat sheets; OBJ still writes them.
+    let mut sheets = mesh_session(json!([mesh_feature(square(0.0, false), 0.0)]));
+    let e = crate::cmd::items::item_bytes(&mut sheets, "stl", &json!({"heightField": "h"})).unwrap_err();
+    assert!(e.contains("zero height"), "{e}");
+    assert!(crate::cmd::items::item_bytes(&mut sheets, "obj", &json!({"heightField": "h"})).is_ok());
+}
+
+#[test]
+fn stl_of_lines_only_says_why_there_is_nothing() {
+    let mut s = mesh_session(json!([mesh_feature(json!({"type": "LineString", "coordinates": [[0.0, 0.0], [0.01, 0.0]]}), 5.0)]));
+    let e = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap_err();
+    assert!(e.contains("not lines"), "{e}");
+    assert!(crate::cmd::items::item_bytes(&mut s, "obj", &json!({"heightField": "h"})).is_ok());
+}
+
+#[test]
+fn stl_fans_a_cap_past_the_triangulator_limit_and_says_so() {
+    // A circle of 5001 vertices is past the triangulator's limit, so its cap is fanned. It has a hole too.
+    let mut ring: Vec<[f64; 2]> = (0..5001)
+        .map(|i| {
+            let a = i as f64 * std::f64::consts::TAU / 5001.0;
+            [0.01 * a.cos(), 0.01 * a.sin()]
+        })
+        .collect();
+    let first = ring[0];
+    ring.push(first);
+    let hole = json!([[0.001, -0.001], [0.002, -0.001], [0.002, 0.001], [0.001, 0.001], [0.001, -0.001]]);
+    let mut s = mesh_session(json!([mesh_feature(json!({"type": "Polygon", "coordinates": [ring, hole]}), 30.0)]));
+    let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
+    assert!(!stl_triangles(&bytes).is_empty());
+    let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
+    assert!(said("1 polygon cap(s) couldn't be triangulated"));
+    assert!(said("holes are filled"));
+}
+
+#[test]
+fn layer_meshes_report_single_vertex_lines_and_skip_heights_of_empty_features() {
+    // A one-vertex line part is left out and said; a feature without geometry draws nothing, so
+    // its unusable height isn't counted as defaulted.
+    let mut s = mesh_session(json!([
+        mesh_feature(square(0.0, false), 30.0),
+        mesh_feature(json!({"type": "LineString", "coordinates": [[0.0, 0.02]]}), 5.0),
+        {"type": "Feature", "geometry": null, "properties": {"h": "tall"}},
+    ]));
+    for kind in ["obj", "stl"] {
+        s.notices.clear();
+        crate::cmd::items::item_bytes(&mut s, kind, &json!({"heightField": "h"})).unwrap();
+        let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
+        assert!(said("Skipped 1 line part(s) with a single vertex"), "{kind}");
+        assert!(!said("default height"), "{kind}");
+    }
+    // A layer whose only line has one vertex says why STL has nothing.
+    let mut lines = mesh_session(json!([mesh_feature(json!({"type": "LineString", "coordinates": [[0.0, 0.0]]}), 5.0)]));
+    let e = crate::cmd::items::item_bytes(&mut lines, "stl", &json!({"heightField": "h"})).unwrap_err();
+    assert!(e.contains("not lines"), "{e}");
+}
+
+#[test]
+fn layer_meshes_say_what_they_leave_out_or_default() {
+    // A hole of two vertices is dropped, and a height that isn't a number takes the default.
+    let two_vertex_hole = json!({"type": "Polygon", "coordinates": [
+        [[0.0, 0.0], [0.01, 0.0], [0.01, 0.01], [0.0, 0.01], [0.0, 0.0]],
+        [[0.002, 0.002], [0.003, 0.003], [0.002, 0.002]]]});
+    let mut s = mesh_session(json!([
+        mesh_feature(two_vertex_hole, 30.0),
+        {"type": "Feature", "geometry": square(0.02, false), "properties": {"h": "tall"}},
+    ]));
+    crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
+    let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
+    assert!(said("Dropped 1 hole(s)"));
+    assert!(said("used the default height"));
+    // Clean input says neither, for OBJ or STL.
+    let mut clean = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
+    crate::cmd::items::item_bytes(&mut clean, "obj", &json!({"heightField": "h"})).unwrap();
+    crate::cmd::items::item_bytes(&mut clean, "stl", &json!({"heightField": "h"})).unwrap();
+    assert!(!clean.notices.iter().any(|n| n.text.contains("hole") || n.text.contains("default height")));
 }
 
 #[test]
