@@ -204,8 +204,11 @@ pub fn join(base: &str, href: &str) -> String {
     let (plain_base, anonymous_base) = crate::s3::split_anonymous(base);
     let (plain_href, anonymous_href) = crate::s3::split_anonymous(href);
     if anonymous_base || anonymous_href {
-        if crate::s3::split_anonymous(plain_base).1 || crate::s3::split_anonymous(plain_href).1 {
-            return if anonymous_base { base } else { href }.to_string();
+        if crate::s3::split_anonymous(plain_base).1 {
+            return base.to_string();
+        }
+        if crate::s3::split_anonymous(plain_href).1 {
+            return href.to_string();
         }
         // An anonymous child narrows authority, including when its parent chose an account.
         let base = crate::logins::inner(rustgis_data::s3_address::inner(plain_base));
@@ -413,5 +416,11 @@ mod tests {
         assert_eq!(join(&anonymous, &anonymous), anonymous);
         assert_eq!(join("https://tiles.example/style.json", &anonymous), anonymous);
         assert_eq!(join(&anonymous, "tile/0"), crate::s3::anonymous("https://tiles.example/{z}/{x}/tile/0"));
+        let malformed_child = crate::s3::anonymous(&anonymous);
+        let joined = join(&crate::s3::anonymous("https://tiles.example/style.json"), &malformed_child);
+        assert!(crate::address::check(&joined, None).is_err(), "a malformed child was replaced with {joined}");
+        assert_eq!(joined, malformed_child);
+        let malformed_base = crate::s3::anonymous(&crate::s3::anonymous("https://tiles.example/style.json"));
+        assert!(crate::address::check(&join(&malformed_base, "tile/0"), None).is_err());
     }
 }

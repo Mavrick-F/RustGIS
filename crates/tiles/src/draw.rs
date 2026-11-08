@@ -80,6 +80,8 @@ pub(crate) struct Item {
 pub(crate) struct TileSelection {
     pub(crate) items: Vec<Item>,
     pub(crate) mesh_gaps: bool,
+    /// A failed or partial read may supply more pixels after the tile cache changes.
+    pub(crate) retry: bool,
 }
 
 /// What of a resolved style was left out, as a drawing's error (the style still draws): what
@@ -172,6 +174,7 @@ pub(crate) enum Pass {
 
 /// Draws the layers of a resolved style for `pass` into `target` (a `w × h` pixmap at `frame`)
 /// from the tiles over `view`, collecting labels into `out`.
+/// Returns whether a failed or partial tile read could add pixels when the cache changes.
 pub(crate) fn draw_layers(
     mut target: Option<&mut Pixmap>,
     (w, h): (u32, u32),
@@ -180,7 +183,8 @@ pub(crate) fn draw_layers(
     frame: &Frame,
     pass: Pass,
     out: &mut Drawn,
-) {
+) -> bool {
+    let mut retry = false;
     let zoom = template::style_zoom(frame.m_per_px * f64::from(frame.ppp));
     let mut items: HashMap<String, Vec<Item>> = HashMap::new();
     let mut boxes: Boxes = HashMap::new();
@@ -229,15 +233,17 @@ pub(crate) fn draw_layers(
             // Hillshade reads the heights a pixel past the view's edges: those tiles too.
             let pad = 2.0 * frame.m_per_px;
             let reach = Extent::new(view.min_x - pad, view.min_y - pad, view.max_x + pad, view.max_y + pad);
-            let list = tiles_for(
+            let selected = tiles_in(
                 src,
                 if matches!(src, Source::RasterDem { .. }) { &reach } else { view },
+                None,
                 frame,
                 zoom,
                 &mut out.pending,
                 &mut out.error,
             );
-            items.insert(src_id.to_string(), list);
+            retry |= selected.retry;
+            items.insert(src_id.to_string(), selected.items);
         }
         let Some(list) = items.get(src_id) else { continue };
         match layer.kind {
@@ -295,6 +301,7 @@ pub(crate) fn draw_layers(
     }
     // The cap keeps the labels placed first, whichever layers they came from.
     crate::symbols::keep_first(&mut out.labels, crate::symbols::MAX_LABELS);
+    retry
 }
 
 /// One raster tile placed on the map, for a renderer that draws each tile itself (the GPU map
@@ -583,10 +590,10 @@ pub(crate) fn tiles_in(
         Source::Vector { tiles, from, min_zoom, max_zoom, .. } => {
             (tiles, from, *min_zoom, *max_zoom, Want::Vector, (zoom.floor() as u8).min(*max_zoom))
         }
-        Source::Other => return TileSelection { items: Vec::new(), mesh_gaps: true },
+        Source::Other => return TileSelection { items: Vec::new(), mesh_gaps: true, retry: false },
     };
     if tiles.is_empty() || z < min_z || zoom + 0.5 < f32::from(min_z) {
-        return TileSelection { items: Vec::new(), mesh_gaps: true };
+        return TileSelection { items: Vec::new(), mesh_gaps: true, retry: false };
     }
     // A mosaic over half the world wide (the globe's, a world projection's) takes the zoom whose
     // tiles all fit, as its far edges are in view; a flat view keeps those nearest its centre.
@@ -618,6 +625,7 @@ pub(crate) fn tiles_in(
     let mut mesh_gaps = ((view.width() / span).ceil() + 1.0) * ((view.height() / span).ceil() + 1.0) > template::MAX_TILES as f64;
     let mut omitted = 0;
     let mut first_error = None;
+    let mut retry = false;
     let mut partial = 0;
     let mut first_partial = None;
     // A missing tile is stood in for by its nearest ancestor in the cache and, for raster tiles,
@@ -665,6 +673,7 @@ pub(crate) fn tiles_in(
         let state = if visible {
             let (state, note) = cache::tile_noted(&u, want, from.as_ref());
             if let Some(note) = note {
+                retry = true;
                 partial += 1;
                 first_partial.get_or_insert(note);
             }
@@ -684,6 +693,7 @@ pub(crate) fn tiles_in(
                 exact.push(Item { payload, at: area, z: p.id.z, clip: area });
             }
             State::Failed(e) => {
+                retry |= visible;
                 mesh_gaps |= visible;
                 if !cache::routine_tile_failure(&e) {
                     omitted += 1;
@@ -707,7 +717,7 @@ pub(crate) fn tiles_in(
     if let Some(reason) = first_partial {
         add_error(error, format!("{partial} tiles are partial (first: {reason})"));
     }
-    TileSelection { items: stand_ins, mesh_gaps }
+    TileSelection { items: stand_ins, mesh_gaps, retry }
 }
 
 /// The nearest ancestor of a missing tile already in the cache, clipped to the missing tile.

@@ -68,8 +68,8 @@ struct Entry {
     /// Drawn while some of it was on its way, at this cache generation: drawn again once the
     /// cache has more.
     waiting: Option<u64>,
-    /// A failed constituent is reconsidered when the tile cache changes, without keeping
-    /// an export pending while its server is refusing it.
+    /// A failed or partial constituent read is reconsidered when the tile cache changes,
+    /// without keeping an export pending while its server is refusing it.
     failed: Option<u64>,
     /// For a style with pattern fills, the ids of the sprites it was drawn from.
     sheets: Option<Vec<String>>,
@@ -331,7 +331,7 @@ pub(crate) fn cover(
         let mut added = false;
         for (&i, d) in todo.iter().zip(drawn) {
             let (Some(slot), Some(d)) = (found.get_mut(i), d) else { continue };
-            let DrawnPicture { image: pm, pending: waiting, error: refused } = d;
+            let DrawnPicture { image: pm, pending: waiting, retry } = d;
             *pending |= waiting;
             let bytes = pm.data().len();
             let picture = Arc::new(Payload::Image(pm));
@@ -341,7 +341,7 @@ pub(crate) fn cover(
                 bytes,
                 used: tick,
                 waiting: waiting.then_some(generation),
-                failed: refused.is_some().then_some(generation),
+                failed: retry.then_some(generation),
                 sheets: read.clone(),
             };
             s.bytes += bytes;
@@ -447,11 +447,11 @@ fn evict(s: &mut Store) {
     }
 }
 
-/// One prepared picture and the pending/refused reads that produced it.
+/// One prepared picture and the pending or incomplete reads that produced it.
 struct DrawnPicture {
     image: Pixmap,
     pending: bool,
-    error: Option<String>,
+    retry: bool,
 }
 
 /// Draws the pictures of `squares`: each a `side`-pixel pixmap and whether some of it is still
@@ -517,8 +517,8 @@ fn draw_one(r: &Resolved, p: &Placed, side: u32, m_per_px: f64, ppp: f32, reach:
     let pad = reach * f64::from(ppp) * m_per_px;
     let view = Extent::new(e.min_x - pad, e.min_y - pad, e.max_x + pad, e.max_y + pad);
     let mut d = Drawn::default();
-    draw_layers(Some(&mut pm), (side, side), &view, r, &frame, Pass::Shapes, &mut d);
-    Some(DrawnPicture { image: pm, pending: d.pending, error: d.error })
+    let retry = draw_layers(Some(&mut pm), (side, side), &view, r, &frame, Pass::Shapes, &mut d);
+    Some(DrawnPicture { image: pm, pending: d.pending, retry })
 }
 
 #[cfg(test)]
@@ -554,48 +554,86 @@ mod tests {
             square.min_x + square.width() * 0.6,
             square.min_y + square.height() * 0.6,
         );
+        let mut kept = Vec::new();
         for _ in 0..2 {
             let mut error = None;
-            assert!(cover(&r, &f, &view, None, &mut false, &mut error).is_some());
+            kept = cover(&r, &f, &view, None, &mut false, &mut error).unwrap();
             cache::wait(Duration::from_secs(2));
             assert!(error.is_none(), "only padding crosses a refused shard: {error:?}");
         }
+        // A deterministic destination refusal does not make these pixels retryable.
+        cache::get_tile("https://picture-view.example/unrelated", cache::Want::Vector);
+        cache::wait(Duration::from_secs(2));
+        let mut error = None;
+        let again = cover(&r, &f, &view, None, &mut false, &mut error).unwrap();
+        assert!(error.is_none());
+        assert_eq!(kept.len(), again.len());
+        assert!(kept.iter().zip(&again).all(|(old, new)| Arc::ptr_eq(&old.payload, &new.payload)));
     }
 
-    /// A failure retained in a picture must disappear after the same tile recovers.
+    /// Routine missing tiles and reported failures both replace their pixels after recovery.
     #[test]
     fn picture_failures_refresh_after_recovery() {
         let _turn = cache::turn();
-        let _alarm = cache::alarm_turn();
-        let bytes = crate::mvt::encode(&Tile::default());
-        cache::set_fetcher(|_, done| done(Err("http status: 503 (retry after 1 s)".into())));
-        let style = crate::style::Style::parse(&serde_json::json!({"version":8,
-            "sources":{"s":{"type":"vector","tiles":["https://picture-retry.example/tile"],"maxzoom":0}},
-            "layers":[{"id":"fill","type":"fill","source":"s","source-layer":"l"}]}))
-        .unwrap();
-        let r = Arc::new(Resolved {
-            style,
-            from: None,
-            sprites: Vec::new(),
-            attribution: Vec::new(),
-            left_out: Vec::new(),
-            made: Mutex::new(Instant::now()),
-            waiting: false,
-        });
-        let f = frame(2.2, 1.0);
-        let view = f.extent(64, 64);
-        cover(&r, &f, &view, None, &mut false, &mut None);
-        cache::wait(Duration::from_secs(2));
-        let mut error = None;
-        cover(&r, &f, &view, None, &mut false, &mut error);
-        assert!(error.is_some());
-        cache::set_fetcher(move |_, done| done(Ok(bytes.clone())));
-        std::thread::sleep(Duration::from_secs(1));
-        cache::get_tile("https://picture-retry.example/tile", cache::Want::Vector);
-        cache::wait(Duration::from_secs(2));
-        let mut error = None;
-        cover(&r, &f, &view, None, &mut false, &mut error);
-        assert!(error.is_none(), "recovered tile still has an old picture warning: {error:?}");
+        let tile = Tile {
+            layers: vec![Layer {
+                name: "l".into(),
+                extent: 4096,
+                features: vec![Feature {
+                    id: None,
+                    kind: GeomKind::Polygon,
+                    props: Vec::new(),
+                    geometry: vec![vec![[0.0, 0.0], [4096.0, 0.0], [4096.0, 4096.0], [0.0, 4096.0], [0.0, 0.0]]],
+                }],
+            }],
+        };
+        let mut stale = Vec::new();
+        for status in [503, 404, 410] {
+            cache::set_fetcher(move |_, done| done(Err(format!("http status: {status}"))));
+            let url = format!("https://picture-retry.example/{status}");
+            let style = crate::style::Style::parse(&serde_json::json!({"version":8,
+                "sources":{"s":{"type":"vector","tiles":[url],"maxzoom":0}},
+                "layers":[{"id":"fill","type":"fill","source":"s","source-layer":"l","paint":{"fill-color":"#ff0000"}}]}))
+            .unwrap();
+            let r = Arc::new(Resolved {
+                style,
+                from: None,
+                sprites: Vec::new(),
+                attribution: Vec::new(),
+                left_out: Vec::new(),
+                made: Mutex::new(Instant::now()),
+                waiting: false,
+            });
+            let f = frame(2.2, 1.0);
+            let view = f.extent(64, 64);
+            cover(&r, &f, &view, None, &mut false, &mut None);
+            cache::wait(Duration::from_secs(2));
+            let mut error = None;
+            let mut pending = false;
+            let failed = cover(&r, &f, &view, None, &mut pending, &mut error).unwrap();
+            assert!(!pending, "an unavailable tile must not keep export pending");
+            assert_eq!(error.is_some(), status == 503, "routine status {status}: {error:?}");
+            assert!(!failed.is_empty());
+            assert!(failed.iter().all(|it| matches!(it.payload.as_ref(), Payload::Image(pm) if pm.data().iter().all(|b| *b == 0))));
+            let bytes = crate::mvt::encode(&tile);
+            cache::set_fetcher(move |_, done| done(Ok(bytes.clone())));
+            cache::forget(&url);
+            cache::get_tile(&url, cache::Want::Vector);
+            cache::wait(Duration::from_secs(2));
+            assert!(matches!(cache::peek(&url).as_deref(), Some(Payload::Vector(t)) if !t.layers[0].features.is_empty()));
+            let mut error = None;
+            let recovered = cover(&r, &f, &view, None, &mut false, &mut error).unwrap();
+            assert!(error.is_none(), "recovered tile still has an old picture warning: {error:?}");
+            let replaced = failed.len() == recovered.len()
+                && failed.iter().zip(&recovered).all(|(old, new)| old.at == new.at && !Arc::ptr_eq(&old.payload, &new.payload));
+            let painted = recovered
+                .iter()
+                .any(|it| matches!(it.payload.as_ref(), Payload::Image(pm) if pm.data().as_chunks::<4>().0.iter().any(|px| px[3] > 0)));
+            if !replaced || !painted {
+                stale.push(status);
+            }
+        }
+        assert!(stale.is_empty(), "recovered geometry left old blank pictures cached for HTTP {stale:?}");
     }
     use super::*;
     use crate::draw::{draw, place};
