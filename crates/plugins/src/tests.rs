@@ -398,6 +398,12 @@ fn registries_and_blocklists_are_read_defensively() {
     assert_eq!(registry::parse_blocklist(&full.to_string()).unwrap().len(), registry::MAX_ENTRIES);
     let over = Value::Array(vec![entry; registry::MAX_ENTRIES + 1]);
     assert!(registry::parse_blocklist(&over.to_string()).unwrap_err().contains("at most"));
+    // A refused entry isn't quoted at length.
+    let long = json!([{"id": "x".repeat(100_000)}, "y".repeat(100_000)]);
+    for list in [json!([long[0].clone()]), json!([long[1].clone()])] {
+        let e = registry::parse_blocklist(&list.to_string()).unwrap_err();
+        assert!(e.starts_with("blocklist entry 1") && e.len() < 400, "{}", e.len());
+    }
 }
 
 /// Blocklisting unloads affected plugins and prevents them from being loaded again.
@@ -420,6 +426,7 @@ fn blocked_plugins_are_unloaded_and_refused() {
         r#"[{"id": "ok"}, {"reason": "no id"}]"#,
         r#"[{"id": "unit-blocked", "sha256": "sha256:abc"}]"#,
         r#"[{"id": "Unit Blocked"}]"#,
+        r#"[{"id": "unit blocked"}]"#,
     ] {
         assert!(crate::store::save_blocklist(registry::DEFAULT_URL, text).is_err(), "{text}");
         assert!(crate::blocked("unit-blocked", "any").is_some(), "{text} cleared the blocklist");

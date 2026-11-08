@@ -193,9 +193,10 @@ pub fn blocklist_url(registry: &str) -> String {
 }
 
 /// Reads a blocklist (an object with a `blocked` array, or a bare array). Any other shape, an
-/// entry whose `id` isn't a plugin id or whose `sha256` isn't a SHA-256 hash (either would match
-/// nothing), or more than [`MAX_ENTRIES`] entries, is an error rather than a shorter list, so a malformed
-/// refresh leaves the last good list in place: only `[]` or `{"blocked": []}` clears it.
+/// entry whose `id` isn't a plugin id or whose `sha256`, when given, isn't a SHA-256 hash (either
+/// would match nothing; no `sha256`, or `null`, withdraws every version), or more than 100,000
+/// entries, is an error rather than a shorter list, so a malformed refresh leaves the last good
+/// list in place: only `[]` or `{"blocked": []}` clears it.
 pub fn parse_blocklist(text: &str) -> Result<Vec<Blocked>, String> {
     let root: Value = serde_json::from_str(text).map_err(|e| format!("the blocklist isn't valid JSON: {e}"))?;
     let list = match root {
@@ -212,9 +213,11 @@ pub fn parse_blocklist(text: &str) -> Result<Vec<Blocked>, String> {
     list.into_iter()
         .enumerate()
         .map(|(i, v)| {
-            let b = serde_json::from_value::<Blocked>(v).map_err(|e| format!("blocklist entry {}: {e}", i + 1))?;
+            // The reason is cut short: it can quote the entry, which comes from the network.
+            let b = serde_json::from_value::<Blocked>(v)
+                .map_err(|e| format!("blocklist entry {}: {}", i + 1, e.to_string().chars().take(200).collect::<String>()))?;
             if !valid_id(&b.id, false) {
-                return Err(format!("blocklist entry {}: '{}' isn't a plugin id", i + 1, b.id));
+                return Err(format!("blocklist entry {}: id isn't a plugin id", i + 1));
             }
             // Either case: `blocked` compares hashes ignoring it.
             match &b.sha256 {
