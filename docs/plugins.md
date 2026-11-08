@@ -436,7 +436,7 @@ Inside a request, `host::call(op, params)` sends one of these to RustGIS:
 | `host.info` | `{rustgis, abi, plugin, permissions}`: version, ABI, plugin id and permissions |
 | `host.layers` | `[{id, name, raster, visible, geometry, features, selected, active, fields: [{name, type}]}]` |
 | `host.features` `{layer, selected?, limit?}` | the layer's features as GeoJSON; each feature has its `row` |
-| `host.view` | `{center: [lon, lat], scale, projection}` |
+| `host.view` | `{center: [lon, lat], scale, projection, bearing, pitch}` (bearing and pitch in degrees, 0 for a flat north-up map) |
 | `host.notify` `{text, error?}` | shows a message in the status bar |
 | `host.addLayer` `{name, geojson}` | adds a layer (`edit`) |
 | `host.fetch` `{url}` | `{url, text, json?}`: the document at a web address (`network`; see [Fetching a document](#fetching-a-document)) |
@@ -717,12 +717,15 @@ its standard input and output: no port, no token, nothing another program can jo
   back as given. Requests go through the same checks as a command's, within the plugin's
   permissions. Between commands, each request that can change the project is an undo step of its
   own, named after the plugin, and an entry in the session log; `host.fetch` is refused: it would make the app wait, and the
-  program can fetch for itself. The desktop app answers requests as they come; `rustgis-cli` and
+  program can fetch for itself. What RustGIS has read before it writes a command is answered as
+  between commands; a request read after that, until the program answers, is part of that
+  command (its undo step), so send one meant to stand alone after answering, not while a command
+  may be on its way. The desktop app answers requests as they come; `rustgis-cli` and
   the Python package only while one of the plugin's commands runs (or as the next one starts);
   `rustgis-cli` ends the program after its last command, and what it asks after that isn't
   answered.
 - When the map changes, the desktop app sends `{"event": "view", "view": {center, scale,
-  projection}}` (the view, as `host.view` answers it), `{"event": "layers"}` (layers added,
+  projection, bearing, pitch}}` (the view, as `host.view` answers it), `{"event": "layers"}` (layers added,
   removed, reordered, made active, renamed, shown or hidden, restyled, made more or less transparent, their
   fields or features changed, and web tile layers changed), `{"event": "selection"}` or `{"event": "project"}` (another project
   opened). Ask for what changed with host requests. Changes the program made itself are told too: a view it set comes back as

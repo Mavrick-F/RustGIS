@@ -10544,7 +10544,10 @@ fn session_plugins_ask_between_commands_and_hear_the_map() {
     s.run("plugin:eng-sess/k", &json!({"op": "host.addLayer", "params": {"name": "Later", "geojson": fc}})).unwrap();
     poll_until(&mut s, &|s| s.map().layer_by_name("Later").is_some());
     assert_eq!(s.undo_label(), Some("Test eng-sess"), "its own step");
-    assert!(s.log.entries().any(|e| e.command == "host.addLayer"), "in the session log");
+    assert!(
+        s.log.entries().any(|e| e.command == "host.addLayer" && e.plugin.as_deref() == Some("eng-sess")),
+        "in the session log, as the plugin's"
+    );
     assert!(s.undo());
     assert!(s.map().layer_by_name("Later").is_none());
     assert!(s.redo());

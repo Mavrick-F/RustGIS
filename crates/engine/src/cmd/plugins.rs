@@ -806,7 +806,7 @@ fn seen(s: &mut Session, view: &Value) -> Seen {
 fn view_of(s: &Session) -> Value {
     let c = &s.map().camera;
     let center = c.center_lonlat();
-    json!({"center": [center.x, center.y], "scale": c.scale(), "projection": s.map().projection.code()})
+    json!({"center": [center.x, center.y], "scale": c.scale(), "projection": s.map().projection.code(), "bearing": c.bearing, "pitch": c.pitch})
 }
 
 impl Session {

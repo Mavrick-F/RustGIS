@@ -263,8 +263,9 @@ pub fn install_bytes(bytes: &[u8]) -> Result<Arc<Plugin>, String> {
     if let Some((s, target)) = &staged {
         // A session plugin's program runs from these files (on Windows they can't be replaced
         // while it does): it stops first.
+        let was_running = crate::session::is_running(&plugin.manifest.id);
         crate::session::stop(&plugin.manifest.id);
-        swap_in(s, target)?;
+        swap_in(s, target).map_err(|e| if was_running { format!("{e} (its running program was stopped first)") } else { e })?;
     }
     Ok(crate::register(plugin))
 }
