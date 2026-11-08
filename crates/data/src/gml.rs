@@ -74,9 +74,11 @@ const GEOMETRIES: &[&str] = &[
     "LinearRing",
 ];
 
-/// GML geometry kinds not read: one is a feature's unreadable shape when it has no other. Other
-/// GML values (a time, a definition) are properties not read.
+/// GML geometry kinds not read (GML 3.2's other geometry elements, curve segments and surface
+/// patches): one is a feature's unreadable shape when it has no other. Other GML values (a time,
+/// a definition) are properties not read.
 const SHAPES_NOT_READ: &[&str] = &[
+    // Primitives, aggregates and complexes.
     "CompositeCurve",
     "OrientableCurve",
     "CompositeSurface",
@@ -87,8 +89,35 @@ const SHAPES_NOT_READ: &[&str] = &[
     "Solid",
     "CompositeSolid",
     "MultiSolid",
+    "Shell",
     "MultiGeometry",
     "GeometricComplex",
+    "Ring",
+    "Grid",
+    "RectifiedGrid",
+    // Curve segments.
+    "LineStringSegment",
+    "Arc",
+    "ArcString",
+    "ArcByBulge",
+    "ArcStringByBulge",
+    "ArcByCenterPoint",
+    "Circle",
+    "CircleByCenterPoint",
+    "Geodesic",
+    "GeodesicString",
+    "OffsetCurve",
+    "Clothoid",
+    "CubicSpline",
+    "BSpline",
+    "Bezier",
+    // Surface patches.
+    "PolygonPatch",
+    "Triangle",
+    "Rectangle",
+    "Cone",
+    "Cylinder",
+    "Sphere",
 ];
 
 /// The coordinates under a node: `gml:pos`/`gml:posList` (with `srsDimension`),
@@ -282,6 +311,8 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         // Properties not read, and those holding GML of a kind not read (another kind of
         // geometry): the feature's unreadable shape when it has none, else not read.
         let (mut unread, mut other_gml) = (Vec::new(), Vec::new());
+        // Geometry properties that couldn't be read: said as not read when another gave the shape.
+        let mut failed = Vec::new();
         for p in f.children().filter(|c| c.is_element()) {
             // A property holding a geometry, or a simple value.
             // A feature's bounding box (gml:boundedBy) is neither its shape nor an attribute.
@@ -308,7 +339,10 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                         zm = dims.get();
                         geom = Some(gm);
                     }
-                    None => bad = true,
+                    None => {
+                        bad = true;
+                        failed.push(local(&p).to_string());
+                    }
                 }
             } else if let Some(c) = p.children().find(|c| c.is_element() && is_gml(c)) {
                 // A geometry of a kind not read (a CompositeCurve, a Solid…) may be the feature's
@@ -329,6 +363,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             bad = true;
         } else {
             unread.append(&mut other_gml);
+        }
+        if geom.is_some() {
+            unread.append(&mut failed);
         }
         for p in unread {
             kind.unread += 1;
@@ -564,6 +601,23 @@ mod tests {
         let (ds, rep) = &layers[0];
         assert_eq!((ds.features.len(), rep.skipped), (2, 1));
         assert!(ds.features[0].geometry.is_none());
+        // A surface patch as the only shape is an unreadable shape too, not a property not read.
+        let gml = r#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:app="http://example.com/app">
+<wfs:member><app:plots gml:id="t.1"><app:geom><gml:Triangle><gml:exterior><gml:LinearRing><gml:posList>10 48 11 48 10 49 10 48</gml:posList></gml:LinearRing></gml:exterior></gml:Triangle></app:geom></app:plots></wfs:member>
+</wfs:FeatureCollection>"#;
+        let layers = read("t.gml", gml.as_bytes()).unwrap();
+        let (ds, rep) = &layers[0];
+        assert_eq!((ds.features.len(), rep.skipped), (1, 1), "{:?}", rep.messages);
+        assert!(!rep.messages.iter().any(|m| m.contains("not read:")), "{:?}", rep.messages);
+        // A shape that can't be read, with another that can: the feature has its shape, and the
+        // one left out is said.
+        let gml = r#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:app="http://example.com/app">
+<wfs:member><app:sites gml:id="s.1"><app:a><gml:LineString><gml:posList>x y</gml:posList></gml:LineString></app:a><app:b><gml:Point><gml:pos>10 48</gml:pos></gml:Point></app:b></app:sites></wfs:member>
+</wfs:FeatureCollection>"#;
+        let layers = read("s.gml", gml.as_bytes()).unwrap();
+        let (ds, rep) = &layers[0];
+        assert_eq!((rep.skipped, ds.features[0].geometry.clone()), (0, Some(Geometry::Point(Coord::new(10.0, 48.0)))));
+        assert!(rep.messages.iter().any(|m| m.ends_with("not read: nested records, times or further shapes (a)")), "{:?}", rep.messages);
     }
 
     #[test]

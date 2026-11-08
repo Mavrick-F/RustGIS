@@ -132,9 +132,10 @@ fn missing() -> DataError {
     )
 }
 
-/// Refuses an ER Mapper header that would open more than its own data: a `Translated` one, whose
-/// data file GDAL opens as any format (a VRT beside it would read whatever it names), or one whose
-/// data file isn't a file beside it (GDAL before 3.12 follows `../`). Other files pass.
+/// Refuses an ER Mapper header that would open more than its own data: any but an `ERStorage` one
+/// (a `Translated` one's data file GDAL opens as any format, so a VRT beside it would read whatever
+/// it names), or one whose data file isn't a file beside it (GDAL before 3.12 follows `../`).
+/// Other files pass.
 fn plain_ers(src: &Path) -> Result<()> {
     if !src.extension().is_some_and(|e| e.eq_ignore_ascii_case("ers")) {
         return Ok(());
@@ -153,8 +154,13 @@ fn plain_ers(src: &Path) -> Result<()> {
             .map(|(_, v)| v.trim().trim_matches('"').to_string())
             .collect::<Vec<_>>()
     };
-    if values("DataSetType").iter().any(|t| t.eq_ignore_ascii_case("Translated")) {
-        return Err(DataError::Unsupported("an ER Mapper header linking to another file (DataSetType = Translated) isn't read".into()));
+    // Only raw data of its own: each type's first word, so trailing text can't change it.
+    let own = |t: &String| t.split_whitespace().next().is_some_and(|w| w.trim_matches('"').eq_ignore_ascii_case("ERStorage"));
+    if !values("DataSetType").iter().all(own) {
+        return Err(DataError::Unsupported(
+            "an ER Mapper header that isn't raw data of its own (DataSetType = ERStorage), such as one linking to another file, isn't read"
+                .into(),
+        ));
     }
     if values("DataFile").iter().any(|f| f.contains(['/', '\\', ':']) || f == "..") {
         return Err(DataError::Unsupported("an ER Mapper header whose data file isn't beside it isn't read".into()));
@@ -565,7 +571,14 @@ mod tests {
         let plain = header("plain.ers", "\tDataSetType\t= ERStorage\n\tDataFile\t= \"plain.dat\"\n");
         assert!(plain_ers(&plain).is_ok());
         let linked = header("linked.ers", "\tDataSetType\t= ERStorage\n\tdatasettype = Translated\n");
-        assert!(plain_ers(&linked).is_err_and(|e| e.to_string().contains("Translated")));
+        assert!(plain_ers(&linked).is_err_and(|e| e.to_string().contains("ERStorage")));
+        // Only raw data passes, whatever follows the type's word.
+        for kind in ["Translated ;", "Translated", "Other", "\"Translated\""] {
+            let p = header("kind.ers", &format!("\tDataSetType\t= {kind}\n"));
+            assert!(plain_ers(&p).is_err(), "{kind}");
+        }
+        let trailing = header("trailing.ers", "\tDataSetType\t= \"ERStorage\" ; raw\n");
+        assert!(plain_ers(&trailing).is_ok());
         for far in ["../far.dat", "/tmp/far.dat", "C:\\far.dat", ".."] {
             let p = header("far.ers", &format!("\tDataFile\t= \"{far}\"\n"));
             assert!(plain_ers(&p).is_err_and(|e| e.to_string().contains("isn't beside it")), "{far}");
