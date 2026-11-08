@@ -150,9 +150,11 @@ fn list(src: &Path) -> Result<Vec<LayerInfo>> {
     let src = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
     // A file or folder on this computer: GDAL would fetch a `/vsicurl/` address.
     std::fs::metadata(&src)?;
+    // Its type first, so a type that isn't read through GDAL says so whether GDAL is installed or not.
+    let drivers = drivers(&src)?;
     let ogrinfo = program("ogrinfo").ok_or_else(missing)?;
     check_version(&ogrinfo)?;
-    let mut c = command(ogrinfo, drivers(&src)?);
+    let mut c = command(ogrinfo, drivers);
     c.arg("-json").arg("-ro").arg("-so").arg("-nomd").arg(&src);
     let out = output(c, LIST_TIMEOUT, "GDAL")?;
     if !out.status.success() {
@@ -410,8 +412,11 @@ mod tests {
         // could name one) has none.
         assert!(EXTENSIONS.iter().all(|e| drivers(Path::new(&format!("a.{e}"))).is_ok()) && drivers(Path::new("/x/a.gdb/")).is_ok());
         assert!(drivers(Path::new("a.vrt")).is_err() && drivers(Path::new("noext")).is_err());
-        // A project saved when GDAL read GML is told to add it again.
-        assert!(drivers(Path::new("a.gml")).is_err_and(|e| e.to_string().contains("add the file again")));
+        // A project saved when GDAL read GML is told to add it again, GDAL installed or not.
+        let dir = tempfile::tempdir().unwrap();
+        let gml = dir.path().join("old.gml");
+        std::fs::write(&gml, "<x/>").unwrap();
+        assert!(layers(&gml).is_err_and(|e| e.to_string().contains("add the file again")));
         // An address is never handed to GDAL in place of a file, installed or not.
         assert!(matches!(layers(Path::new("/vsicurl/http://127.0.0.1:9/a.osm")), Err(DataError::Io(_))));
         // GDAL before 3.8 doesn't hold `ogrinfo` to the drivers given.

@@ -241,6 +241,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
     let (mut skipped, mut file_srs): (usize, Option<(Crs, bool)>) = (0, None);
     let mut unknown_srs: Option<String> = None;
     let mut over = 0usize;
+    // Properties holding other elements (a nested record), which aren't attributes: how many,
+    // and the first few names.
+    let (mut nested, mut nested_names) = (0usize, Vec::<String>::new());
     for f in members {
         let name = local(&f).to_string();
         if !kinds.contains_key(&name) {
@@ -288,7 +291,13 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                 if geom.is_none() {
                     bad = true;
                 }
-            } else if !(p.children().any(|c| c.is_element()) || is_gml(&p) && local(&p) == "boundedBy") {
+            } else if p.children().any(|c| c.is_element()) {
+                nested += 1;
+                let key = local(&p).to_string();
+                if nested_names.len() < 3 && !nested_names.contains(&key) {
+                    nested_names.push(key);
+                }
+            } else if !(is_gml(&p) && local(&p) == "boundedBy") {
                 let key = local(&p).to_string();
                 if !kind.columns.contains(&key) && kind.columns.len() < 500 {
                     kind.columns.push(key.clone());
@@ -314,6 +323,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
     }
     if over > 0 {
         report.messages.push(format!("{over} features of more than {MAX_LAYERS} feature types were left out"));
+    }
+    if nested > 0 {
+        report.messages.push(format!("{nested} nested properties weren't read ({})", nested_names.join(", ")));
     }
     if let Some(s) = &unknown_srs {
         report.messages.push(format!("unknown coordinate system '{s}': coordinates are read as they are"));
@@ -401,6 +413,7 @@ mod tests {
         );
         assert!(matches!(&layers[1].0.features[0].geometry, Some(Geometry::Polygon(p)) if p[0].len() == 2));
         assert_eq!(layers[0].1.skipped, 0, "a feature's boundedBy is no failed geometry");
+        assert!(!layers[0].1.messages.iter().any(|m| m.contains("nested")), "{:?}", layers[0].1.messages);
     }
 
     #[test]
@@ -436,8 +449,9 @@ mod tests {
         let (ds, rep) = &layers[0];
         assert_eq!((ds.features.len(), rep.skipped), (1, 0));
         assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(10.0, 48.0))));
-        // Its height is dropped, and said.
+        // Its height is dropped, and said; so is the nested `member` property, not an attribute.
         assert!(ds.zm_dropped && rep.messages.iter().any(|m| m.contains("Z or M values")), "{:?}", rep.messages);
+        assert!(rep.messages.iter().any(|m| m == "1 nested properties weren't read (member)"), "{:?}", rep.messages);
 
         // A one-point 3D part is left out, and its height with it: the 2D line kept says nothing.
         let gml = r#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:app="http://example.com/app">
