@@ -142,13 +142,19 @@ fn plain_ers(src: &Path) -> Result<()> {
     }
     // A header is a few kilobytes of text.
     const MAX_HEADER: u64 = 1 << 20;
-    if std::fs::metadata(src)?.len() > MAX_HEADER {
+    let meta = std::fs::metadata(src)?;
+    // A pipe or device named `.ers` would never finish being read.
+    if !meta.is_file() {
+        return Err(DataError::Format("not a file: an ER Mapper header is one".into()));
+    }
+    if meta.len() > MAX_HEADER {
         return Err(DataError::Format("too large for an ER Mapper header".into()));
     }
     let text = String::from_utf8_lossy(&std::fs::read(src)?).into_owned();
     // Every line naming a key, so a second one can't hide behind the first.
     let values = |key: &str| {
-        text.lines()
+        // GDAL ends a line at a carriage return too.
+        text.split(['\r', '\n'])
             .filter_map(|l| l.split_once('='))
             .filter(|(k, _)| k.trim().eq_ignore_ascii_case(key))
             .map(|(_, v)| v.trim().trim_matches('"').to_string())
@@ -579,11 +585,18 @@ mod tests {
         }
         let trailing = header("trailing.ers", "\tDataSetType\t= \"ERStorage\" ; raw\n");
         assert!(plain_ers(&trailing).is_ok());
+        // Lines ended by carriage returns alone are lines to GDAL too.
+        let cr = header("cr.ers", "\tVersion\t= \"6.0\"\r\tDataSetType\t= Translated\r");
+        assert!(plain_ers(&cr).is_err());
         for far in ["../far.dat", "/tmp/far.dat", "C:\\far.dat", ".."] {
             let p = header("far.ers", &format!("\tDataFile\t= \"{far}\"\n"));
             assert!(plain_ers(&p).is_err_and(|e| e.to_string().contains("isn't beside it")), "{far}");
         }
         assert!(subdatasets(&linked).is_err());
+        // A folder named like one isn't read as a header.
+        let folder = dir.path().join("folder.ers");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(plain_ers(&folder).is_err());
         // Not an ER Mapper header: nothing to check.
         assert!(plain_ers(Path::new("/nowhere/a.img")).is_ok());
     }

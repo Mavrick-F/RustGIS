@@ -433,6 +433,12 @@ mod tests {
         assert_ne!(fnv1a(b"a"), fnv1a(b"b"));
     }
 
+    /// Whether GDAL is installed and new enough to convert (3.8 or later), for the tests that
+    /// convert; with an older one they're refused, which the renamed-VRT test checks.
+    fn usable() -> bool {
+        available() && program("ogrinfo").is_some_and(|p| check_version(&p).is_ok())
+    }
+
     /// A VRT renamed `.tab` isn't opened as a VRT, so the file it names isn't read.
     #[test]
     fn a_renamed_vrt_isnt_read_when_gdal_is_installed() {
@@ -483,7 +489,7 @@ mod tests {
     /// keeps all five: the surfaces, the curves and the collection were left out before.
     #[test]
     fn keeps_surfaces_curves_and_collections_when_gdal_is_installed() {
-        if !available() {
+        if !usable() {
             return;
         }
         let dir = std::env::temp_dir().join(format!("rustgis-gdal-surfaces-{}", std::process::id()));
@@ -523,7 +529,7 @@ mod tests {
     /// A KML mixing points and polygons, through GDAL when it is installed (skipped otherwise).
     #[test]
     fn converts_a_mixed_kml_when_gdal_is_installed() {
-        if !available() {
+        if !usable() {
             return;
         }
         let dir = std::env::temp_dir().join(format!("rustgis-gdal-test-{}", std::process::id()));

@@ -74,51 +74,32 @@ const GEOMETRIES: &[&str] = &[
     "LinearRing",
 ];
 
-/// GML geometry kinds not read (GML 3.2's other geometry elements, curve segments and surface
-/// patches): one is a feature's unreadable shape when it has no other. Other GML values (a time,
-/// a definition) are properties not read.
-const SHAPES_NOT_READ: &[&str] = &[
-    // Primitives, aggregates and complexes.
-    "CompositeCurve",
-    "OrientableCurve",
-    "CompositeSurface",
-    "OrientableSurface",
-    "PolyhedralSurface",
-    "TriangulatedSurface",
-    "Tin",
-    "Solid",
-    "CompositeSolid",
-    "MultiSolid",
-    "Shell",
-    "MultiGeometry",
-    "GeometricComplex",
-    "Ring",
-    "Grid",
-    "RectifiedGrid",
-    // Curve segments.
-    "LineStringSegment",
-    "Arc",
-    "ArcString",
-    "ArcByBulge",
-    "ArcStringByBulge",
-    "ArcByCenterPoint",
-    "Circle",
-    "CircleByCenterPoint",
-    "Geodesic",
-    "GeodesicString",
-    "OffsetCurve",
-    "Clothoid",
-    "CubicSpline",
-    "BSpline",
-    "Bezier",
-    // Surface patches.
-    "PolygonPatch",
-    "Triangle",
-    "Rectangle",
-    "Cone",
-    "Cylinder",
-    "Sphere",
-];
+/// Whether a GML element under a property is a shape (read, or of a kind not read). GML's values
+/// that aren't geometry are few: times, definitions, dictionaries and units, and value objects.
+fn is_shape(name: &str) -> bool {
+    !(name.starts_with("Time")
+        || name.ends_with("Definition")
+        || name.ends_with("Dictionary")
+        || name.ends_with("Unit")
+        || matches!(
+            name,
+            "DefinitionCollection"
+                | "Null"
+                | "Boolean"
+                | "Category"
+                | "Count"
+                | "Quantity"
+                | "BooleanList"
+                | "CategoryList"
+                | "CountList"
+                | "QuantityList"
+                | "CategoryExtent"
+                | "CountExtent"
+                | "QuantityExtent"
+                | "CompositeValue"
+                | "ValueArray"
+        ))
+}
 
 /// The coordinates under a node: `gml:pos`/`gml:posList` (with `srsDimension`),
 /// `gml:coordinates` (`cs`, `ts`) or `gml:coord` (`X`, `Y`). `zm` is set when a third or fourth
@@ -310,7 +291,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         let mut zm = false;
         // Properties not read, and those holding GML of a kind not read (another kind of
         // geometry): the feature's unreadable shape when it has none, else not read.
-        let (mut unread, mut other_gml) = (Vec::new(), Vec::new());
+        let (mut unread, mut shapes_not_read) = (Vec::new(), Vec::new());
         // Geometry properties that couldn't be read: said as not read when another gave the shape.
         let mut failed = Vec::new();
         for p in f.children().filter(|c| c.is_element()) {
@@ -347,7 +328,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             } else if let Some(c) = p.children().find(|c| c.is_element() && is_gml(c)) {
                 // A geometry of a kind not read (a CompositeCurve, a Solid…) may be the feature's
                 // only shape; another GML value (a time, a definition) is no shape.
-                if SHAPES_NOT_READ.contains(&local(&c)) { &mut other_gml } else { &mut unread }.push(local(&p).to_string());
+                if is_shape(local(&c)) { &mut shapes_not_read } else { &mut unread }.push(local(&p).to_string());
             } else if p.children().any(|c| c.is_element()) {
                 // A nested record isn't an attribute.
                 unread.push(local(&p).to_string());
@@ -359,10 +340,10 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                 attrs.insert(key, text_of(&p).trim().to_string());
             }
         }
-        if geom.is_none() && !other_gml.is_empty() {
+        if geom.is_none() && !shapes_not_read.is_empty() {
             bad = true;
         } else {
-            unread.append(&mut other_gml);
+            unread.append(&mut shapes_not_read);
         }
         if geom.is_some() {
             unread.append(&mut failed);
@@ -447,7 +428,10 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         }
         if unread > 0 {
             let what = if unread == 1 { "property" } else { "properties" };
-            rep.messages.push(format!("{}: {unread} {what} not read: nested records, times or further shapes ({unread_names})", ds.name));
+            rep.messages.push(format!(
+                "{}: {unread} {what} not read: nested records, other GML values or further shapes ({unread_names})",
+                ds.name
+            ));
         }
         out.push((ds, rep));
     }
@@ -526,7 +510,7 @@ mod tests {
         // Its height is dropped, and said; so is the nested `member` property, not an attribute.
         assert!(ds.zm_dropped && rep.messages.iter().any(|m| m.contains("Z or M values")), "{:?}", rep.messages);
         assert!(
-            rep.messages.iter().any(|m| m == "n: 1 property not read: nested records, times or further shapes (member)"),
+            rep.messages.iter().any(|m| m == "n: 1 property not read: nested records, other GML values or further shapes (member)"),
             "{:?}",
             rep.messages
         );
@@ -567,10 +551,12 @@ mod tests {
         assert!(!layers[0].1.messages.iter().any(|m| m.contains("not read")), "{:?}", layers[0].1.messages);
         let (ds, rep) = &layers[1];
         assert_eq!(ds.features.len(), 1);
+        // The first shape is the one kept; the second is said as not read.
+        assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(10.0, 48.0))));
         assert!(
             rep.messages
                 .iter()
-                .any(|m| m == "t parks: 3 properties not read: nested records, times or further shapes (owner, built, entrance)"),
+                .any(|m| m == "t parks: 3 properties not read: nested records, other GML values or further shapes (owner, built, entrance)"),
             "{:?}",
             rep.messages
         );
@@ -585,7 +571,7 @@ mod tests {
         let (ds, rep) = &layers[0];
         assert_eq!((ds.features.len(), rep.skipped), (1, 0), "{:?}", rep.messages);
         assert!(
-            rep.messages.iter().any(|m| m == "d: 4 properties not read: nested records, times or further shapes (a, b, c, …)"),
+            rep.messages.iter().any(|m| m == "d: 4 properties not read: nested records, other GML values or further shapes (a, b, c, …)"),
             "{:?}",
             rep.messages
         );
@@ -617,7 +603,11 @@ mod tests {
         let layers = read("s.gml", gml.as_bytes()).unwrap();
         let (ds, rep) = &layers[0];
         assert_eq!((rep.skipped, ds.features[0].geometry.clone()), (0, Some(Geometry::Point(Coord::new(10.0, 48.0)))));
-        assert!(rep.messages.iter().any(|m| m.ends_with("not read: nested records, times or further shapes (a)")), "{:?}", rep.messages);
+        assert!(
+            rep.messages.iter().any(|m| m.ends_with("not read: nested records, other GML values or further shapes (a)")),
+            "{:?}",
+            rep.messages
+        );
     }
 
     #[test]
