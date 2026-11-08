@@ -4217,6 +4217,7 @@ mod tests {
         let from = Origin::named("https://public-style.example/style.json");
         for case in ["ready", "failures", "retry", "public"] {
             let url = format!("https://shared-reach.example/{case}");
+            let mut retry_times = None;
             get(&url, Want::Json);
             wait(std::time::Duration::from_secs(2));
             for _ in 0..3 {
@@ -4238,11 +4239,35 @@ mod tests {
                         assert_eq!(retry_after(&error), Some(Duration::from_secs(30)));
                         let State::Failed(error) = get(&url, Want::Json) else { panic!("the explicit layer keeps its cooldown") };
                         assert_eq!(retry_after(&error), Some(Duration::from_secs(120)));
+                        let c = lock();
+                        let slot = c.slots.get(&url).unwrap();
+                        let times = [Reach::Local, Reach::Public].map(|reach| match slot.for_reach(reach) {
+                            (Entry::Failed(_, at), stored) if reach == stored => *at,
+                            _ => panic!("each reach keeps its own failed-at time"),
+                        });
+                        if let Some(previous) = retry_times {
+                            assert_eq!(times, previous, "alternating reads must not postpone either retry");
+                        }
+                        retry_times = Some(times);
                     }
                 }
             }
             let sent = calls.lock().unwrap();
             assert_eq!(sent.iter().filter(|(u, _)| u == &url).count(), 2, "one fetch under each reach, not one per frame: {sent:?}");
+            drop(sent);
+            if case == "retry" {
+                // Move each recorded failure just past its own original wait, without sleeping
+                // or changing production clocks. The other reach's cooldown remains usable.
+                for (reach, count) in [(Reach::Public, 3), (Reach::Local, 4)] {
+                    let from = (reach == Reach::Public).then_some(&from);
+                    let State::Failed(error) = get_from(&url, Want::Json, from) else { panic!("the cooldown is still active") };
+                    let expired = Instant::now() - retry_wait(&error, RETRY) - Duration::from_secs(1);
+                    store_from(&url, Entry::Failed(error, expired), reach);
+                    assert!(matches!(get_from(&url, Want::Json, from), State::Pending), "retry at this reach's deadline");
+                    wait(std::time::Duration::from_secs(2));
+                    assert_eq!(calls.lock().unwrap().iter().filter(|(u, _)| u == &url).count(), count);
+                }
+            }
         }
     }
 

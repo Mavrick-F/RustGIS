@@ -280,13 +280,18 @@ HTTPS tiles use [platform certificate trust](data.md#https-certificates) on desk
 command line, including private CAs trusted by the operating system. The web app uses the browser.
 
 Tile addresses are checked after filling their placeholders, before cached bytes or network
-requests are used. In the native app, a document on the internet cannot direct tiles into the
-local network. Explicitly selected self-hosted servers remain supported, including ordinary
+requests are used. In the native app, a document on the internet cannot select a local
+destination IP. Explicitly selected self-hosted servers remain supported, including ordinary
 hostnames resolved by local DNS, with local fallback when the same hostname also returns
 public addresses. Native fetchers filter the resolved IPs before connecting,
-using the supplying document's actual connection reach. Native requests always refuse
+using the supplying document's actual connection reach. Native requests refuse
 link-local and unspecified addresses, including the well-known NAT64 translation of IPv4
 addresses. Document redirects also change the base for relative references.
+IPv4 decoding covers mapped addresses and the well-known `64:ff9b::/96` prefix. It does not
+inspect destinations behind 6to4 tunnels or custom translation gateways, including the
+[RFC 8215](https://www.rfc-editor.org/rfc/rfc8215#section-5) `64:ff9b:1::/48` prefix, whose
+translation is network-specific. Such routes can hide a private or link-local IPv4 destination
+behind a public-looking IPv6 address; restrictions on those routes require network firewall policy.
 Native redirects are checked at each hop. In the web app, use the final service address:
 tile, style, TileJSON and sprite redirects, including HTTP-to-HTTPS upgrades and CDN hops,
 are refused because the browser hides their destinations from the app. The same browser

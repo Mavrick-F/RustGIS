@@ -201,7 +201,18 @@ pub fn expand(template: &str, t: TileId, tile_size: u32, tms: bool, subdomains: 
 /// Resolves `href` against the document at `base` (for addresses inside a style or TileJSON).
 /// An invalid bound base stays refused by request validation rather than resolving anonymously.
 pub fn join(base: &str, href: &str) -> String {
-    let href = crate::logins::inner(href);
+    // Only the supplying document's base carries authority. A link may name a resource,
+    // but neither a service-login nor an S3 selector in it can choose an account.
+    let href = match rustgis_data::login_address::parse(href) {
+        Ok(Some(bound)) => bound.url,
+        Err(_) => return href.to_string(),
+        Ok(None) => href,
+    };
+    let href = match rustgis_data::s3_address::parse(href) {
+        Ok(Some(bound)) => bound.url,
+        Err(_) => return href.to_string(),
+        Ok(None) => href,
+    };
     match rustgis_data::s3_address::parse(base) {
         Ok(Some(bound)) => {
             let joined = join(bound.url, href);
@@ -288,6 +299,29 @@ mod tests {
         assert_eq!(join("https://a.test/style.json", &supplied), "https://a.test/tile");
         assert_eq!(rustgis_data::login_address::parse(&join(&base, &supplied)).unwrap().unwrap().binding, "0123456789abcdef");
         assert_eq!(join("rustgis-login:broken", "/tile"), "rustgis-login:broken");
+    }
+
+    /// A document may name a resource, but cannot choose another saved S3 account for it.
+    #[test]
+    fn document_s3_selectors_do_not_choose_an_account() {
+        let endpoint = "https://s3-links.example";
+        let base = rustgis_data::s3_address::bind("0123456789abcdef", endpoint, &format!("{endpoint}/bucket/style.json")).unwrap();
+        for url in [format!("{endpoint}/bucket/tile"), "https://other.example/tile".into()] {
+            let supplied = rustgis_data::s3_address::bind("fedcba9876543210", endpoint, &url).unwrap();
+            assert_eq!(join("https://public.example/style.json", &supplied), url, "the supplied selector is removed");
+            let joined = join(&base, &supplied);
+            let selected = rustgis_data::s3_address::parse(&joined).unwrap();
+            if url.starts_with(endpoint) {
+                assert_eq!(selected.unwrap().binding, "0123456789abcdef", "only the document's own account is inherited");
+            } else {
+                assert!(selected.is_none(), "a different server has no inherited account");
+            }
+        }
+        for malformed in ["rustgis-s3:broken", "rustgis-login:broken"] {
+            let joined = join(&base, malformed);
+            assert_eq!(joined, malformed, "malformed selectors remain refused, not relative paths");
+            assert!(crate::address::check(&joined, None).is_err());
+        }
     }
 
     #[test]

@@ -1188,6 +1188,62 @@ mod tests {
         assert!(notes[0].contains("won't fetch"), "{notes:?}");
     }
 
+    /// The generated raster style names the user's selected address as both base and tile;
+    /// resolving it must retain one wrapper rather than nesting the same selection.
+    #[test]
+    fn direct_saved_s3_rasters_keep_one_binding() {
+        let _turn = cache::turn();
+        let selected = rustgis_data::s3_address::bind(
+            "0123456789abcdef",
+            "https://s3-direct.example",
+            "https://s3-direct.example/bucket/{z}/{x}/{y}.png",
+        )
+        .unwrap();
+        let spec = spec(Kind::Raster, &selected);
+        let Resolve::Ready(resolved) = resolve(&spec) else { panic!("a direct raster needs no document fetch") };
+        let source = &resolved.style.sources.first().unwrap().1;
+        let Source::Raster { tiles, .. } = source else { panic!("the generated raster source is retained") };
+        assert_eq!(tiles, &[selected]);
+    }
+
+    /// A direct TileJSON selection reaches the cache once with its chosen account, and
+    /// relative tile addresses inherit that same account from the returned document.
+    #[test]
+    fn direct_saved_s3_tilejson_keeps_its_binding() {
+        let _turn = cache::turn();
+        let endpoint = "https://s3-direct-vector.example";
+        let binding = crate::s3::new_binding().unwrap();
+        let name = "direct TileJSON fixture";
+        crate::s3::connect_saved(
+            crate::s3::Connection {
+                name: name.into(),
+                endpoint: Some(endpoint.into()),
+                region: "us-east-1".into(),
+                buckets: vec!["bucket".into()],
+                credentials: None,
+            },
+            &binding,
+            "direct-vector",
+        )
+        .unwrap();
+        let selected = rustgis_data::s3_address::bind(&binding, endpoint, &format!("{endpoint}/bucket/tiles.json")).unwrap();
+        let asked = selected.clone();
+        cache::set_fetcher_with_origin(move |url, _, done, _| {
+            assert_eq!(url, asked, "the TileJSON request keeps exactly one selected wrapper");
+            let plain = crate::s3::bound_destination(&url).unwrap().unwrap();
+            let origin = address::Origin::named(&plain).retain_binding(&url).unwrap();
+            done(Ok(cache::Fetched { bytes: br#"{"tiles":["{z}/{x}/{y}.pbf"]}"#.to_vec(), origin }));
+        });
+        let spec = spec(Kind::Vector, &selected);
+        assert!(matches!(resolve(&spec), Resolve::Pending));
+        cache::wait(std::time::Duration::from_secs(2));
+        let Resolve::Ready(resolved) = resolve(&spec) else { panic!("the selected TileJSON must load") };
+        let Source::Vector { tiles, .. } = &resolved.style.sources.first().unwrap().1 else { panic!("the vector source is retained") };
+        let child = rustgis_data::s3_address::parse(&tiles[0]).unwrap().unwrap();
+        assert_eq!((child.binding, child.url), (binding.as_str(), &*format!("{endpoint}/bucket/{{z}}/{{x}}/{{y}}.pbf")));
+        crate::s3::disconnect(name);
+    }
+
     /// Label-only sources are checked too, even when the GPU or prepared pictures draw
     /// a different source's shapes. Neither renderer may discard a label refusal.
     #[test]

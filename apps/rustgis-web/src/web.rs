@@ -630,9 +630,7 @@ async fn fetch_reached(
                 let bound = url;
                 let prepared = rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::s3::prepare(logins::inner(url))?;
                 let url = prepared.url.as_str();
-                check_destination(url)?;
-                let destination = web_sys::Url::new(url).map_err(|_| "not a valid request address")?.href();
-                address::check_reach(&destination, ceiling)?;
+                let destination = check_destination(url, ceiling)?;
                 // An ArcGIS sign-in's token, for the portal and the servers it covers, renewed first when it
                 // is about to expire. It goes as the request's `token` parameter, not a header: ArcGIS's
                 // query endpoints answer the header's CORS preflight with an error.
@@ -813,7 +811,7 @@ async fn post_json(
     use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache::RequestDiagnostics, failure::Failure};
     let mut diagnostics = RequestDiagnostics::with_capture(url, "POST", capture);
     let answer = async {
-        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache, logins, s3};
+        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{address, cache, logins, s3};
         let (promise, authenticated) = crate::request::prepare_and_send(
             &still,
             || async {
@@ -827,7 +825,7 @@ async fn post_json(
                 let target = logins::inherit(url, &prepared.url);
                 let login = logins::apply(&target).map_err(str::to_string)?;
                 let request = prepared.url.as_str();
-                check_destination(request)?;
+                check_destination(request, address::Reach::Local)?;
                 let err = |e: wasm_bindgen::JsValue| {
                     if login.is_some() { "the browser couldn't process the authenticated request".to_string() } else { format!("{e:?}") }
                 };
@@ -895,7 +893,7 @@ async fn head(
     use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache::RequestDiagnostics, failure::Failure};
     let mut diagnostics = RequestDiagnostics::with_capture(url, "HEAD", capture);
     let answer = async {
-        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache, logins, s3};
+        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{address, cache, logins, s3};
         let sent = crate::request::prepare_and_send(
             &still,
             || async {
@@ -908,7 +906,7 @@ async fn head(
                     return Ok(None);
                 }
                 let url = prepared.url.as_str();
-                check_destination(url)?;
+                check_destination(url, address::Reach::Local)?;
                 let target = logins::inherit(bound, url);
                 let login = logins::apply(&target).map_err(str::to_string)?;
                 let request = login.as_ref().map_or(url, |applied| applied.url.as_str());
@@ -977,17 +975,17 @@ async fn head(
 }
 
 /// Checks the URL as the browser parses it, before any request or login renewal is sent.
-fn check_destination(url: &str) -> Result<(), String> {
-    use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::address;
-    let normalized = web_sys::Url::new(url).map_err(|_| "not a valid request address")?;
-    address::check(&normalized.href(), Some(url))
+fn check_destination(url: &str, ceiling: rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::address::Reach) -> Result<String, String> {
+    crate::request::destination(url, ceiling, |url| {
+        web_sys::Url::new(url).map(|normalized| normalized.href()).map_err(|_| "not a valid request address".into())
+    })
 }
 
 /// A manual redirect is an opaque, zero-status response: Fetch exposes no Location to check.
 /// Other zero-status responses are unusable too; none is treated as a successful download.
 fn check_redirect(response: &web_sys::Response) -> Result<(), String> {
     if response.status() == 0 {
-        Err("The browser cannot verify this redirect's destination. Use the final service address.".into())
+        Err(rustgis_ui_egui::tl!("The browser cannot verify this redirect's destination. Use the final service address.").into())
     } else {
         Ok(())
     }
