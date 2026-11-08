@@ -75,17 +75,23 @@ fn write_state(st: &State) -> Result<(), String> {
 pub fn load_installed() -> Vec<String> {
     let mut errors = Vec::new();
     let Some(dir) = dir() else { return errors };
-    // A cache this version can't read (one an older version saved) is reported, not trusted.
+    // A cache that can't be read (or one an older version saved that this one refuses) is
+    // reported, not trusted; there being none is fine.
     let cached = dir.join("blocklist.json");
-    if let Ok(text) = std::fs::read_to_string(&cached) {
-        match registry::parse_blocklist(&text) {
-            Ok(list) => {
-                crate::set_blocklist(list);
-            }
-            Err(e) => {
-                errors.push(format!("{}: {e}; withdrawn plugins aren't blocked until the blocklist is fetched again", cached.display()))
-            }
+    let list = match std::fs::read_to_string(&cached) {
+        Ok(text) => registry::parse_blocklist(&text).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    };
+    match list {
+        Ok(Some(list)) => {
+            crate::set_blocklist(list);
         }
+        Ok(None) => {}
+        Err(e) => errors.push(format!(
+            "{}: {e}; it was ignored, so withdrawn plugins may not be blocked until the blocklist is fetched again",
+            cached.display()
+        )),
     }
     let st = read_state();
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)

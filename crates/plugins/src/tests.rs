@@ -1230,6 +1230,11 @@ fn cached_blocklist_survives_refused_refreshes() {
     std::fs::write(&cache, r#"[{"id": "a"}, {"reason": "no id"}]"#).unwrap();
     let errors = crate::store::load_installed();
     assert!(errors.iter().any(|e| e.contains("blocklist.json") && e.contains("entry 2")), "{errors:?}");
+    // So is one that isn't text; none at all is fine.
+    std::fs::write(&cache, [0xff, 0xfe]).unwrap();
+    assert!(crate::store::load_installed().iter().any(|e| e.contains("blocklist.json")));
+    std::fs::remove_file(&cache).unwrap();
+    assert!(crate::store::load_installed().is_empty());
     let _ = std::fs::remove_dir_all(&plugins);
 }
 

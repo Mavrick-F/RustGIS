@@ -12692,6 +12692,11 @@ fn unreadable_plugin_blocklist_warns() {
         s.run("plugin.registry", &json!({"url": format!("{base}/registry.json")})).unwrap();
         let said: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("stays in force")).collect();
         assert!(said.iter().all(|n| n.severity == rustgis_data::diagnostics::Severity::Warning), "{said:?}");
+        // It names the blocklist and why it was refused.
+        assert!(
+            said.iter().all(|n| n.text.contains(&format!("{base}/blocklist.json")) && n.text.contains("no 'blocked' list")),
+            "{said:?}"
+        );
         said.len()
     };
     assert_eq!(warned(br#"{"blocked": {}}"#), 1);
