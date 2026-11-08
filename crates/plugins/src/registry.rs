@@ -193,8 +193,8 @@ pub fn blocklist_url(registry: &str) -> String {
 }
 
 /// Reads a blocklist (an object with a `blocked` array, or a bare array). Any other shape, an
-/// entry without an `id` or with a `sha256` that isn't a SHA-256 hash (it would match nothing), or
-/// more than [`MAX_ENTRIES`] entries, is an error rather than a shorter list, so a malformed
+/// entry whose `id` isn't a plugin id or whose `sha256` isn't a SHA-256 hash (either would match
+/// nothing), or more than [`MAX_ENTRIES`] entries, is an error rather than a shorter list, so a malformed
 /// refresh leaves the last good list in place: only `[]` or `{"blocked": []}` clears it.
 pub fn parse_blocklist(text: &str) -> Result<Vec<Blocked>, String> {
     let root: Value = serde_json::from_str(text).map_err(|e| format!("the blocklist isn't valid JSON: {e}"))?;
@@ -213,6 +213,9 @@ pub fn parse_blocklist(text: &str) -> Result<Vec<Blocked>, String> {
         .enumerate()
         .map(|(i, v)| {
             let b = serde_json::from_value::<Blocked>(v).map_err(|e| format!("blocklist entry {}: {e}", i + 1))?;
+            if !valid_id(&b.id, false) {
+                return Err(format!("blocklist entry {}: '{}' isn't a plugin id", i + 1, b.id));
+            }
             // Either case: `blocked` compares hashes ignoring it.
             match &b.sha256 {
                 Some(h) if !is_sha256(&h.to_ascii_lowercase()) => Err(format!("blocklist entry {}: sha256 isn't a SHA-256 hash", i + 1)),

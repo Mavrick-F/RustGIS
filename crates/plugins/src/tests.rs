@@ -419,6 +419,7 @@ fn blocked_plugins_are_unloaded_and_refused() {
         "[1]",
         r#"[{"id": "ok"}, {"reason": "no id"}]"#,
         r#"[{"id": "unit-blocked", "sha256": "sha256:abc"}]"#,
+        r#"[{"id": "Unit Blocked"}]"#,
     ] {
         assert!(crate::store::save_blocklist(registry::DEFAULT_URL, text).is_err(), "{text}");
         assert!(crate::blocked("unit-blocked", "any").is_some(), "{text} cleared the blocklist");
