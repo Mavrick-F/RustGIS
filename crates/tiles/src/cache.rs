@@ -599,11 +599,21 @@ fn refused_request(url: &str, message: String) -> (State, Option<crate::address:
 
 /// A policy refusal is retried by drawing each frame; keep its network facts once per history.
 pub(crate) fn note_refusal(url: &str, message: &str) {
-    let mut diagnostics = RequestDiagnostics::new(url, "GET");
+    // Validation reports the effective web destination, without request-only account markers.
+    // Resolve S3 endpoints without credentials, signing or I/O, just as destination checks do.
+    let plain = crate::logins::inner(crate::s3::split_anonymous(url).0);
+    let destination = match crate::s3::bound_destination(plain) {
+        Ok(Some(at)) => Some(at),
+        _ if crate::s3::is_s3(plain) => crate::s3::https_url(url).ok(),
+        _ => None,
+    };
+    let effective = destination.as_deref().unwrap_or(plain);
+    let mut diagnostics = RequestDiagnostics::new(effective, "GET");
     diagnostics.once = true;
     // Keep the reason independent of expanded tile paths; the history groups by server.
-    let reason = message.strip_prefix(url).and_then(|s| s.strip_prefix(": ")).unwrap_or(message);
-    diagnostics.failed(&Failure::new(url, reason));
+    let reason =
+        message.strip_prefix(url).or_else(|| message.strip_prefix(effective)).and_then(|s| s.strip_prefix(": ")).unwrap_or(message);
+    diagnostics.failed(&Failure::new(effective, reason));
 }
 
 /// What the cache holds for `url`, without fetching it.
@@ -2744,13 +2754,24 @@ mod native {
 mod tests {
     #[test]
     fn policy_refusals_group_paths_without_evicting_other_diagnostics() {
+        let _turn = turn();
         let history = rustgis_data::diagnostics::History::default();
         let _capture = history.enter();
         for i in 0..20 {
             let url = format!("http://127.0.0.1/{i}/0/0");
-            note_refusal(&url, &format!("{url}: a document on the web can't point into the local network"));
+            for asked in [
+                url.clone(),
+                crate::s3::anonymous(&url),
+                rustgis_data::s3_address::bind("0123456789abcdef", "http://127.0.0.1", &url).unwrap(),
+                rustgis_data::s3_address::bind("0123456789abcdef", "http://127.0.0.1", &format!("s3://fixture-bucket/{i}/0/0")).unwrap(),
+            ] {
+                let reason = crate::address::check_reach(&asked, crate::address::Reach::Public).unwrap_err();
+                note_refusal(&asked, &reason);
+            }
         }
         assert_eq!(history.records().len(), 1, "expanded paths must share a policy diagnostic");
+        assert_eq!(history.records()[0].network.as_ref().unwrap().url, "http://127.0.0.1");
+        assert_eq!(history.records()[0].message, "a document on the web can't point into the local network");
         note_refusal("http://127.0.0.1/other", "different refusal");
         note_refusal("http://127.0.0.2/0", "different refusal");
         assert_eq!(history.records().len(), 3);
