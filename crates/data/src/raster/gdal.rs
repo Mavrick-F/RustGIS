@@ -182,10 +182,11 @@ pub fn subdatasets(src: &Path) -> Result<Vec<(String, String)>> {
 
 /// Lists subdatasets with the downloaded raster's optional workspace budget.
 fn subdatasets_with_budget(src: &Path, workspace: Option<(&Path, u64)>) -> Result<Vec<(String, String)>> {
-    let gdalinfo = program("gdalinfo").ok_or_else(missing)?;
     let full = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
+    // Its type and header first, so a file that isn't read says so whether GDAL is installed or not.
     let drivers = drivers(&full)?;
     plain_ers(&full)?;
+    let gdalinfo = program("gdalinfo").ok_or_else(missing)?;
     let mut c = command(gdalinfo, drivers);
     // With the metadata (`-nomd` would drop the SUBDATASETS domain too, `-mdd` or not).
     c.arg("-json").arg("-nogcp").arg("-norat").arg("-noct").arg(&full);
@@ -592,11 +593,21 @@ mod tests {
             let p = header("far.ers", &format!("\tDataFile\t= \"{far}\"\n"));
             assert!(plain_ers(&p).is_err_and(|e| e.to_string().contains("isn't beside it")), "{far}");
         }
-        assert!(subdatasets(&linked).is_err());
-        // A folder named like one isn't read as a header.
+        assert!(subdatasets(&linked).is_err_and(|e| e.to_string().contains("ERStorage")));
+        // No type at all is raw data to GDAL (only `Translated` links), so it opens.
+        let untyped = header("untyped.ers", "\tDataFile\t= \"untyped.dat\"\n");
+        assert!(plain_ers(&untyped).is_ok());
+        // A folder named like one isn't read as a header, nor a pipe (which would never finish).
         let folder = dir.path().join("folder.ers");
         std::fs::create_dir(&folder).unwrap();
         assert!(plain_ers(&folder).is_err());
+        #[cfg(unix)]
+        {
+            let pipe = dir.path().join("pipe.ers");
+            if Command::new("mkfifo").arg(&pipe).status().is_ok_and(|s| s.success()) {
+                assert!(plain_ers(&pipe).is_err_and(|e| e.to_string().contains("not a file")));
+            }
+        }
         // Not an ER Mapper header: nothing to check.
         assert!(plain_ers(Path::new("/nowhere/a.img")).is_ok());
     }
