@@ -285,11 +285,11 @@ fn georeference(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// A coordinate system given as an EPSG code or any text [`Crs::parse`] reads.
-fn crs_param(p: &Value, key: &str) -> Result<Option<Crs>, String> {
+fn crs_param(s: &mut Session, p: &Value, key: &str) -> Result<Option<Crs>, String> {
     let bad = || format!("{key} is an EPSG code such as 32613 or \"EPSG:32613\"");
     match p.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(t)) => Crs::parse(t).map(Some),
+        Some(Value::String(t)) => super::parse_crs(s, t).map(Some),
         Some(v) => {
             let code = v.as_u64().filter(|c| *c <= u64::from(u32::MAX)).ok_or_else(bad)?;
             Crs::from_epsg(code as u32).map(Some).ok_or_else(|| format!("unknown coordinate system EPSG:{code}"))
@@ -306,8 +306,8 @@ fn warp_to_fit(s: &mut Session, p: &Value, layer: &str, r: &Raster) -> CmdResult
     let fit = georef::fit(kind, &gcps(p)?)?;
     // Points are longitude/latitude unless said otherwise, and the output stays in their system
     // unless asked to reproject.
-    let points_crs = crs_param(p, "pointsCrs")?.unwrap_or(Crs::LonLat);
-    let crs = crs_param(p, "crs")?.unwrap_or(points_crs);
+    let points_crs = crs_param(s, p, "pointsCrs")?.unwrap_or(Crs::LonLat);
+    let crs = crs_param(s, p, "crs")?.unwrap_or(points_crs);
     let resampling = match p.get("resampling") {
         None | Some(Value::Null) => warp::Resampling::Bilinear,
         Some(v) => v.as_str().and_then(warp::Resampling::parse).ok_or("resampling is nearest, bilinear or cubic")?,
@@ -687,7 +687,7 @@ fn grid_param(
             warp::Grid::of(&t)
         }
         None => {
-            let crs = crs_param(p, "crs")?.unwrap_or(crs);
+            let crs = crs_param(s, p, "crs")?.unwrap_or(crs);
             let (footprint, pixel) = natural(crs)?;
             let positive = |v: &Value| v.as_f64().filter(|c| c.is_finite() && *c > 0.0);
             let bad_cell = "cellSize is a positive number, or [x, y], in the output's units";
@@ -1566,7 +1566,14 @@ fn measure(s: &mut Session, p: &Value) -> CmdResult {
             if let Some(first) = pts.first() {
                 ring.push(*first);
             }
-            json!({"kind": "area", "squareMetres": body.area(rustgis_geom::geodesic_ring_area_m2(&ring)), "perimeterMetres": body.length(rustgis_geom::geodesic_ring_perimeter_m(&ring))})
+            if rustgis_geom::ring_area_is_ambiguous(&ring) {
+                return Err("the area is ambiguous: 1 ring winds beyond one whole surface".into());
+            }
+            let area = body.area(rustgis_geom::geodesic_ring_area_m2(&ring));
+            if !area.is_finite() {
+                return Err("the area cannot be measured from these coordinates".into());
+            }
+            json!({"kind": "area", "squareMetres": area, "perimeterMetres": body.length(rustgis_geom::geodesic_ring_perimeter_m(&ring))})
         }
         "height" => {
             let (Some(a), Some(c)) = (pts.first(), pts.get(1)) else { return Err("a height needs two points (base, top)".into()) };

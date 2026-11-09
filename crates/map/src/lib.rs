@@ -4,6 +4,7 @@
 pub mod antimeridian;
 pub mod camera;
 pub mod color;
+pub mod content;
 pub mod design;
 pub mod diagram;
 pub mod effects;
@@ -241,6 +242,9 @@ pub struct Layer {
     /// Process-local identity, preserved by snapshots but never stored in a project.
     #[serde(skip, default = "next_layer_instance")]
     instance_id: u64,
+    /// Process-local replacement identity; ordinary geometry edits leave chosen vertices valid.
+    #[serde(skip)]
+    replacement_rev: u64,
     /// Shared, like the features: an undo snapshot or other copy of the layer doesn't copy it.
     #[serde(skip)]
     projected: std::sync::Arc<Vec<Option<Geometry>>>,
@@ -293,6 +297,16 @@ impl Layer {
     /// Identifies this live layer, independently of its reusable map-local ID.
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    /// Identifies the current source contents independently of ordinary vertex edits.
+    pub fn replacement_revision(&self) -> u64 {
+        self.replacement_rev
+    }
+
+    /// Marks a wholesale data replacement, not an edit to the existing features.
+    pub fn touch_replacement(&mut self) {
+        self.replacement_rev = next_layer_instance();
     }
 
     /// Starts a distinct live instance after copying a layer or its owning map.
@@ -371,14 +385,24 @@ impl Layer {
         })
     }
 
-    /// Installs a fresh source, retaining styling but clearing feature-specific state whose ids
-    /// may identify different features. Returns the number of saved label moves reset for a notice.
-    pub fn replace_source(&mut self, src: source::SourceLayer) -> usize {
+    /// Installs a fresh source, retaining styling except an untouched no-geometry default.
+    /// Clears feature-specific state whose ids may identify different features, returning the
+    /// number of saved label moves reset for a notice.
+    pub fn replace_source(&mut self, mut src: source::SourceLayer) -> usize {
         self.selection.clear();
         let moved = self.labels.in_order().map(|class| class.moved.len()).sum();
         self.labels.default.moved.clear();
         self.labels.classes.iter_mut().for_each(|class| class.moved.clear());
+        src.reads = self.source.as_ref().map_or(0, |old| old.reads);
         if let Some(info) = src.info() {
+            if self.dataset.geometry_type == rustgis_data::GeometryType::None
+                && info.geometry_type != rustgis_data::GeometryType::None
+                && let Renderer::Single(sym) = &self.renderer
+                && let Some(seed) = sym.default_seed(rustgis_data::GeometryType::None)
+            {
+                self.renderer = Renderer::Single(Symbol::default_for(info.geometry_type, seed));
+            }
+            self.dataset.geometry_type = info.geometry_type;
             self.dataset.fields = info.fields.clone();
             self.dataset.crs = info.coordinate_system();
             // The new source's Z and M, which reading it drops (see `Dataset::zm_dropped`).
@@ -386,6 +410,7 @@ impl Layer {
         }
         self.dataset.source = src.linked_file().map(String::from);
         self.source = Some(src);
+        self.touch_replacement();
         self.install(Vec::new());
         moved
     }
@@ -403,6 +428,7 @@ impl Layer {
         Layer {
             id,
             instance_id: next_layer_instance(),
+            replacement_rev: 0,
             name: dataset.name.clone(),
             visible: true,
             labels: Labeling::default_for(&dataset),
@@ -555,6 +581,7 @@ impl Layer {
 
     /// Replaces a streamed layer's features, keeping the selection (by feature id).
     fn install(&mut self, features: Vec<rustgis_data::Feature>) {
+        let areas = self.source.as_ref().and_then(|source| source.ready_cache.as_ref()).map(|cache| cache.areas).unwrap_or_default();
         let mut ids: std::collections::HashSet<u64> =
             self.selection.iter().filter_map(|r| self.dataset.features.get(*r)).map(|f| f.id).collect();
         if let Some(src) = &mut self.source {
@@ -590,6 +617,10 @@ impl Layer {
                 if padded { rustgis_data::source::memory::features_bytes(&self.dataset.features) } else { cache.feature_bytes };
             self.view_memory.seed(&self.dataset.features, &self.projected, feature_bytes, cache.projected_bytes);
         }
+        if let Some(source) = &mut self.source {
+            source.area_counts = areas;
+            source.area_features = Some(self.dataset.features.allocation_key());
+        }
     }
 
     /// Allocated row, projected-geometry, extent and optional display storage for this layer.
@@ -613,6 +644,14 @@ impl Layer {
         let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), 0)) };
         let (mut ds, report) = copy.read_all()?;
         ds.name = self.dataset.name.clone();
+        ds.zm_dropped |= self.dataset.zm_dropped;
+        if ds.features.is_empty() && ds.geometry_type == rustgis_data::GeometryType::None {
+            ds.geometry_type = if self.dataset.geometry_type != rustgis_data::GeometryType::None {
+                self.dataset.geometry_type
+            } else {
+                copy.info().map_or(rustgis_data::GeometryType::None, |info| info.geometry_type)
+            };
+        }
         // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
@@ -628,7 +667,15 @@ impl Layer {
         let Some(copy) = self.open_source()? else { return Ok(None) };
         let Some(src) = copy.visit_source() else { return Ok(None) };
         let info = src.info();
-        let mut ds = Dataset::new(self.dataset.name.clone(), info.geometry_type, info.fields.clone());
+        // (A reload that read no rows leaves the reader without a type: the layer's declared one
+        // stands, as in `load_all_counted`.)
+        let geometry_type =
+            if info.geometry_type == rustgis_data::GeometryType::None && self.dataset.geometry_type != rustgis_data::GeometryType::None {
+                self.dataset.geometry_type
+            } else {
+                info.geometry_type
+            };
+        let mut ds = Dataset::new(self.dataset.name.clone(), geometry_type, info.fields.clone());
         ds.crs = info.coordinate_system();
         // What reading the source drops, the export lacks (see `Dataset::zm_dropped`).
         ds.zm_dropped = info.zm_dropped || self.dataset.zm_dropped;
@@ -1035,7 +1082,7 @@ impl Layer {
             }
         }
         for f in self.display_filters.iter().filter(|f| f.applies(scale)) {
-            if let Ok(e) = rustgis_data::query::parse(&f.where_, &self.dataset) {
+            if let Ok(e) = rustgis_data::query::parse_fields(&f.where_, &self.dataset) {
                 for (r, keep) in rows.iter_mut().enumerate() {
                     *keep = *keep && rustgis_data::query::eval(&e, &self.dataset, r);
                 }
@@ -1065,7 +1112,7 @@ impl Layer {
     pub fn visible_rows(&self) -> Vec<bool> {
         let n = self.dataset.features.len();
         match self.definition_query.as_deref().filter(|q| !q.trim().is_empty()) {
-            Some(q) => match rustgis_data::query::parse(q, &self.dataset) {
+            Some(q) => match rustgis_data::query::parse_fields(q, &self.dataset) {
                 Ok(e) => (0..n).map(|r| rustgis_data::query::eval(&e, &self.dataset, r)).collect(),
                 Err(_) => vec![true; n],
             },
@@ -2066,11 +2113,14 @@ impl Map {
     /// Makes a project file's groups whole (#836): a parent that is the group itself, missing,
     /// in a loop or past [`MAX_GROUP_DEPTH`] levels is dropped (the group goes to the top
     /// level), and each group's layers are gathered together, the outermost groups first.
-    pub fn tidy_groups(&mut self) {
+    /// Returns the number of invalid parent links removed.
+    pub fn tidy_groups(&mut self) -> usize {
+        let mut removed = 0;
         let ids: std::collections::HashSet<u32> = self.groups.iter().map(|g| g.id).collect();
         for g in &mut self.groups {
             if g.parent.is_some_and(|p| p == g.id || !ids.contains(&p)) {
                 g.parent = None;
+                removed += 1;
             }
         }
         let mut parent: std::collections::HashMap<u32, Option<u32>> = self.groups.iter().map(|g| (g.id, g.parent)).collect();
@@ -2080,6 +2130,7 @@ impl Map {
             while let Some(p) = next {
                 if seen.contains(&p) || seen.len() >= MAX_GROUP_DEPTH {
                     g.parent = None;
+                    removed += 1;
                     parent.insert(g.id, None);
                     break;
                 }
@@ -2092,6 +2143,7 @@ impl Map {
         for (_, id) in order {
             self.gather_group(id);
         }
+        removed
     }
 
     /// The map's layers as they stand (their ids in order, and the next id), cheap to take before
@@ -2881,6 +2933,7 @@ impl Layer {
             view_memory: _,
             geometry_kinds: _,
             geometry_rev: _,
+            replacement_rev: _,
             diagram: _,
         } = self;
         let mut out = Vec::new();

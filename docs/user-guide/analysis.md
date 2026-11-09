@@ -342,7 +342,8 @@ surface from point features using a Quartic (biweight, default) or Gaussian kern
 renormalised to integrate to 1).
 Points can optionally be weighted by a numeric population field (invalid or non-positive weights
 are excluded and reported in the tool messages; for multipoint features, each constituent point part
-receives the feature's weight). Calculations are performed in the linear units
+receives the feature's weight, a part with a coordinate missing or infinite is left out and
+counted, and a feature with no finite part is skipped). Calculations are performed in the linear units
 of a projected coordinate system (defaults to the layer's projected system; if the input layer lacks a
 coordinate system or is in degrees, or to project into a specific system, supply a projected system via `crs`,
 e.g. `EPSG:32618`).
@@ -404,6 +405,12 @@ keep their full area and small antimeridian crossings stay small. Rings winding 
 use the smaller polar region in either direction; reversing a ring does not select its global
 complement. Edges follow the shortest geodesics between vertices. The output fields remain
 `area_km2`, `perimeter_km` and `length_km`; point coordinates are unchanged.
+A ring through both poles can wind beyond one whole surface and bound no single
+region. Calculate Geometry Attributes refuses such input, with the numbers of affected rings
+and features, before changing any fields. The attribute table's Calculate Geometry does the
+same for its chosen rows. Spatial Join's Largest overlap refuses affected selected target or
+join features before writing output. Ordinary polar caps and whole-world rectangles remain
+measurable. Measure Area explains the ambiguity and still shows the perimeter.
 Spatial Join's **Largest overlap** still measures area on a sphere of radius 6,371 km; it can
 differ from the ellipsoid by up to about 0.9 % (a small area near a pole). The same WGS 84
 measure backs the attribute table's **Calculate Geometry** (`edit.calculateGeometry`), the
@@ -420,6 +427,8 @@ and the Measure tools (a ring that goes all the way round at 60° N gives the la
 while **Calculate Geometry Attributes** gives the smaller polar cap. On the Moon or another body, the Measure tools measure on
 that body's sphere. The Radius tools still measure a local Mercator distance, and **Mensuration
 Tools** (`raster.measure`) still measure on the sphere, so those can differ from the numbers above.
+
+For an ambiguous area, the `raster.measure` command with `kind: "area"` returns an error without a measurement object. To request its finite closed-ring perimeter, use `kind: "distance"` and repeat the first point at the end. The on-map Measure overlay continues to show perimeter alongside the area refusal.
 
 **Merge** (`merge`, Data Management › General) appends loaded vector layers of the same geometry
 type (points, lines or polygons) into a new layer. It needs no GeoLibre runner. Choose **Input
@@ -765,9 +774,24 @@ notice. A Double field's values are decimals already, rounded as decimal arithme
 get no notice. Without `statistics`, `field` gives that field's `COUNT`, `SUM`, `MEAN`, `MIN`,
 `MAX` and `STD`, reading its values as numbers.
 
+**Minimum Bounding Geometry** (`convexHull`) encloses each feature in its convex hull (Group
+Option `None`), or all of them in one (`All`, with `count`, the features it enclosed). It passes
+over a vertex with a coordinate missing or infinite, or so far out the hull can't take it (past
+about 9 million degrees), and skips a feature without geometry or with no point left to enclose,
+writing no hull for it; if every feature is skipped, it is an error. A latitude past a pole is
+taken as that pole. A hull with no area is written as what it is: a point for points in one place,
+or the line between the two farthest apart for points on one straight line on the map. The layer is
+a point or line layer when every hull is one, and the tool says so; otherwise it's a polygon layer
+holding any points and lines among its polygons. Dissolve leaves those out, saying how many; as
+Clip masks they cover nothing; a Shapefile export leaves them out, saying how many; and a
+GeoPackage export keeps them in a column that holds any kind of geometry. It says how many of
+each.
+
 **Dissolve** (`dissolve`) merges the polygons sharing a value of `field` into one feature for
 each value, or all of them into one without a field. Each feature has the value and `count`, the
-polygons merged; records with no value form a feature of their own. **Summarize Within**
+polygons merged; records with no value form a feature of their own. A feature with no polygon (no
+geometry, or a point or line in the polygon layer) is left out, with its values, and the tool says
+how many; if none has a polygon, it is an error. **Summarize Within**
 (`countPoints`) copies the polygons and adds `point_count`, the points inside each polygon or on
 its edge; a point where polygons overlap counts in each of them.
 

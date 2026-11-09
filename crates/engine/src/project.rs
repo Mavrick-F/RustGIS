@@ -846,7 +846,14 @@ impl Project {
     /// Takes the notices of what reading the project changed, keeping those of the parts given
     /// (an import says only what it takes); the rest are dropped.
     pub(crate) fn take_read_notices(&mut self, parts: &[ReadPart]) -> Vec<NoticeText> {
-        std::mem::take(&mut self.read_notices).into_iter().filter(|(part, _)| parts.contains(part)).map(|(_, n)| n).collect()
+        let mut notices: Vec<NoticeText> =
+            std::mem::take(&mut self.read_notices).into_iter().filter(|(part, _)| parts.contains(part)).map(|(_, n)| n).collect();
+        if parts.contains(&ReadPart::AreaExpressions)
+            && let Some(message) = crate::cmd::design::display_area_messages(self.maps.iter().flat_map(|map| map.layers.iter()))
+        {
+            notices.push(message.into());
+        }
+        notices
     }
 
     /// Repairs invariants after loading (at least one map; a valid active index). Returns a
@@ -872,8 +879,8 @@ impl Project {
         self.repair(true)
     }
 
-    /// Repairs the project; returns a notice per kind of change that removed, cut or renamed
-    /// something (new table ids and values brought into range go unsaid), with its part.
+    /// Reports removed or shortened content, renamed items and repaired group display settings
+    /// with their affected part. Table ids absent from older formats are filled in for compatibility.
     fn repair(&mut self, opened: bool) -> Vec<(ReadPart, NoticeText)> {
         if self.maps.is_empty() {
             self.maps.push(Map::new("Map"));
@@ -913,9 +920,6 @@ impl Project {
         let mut done = Repaired::default();
         // Files skip the commands' limits, and notebooks and presentations are found (and
         // notebooks trusted) by name, so names are made unique.
-        for r in &mut self.reports {
-            r.clamp();
-        }
         for (what, len) in [
             ("report(s)", self.reports.len()),
             ("presentation(s)", self.presentations.len()),
@@ -940,11 +944,17 @@ impl Project {
         });
         self.shared.truncate(MAX_ITEMS);
         self.data_stores.truncate(MAX_ITEMS);
+        for r in &mut self.reports {
+            let repairs = r.clamp();
+            done.content(repairs, &r.name);
+        }
         for p in &mut self.presentations {
-            p.clamp();
+            let repairs = p.clamp();
+            done.content(repairs, &p.name);
         }
         for nb in &mut self.notebooks {
-            nb.clamp();
+            let repairs = nb.clamp();
+            done.content(repairs, &nb.name);
         }
         done.renamed.add_kind(unique_names(self.presentations.iter_mut().map(|p| &mut p.name)), "presentation(s)");
         done.renamed.add_kind(unique_names(self.notebooks.iter_mut().map(|nb| &mut nb.name)), "notebook(s)");
@@ -990,9 +1000,16 @@ impl Project {
                 }
                 names_cut += usize::from(g.name.chars().nth(200).is_some());
                 g.name = g.name.chars().take(200).collect();
+                let (transparency, min_scale, max_scale) = (g.transparency, g.min_scale, g.max_scale);
                 g.transparency = if g.transparency.is_finite() { g.transparency.clamp(0.0, 100.0) } else { 0.0 };
                 g.min_scale = g.min_scale.filter(|v| v.is_finite() && *v > 0.0);
                 g.max_scale = g.max_scale.filter(|v| v.is_finite() && *v > 0.0);
+                done.group_settings.add(
+                    usize::from(transparency != g.transparency)
+                        + usize::from(min_scale != g.min_scale)
+                        + usize::from(max_scale != g.max_scale),
+                    &m.name,
+                );
                 let members = g.children.len();
                 g.children.retain(|c| layer_ids.contains(c) && children.insert(*c));
                 members_removed += members - g.children.len();
@@ -1001,7 +1018,7 @@ impl Project {
             done.groups_removed.add(groups_before - m.service_groups.len() - m.groups.len(), &m.name);
             done.members_removed.add(members_removed, &m.name);
             done.group_names_cut.add(names_cut, &m.name);
-            m.tidy_groups();
+            done.group_parents.add(m.tidy_groups(), &m.name);
             // A projection this version can't use (a hand edit, or a newer file) falls back to
             // Web Mercator rather than being named while another is drawn.
             if let rustgis_map::Projection::Custom(code) = &m.projection
@@ -1023,8 +1040,18 @@ impl Project {
                 }
             }
             // Tile layers with an address that can't be fetched (a hand edit) are dropped.
-            m.tiles.retain_mut(|t| match t.repair() {
-                Ok(()) => true,
+            let mut kept_tiles = 0usize;
+            m.tiles.retain_mut(|t| match t.repair_counted() {
+                Ok(repairs) => {
+                    let converted = opened && crate::cmd::tiles::cog_tile_is_raster(t);
+                    if converted || kept_tiles < rustgis_map::tiles::MAX_TILE_LAYERS {
+                        done.tile(repairs, &t.name);
+                    }
+                    if !converted {
+                        kept_tiles += 1;
+                    }
+                    true
+                }
                 Err(e) => {
                     log::warn!("{}: {e}", m.name);
                     done.tiles_removed.add(1, &t.name);
@@ -1221,23 +1248,28 @@ impl Project {
 
     /// Reads a project from its JSON text (a browser upload).
     pub fn from_json(text: &str) -> Result<Project, String> {
-        Self::read_json(text, true, None, true)
+        Self::read_json(text, true, None, true, None)
     }
 
     /// Reads imported JSON (including package contents) without restoring a saved file's secrets.
     pub(crate) fn from_import_json(text: &str, dir: Option<&Path>) -> Result<Project, String> {
-        Self::read_json(text, false, dir, true)
+        Self::read_json(text, false, dir, true, None)
+    }
+
+    /// Repairs only the maps the import will retain, so excluded maps produce no notices.
+    pub(crate) fn from_import_maps_json(text: &str, dir: Option<&Path>, limit: usize) -> Result<Project, String> {
+        Self::read_json(text, false, dir, true, Some(limit))
     }
 
     /// Peer census must precede normalization: duplicate ids cannot become proof of a unique
     /// matching slot after the normalizer renumbers or drops them. Saved-text restore is absent.
     pub(crate) fn from_peer_raw(text: &str) -> Result<Project, String> {
-        Self::read_json(text, false, None, false)
+        Self::read_json(text, false, None, false, None)
     }
 
     /// Validates compatibility before typed decoding. Saved files may restore exact fields;
     /// peer input stays unnormalized until its slot census has rejected ambiguous identities.
-    fn read_json(text: &str, restore: bool, dir: Option<&Path>, normalize: bool) -> Result<Project, String> {
+    fn read_json(text: &str, restore: bool, dir: Option<&Path>, normalize: bool, map_limit: Option<usize>) -> Result<Project, String> {
         check_format(text, "project")?;
         let mut p: Project = serde_json::from_str(text).map_err(|e| {
             let msg = e.to_string();
@@ -1262,9 +1294,20 @@ impl Project {
         if let Some(d) = dir.and_then(Path::to_str) {
             p.resolve_paths(d);
         }
+        let excluded_maps = map_limit.map_or(0, |limit| p.maps.len().saturating_sub(limit));
+        if let Some(limit) = map_limit {
+            p.maps.truncate(limit);
+        }
         let repair_notices = if normalize { p.normalize_opened() } else { Vec::new() };
-        p.read_notices = label_losses::notices(text, &p)?.into_iter().map(|(part, text)| (part, text.into())).collect();
+        p.read_notices =
+            label_losses::notices_for_maps(text, &p, map_limit.is_some())?.into_iter().map(|(part, text)| (part, text.into())).collect();
         p.read_notices.extend(repair_notices);
+        if excluded_maps > 0 {
+            p.read_notices.push((
+                ReadPart::Maps,
+                NoticeText::format("{n} map(s) beyond the import limit left out", [("n", excluded_maps.to_string().into())]),
+            ));
+        }
         Ok(p)
     }
 
@@ -1301,7 +1344,7 @@ impl Project {
         let bytes = read_file(path, max)?;
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a RustGIS project", path.display()))?;
         let dir = std::path::absolute(path).ok().and_then(|p| p.parent().map(Path::to_path_buf));
-        Self::read_json(&text, true, dir.as_deref(), true)
+        Self::read_json(&text, true, dir.as_deref(), true, None)
     }
 }
 
@@ -1368,6 +1411,7 @@ pub const MAX_ITEMS: usize = 1000;
 /// The part of a project a read notice is about, so an import says only what it takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadPart {
+    AreaExpressions,
     Labels,
     Diagrams,
     /// Diagrams that won't show for their layer's aggregation or extrusion (#1596).
@@ -1380,8 +1424,15 @@ pub(crate) enum ReadPart {
 }
 
 /// Every part: a whole project opened.
-pub(crate) const ALL_PARTS: [ReadPart; 6] =
-    [ReadPart::Labels, ReadPart::Diagrams, ReadPart::HiddenDiagrams, ReadPart::Layouts, ReadPart::Maps, ReadPart::Items];
+pub(crate) const ALL_PARTS: [ReadPart; 7] = [
+    ReadPart::AreaExpressions,
+    ReadPart::Labels,
+    ReadPart::Diagrams,
+    ReadPart::HiddenDiagrams,
+    ReadPart::Layouts,
+    ReadPart::Maps,
+    ReadPart::Items,
+];
 
 /// The most layouts a project keeps (`layout.*` commands refuse to make more).
 pub(crate) const MAX_LAYOUTS: usize = 200;
@@ -1466,6 +1517,20 @@ impl Tally {
     }
 }
 
+/// The same content notices for a standalone import, published only after it succeeds.
+pub(crate) fn content_notices(repairs: rustgis_map::content::ContentRepairs, name: &str) -> Vec<NoticeText> {
+    let mut done = Repaired::default();
+    done.content(repairs, name);
+    done.notices(name, "while importing the item").into_iter().map(|(_, n)| n).collect()
+}
+
+/// Successful tile additions use the same counted, redacted notices as project reads.
+pub(crate) fn tile_notices(repairs: rustgis_map::tiles::TileRepairs, name: &str) -> Vec<NoticeText> {
+    let mut done = Repaired::default();
+    done.tile(repairs, name);
+    done.notices(name, "while checking the tile layer").into_iter().map(|(_, n)| n).collect()
+}
+
 /// What [`Project::repair`] removed, cut or renamed outside the layouts, for its notices.
 #[derive(Default)]
 struct Repaired {
@@ -1476,15 +1541,45 @@ struct Repaired {
     groups_removed: Tally,
     members_removed: Tally,
     group_names_cut: Tally,
+    group_settings: Tally,
+    group_parents: Tally,
+    content_text: Tally,
+    content_filters: Tally,
+    content_entries: Tally,
+    content_images: Tally,
+    content_settings: Tally,
     projection_lost: Tally,
     /// A map whose projection was lost has bookmarks, which stay in that projection's units.
     bookmarks_kept: bool,
+    tile_addresses: Tally,
+    tile_entries: Tally,
+    tile_styles: Tally,
+    tile_text: Tally,
+    tile_settings: Tally,
     tiles_removed: Tally,
     tiles_over_limit: Tally,
     values_cut: Tally,
 }
 
 impl Repaired {
+    /// Groups successful tile repairs by kind without keeping any saved addresses.
+    fn tile(&mut self, repairs: rustgis_map::tiles::TileRepairs, name: &str) {
+        self.tile_addresses.add(repairs.addresses, name);
+        self.tile_entries.add(repairs.entries, name);
+        self.tile_styles.add(repairs.styles, name);
+        self.tile_text.add(repairs.text, name);
+        self.tile_settings.add(repairs.settings, name);
+    }
+
+    /// Keeps loss kinds separate while aggregating affected item names across their clamps.
+    fn content(&mut self, repairs: rustgis_map::content::ContentRepairs, name: &str) {
+        self.content_text.add(repairs.text, name);
+        self.content_filters.add(repairs.filters, name);
+        self.content_entries.add(repairs.entries, name);
+        self.content_images.add(repairs.images, name);
+        self.content_settings.add(repairs.settings, name);
+    }
+
     /// One deferred notice per kind: only trusted templates and kind labels are translated.
     fn notices(&self, name: &str, when: &'static str) -> Vec<(ReadPart, NoticeText)> {
         let name = short_name(name);
@@ -1509,6 +1604,21 @@ impl Repaired {
                 vec![("kinds", t.kinds()), ("limit", MAX_ITEMS.to_string().into())],
             ),
         );
+        for (t, key) in [
+            (&self.content_text, "{n} report, presentation or notebook text field(s) shortened to supported limits {when} ({places})"),
+            (&self.content_filters, "{n} report filter(s) shortened to 2000 characters; included records may change {when} ({places})"),
+            (
+                &self.content_entries,
+                "{n} report field(s), group(s), statistic(s), section(s), presentation page(s) or notebook cell(s) beyond supported limits removed {when} ({places})",
+            ),
+            (&self.content_images, "{n} presentation picture(s) or video poster(s) beyond the size limit removed {when} ({places})"),
+            (
+                &self.content_settings,
+                "{n} report or presentation page-size, timing or map-view setting(s) brought into supported ranges {when} ({places})",
+            ),
+        ] {
+            say(ReadPart::Items, t, message(key, t, vec![]));
+        }
         let t = &self.models_removed;
         say(ReadPart::Items, t, message("{n} deep-learning model(s) this version can't use removed {when} ({places})", t, vec![]));
         let t = &self.renamed;
@@ -1541,6 +1651,18 @@ impl Repaired {
         );
         let t = &self.group_names_cut;
         say(ReadPart::Maps, t, message("{n} group name(s) cut to 200 characters {when} (in {places})", t, vec![]));
+        let t = &self.group_settings;
+        say(
+            ReadPart::Maps,
+            t,
+            message(
+                "{n} group transparency or scale-range setting(s) replaced or removed to fit supported values {when} (in {places})",
+                t,
+                vec![],
+            ),
+        );
+        let t = &self.group_parents;
+        say(ReadPart::Maps, t, message("{n} group(s) with an invalid parent moved to the top level {when} (in {places})", t, vec![]));
         let t = &self.projection_lost;
         let bookmarks = if self.bookmarks_kept {
             NoticeText::term("; their bookmarks are still in the old projection's units")
@@ -1556,6 +1678,15 @@ impl Repaired {
                 vec![("bookmarks", bookmarks)],
             ),
         );
+        for (t, key) in [
+            (&self.tile_addresses, "{n} invalid, repeated or excess dated tile address(es) removed {when} ({places})"),
+            (&self.tile_entries, "{n} invalid or excess tile layer-name or subdomain entry(ies) removed {when} ({places})"),
+            (&self.tile_styles, "{n} unreadable tile style definition(s) removed {when}; the tiles keep their colours ({places})"),
+            (&self.tile_text, "{n} tile address, name, attribution or identifier field(s) shortened or replaced {when} ({places})"),
+            (&self.tile_settings, "{n} tile coverage or numeric setting(s) removed or brought into range {when} ({places})"),
+        ] {
+            say(ReadPart::Maps, t, message(key, t, vec![]));
+        }
         let t = &self.tiles_removed;
         say(ReadPart::Maps, t, message("{n} tile layer(s) with an address that can't be used removed {when} ({places})", t, vec![]));
         let t = &self.tiles_over_limit;

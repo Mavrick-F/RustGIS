@@ -2262,6 +2262,11 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let _ = app.run("ui.dialog", json!({"name": "repairSource", "layer": l.id}));
         ui.close();
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::reloaddata::supported(l) && ui.button(tl!("Reload Data")).on_hover_text(tl!(crate::reloaddata::HELP)).clicked() {
+        let _ = app.run("ui.reloadData", json!({"layer": l.id}));
+        ui.close();
+    }
     ui.separator();
     // Not while the list is filtered: the layer would move among hidden ones.
     if ui.add_enabled(reorder, egui::Button::new(tl!("Move Up"))).clicked() {
@@ -5668,9 +5673,9 @@ pub(crate) fn expression_box(
             .labelled_by(input_label.id)
         })
         .inner;
-    // Checked here, as Calculate Field checks it, only while it differs from what is set.
+    // Check syntax and fields while typing; the applying command validates area values once.
     let text = buf.trim();
-    let error = (text != cur.trim() && !text.is_empty()).then(|| rustgis_engine::data::query::parse(text, ds).err()).flatten();
+    let error = (text != cur.trim() && !text.is_empty()).then(|| rustgis_engine::data::query::parse_fields(text, ds).err()).flatten();
     let mut apply = None;
     if r.lost_focus() {
         ui.data_mut(|d| d.remove::<(String, String)>(typing));

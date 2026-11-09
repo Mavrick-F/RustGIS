@@ -326,7 +326,7 @@ fn fit_to_layer(r: &mut Report, ds: &rustgis_data::Dataset) {
     if r.fields.is_empty() {
         r.fields = ds.fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect();
     }
-    if !r.where_clause.is_empty() && rustgis_data::query::parse(&r.where_clause, ds).is_err() {
+    if !r.where_clause.is_empty() && rustgis_data::query::parse_fields(&r.where_clause, ds).is_err() {
         r.where_clause.clear();
     }
 }
@@ -538,7 +538,7 @@ pub fn report_file(s: &Session, i: usize, template: bool) -> Result<Vec<u8>, Str
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let text = super::items::read_text(p)?;
     let mut r: Report = serde_json::from_str(&text).map_err(|e| format!("not a RustGIS report: {e}"))?;
-    r.clamp();
+    let repairs = r.clamp();
     import_layer(s, p, &mut r)?;
     // Drop what the layer lacks, so the report still draws.
     if let Some(l) = find_layer(s, &r.layer) {
@@ -552,6 +552,9 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     s.project.reports.push(r);
     let i = s.project.reports.len() - 1;
     s.active_report = Some(i);
+    for notice in crate::project::content_notices(repairs, &name) {
+        s.notify_text(notice, false);
+    }
     Ok(json!({"report": i, "name": name}))
 }
 

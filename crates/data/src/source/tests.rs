@@ -5,6 +5,30 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[test]
+fn explicit_method_1028_warns_for_known_geopackage_authorities() {
+    let wkt = r#"PROJCRS["World EQC",BASEGEOGCRS["WGS 84",DATUM["WGS_1984",ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0]],CONVERSION["EQC",METHOD["Equidistant Cylindrical",ID["EPSG",1028]]],CS[Cartesian,2],AXIS["Easting",east],AXIS["Northing",north],LENGTHUNIT["metre",1]]"#;
+    let sphere = wkt.replace("298.257223563", "0");
+    let wkt1 = crate::raster::wkt::to_wkt(Crs::from_epsg(4087).unwrap()).unwrap();
+    for (definition, code, warned) in [(wkt, 4087, true), (&sphere, 4087, false), (&wkt1, 4087, false), (wkt, 3857, false)] {
+        let mut notes = Vec::new();
+        let row = GpkgSrs { organization: Some("EPSG".into()), code: Some(code), definition: Some(definition.into()) };
+        let read = gpkg_reproject(100001, Some(row), &mut notes).unwrap();
+        assert_eq!(notes.iter().filter(|n| n.contains("EPSG method 1028")).count(), usize::from(warned), "{definition}: {notes:?}");
+        if warned {
+            assert!(
+                notes[0].contains("srs_id 100001")
+                    && notes[0].contains("PROJ/GDAL")
+                    && notes[0].contains("using EPSG:4087 parameters in preference to the WKT definition"),
+                "{notes:?}"
+            );
+            let point = Geometry::Point(Coord::new(0.0, 5_009_377.085_697_311));
+            let Geometry::Point(at) = read.geometry(point).unwrap() else { panic!("not a point") };
+            assert!(at.x.abs() < 1e-9 && (at.y - 45.0).abs() < 1e-9, "{at:?}");
+        }
+    }
+}
+
+#[test]
 fn file_geodatabase_names() {
     assert!(is_gdb_name("/x/roads.gdb") && is_gdb_name("Roads.GDB/") && is_gdb_name(r"C:\x\roads.gdb\"));
     assert!(!is_gdb_name("roads.gdbtable") && !is_gdb_name("gdb") && !is_gdb_name("roads.shp"));
@@ -2890,4 +2914,48 @@ fn geopackage_export_into_a_file_refuses_what_it_cannot_replace() {
     std::fs::write(&text, b"not a database").unwrap();
     assert!(write_path_to(&ds, &text, Crs::LonLat, &replace("permits")).is_err());
     assert_eq!(std::fs::read(&text).unwrap(), b"not a database");
+}
+
+#[test]
+fn geojson_latitude_past_the_poles_is_said_once_with_a_count_by_every_path() {
+    let point = |x: f64, y: f64| format!(r#"{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[{x},{y}]}}}}"#);
+    let line = r#"{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[1,2],[3,-95]]}}"#;
+    let fc = |features: &[String]| format!(r#"{{"type":"FeatureCollection","features":[{}]}}"#, features.join(","));
+    // One feature with a swapped position, then two (a line counts once, not by position).
+    let (ds, messages, _) = geojson_paths("lat95.geojson", &fc(&[point(10.0, 60.0), point(60.0, 95.0)]));
+    assert_eq!(ds.features.len(), 2, "the data stays as read");
+    assert_eq!(messages, ["1 feature has a latitude past ±90°: longitude and latitude may be swapped"]);
+    let (_, messages, _) = geojson_paths("lat95b.geojson", &fc(&[point(60.0, 95.0), point(1.0, -91.0), point(2.0, 3.0), line.to_string()]));
+    assert_eq!(messages, ["3 features have a latitude past ±90°: longitude and latitude may be swapped"]);
+    // A swapped position is said even when another position of the feature is far east.
+    let multi = r#"{"type":"Feature","properties":{},"geometry":{"type":"MultiPoint","coordinates":[[60,95],[200,10]]}}"#;
+    let (_, messages, _) = geojson_paths("lat95c.geojson", &fc(&[multi.to_string()]));
+    assert_eq!(messages, ["1 feature has a latitude past ±90°: longitude and latitude may be swapped"]);
+    // Clean files, even at the poles and the antimeridian, give nothing; a lone Feature as well.
+    let (_, messages, _) = geojson_paths("clean.geojson", &fc(&[point(10.0, 60.0), point(180.0, -90.0), point(-180.0, 90.0)]));
+    assert!(messages.is_empty(), "{messages:?}");
+    // Within the readers' ±90.5° tolerance is still not past the poles.
+    let (_, messages, _) =
+        geojson_paths("tolerance.geojson", &fc(&[point(1.0, 90.2), point(1.0, -90.2), point(180.5, 90.5), point(-180.5, -90.5)]));
+    assert!(messages.is_empty(), "{messages:?}");
+    let (_, report) = crate::io::read_geojson(&point(60.0, 95.0), "x").unwrap();
+    assert_eq!(report.messages.len(), 1, "{:?}", report.messages);
+    let (_, report) = crate::io::read_geojson(&point(10.0, 60.0), "x").unwrap();
+    assert!(report.messages.is_empty());
+    // Eastings and northings (x past 180 as well) are not longitude/latitude swapped.
+    let (_, messages, _) = geojson_paths("rd-not-swapped.geojson", &fc(&[point(188000.0, 445000.0)]));
+    assert!(messages.is_empty(), "{messages:?}");
+}
+
+#[test]
+fn geojson_in_a_declared_projected_system_is_not_taken_for_swapped() {
+    // Northings far past 90 are what RD New coordinates are: they convert, so nothing is said.
+    let (ds, messages, _) = geojson_paths("rd-quiet.geojson", &rd_geojson(Some(&named("EPSG:28992"))));
+    assert!(in_arnhem(&ds.extent()));
+    assert!(messages.is_empty(), "{messages:?}");
+    // Web Mercator metres that would look like a latitude past the poles if read as degrees.
+    let point = r#"{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[10,100]}}"#;
+    let (ds, messages, _) = geojson_paths("merc-quiet.geojson", &merc_collection(&[point]));
+    assert_eq!(ds.features.len(), 1);
+    assert!(messages.is_empty(), "{messages:?}");
 }

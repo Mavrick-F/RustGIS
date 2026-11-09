@@ -53,8 +53,8 @@ pub fn commands() -> Vec<C> {
             let (left_out, table) =
                 rustgis_data::io::write_path_to(&t.dataset, Path::new(path), Crs::LonLat, &gpkg).map_err(|e| e.to_string())?;
             s.check_continuation(&owner).map_err(|why| super::exports::completion_refused(Some(path), why))?;
-            if left_out > 0 {
-                s.notify(format!("{path}: {left_out} features without drawable geometry were left out"), false);
+            if let Some(note) = rustgis_data::io::left_out_note(path, &ext, left_out) {
+                s.notify(note, false);
             }
             for note in notes.into_iter().chain(dbf_notes) {
                 s.notify(note, false);
@@ -587,7 +587,15 @@ pub(crate) fn layer_work(s: &Session, p: &Value) -> Result<Work, String> {
     // Checked now, so a bad table option is refused before the export starts.
     let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let gpkg = gpkg_table(p, &ext)?;
-    Ok(Box::new(move || write_layer(&l, &path, asked, gpkg)))
+    let compatibility =
+        ps(p, "crs").and_then(|text| asked.and_then(|crs| rustgis_data::raster::wkt::projection_compatibility_note(text, crs)));
+    Ok(Box::new(move || {
+        let mut wrote = write_layer(&l, &path, asked, gpkg)?;
+        if let Some(note) = compatibility {
+            wrote.notes.insert(0, format!("crs: {note}"));
+        }
+        Ok(wrote)
+    }))
 }
 
 /// Writes layer `l` to `path`, in `asked` or the system the format defaults to; a GeoPackage's
@@ -635,11 +643,9 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         dbf_notes.extend(rustgis_data::io::shapefile_values_notes(ds, path));
     }
     // FlatGeobuf, KML, GPX and Shapefile hold features with geometry only (a Shapefile, only
-    // geometry it can draw).
+    // geometry it can draw, of the layer's kind).
     let mut said = Vec::new();
-    if left_out > 0 {
-        said.push(format!("{path}: {left_out} features without drawable geometry were left out"));
-    }
+    said.extend(rustgis_data::io::left_out_note(path, &ext, left_out));
     if skipped > 0 {
         said.push(format!("{path}: {skipped} rows couldn't be read and were left out"));
     }
