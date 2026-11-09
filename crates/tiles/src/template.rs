@@ -262,6 +262,16 @@ pub fn join(base: &str, href: &str) -> String {
         return format!("{scheme}://{host}{}{tail}", remove_dots(href_path));
     }
     let path = rest.get(host_end..).unwrap_or("").split(['?', '#']).next().unwrap_or("");
+    if href_path.is_empty() {
+        // RFC 3986 §5.2.2: an empty reference path keeps the document, and keeps its
+        // query only when the reference supplies none. A base fragment is never inherited.
+        let query = if href.starts_with('?') {
+            ""
+        } else {
+            rest.split('#').next().and_then(|r| r.find('?').and_then(|i| r.get(i..))).unwrap_or("")
+        };
+        return format!("{scheme}://{host}{path}{query}{tail}");
+    }
     let dir = path.rfind('/').map_or("/", |i| path.get(..=i).unwrap_or("/"));
     format!("{scheme}://{host}{}{tail}", remove_dots(&format!("{dir}{href_path}")))
 }
@@ -293,6 +303,30 @@ fn remove_dots(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Empty-path references keep the document path and inherit only an absent query.
+    #[test]
+    fn empty_path_links_keep_the_bound_document_path() {
+        let url = "https://s3.example/dir/style.json?old=1#old";
+        for base in [
+            url.to_string(),
+            rustgis_data::s3_address::bind("0123456789abcdef", "https://s3.example", url).unwrap(),
+            rustgis_data::login_address::bind("0123456789abcdef", "https://s3.example", url).unwrap(),
+            crate::s3::anonymous(url),
+        ] {
+            for (href, expected) in [
+                ("?f=json", "https://s3.example/dir/style.json?f=json"),
+                ("#new", "https://s3.example/dir/style.json?old=1#new"),
+                ("", "https://s3.example/dir/style.json?old=1"),
+                ("?", "https://s3.example/dir/style.json?"),
+                ("#", "https://s3.example/dir/style.json?old=1#"),
+            ] {
+                let joined = join(&base, href);
+                let (plain, _) = crate::s3::split_anonymous(&joined);
+                assert_eq!(crate::logins::inner(rustgis_data::s3_address::inner(plain)), expected, "reference {href:?}");
+            }
+        }
+    }
 
     #[test]
     fn derived_links_keep_only_the_document_binding() {

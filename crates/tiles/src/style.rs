@@ -1617,6 +1617,11 @@ impl StyleLayer {
         self.paint.get(name).is_some_and(Expr::uses_zoom)
     }
 
+    /// Whether the paint property `name` can differ between features at the same zoom.
+    pub(crate) fn paint_uses_features(&self, name: &str) -> bool {
+        self.paint.get(name).is_some_and(|expr| !expr.feature_free())
+    }
+
     /// Whether the paint property `name` asks the sprite for an image.
     pub fn paint_uses_image(&self, name: &str) -> bool {
         self.paint.get(name).is_some_and(Expr::uses_image)

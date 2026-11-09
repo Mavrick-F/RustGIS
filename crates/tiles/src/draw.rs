@@ -88,13 +88,23 @@ pub(crate) struct TileSelection {
 /// resolving it left out, and any sprites that couldn't be read, for the images shown at `frame`.
 /// A drawing takes its images at the frame's density; a mesh (`mesh`) its pattern fills at 1×.
 pub(crate) fn left_out(r: &Resolved, frame: &Frame, mesh: bool) -> Option<String> {
+    left_out_at(r, frame, frame, mesh)
+}
+
+/// Reports icons at their live frame and patterns and relief at their prepared shape frame.
+pub(crate) fn left_out_at(r: &Resolved, frame: &Frame, shapes: &Frame, mesh: bool) -> Option<String> {
     let zoom = template::style_zoom(frame.m_per_px * f64::from(frame.ppp));
-    let shown = |draws: fn(&StyleLayer) -> bool| r.style.layers.iter().any(|l| l.visible_at(zoom) && draws(l));
+    let shape_zoom = template::style_zoom(shapes.m_per_px * f64::from(shapes.ppp));
+    let shown = |zoom, draws: fn(&StyleLayer) -> bool| r.style.layers.iter().any(|l| l.visible_at(zoom) && draws(l));
     let hi_dpi = frame.ppp >= 1.5;
-    let unread = sprite_notes(shown(StyleLayer::draws_icons), shown(StyleLayer::draws_patterns), hi_dpi, hi_dpi && !mesh, |hi, what| {
-        sprite::unread_note(&r.sprites, r.style.sprites_listed, &r.load_sprites(hi), what)
-    });
-    let relief = relief_note(&r.style.layers, zoom);
+    let unread = sprite_notes(
+        shown(zoom, StyleLayer::draws_icons),
+        shown(shape_zoom, StyleLayer::draws_patterns),
+        hi_dpi,
+        shapes.ppp >= 1.5 && !mesh,
+        |hi, what| sprite::unread_note(&r.sprites, r.style.sprites_listed, &r.load_sprites(hi), what),
+    );
+    let relief = relief_note(&r.style.layers, shape_zoom);
     let all: Vec<&str> = r.left_out.iter().map(String::as_str).chain(unread.iter().map(String::as_str)).chain(relief.as_deref()).collect();
     (!all.is_empty()).then(|| all.join("; "))
 }
@@ -154,9 +164,9 @@ pub fn draw(pm: &mut Pixmap, spec: &Spec, opacity: f32, frame: &Frame, labels: b
         }
     };
     out.attribution = r.attribution.clone();
-    out.error = left_out(&r, frame, false);
     out.pending |= r.waiting;
     if !(frame.m_per_px.is_finite() && frame.m_per_px > 0.0) || opacity <= 0.0 {
+        out.error = left_out(&r, frame, false);
         return out;
     }
     let (w, h) = (pm.width(), pm.height());
@@ -171,6 +181,7 @@ pub fn draw(pm: &mut Pixmap, spec: &Spec, opacity: f32, frame: &Frame, labels: b
         }
         return out;
     }
+    out.error = left_out(&r, frame, false);
     let mut layer_pm = if opacity < 0.999 { Pixmap::new(w, h) } else { None };
     let target: &mut Pixmap = match layer_pm.as_mut() {
         Some(p) => p,
@@ -233,7 +244,7 @@ pub(crate) fn draw_layers(
             Pass::Shapes => layer.kind != LayerKind::Symbol,
             Pass::Labels => layer.kind == LayerKind::Symbol,
         };
-        if !wanted || !layer.visible_at(zoom) {
+        if !wanted || !layer.visible_at(zoom) || !drawable(layer) {
             continue;
         }
         if layer.kind == LayerKind::Background {
@@ -295,9 +306,6 @@ pub(crate) fn draw_layers(
             }
             LayerKind::Fill | LayerKind::FillExtrusion | LayerKind::Line | LayerKind::Circle => {
                 let Some(t) = target.as_deref_mut() else { continue };
-                if !drawable(layer) {
-                    continue;
-                }
                 // A pattern fill without its sprite isn't drawn: its fallback colour is black.
                 let sheet = if pattern(layer).is_some() {
                     match sprite(&mut out.pending) {
@@ -401,9 +409,9 @@ fn place_as(
         }
     };
     out.attribution = r.attribution.clone();
-    out.error = left_out(&r, frame, false);
     out.pending |= r.waiting;
     if !(frame.m_per_px.is_finite() && frame.m_per_px > 0.0) || opacity <= 0.0 {
+        out.error = left_out(&r, frame, false);
         return Some(out);
     }
     // Without pictures, a style drawing shapes is left to the check below (no raster layers only).
@@ -423,6 +431,7 @@ fn place_as(
         }
         return Some(out);
     }
+    out.error = left_out(&r, frame, false);
     let zoom = template::style_zoom(frame.m_per_px * f64::from(frame.ppp));
     let shown: Vec<&StyleLayer> = r.style.layers.iter().filter(|l| l.visible_at(zoom) && l.kind != LayerKind::Other).collect();
     // Raster layers only; several are composited together before the layer's opacity applies.
@@ -915,9 +924,17 @@ fn boxes_of(known: &mut Boxes, it: &Item, layer: &StyleLayer) -> Arc<Vec<[f32; 4
 const OVERHANG: f32 = 16.0;
 
 /// How far a layer's shapes reach past their geometry at `zoom`, in points: a line's half width
-/// (twice its width at a mitred corner), a circle's radius and outline. Widths that depend on
-/// the feature are taken at the layer's own, and never less than [`OVERHANG`].
+/// (twice its width at a mitred corner), a circle's radius and outline. Feature-dependent
+/// widths use the drawing's bounded 512-point margin; other widths use at least [`OVERHANG`].
 pub(crate) fn overhang(layer: &StyleLayer, zoom: f32) -> f32 {
+    let widths: &[&str] = match layer.kind {
+        LayerKind::Line => &["line-width"],
+        LayerKind::Circle => &["circle-radius", "circle-stroke-width"],
+        _ => &[],
+    };
+    if widths.iter().any(|name| layer.paint_uses_features(name)) {
+        return 512.0;
+    }
     let ctx = FeatureCtx::zoom_only(zoom);
     let reach = match layer.kind {
         LayerKind::Line => {

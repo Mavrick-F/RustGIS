@@ -228,9 +228,6 @@ pub(crate) fn cover(
         return None;
     }
     let zoom = template::style_zoom(frame.m_per_px * f64::from(ppp));
-    if !draws_shapes(r, zoom) {
-        return None;
-    }
     let step = (zoom * STEPS).round();
     let level = (step / STEPS).floor();
     // Squares of 256 to 512 pixels: those the size of a 256-point tile at one pixel a point, of
@@ -240,23 +237,33 @@ pub(crate) fn cover(
     let z = (level + down) as u8;
     let side = (512.0 * ppp * (step / STEPS - level - down).exp2()).round().clamp(16.0, MAX_SIDE) as u32;
     let m_per_px = TileId::span(z) / f64::from(side);
+    // Tile selection, visibility and retries must describe the pixels actually prepared,
+    // including rounding across a source zoom boundary and fractional pixel densities.
+    let picture_frame = Frame { left: frame.left, top: frame.top, m_per_px, ppp };
+    let zoom = template::style_zoom(m_per_px * f64::from(ppp));
+    if !draws_shapes(r, zoom) {
+        return None;
+    }
     let key = |tile| Key { style: Arc::as_ptr(r) as usize, tile, step: step as i32, ppp: ppp.to_bits() };
     let generation = cache::generation();
+    // Decline before starting diagnostics or reads if this view needs straight drawing.
+    let span = TileId::span(z);
+    if ((view.width() / span).ceil() + 1.0) * ((view.height() / span).ceil() + 1.0) > template::MAX_TILES as f64 {
+        return None;
+    }
+    if let Some(reason) = crate::draw::left_out_at(r, frame, &picture_frame, false) {
+        crate::draw::add_error(error, reason);
+    }
     // Pictures include padding and may stand in at another zoom. Their preparation errors
     // do not describe this viewport: gather current diagnostics without repainting shapes.
     let mut visible = Drawn::default();
-    draw_layers(None, (0, 0), view, r, frame, Pass::Shapes, &mut visible);
+    draw_layers(None, (0, 0), view, r, &picture_frame, Pass::Shapes, &mut visible);
     *pending |= visible.pending;
     if let Some(reason) = visible.error {
         crate::draw::add_error(error, reason);
     }
     let (sprites_pending, read) = sprites_read(r, zoom, ppp);
-    // A view of more squares than a covering holds (a huge window) is drawn straight instead;
-    // a reach of more keeps to the view.
-    let span = TileId::span(z);
-    if ((view.width() / span).ceil() + 1.0) * ((view.height() / span).ceil() + 1.0) > template::MAX_TILES as f64 {
-        return None;
-    }
+    // A reach of more squares than a covering holds keeps to the view.
     let squares = reach
         .map(|e| template::covering(e, z))
         .filter(|s| !s.is_empty() && s.len() < template::MAX_TILES)
@@ -523,6 +530,154 @@ fn draw_one(r: &Resolved, p: &Placed, side: u32, m_per_px: f64, ppp: f32, reach:
 
 #[cfg(test)]
 mod tests {
+    /// Pattern failures follow prepared pixels, while absent patterns leave no sprite warning.
+    #[test]
+    fn rounded_picture_patterns_report_sprite_failures() {
+        let _turn = cache::turn();
+        for min in [3, 4] {
+            let base = format!("https://rounded-pattern.example/{min}");
+            let style = serde_json::to_vec(&serde_json::json!({"version":8,"sprite":format!("{base}/sprite"),
+                "sources":{"s":{"type":"vector","tiles":[format!("{base}/tile")],"maxzoom":0}},
+                "layers":[{"id":"pattern","type":"fill","source":"s","source-layer":"l","minzoom":min,"paint":{"fill-pattern":"a"}}]}))
+            .unwrap();
+            let bytes = crate::mvt::encode(&Tile::default());
+            cache::set_fetcher(move |url, done| {
+                if url.ends_with("/style.json") {
+                    done(Ok(style.clone()));
+                } else if url.contains("/sprite") {
+                    done(Err("HTTP 503".into()));
+                } else {
+                    done(Ok(bytes.clone()));
+                }
+            });
+            let spec = Spec {
+                kind: Kind::Style,
+                url: format!("{base}/style.json"),
+                subdomains: Vec::new(),
+                min_zoom: 0,
+                max_zoom: 14,
+                tile_size: 512,
+                tms: false,
+                attribution: String::new(),
+                layers: Vec::new(),
+                style_layers: String::new(),
+                hidden_layers: Vec::new(),
+            };
+            let f = frame(2.999, 1.0);
+            let view = f.extent(64, 64);
+            resolved(&spec);
+            let mut pm = Pixmap::new(64, 64).unwrap();
+            draw(&mut pm, &spec, 1.0, &f, false);
+            cache::wait(Duration::from_secs(2));
+            let d = draw(&mut pm, &spec, 1.0, &f, false);
+            assert_eq!(d.error.as_deref().is_some_and(|e| e.contains("pattern")), min == 3, "draw at pattern minzoom {min}: {:?}", d.error);
+            let placed = place(&spec, 1.0, &f, &view, &view, None).unwrap();
+            assert_eq!(
+                placed.error.as_deref().is_some_and(|e| e.contains("pattern")),
+                min == 3,
+                "placement at pattern minzoom {min}: {:?}",
+                placed.error
+            );
+        }
+    }
+
+    /// A rounded picture zoom must report and retry the tiles that supplied its pixels.
+    #[test]
+    fn picture_failures_at_rounded_zoom_retry_through_cover() {
+        let _turn = cache::turn();
+        let tile = Tile {
+            layers: vec![Layer {
+                name: "l".into(),
+                extent: 4096,
+                features: vec![Feature {
+                    id: None,
+                    kind: GeomKind::Polygon,
+                    props: Vec::new(),
+                    geometry: vec![vec![[0.0, 0.0], [4096.0, 0.0], [4096.0, 4096.0], [0.0, 4096.0], [0.0, 0.0]]],
+                }],
+            }],
+        };
+        for ppp in [1.0, 1.5] {
+            let root = format!("https://picture-rounded.example/{ppp}");
+            let failed_url = format!("{root}/3");
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let attempts = calls.clone();
+            let bytes = crate::mvt::encode(&tile);
+            cache::set_fetcher(move |url, done| {
+                if url.ends_with("/3") && attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    done(Err("HTTP 503".into()));
+                } else {
+                    done(Ok(bytes.clone()));
+                }
+            });
+            let style = crate::style::Style::parse(&serde_json::json!({"version":8,
+                "sources":{"s":{"type":"vector","tiles":[format!("{root}/{{z}}")]}},
+                "layers":[{"id":"fill","type":"fill","source":"s","source-layer":"l"}]}))
+            .unwrap();
+            let r = Arc::new(Resolved {
+                style,
+                from: None,
+                sprites: Vec::new(),
+                attribution: Vec::new(),
+                left_out: Vec::new(),
+                made: Mutex::new(Instant::now()),
+                waiting: false,
+            });
+            let f = frame(2.999, ppp);
+            let view = f.extent(64, 64);
+            cover(&r, &f, &view, None, &mut false, &mut None);
+            cache::wait(Duration::from_secs(2));
+            let mut error = None;
+            let failed = cover(&r, &f, &view, None, &mut false, &mut error).unwrap();
+            assert!(error.is_some(), "the failed picture input must be reported at {ppp} pixels per point");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(cache::expire_failure(&failed_url));
+            cover(&r, &f, &view, None, &mut false, &mut None);
+            cache::wait(Duration::from_secs(2));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "cover must retry its rounded-zoom input");
+            let recovered = cover(&r, &f, &view, None, &mut false, &mut None).unwrap();
+            assert!(failed.iter().zip(&recovered).all(|(a, b)| !Arc::ptr_eq(&a.payload, &b.payload)));
+            assert!(
+                recovered
+                    .iter()
+                    .any(|it| matches!(it.payload.as_ref(), Payload::Image(pm) if pm.data().as_chunks::<4>().0.iter().any(|p| p[3]>0)))
+            );
+        }
+    }
+
+    /// A layer the renderer cannot draw must not select or report its separate source.
+    #[test]
+    fn undrawn_line_patterns_do_not_report_refused_tiles() {
+        let _turn = cache::turn();
+        let bytes = crate::mvt::encode(&Tile::default());
+        cache::set_fetcher(move |url, done| {
+            assert!(url.starts_with("https://pattern-control.example/"));
+            done(Ok(bytes.clone()));
+        });
+        let mut style = crate::style::Style::parse(&serde_json::json!({"version":8,
+            "sources":{"hidden":{"type":"vector","tiles":["http://127.0.0.1/{z}"]},"shown":{"type":"vector","tiles":["https://pattern-control.example/{z}"]}},
+            "layers":[{"id":"pattern","type":"line","source":"hidden","source-layer":"l","paint":{"line-pattern":"rail"}},
+                {"id":"fill","type":"fill","source":"shown","source-layer":"l"}]})).unwrap();
+        for (_, src) in &mut style.sources {
+            if let Source::Vector { from, .. } = src {
+                *from = Some(crate::address::Origin::named("https://pattern-control.example/style.json"));
+            }
+        }
+        let r = Resolved {
+            style,
+            from: None,
+            sprites: Vec::new(),
+            attribution: Vec::new(),
+            left_out: Vec::new(),
+            made: Mutex::new(Instant::now()),
+            waiting: false,
+        };
+        let f = frame(2.2, 1.0);
+        let mut drawn = Drawn::default();
+        draw_layers(None, (64, 64), &f.extent(64, 64), &r, &f, Pass::Shapes, &mut drawn);
+        assert!(drawn.error.is_none(), "an unsupported layer cannot omit drawable tiles: {:?}", drawn.error);
+    }
+
     /// Padded preparation and later cache reuse must report the current viewport only.
     #[test]
     fn picture_refusals_follow_the_viewport_not_preparation_padding() {
@@ -579,44 +734,56 @@ mod tests {
             layers: vec![Layer {
                 name: "l".into(),
                 extent: 4096,
-                features: vec![Feature { id: None, kind: GeomKind::Point, props: Vec::new(), geometry: vec![vec![[4090.0, 1024.0]]] }],
+                features: vec![Feature {
+                    id: None,
+                    kind: GeomKind::Point,
+                    props: vec![("radius".into(), crate::mvt::Value::Number(40.0))],
+                    geometry: vec![vec![[4090.0, 1024.0]]],
+                }],
             }],
         });
         cache::set_fetcher(move |_, done| done(Ok(bytes.clone())));
-        let tile = TileId { z: 2, x: 3, y: 2 }.extent();
-        let m_per_px = frame(2.2, 1.0).m_per_px;
-        let f = Frame { left: tile.min_x + 4.0 * m_per_px, top: tile.max_y - tile.height() * 0.25 + 32.0 * m_per_px, m_per_px, ppp: 1.0 };
-        let view = f.extent(64, 64);
-        for restricted in [false, true] {
-            let mut style = crate::style::Style::parse(&serde_json::json!({"version":8,
+        for dependent in [false, true] {
+            let tile = TileId { z: 2, x: 3, y: 2 }.extent();
+            let m_per_px = frame(2.2, 1.0).m_per_px;
+            let f = Frame {
+                left: tile.min_x + if dependent { 24.0 } else { 4.0 } * m_per_px,
+                top: tile.max_y - tile.height() * 0.25 + 32.0 * m_per_px,
+                m_per_px,
+                ppp: 1.0,
+            };
+            let view = f.extent(64, 64);
+            for restricted in [false, true] {
+                let mut style = crate::style::Style::parse(&serde_json::json!({"version":8,
                 "sources":{"s":{"type":"vector","tiles":["http://127.0.0.1/{z}/{x}/{y}","https://picture-neighbour.example/{z}/{x}/{y}"]}},
-                "layers":[{"id":"point","type":"circle","source":"s","source-layer":"l","paint":{"circle-radius":20,"circle-color":"#ff0000"}}]}))
+                "layers":[{"id":"point","type":"circle","source":"s","source-layer":"l","paint":{"circle-radius":if dependent { serde_json::json!(["get","radius"]) } else { serde_json::json!(20) },"circle-color":"#ff0000"}}]}))
             .unwrap();
-            let from = restricted.then(|| crate::address::Origin::named("https://picture-neighbour.example/style.json"));
-            if let Source::Vector { from: selected, .. } = &mut style.sources.first_mut().unwrap().1 {
-                *selected = from.clone();
+                let from = restricted.then(|| crate::address::Origin::named("https://picture-neighbour.example/style.json"));
+                if let Source::Vector { from: selected, .. } = &mut style.sources.first_mut().unwrap().1 {
+                    *selected = from.clone();
+                }
+                let r = Arc::new(Resolved {
+                    style,
+                    from,
+                    sprites: Vec::new(),
+                    attribution: Vec::new(),
+                    left_out: Vec::new(),
+                    made: Mutex::new(Instant::now()),
+                    waiting: false,
+                });
+                cover(&r, &f, &view, None, &mut false, &mut None);
+                cache::wait(Duration::from_secs(2));
+                let mut error = None;
+                let pictures = cover(&r, &f, &view, None, &mut false, &mut error).unwrap();
+                let painted = pictures.iter().any(|it| {
+                    let Payload::Image(pm) = it.payload.as_ref() else { return false };
+                    let x = ((view.min_x + 2.0 * m_per_px - it.at.min_x) / it.at.width() * f64::from(pm.width())).floor();
+                    let y = ((it.at.max_y - (view.max_y - 32.0 * m_per_px)) / it.at.height() * f64::from(pm.height())).floor();
+                    x >= 0.0 && y >= 0.0 && pm.pixel(x as u32, y as u32).is_some_and(|px| px.alpha() > 0)
+                });
+                assert_eq!(painted, !restricted, "the permitted neighbour must paint into the actual viewport");
+                assert_eq!(error.is_some(), restricted, "visible missing neighbour geometry must be reported: {error:?}");
             }
-            let r = Arc::new(Resolved {
-                style,
-                from,
-                sprites: Vec::new(),
-                attribution: Vec::new(),
-                left_out: Vec::new(),
-                made: Mutex::new(Instant::now()),
-                waiting: false,
-            });
-            cover(&r, &f, &view, None, &mut false, &mut None);
-            cache::wait(Duration::from_secs(2));
-            let mut error = None;
-            let pictures = cover(&r, &f, &view, None, &mut false, &mut error).unwrap();
-            let painted = pictures.iter().any(|it| {
-                let Payload::Image(pm) = it.payload.as_ref() else { return false };
-                let x = ((view.min_x + 2.0 * m_per_px - it.at.min_x) / it.at.width() * f64::from(pm.width())).floor();
-                let y = ((it.at.max_y - (view.max_y - 32.0 * m_per_px)) / it.at.height() * f64::from(pm.height())).floor();
-                x >= 0.0 && y >= 0.0 && pm.pixel(x as u32, y as u32).is_some_and(|px| px.alpha() > 0)
-            });
-            assert_eq!(painted, !restricted, "the permitted neighbour must paint into the actual viewport");
-            assert_eq!(error.is_some(), restricted, "visible missing neighbour geometry must be reported: {error:?}");
         }
     }
 

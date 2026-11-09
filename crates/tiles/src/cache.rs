@@ -3564,6 +3564,32 @@ mod tests {
         serve_bytes(answers.into_iter().map(String::into_bytes).collect())
     }
 
+    /// Both responses on one owned keep-alive socket retain its actual local provenance.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn reused_native_connection_keeps_its_origin() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for i in 0..2 {
+                assert!(read_request(&mut stream).starts_with("GET /"), "both requests must use the accepted socket");
+                let connection = if i == 0 { "keep-alive" } else { "close" };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: {connection}\r\n\r\n{{}}").unwrap();
+            }
+        });
+        let agent = native::agent();
+        for path in ["first", "second"] {
+            let url = format!("http://{address}/{path}");
+            let answer = native::fetch_answer(&agent, &url, crate::address::Reach::Local, false, &[]).unwrap();
+            assert_eq!(answer.origin.reach, crate::address::Reach::Local);
+            assert_eq!(answer.origin.url, url);
+            assert_eq!(answer.bytes, b"{}");
+        }
+        server.join().unwrap();
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn serve_bytes(answers: Vec<Vec<u8>>) -> String {
         serve_recorded(answers).0
