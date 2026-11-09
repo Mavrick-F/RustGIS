@@ -684,7 +684,9 @@ fn write_new_with(path: &Path, write: impl FnOnce(&mut dyn std::io::Write) -> st
 
 /// Writes through a temporary file that is synced and renamed into place, so an interrupted
 /// write never truncates an existing file. The temporary file is removed on failure. A symbolic
-/// link is written through, and an existing file keeps its permissions.
+/// link is written through, and an existing file keeps its permissions. For app-managed files
+/// whose destination link must be replaced instead, use [`replace_atomic`]. On Unix, failure to
+/// inspect or preserve an existing file's permissions is an error and leaves that file unchanged.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     write_atomic_with(path, |w| w.write_all(bytes))
@@ -697,9 +699,24 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
     path: &Path,
     write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
+    let path = link_target(path)?;
+    atomic_write_at(&path, write)
+}
+
+/// Atomically replaces an app-managed file, replacing a final symbolic link rather than
+/// writing through it. Parent directories must be trusted, as for [`write_atomic`]. Existing
+/// regular files keep their permissions; a replaced link uses a new file's permissions.
+pub fn replace_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    // The rename replaces the file a link leads to, not the link, so the link stays a link.
-    let path = &link_target(path)?;
+    atomic_write_at(path, |out| out.write_all(bytes))
+}
+
+/// Stages content beside the chosen destination; errors and cancellation retain the old file.
+fn atomic_write_at<T, E: From<std::io::Error>>(
+    path: &Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    use std::io::Write;
     let tmp = temp_beside(path)?;
     // Opened before the guard, so a name already taken is never removed.
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
@@ -709,8 +726,19 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
     // (0600) never becomes readable by others. On Windows a new file inherits its folder's access
     // rules, and copying a read-only flag would only make the rename fail.
     #[cfg(unix)]
-    if let Ok(old) = std::fs::metadata(path) {
-        file.set_permissions(old.permissions())?;
+    match std::fs::symlink_metadata(path) {
+        Ok(old) if !old.file_type().is_symlink() => {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = old.permissions();
+            // Mounts that cannot chmod need no syscall when the mode already matches.
+            // If preserving a different mode fails, refuse the save instead of widening it.
+            if file.metadata()?.permissions().mode() != permissions.mode() {
+                file.set_permissions(permissions)?;
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let mut out = std::io::BufWriter::new(file);
     let value = write(&mut out)?;
@@ -733,14 +761,16 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
 /// the link's folder. More than [`MAX_LINKS`] links in a row, as in a loop, is an error.
 fn link_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
     let mut at = path.to_path_buf();
-    for _ in 0..MAX_LINKS {
+    for _ in 0..=MAX_LINKS {
         match std::fs::symlink_metadata(&at) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 let next = std::fs::read_link(&at)?;
                 // `join` keeps an absolute target as it is.
                 at = at.parent().map_or_else(|| next.clone(), |folder| folder.join(&next));
             }
-            _ => return Ok(at),
+            Ok(_) => return Ok(at),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(at),
+            Err(error) => return Err(error),
         }
     }
     Err(std::io::Error::new(
@@ -2890,6 +2920,23 @@ mod tests {
         assert!(write_atomic(&a, b"loop").is_err());
         assert!(std::fs::symlink_metadata(&a)?.file_type().is_symlink());
         assert_eq!(std::fs::read_dir(&root)?.count(), 6, "a temp file was left behind");
+        let mut target = real.clone();
+        for i in 0..MAX_LINKS {
+            let next = root.join(format!("chain-{i}"));
+            std::os::unix::fs::symlink(&target, &next)?;
+            target = next;
+        }
+        write_atomic(&target, b"forty links")?;
+        assert_eq!(std::fs::read(&real)?, b"forty links");
+        let too_many = root.join("chain-over-limit");
+        std::os::unix::fs::symlink(&target, &too_many)?;
+        assert!(write_atomic(&too_many, b"too many").is_err());
+        assert_eq!(std::fs::read(&real)?, b"forty links");
+        // Managed files replace the link itself, retaining the target's original contents.
+        replace_atomic(&link, b"managed file")?;
+        assert!(!std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+        assert_eq!(std::fs::read(&link)?, b"managed file");
+        assert_eq!(std::fs::read(&real)?, b"forty links");
         std::fs::remove_dir_all(root)
     }
 
