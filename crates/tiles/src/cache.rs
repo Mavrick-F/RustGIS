@@ -2193,9 +2193,10 @@ mod native {
         assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 
-    /// A download agent that connects only to internet addresses.
+    /// An internet-only agent with the same idle capacity as the tile workers' ordinary pool.
     pub(super) fn public_agent(timeout: std::time::Duration) -> ureq::Agent {
-        checked_agent(config_builder(timeout).build(), ureq::unversioned::resolver::DefaultResolver::default(), true)
+        let config = config_builder(timeout).max_idle_connections_per_host(PER_HOST).max_idle_connections(WORKERS).build();
+        checked_agent(config, ureq::unversioned::resolver::DefaultResolver::default(), true)
     }
 
     /// Asks for an address's headers on a thread of its own.
@@ -3564,30 +3565,34 @@ mod tests {
         serve_bytes(answers.into_iter().map(String::into_bytes).collect())
     }
 
-    /// Both responses on one owned keep-alive socket retain its actual local provenance.
+    /// Both responses on one owned keep-alive socket retain its actual local provenance,
+    /// including when the URL's hostname alone would classify it as public.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn reused_native_connection_keeps_its_origin() {
         use std::io::Write;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for i in 0..2 {
-                assert!(read_request(&mut stream).starts_with("GET /"), "both requests must use the accepted socket");
-                let connection = if i == 0 { "keep-alive" } else { "close" };
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: {connection}\r\n\r\n{{}}").unwrap();
+        for named in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                for i in 0..2 {
+                    assert!(read_request(&mut stream).starts_with("GET /"), "both requests must use the accepted socket");
+                    let connection = if i == 0 { "keep-alive" } else { "close" };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: {connection}\r\n\r\n{{}}").unwrap();
+                }
+            });
+            let agent = native::checked_agent(native::agent().config().clone(), LocalAnswer(address), false);
+            let host = if named { format!("reuse.public.example:{}", address.port()) } else { address.to_string() };
+            for path in ["first", "second"] {
+                let url = format!("http://{host}/{path}");
+                let answer = native::fetch_answer(&agent, &url, crate::address::Reach::Local, false, &[]).unwrap();
+                assert_eq!(answer.origin.reach, crate::address::Reach::Local);
+                assert_eq!(answer.origin.url, url);
+                assert_eq!(answer.bytes, b"{}");
             }
-        });
-        let agent = native::agent();
-        for path in ["first", "second"] {
-            let url = format!("http://{address}/{path}");
-            let answer = native::fetch_answer(&agent, &url, crate::address::Reach::Local, false, &[]).unwrap();
-            assert_eq!(answer.origin.reach, crate::address::Reach::Local);
-            assert_eq!(answer.origin.url, url);
-            assert_eq!(answer.bytes, b"{}");
+            server.join().unwrap();
         }
-        server.join().unwrap();
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -4120,6 +4125,30 @@ mod tests {
         // Too many.
         let base = serve((0..7).map(|_| redirect("/again")).collect());
         assert!(native::get(&agent, &format!("{base}/x"), &[]).unwrap_err().contains("too many"));
+    }
+
+    /// URL text inside a redirect query remains data on the same document and server.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn query_only_redirects_keep_the_document_origin() {
+        let (base, asked) = serve_recorded(
+            [
+                "HTTP/1.1 302 Found\r\nLocation: ?next=https://other.example/tiles\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile",
+            ]
+            .into_iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect(),
+        );
+        let answer =
+            native::fetch_answer(&native::agent(), &format!("{base}/style.json?old=1"), crate::address::Reach::Local, false, &[]).unwrap();
+        assert_eq!(answer.bytes, b"tile");
+        assert_eq!(answer.origin.url, format!("{base}/style.json?next=https://other.example/tiles"));
+        assert_eq!(answer.origin.reach, crate::address::Reach::Local);
+        assert!(asked.recv_timeout(std::time::Duration::from_secs(2)).unwrap().starts_with("GET /style.json?old=1 "));
+        assert!(
+            asked.recv_timeout(std::time::Duration::from_secs(2)).unwrap().starts_with("GET /style.json?next=https://other.example/tiles ")
+        );
     }
 
     /// A redirected style/TileJSON must use its effective public origin, including from

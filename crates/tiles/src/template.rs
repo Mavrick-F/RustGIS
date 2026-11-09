@@ -244,7 +244,12 @@ pub fn join(base: &str, href: &str) -> String {
         Err(_) => return base.to_string(),
         Ok(None) => {}
     }
-    if href.contains("://") {
+    // URL-like text in the query or fragment is data, not an absolute reference.
+    let (href_path, tail) = match href.find(['?', '#']) {
+        Some(i) => (href.get(..i).unwrap_or(href), href.get(i..).unwrap_or("")),
+        None => (href, ""),
+    };
+    if href_path.contains("://") {
         return href.to_string();
     }
     let Some((scheme, rest)) = base.split_once("://") else { return href.to_string() };
@@ -253,11 +258,6 @@ pub fn join(base: &str, href: &str) -> String {
     if let Some(path) = href.strip_prefix("//") {
         return format!("{scheme}://{path}");
     }
-    // The path (with `.` and `..` resolved, RFC 3986) and what follows it.
-    let (href_path, tail) = match href.find(['?', '#']) {
-        Some(i) => (href.get(..i).unwrap_or(href), href.get(i..).unwrap_or("")),
-        None => (href, ""),
-    };
     if href.starts_with('/') {
         return format!("{scheme}://{host}{}{tail}", remove_dots(href_path));
     }
@@ -316,6 +316,8 @@ mod tests {
         ] {
             for (href, expected) in [
                 ("?f=json", "https://s3.example/dir/style.json?f=json"),
+                ("?next=https://other.example/tiles", "https://s3.example/dir/style.json?next=https://other.example/tiles"),
+                ("#https://other.example/tiles", "https://s3.example/dir/style.json?old=1#https://other.example/tiles"),
                 ("#new", "https://s3.example/dir/style.json?old=1#new"),
                 ("", "https://s3.example/dir/style.json?old=1"),
                 ("?", "https://s3.example/dir/style.json?"),
@@ -448,6 +450,8 @@ mod tests {
         assert_eq!(join("https://a.com/styles/x", "/planet"), "https://a.com/planet");
         assert_eq!(join("https://a.com/x", "//b.com/y"), "https://b.com/y");
         assert_eq!(join("https://a.com/x", "https://c.com/z"), "https://c.com/z");
+        assert_eq!(join("https://a.com/x", "tiles.json?next=https://b.com"), "https://a.com/tiles.json?next=https://b.com");
+        assert_eq!(join("https://a.com/x", "/tiles.json#https://b.com"), "https://a.com/tiles.json#https://b.com");
         assert_eq!(join("https://tiles.example?token=x", "/tile/0"), "https://tiles.example/tile/0");
         assert_eq!(join("https://tiles.example#view", "tile/0"), "https://tiles.example/tile/0");
     }
