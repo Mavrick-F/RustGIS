@@ -4189,6 +4189,59 @@ fn a_new_feature_doesnt_take_the_moved_label_of_a_deleted_one() {
     assert!(s.map().layer(layer).unwrap().labels.default.moved.is_empty());
 }
 
+/// Opening a hand-edited project says once per kind what its repair removed, cut or renamed
+/// (lists past their limit, repeated or built-in names, bad groups, an unusable projection or
+/// tile address, extra attribute values); the sample saved and opened again says nothing.
+#[test]
+fn opening_projects_reports_repairs() {
+    use crate::project::MAX_ITEMS;
+    use rustgis_map::tiles::{TileKind, TileLayer};
+    let clean = serde_json::to_string(&sample::world_project()).unwrap();
+    let reopened = Session::new(Project::from_json(&clean).unwrap());
+    assert!(reopened.notices.is_empty(), "{:?}", reopened.notices);
+    let mut p = Project::from_json(&clean).unwrap();
+    // A saved name equal to a translation key is still literal project data.
+    p.name = "while opening the project".into();
+    let m = &mut p.maps[0];
+    m.projection = rustgis_map::Projection::Custom("no such projection".into());
+    m.groups.push(rustgis_map::LayerGroup::new("No id"));
+    m.tiles.push(TileLayer::new("Bad address", TileKind::Raster, "ftp://x/{z}"));
+    m.layers[0].dataset.features[0].attrs.push(rustgis_data::Value::Null);
+    let layer = m.layers[0].name.clone();
+    let mut v: Value = serde_json::to_value(&p).unwrap();
+    v["data_stores"] = (0..=MAX_ITEMS).map(|i| json!({"name": format!("Store {i}"), "path": "/data"})).collect();
+    v["notebooks"] = json!([{"name": "Tour"}, {"name": "tour"}]);
+    v["ramps"] = json!([{"name": "Ember", "stops": ["#000000", "#ffffff"]}]);
+    let opened = Session::new(Project::from_json(&v.to_string()).unwrap());
+    let said = |text: &str| opened.notices.iter().filter(|n| n.text.contains(text)).count();
+    assert_eq!(said("while opening the project"), 7, "{:?}", opened.notices);
+    for notice in &opened.notices {
+        let translated = notice
+            .translated(|key, args| {
+                let key = if key == "while opening the project" { "pendant l'ouverture du projet" } else { key };
+                args.iter().fold(key.to_string(), |text, (name, value)| text.replace(&format!("{{{name}}}"), value))
+            })
+            .unwrap();
+        assert!(translated.starts_with("while opening the project: "), "the saved project name is never translated");
+        assert!(translated.contains("pendant l'ouverture du projet"), "repair timing is translatable");
+    }
+    assert_eq!(said(&format!("1 data store(s) beyond the {MAX_ITEMS} of each a project holds removed")), 1);
+    assert_eq!(said("renamed with a number while opening the project: 1 notebook(s)"), 1);
+    assert_eq!(said("1 color ramp(s) named like a built-in ramp renamed with \" (custom)\""), 1);
+    assert_eq!(said("1 layer group(s) with no id"), 1);
+    assert_eq!(said("1 map(s) with a projection this version can't use drawn in Web Mercator"), 1);
+    assert_eq!(said("1 tile layer(s) with an address that can't be used removed while opening the project (\"Bad address\")"), 1);
+    assert_eq!(
+        said(&format!(
+            "1 feature(s) with more attribute values than their layer has fields lost the extra values while opening the project (in \"{layer}\")"
+        )),
+        1
+    );
+    // What was repaired is saved repaired: opened again, it says nothing.
+    let again = Session::new(Project::from_json(&serde_json::to_string(&opened.project).unwrap()).unwrap());
+    assert!(again.notices.is_empty(), "{:?}", again.notices);
+}
+
 /// Project opening reports discarded label settings once per kind; clean settings stay quiet.
 #[test]
 fn opening_projects_reports_moved_label_and_callout_adjustments() {

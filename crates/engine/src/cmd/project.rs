@@ -158,7 +158,7 @@ fn reset(s: &mut Session, p: Project) {
     s.put_aside();
     s.project = p;
     for text in s.project.take_read_notices(&crate::project::ALL_PARTS) {
-        s.notify(text, false);
+        s.notify_text(text, false);
     }
     s.opened_package = None;
     s.opened = s.opened.wrapping_add(1);
