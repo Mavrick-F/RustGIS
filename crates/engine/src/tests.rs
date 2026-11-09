@@ -9479,7 +9479,11 @@ fn plugin_commands_run_like_commands() {
     assert!(!s.can_undo(), "a plugin without 'edit' doesn't take undo snapshots");
     // Reading the map needs no permission.
     let layers = forward(&mut s, "eng-view", "host.layers", json!({})).unwrap();
-    assert!(layers.as_array().unwrap().iter().any(|l| l["name"] == "Cities"));
+    let cities = layers.as_array().unwrap().iter().find(|l| l["name"] == "Cities").unwrap();
+    let e = cities["extent"].as_array().unwrap();
+    assert!(e.len() == 4 && e[0].as_f64() <= e[2].as_f64() && (-180.0..=180.0).contains(&e[0].as_f64().unwrap()), "{cities}");
+    assert_eq!(cities["transparency"], 0.0, "{cities}");
+    assert!(cities.get("group").is_some_and(Value::is_null), "{cities}");
     let fc = forward(&mut s, "eng-view", "host.features", json!({"layer": "Cities", "limit": 2})).unwrap();
     assert_eq!(fc["features"].as_array().unwrap().len(), 2);
     assert_eq!(fc["features"][1]["row"], 1);
@@ -26649,6 +26653,8 @@ fn project_info_describes_the_whole_project() {
     assert_eq!(layouts.len(), 1, "{info}");
     assert_eq!(layouts[0]["name"], "Wall map");
     assert_eq!(layouts[0]["mapFrames"][0]["map"], "World", "{info}");
+    assert!(layouts[0]["width"].as_f64().is_some_and(|w| w > 0.0) && layouts[0]["height"].as_f64().is_some_and(|h| h > 0.0), "{info}");
+    assert_eq!(layer("Cities")["transparency"], 0.0, "{info}");
 
     let some = s.run("info.project", &json!({"nameFilter": "CIT", "includeFields": false})).unwrap();
     let layers = some["layers"].as_array().unwrap();

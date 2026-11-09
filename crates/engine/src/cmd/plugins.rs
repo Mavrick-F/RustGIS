@@ -312,6 +312,8 @@ fn layers_of(s: &Session) -> Value {
                     "id": l.id, "name": l.name, "raster": l.is_raster(), "visible": l.visible,
                     "geometry": format!("{:?}", l.dataset.geometry_type), "features": l.dataset.features.len(),
                     "selected": l.selection.len(), "active": Some(l.id) == active,
+                    "extent": super::project::bbox(l.extent()), "transparency": l.transparency,
+                    "group": s.map().group_of(l.id).map(|g| g.name.as_str()),
                     "fields": l.dataset.fields.iter().map(|f| json!({"name": f.name, "type": format!("{:?}", f.ty)})).collect::<Vec<_>>(),
                 })
             })

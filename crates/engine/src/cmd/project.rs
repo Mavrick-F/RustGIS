@@ -382,7 +382,7 @@ fn parse_tool(p: &Value) -> Result<Tool, String> {
 }
 
 /// A longitude/latitude extent as `[west, south, east, north]`, or null when there is none.
-fn bbox(e: rustgis_geom::Extent) -> Value {
+pub(crate) fn bbox(e: rustgis_geom::Extent) -> Value {
     let r = |v: f64| (v * 1e6).round() / 1e6;
     if e.is_empty() { Value::Null } else { json!([r(e.min_x), r(e.min_y), r(e.max_x), r(e.max_y)]) }
 }
@@ -435,6 +435,7 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
             };
             if let Some(o) = v.as_object_mut() {
                 o.insert("group".into(), json!(m.group_of(l.id).map(|g| g.name.as_str())));
+                o.insert("transparency".into(), json!(l.transparency));
                 o.insert("source".into(), json!(source(l)));
                 o.insert("extent".into(), bbox(l.extent()));
                 if !fields {
@@ -459,7 +460,8 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
                     _ => None,
                 })
                 .collect();
-            json!({"name": lo.name, "mapFrames": frames})
+            // The page in millimetres, as `layout.page` sets it.
+            json!({"name": lo.name, "width": lo.width, "height": lo.height, "mapFrames": frames})
         })
         .collect();
     Ok(json!({
