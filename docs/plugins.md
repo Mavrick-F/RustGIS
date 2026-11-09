@@ -721,8 +721,9 @@ its standard input and output: no port, no token, nothing another program can jo
   it, not when the program sent it: one handled before the command starts (by a poll, or as the
   command is about to run) is answered as between commands; one handled while the command runs,
   until the program answers, is part of that command (its undo step), even if it was sent just
-  before. Send a request meant to stand alone after answering the command, and wait for its
-  reply. The desktop app answers requests as they come; `rustgis-cli` and
+  before. Sending a request meant to stand alone after answering the command, and
+  waiting for its reply, makes that likely but not certain: if another of its commands starts
+  before RustGIS handles the request, the request is part of that command. The desktop app answers requests as they come; `rustgis-cli` and
   the Python package only while one of the plugin's commands runs (or as the next one starts);
   `rustgis-cli` ends the program after its last command, and what it asks after that isn't
   answered.

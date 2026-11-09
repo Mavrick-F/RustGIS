@@ -739,9 +739,11 @@ pub(crate) struct Watch {
     /// changes the state (a read or a move of the view doesn't), and at least every
     /// [`RESTYLE_EVERY`] for what changes it without one: not every frame.
     styled: Option<(u64, web_time::Instant, u64)>,
-    /// The selection, fingerprinted, with the [`Session::revision`] it was taken at: selecting
-    /// changes no project state but runs a command, which bumps the revision.
-    selected: Option<(u64, u64)>,
+    /// The selection, fingerprinted, with the [`Session::revision`] and the time it was taken
+    /// at: selecting changes no project state but runs a command, which bumps the revision; what
+    /// changes it without one (a streamed layer reading another window) is caught within
+    /// [`RESTYLE_EVERY`].
+    selected: Option<(u64, web_time::Instant, u64)>,
 }
 
 /// How often a session plugin's layer symbology is looked at again without a command.
@@ -792,7 +794,7 @@ fn seen(s: &mut Session, view: &Value) -> Seen {
     // A large selection is many rows to walk: again only after a command. Layers with nothing
     // selected don't count: adding one changes no selection.
     let selection = match s.plugin_watch.selected {
-        Some((revision, selection)) if revision == s.revision => selection,
+        Some((revision, at, selection)) if revision == s.revision && at.elapsed() < RESTYLE_EVERY => selection,
         _ => {
             let map = s.map();
             let selection = hash(&|h| {
@@ -800,7 +802,7 @@ fn seen(s: &mut Session, view: &Value) -> Seen {
                     (l.id, &l.selection).hash(h);
                 }
             });
-            s.plugin_watch.selected = Some((s.revision, selection));
+            s.plugin_watch.selected = Some((s.revision, web_time::Instant::now(), selection));
             selection
         }
     };

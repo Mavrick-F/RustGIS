@@ -72,6 +72,8 @@ struct Running {
     /// How many polls have found it exited with its output still coming: something it left
     /// running keeps writing. At [`DRAIN_BATCHES`] it's stopped.
     drained: usize,
+    /// Writing to it failed: it closed its input (stopped reading) while it may still run.
+    input_closed: bool,
     /// The last line of its error output logged so far.
     last_stderr: Option<String>,
 }
@@ -195,6 +197,7 @@ fn start(plugin: &str, spec: &Spec) -> Result<Running, String> {
         logged: (Instant::now(), 0),
         held: Vec::new(),
         drained: 0,
+        input_closed: false,
         last_stderr: None,
     };
     let hello = json!({"session": {"abi": crate::manifest::ABI, "plugin": plugin, "rustgis": crate::manifest::RUSTGIS_VERSION, "lang": crate::language()}});
@@ -527,7 +530,10 @@ pub fn poll(plugin: &str, host: &mut dyn Host) -> Polled {
             // Exited, it can't be answered; what it asked was done.
             Err(_) if gone.is_some() => {}
             // It can't be written to: it's exiting, and what it sent last is read first.
-            Err(_) => gone = Some(Instant::now() + END_GRACE),
+            Err(_) => {
+                r.input_closed = true;
+                gone = Some(Instant::now() + END_GRACE);
+            }
         }
     }
     // Exited, and its output still coming after this batch: something it left running keeps
@@ -540,6 +546,11 @@ pub fn poll(plugin: &str, host: &mut dyn Host) -> Polled {
             out.ended = Some(Ended { failed: status.is_some_and(|s| !s.success()), last_error, unread: true, reason: None });
             return out;
         }
+    }
+    // It stopped reading while it still runs: nothing RustGIS says reaches it. Stopped, and said.
+    if ended.is_none() && r.input_closed && !process::exited(&mut r.child) {
+        reason = Some("it stopped reading its input while running".to_string());
+        ended = Some(true);
     }
     let Some(stopped) = ended else {
         flush(&mut r);
@@ -555,11 +566,14 @@ pub fn poll(plugin: &str, host: &mut dyn Host) -> Polled {
     // Its own exit status says whether it failed; one stopped for what it sent did. Its output
     // ends as it exits: a moment for the exit to land, on the app's thread. One still running
     // after it is stopped, but closing its output was its own doing: no failure.
+    let input_closed = r.input_closed;
     let (status, had_to_stop, last_error) = shut(r, if stopped { Duration::ZERO } else { END_GRACE });
     // Its output closed but it didn't exit: it was stopped, and that's said. (No status of its
     // own isn't enough: something else may have reaped it after a clean exit.)
     if !stopped && had_to_stop && reason.is_none() {
-        reason = Some("it closed its output but kept running".to_string());
+        reason = Some(
+            if input_closed { "it stopped reading its input while running" } else { "it closed its output but kept running" }.to_string(),
+        );
     }
     out.ended = Some(Ended { failed: stopped || status.is_some_and(|s| !s.success()), last_error, unread: false, reason });
     out
@@ -583,7 +597,9 @@ pub fn event(plugin: &str, event: &Value) {
 fn flush(r: &mut Running) {
     if r.stdin.backlog() < process::HOLD_EVENTS_AT {
         for e in std::mem::take(&mut r.held) {
-            let _ = r.stdin.send(&e);
+            if r.stdin.send(&e).is_err() {
+                r.input_closed = true;
+            }
         }
     }
 }
