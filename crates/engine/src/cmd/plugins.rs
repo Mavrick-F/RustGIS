@@ -836,6 +836,19 @@ fn seen(s: &mut Session, view: &Value) -> Seen {
             // Which rows these are: an edit writes new ones and undo puts the old ones back, so it
             // changes even where undo brings `geometry_rev` back to the edit's number.
             (l.dataset.features.allocation_key().as_ptr() as usize).hash(h);
+            // A raster's bounds, which `host.layers` answers, are known once it's read.
+            l.raster
+                .as_ref()
+                .and_then(|r| r.data.as_ref())
+                .map(|d| {
+                    let e = d.extent();
+                    [e.min_x, e.min_y, e.max_x, e.max_y].map(f64::to_bits)
+                })
+                .hash(h);
+        }
+        // The group each layer is in, by name: renamed, regrouped or nested elsewhere.
+        for g in &map.groups {
+            (g.id, &g.name, &g.children, g.parent).hash(h);
         }
     });
     Seen { view, layers, selection, project: s.opened }

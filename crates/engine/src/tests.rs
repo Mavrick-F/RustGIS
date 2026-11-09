@@ -9480,10 +9480,17 @@ fn plugin_commands_run_like_commands() {
     // Reading the map needs no permission.
     let layers = forward(&mut s, "eng-view", "host.layers", json!({})).unwrap();
     let cities = layers.as_array().unwrap().iter().find(|l| l["name"] == "Cities").unwrap();
-    let e = cities["extent"].as_array().unwrap();
-    assert!(e.len() == 4 && e[0].as_f64() <= e[2].as_f64() && (-180.0..=180.0).contains(&e[0].as_f64().unwrap()), "{cities}");
+    let e: Vec<f64> = cities["extent"].as_array().unwrap().iter().filter_map(Value::as_f64).collect();
+    assert!(e.len() == 4 && e[0] <= e[2] && e[1] <= e[3] && (-180.0..=180.0).contains(&e[0]) && (-90.0..=90.0).contains(&e[1]), "{cities}");
     assert_eq!(cities["transparency"], 0.0, "{cities}");
     assert!(cities.get("group").is_some_and(Value::is_null), "{cities}");
+    if let Some(l) = s.map_mut().layers.iter_mut().find(|l| l.name == "Cities") {
+        l.transparency = 40.0;
+    }
+    s.run("group.add", &json!({"name": "Places", "layers": ["Cities"]})).unwrap();
+    let layers = forward(&mut s, "eng-view", "host.layers", json!({})).unwrap();
+    let cities = layers.as_array().unwrap().iter().find(|l| l["name"] == "Cities").unwrap();
+    assert_eq!((&cities["transparency"], &cities["group"]), (&json!(40.0), &json!("Places")), "{cities}");
     let fc = forward(&mut s, "eng-view", "host.features", json!({"layer": "Cities", "limit": 2})).unwrap();
     assert_eq!(fc["features"].as_array().unwrap().len(), 2);
     assert_eq!(fc["features"][1]["row"], 1);
@@ -10576,6 +10583,13 @@ fn session_plugins_ask_between_commands_and_hear_the_map() {
     if let Some(l) = s.map_mut().layers.first_mut() {
         l.transparency = 0.5;
     }
+    s.poll_plugin_sessions();
+    assert_eq!(s.run("plugin:eng-sess/v", &Value::Null).unwrap()["events"], json!(["layers"]));
+    // So is a group renamed: `host.layers` names each layer's group.
+    s.run("group.add", &json!({"name": "Places", "layers": ["Cities"]})).unwrap();
+    s.poll_plugin_sessions();
+    let _ = s.run("plugin:eng-sess/v", &Value::Null).unwrap();
+    s.map_mut().groups.iter_mut().for_each(|g| g.name = "Towns".into());
     s.poll_plugin_sessions();
     assert_eq!(s.run("plugin:eng-sess/v", &Value::Null).unwrap()["events"], json!(["layers"]));
     // Another layer made active is a layer change too: `host.layers` says which one is.
@@ -26653,8 +26667,15 @@ fn project_info_describes_the_whole_project() {
     assert_eq!(layouts.len(), 1, "{info}");
     assert_eq!(layouts[0]["name"], "Wall map");
     assert_eq!(layouts[0]["mapFrames"][0]["map"], "World", "{info}");
-    assert!(layouts[0]["width"].as_f64().is_some_and(|w| w > 0.0) && layouts[0]["height"].as_f64().is_some_and(|h| h > 0.0), "{info}");
-    assert_eq!(layer("Cities")["transparency"], 0.0, "{info}");
+    let page = s.project.layouts.first().map(|l| (l.width, l.height)).unwrap();
+    assert_eq!((&layouts[0]["width"], &layouts[0]["height"]), (&json!(page.0), &json!(page.1)), "{info}");
+    assert!(page.0 > 0.0 && page.1 > 0.0);
+    if let Some(l) = s.map_mut().layers.iter_mut().find(|l| l.name == "Cities") {
+        l.transparency = 25.0;
+    }
+    let again = s.run("info.project", &json!({})).unwrap();
+    let cities = again["layers"].as_array().unwrap().iter().find(|l| l["name"] == "Cities").cloned().unwrap();
+    assert_eq!(cities["transparency"], 25.0, "{again}");
 
     let some = s.run("info.project", &json!({"nameFilter": "CIT", "includeFields": false})).unwrap();
     let layers = some["layers"].as_array().unwrap();

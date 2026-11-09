@@ -383,8 +383,9 @@ fn parse_tool(p: &Value) -> Result<Tool, String> {
 
 /// A longitude/latitude extent as `[west, south, east, north]`, or null when there is none.
 pub(crate) fn bbox(e: rustgis_geom::Extent) -> Value {
-    let r = |v: f64| (v * 1e6).round() / 1e6;
-    if e.is_empty() { Value::Null } else { json!([r(e.min_x), r(e.min_y), r(e.max_x), r(e.max_y)]) }
+    // Rounded outwards, so the bounds still hold every coordinate.
+    let (down, up) = (|v: f64| (v * 1e6).floor() / 1e6, |v: f64| (v * 1e6).ceil() / 1e6);
+    if e.is_empty() { Value::Null } else { json!([down(e.min_x), down(e.min_y), up(e.max_x), up(e.max_y)]) }
 }
 
 /// Everything about the open project in one call (the AI Assistant's and MCP's `list_layers`).
