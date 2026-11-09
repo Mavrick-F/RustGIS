@@ -1622,7 +1622,19 @@ pub fn written_bands(r: &Raster, band: usize) -> Vec<usize> {
 /// raster always writes its colour bands, as its 8-bit form did before. A cancelled run stops
 /// it (with [`DataError::Cancelled`]) within a strip.
 pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
-    match encode(r, band) {
+    finish(encode(r, band, false))
+}
+
+/// Writes every band of a raster, for a layer whose pixels the project keeps: as [`write`] does
+/// when that keeps them all, otherwise as 32-bit float samples (RGB first for a colour raster,
+/// and alpha after them when it has one), which [`read`] reads back as the same bands.
+pub fn write_all(r: &Raster) -> Result<Vec<u8>> {
+    finish(encode(r, 0, true))
+}
+
+/// The encoder's answer, a cancel during it as [`DataError::Cancelled`].
+fn finish(encoded: Result<Vec<u8>>) -> Result<Vec<u8>> {
+    match encoded {
         Ok(bytes) => Ok(bytes),
         // The encoder's error for a cancel only says the write stopped.
         Err(e) => crate::progress::check().and(Err(e)),
@@ -1650,8 +1662,8 @@ impl<W: Seek> Seek for Probed<W> {
     }
 }
 
-/// [`write`], a cancel failing as any write error does.
-fn encode(r: &Raster, band: usize) -> Result<Vec<u8>> {
+/// [`write`] (or with `every`, [`write_all`]), a cancel failing as any write error does.
+fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
     use tiff::encoder::{Compression, DeflateLevel, TiffEncoder, colortype};
     // A scan's place is only where it was laid on the view: not coordinates to write into a file.
     r.require_coordinates().map_err(err)?;
@@ -1715,7 +1727,30 @@ fn encode(r: &Raster, band: usize) -> Result<Vec<u8>> {
     let byte_holes = r.nodata.is_none()
         && matches!(r.color, ColorHint::Rgb { alpha: false })
         && written_bands(r, band).iter().any(|b| r.bands.get(*b).is_some_and(|b| b.stats.count < (w as usize) * (h as usize)));
-    if rgb
+    let all: Vec<usize> = (0..r.bands.len()).collect();
+    if every && written_bands(r, band).len() < all.len() {
+        // More bands than colour (or one grey band) takes: each a 32-bit float sample, the first
+        // past the colour (or grey) ones alpha when the raster says it is.
+        use tiff::tags::ExtraSamples;
+        let alpha = matches!(r.color, ColorHint::Rgb { alpha: true } | ColorHint::GrayAlpha);
+        let extras: Vec<ExtraSamples> = (0..all.len() - if rgb { 3 } else { 1 })
+            .map(|i| if i == 0 && alpha { ExtraSamples::UnassociatedAlpha } else { ExtraSamples::Unspecified })
+            .collect();
+        let n = (w as usize) * (h as usize);
+        let mut data = Vec::with_capacity(n * all.len());
+        for i in 0..n {
+            data.extend(r.bands.iter().map(|b| b.data.get(i).copied().unwrap_or(f32::NAN)));
+        }
+        macro_rules! wide {
+            ($colour:ty) => {{
+                let mut img = enc.new_image::<$colour>(w, h).map_err(err)?;
+                img.extra_samples(&extras).map_err(err)?;
+                tags!(img, &all[..]);
+                img.write_data(&data).map_err(err)?;
+            }};
+        }
+        if rgb { wide!(colortype::RGB32Float) } else { wide!(colortype::Gray32Float) }
+    } else if rgb
         && !byte_holes
         && (!written_bands(r, band).contains(&3) || fits_bytes(r, 3))
         && let (Some(red), Some(green), Some(blue)) = (bytes(0), bytes(1), bytes(2))
@@ -1976,6 +2011,26 @@ mod tests {
         assert_eq!((back.band_count(), back.color.clone()), (4, ColorHint::Rgb { alpha: false }));
         assert_eq!(back.value(0, 0, 0), Some(200.0));
         assert_eq!(back.value(3, 0, 0), Some(0.0));
+    }
+
+    /// `write_all` keeps the bands `write` leaves out: every band of a grey raster, grey and its
+    /// alpha, and a colour raster's bands past RGB and alpha, each read back as written.
+    #[test]
+    fn write_all_keeps_every_band() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let raster = |n: usize, color: ColorHint| {
+            let bands = (0..n).map(|b| (0..6).map(|i| (b * 10 + i) as f32 + 0.5).collect()).collect();
+            Raster::new("r", 3, 2, bands, gt, Crs::LonLat, None, color, "Float32").unwrap()
+        };
+        for r in [raster(3, ColorHint::Gray), raster(2, ColorHint::GrayAlpha), raster(6, ColorHint::Rgb { alpha: true })] {
+            assert!(written_bands(&r, 0).len() < r.band_count());
+            let back = read(std::io::Cursor::new(write_all(&r).unwrap()), "r").unwrap();
+            assert_eq!((back.band_count(), &back.color), (r.band_count(), &r.color));
+            assert!((0..r.band_count()).all(|b| back.bands[b].data == r.bands[b].data), "{:?}", r.color);
+        }
+        // What `write` keeps whole is written as `write` writes it.
+        let rgb = raster(3, ColorHint::Rgb { alpha: false });
+        assert_eq!(write_all(&rgb).unwrap(), write(&rgb, 0).unwrap());
     }
 
     /// An Equi7 tile (a Sentinel-1 product on TU Wien's grid, say) names its system by its EPSG

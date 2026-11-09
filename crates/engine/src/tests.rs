@@ -16597,6 +16597,39 @@ fn rasters_made_from_rounded_ones_keep_the_rounded_note() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A raster derived from a multiband grey one (resampled, clipped, pixel-edited) keeps every band
+/// in the project: saved and reopened, its bands are as they were.
+#[test]
+fn derived_multiband_rasters_keep_every_band_in_the_project() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-derived-bands-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gt = GeoTransform { origin_x: 10.0, origin_y: 42.0, pixel_width: 0.5, pixel_height: -0.5 };
+    let bands = vec![(0..16).map(|i| i as f32).collect(), (0..16).map(|i| 100.0 + i as f32).collect()];
+    let r = Raster::new("two", 4, 4, bands, gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    let path = dir.join("two.tif");
+    std::fs::write(&path, geotiff::write_all(&r).unwrap()).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path})).unwrap();
+    s.run("raster.process", &json!({"layer": "two", "operation": "resample", "factor": 2, "name": "half"})).unwrap();
+    s.run("raster.process", &json!({"layer": "two", "operation": "clip", "extent": [10.0, 40.0, 11.0, 41.0], "name": "part"})).unwrap();
+    s.run("raster.editPixels", &json!({"layer": "two", "polygon": [[10.1, 41.6], [10.4, 41.6], [10.4, 41.9], [10.1, 41.9]], "value": 1}))
+        .unwrap();
+    let bands = |s: &Session, name: &str| {
+        let r = s.map().layer_by_name(name).and_then(|l| l.raster.as_ref()?.data.clone()).unwrap();
+        r.bands.iter().map(|b| b.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()).collect::<Vec<_>>()
+    };
+    let before: Vec<_> = ["half", "part", "two"].iter().map(|name| bands(&s, name)).collect();
+    assert!(before.iter().all(|b| b.len() == 2));
+    let proj = dir.join("bands.rgis");
+    s.run("project.saveAs", &json!({"path": proj})).unwrap();
+    s.run("project.open", &json!({"path": proj})).unwrap();
+    for (name, before) in ["half", "part", "two"].iter().zip(before) {
+        assert_eq!(bands(&s, name), before, "{name}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// An ASCII grid whose `.prj` can't be read is added in longitude/latitude, and adding it says so;
 /// one whose `.prj` is read says nothing of it.
 #[test]

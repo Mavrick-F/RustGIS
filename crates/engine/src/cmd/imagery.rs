@@ -136,9 +136,9 @@ pub(crate) fn bands_param(p: &Value, r: &Raster) -> Result<Vec<usize>, String> {
     }
 }
 
-/// Embeds a raster as GeoTIFF bytes (colour rasters keep their bands; others band 1).
+/// Embeds a raster as GeoTIFF bytes holding every band, so the project keeps them all.
 fn layer_of(r: Raster) -> Result<rustgis_map::RasterLayer, String> {
-    let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
+    let bytes = rustgis_data::raster::geotiff::write_all(&r).map_err(|e| e.to_string())?;
     let fname = format!("{}.tif", r.name);
     Ok(rustgis_map::RasterLayer::from_bytes(r, fname, bytes))
 }
