@@ -221,6 +221,7 @@ fn field_kind(name: &str) -> Option<ParamKind> {
     }
 }
 
+/// Builds the form and staging metadata together, including legacy Composite Bands inputs.
 fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
     let id = m.get("id")?.as_str()?;
     let name = m.get("display_name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(id);
@@ -232,13 +233,21 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
     for p in m.get("params").and_then(Value::as_array).into_iter().flatten() {
         let Some(pname) = p.get("name").and_then(Value::as_str) else { continue };
         let schema = p.get("schema");
-        let data = Data::of(p.get("data_kind").and_then(Value::as_str).unwrap_or(""));
+        // GeoLibre 1.8.0/1.8.1 describe this raster list as a string option (#1684).
+        // Correct both the form and staging; leave explicit metadata from newer runners alone.
+        let composite_inputs = id == "composite_bands"
+            && pname == "inputs"
+            && p.get("io_role").is_none()
+            && p.get("data_kind").and_then(Value::as_str) == Some("string")
+            && schema.and_then(|s| s.get("kind")).and_then(Value::as_str) == Some("string");
+        let data = if composite_inputs { Data::Raster } else { Data::of(p.get("data_kind").and_then(Value::as_str).unwrap_or("")) };
         let role = match p.get("io_role").and_then(Value::as_str) {
+            None if composite_inputs => Role::Input,
             Some("input") => Role::Input,
             Some("output") => Role::Output,
             _ => Role::Option,
         };
-        let many = schema.and_then(|s| s.get("cardinality")).and_then(Value::as_str).is_some_and(|c| c != "single");
+        let many = composite_inputs || schema.and_then(|s| s.get("cardinality")).and_then(Value::as_str).is_some_and(|c| c != "single");
         let optional = !p.get("required").and_then(Value::as_bool).unwrap_or(false);
         let default = defaults.and_then(|d| d.get(pname)).filter(|v| optional && !v.is_null()).cloned();
         meta.push(MetaParam { name: pname.to_string(), role, data, default });
