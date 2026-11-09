@@ -743,20 +743,20 @@ mod tests {
             }],
         });
         cache::set_fetcher(move |_, done| done(Ok(bytes.clone())));
-        for dependent in [false, true] {
+        for (radius, inset, reaches) in [
+            (serde_json::json!(20), 4.0, true),
+            (serde_json::json!(["get", "radius"]), 24.0, true),
+            (serde_json::json!(["min", 2, ["get", "radius"]]), 300.0, false),
+        ] {
             let tile = TileId { z: 2, x: 3, y: 2 }.extent();
             let m_per_px = frame(2.2, 1.0).m_per_px;
-            let f = Frame {
-                left: tile.min_x + if dependent { 24.0 } else { 4.0 } * m_per_px,
-                top: tile.max_y - tile.height() * 0.25 + 32.0 * m_per_px,
-                m_per_px,
-                ppp: 1.0,
-            };
+            let f =
+                Frame { left: tile.min_x + inset * m_per_px, top: tile.max_y - tile.height() * 0.25 + 32.0 * m_per_px, m_per_px, ppp: 1.0 };
             let view = f.extent(64, 64);
             for restricted in [false, true] {
                 let mut style = crate::style::Style::parse(&serde_json::json!({"version":8,
                 "sources":{"s":{"type":"vector","tiles":["http://127.0.0.1/{z}/{x}/{y}","https://picture-neighbour.example/{z}/{x}/{y}"]}},
-                "layers":[{"id":"point","type":"circle","source":"s","source-layer":"l","paint":{"circle-radius":if dependent { serde_json::json!(["get","radius"]) } else { serde_json::json!(20) },"circle-color":"#ff0000"}}]}))
+                "layers":[{"id":"point","type":"circle","source":"s","source-layer":"l","paint":{"circle-radius":radius,"circle-color":"#ff0000"}}]}))
             .unwrap();
                 let from = restricted.then(|| crate::address::Origin::named("https://picture-neighbour.example/style.json"));
                 if let Source::Vector { from: selected, .. } = &mut style.sources.first_mut().unwrap().1 {
@@ -781,8 +781,12 @@ mod tests {
                     let y = ((it.at.max_y - (view.max_y - 32.0 * m_per_px)) / it.at.height() * f64::from(pm.height())).floor();
                     x >= 0.0 && y >= 0.0 && pm.pixel(x as u32, y as u32).is_some_and(|px| px.alpha() > 0)
                 });
-                assert_eq!(painted, !restricted, "the permitted neighbour must paint into the actual viewport");
-                assert_eq!(error.is_some(), restricted, "visible missing neighbour geometry must be reported: {error:?}");
+                assert_eq!(
+                    painted,
+                    reaches && !restricted,
+                    "the permitted neighbour paints only when its radius reaches the actual viewport"
+                );
+                assert_eq!(error.is_some(), reaches && restricted, "only visible missing neighbour geometry must be reported: {error:?}");
             }
         }
     }

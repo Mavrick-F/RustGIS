@@ -544,6 +544,31 @@ fn calls(n: &Node, op: Op) -> bool {
     }
 }
 
+/// A finite upper bound for numeric results at this zoom. Unknown arithmetic stays unbounded;
+/// a cap or a finite set of possible outputs can still bound a feature-dependent expression.
+fn numeric_upper(n: &Node, f: &FeatureCtx) -> Option<f64> {
+    if free(n) {
+        return eval(n, f, &mut Vec::new()).as_f64().filter(|v| v.is_finite());
+    }
+    let bound = |n| numeric_upper(n, f);
+    match n {
+        Node::Call(Op::Min, args) => args.iter().filter_map(bound).reduce(f64::min),
+        Node::Call(Op::Max | Op::Coalesce | Op::IsNumber, args) => numeric_upper_all(args.iter(), f),
+        Node::Call(Op::Case, args) => {
+            numeric_upper_all(args.iter().skip(1).step_by(2).chain(args.last().filter(|_| args.len() % 2 == 1)), f)
+        }
+        Node::Match(_, arms, default) => numeric_upper_all(arms.iter().map(|(_, n)| n).chain(std::iter::once(default.as_ref())), f),
+        Node::Step(_, first, stops) => numeric_upper_all(std::iter::once(first.as_ref()).chain(stops.iter().map(|(_, n)| n)), f),
+        // Interpolation and other arithmetic may create NaN or lose precision even from
+        // bounded inputs. Only an enclosing proven cap may narrow their full margin.
+        _ => None,
+    }
+}
+
+fn numeric_upper_all<'a>(nodes: impl Iterator<Item = &'a Node>, f: &FeatureCtx) -> Option<f64> {
+    nodes.map(|n| numeric_upper(n, f)).try_fold(f64::NEG_INFINITY, |upper, n| Some(upper.max(n?))).filter(|v| v.is_finite())
+}
+
 /// See [`Expr::feature_free`].
 fn free(n: &Node) -> bool {
     match n {
@@ -1617,9 +1642,20 @@ impl StyleLayer {
         self.paint.get(name).is_some_and(Expr::uses_zoom)
     }
 
-    /// Whether the paint property `name` can differ between features at the same zoom.
-    pub(crate) fn paint_uses_features(&self, name: &str) -> bool {
-        self.paint.get(name).is_some_and(|expr| !expr.feature_free())
+    /// A conservative width at this zoom, including the property's default when evaluation
+    /// fails. `None` leaves an unbounded expression to the drawing's full margin.
+    pub(crate) fn paint_width_bound(&self, name: &str, zoom: f32, default: f32) -> Option<f32> {
+        let f = FeatureCtx::zoom_only(zoom);
+        let Some(expr) = self.paint.get(name) else { return Some(default) };
+        if expr.feature_free() {
+            return Some(self.width(name, &f, default));
+        }
+        numeric_upper(&expr.0, &f).map(|v| (v as f32).max(default)).filter(|v| v.is_finite())
+    }
+
+    /// Whether a layout property can differ between features at the same zoom.
+    pub(crate) fn layout_uses_features(&self, name: &str) -> bool {
+        self.layout.get(name).is_some_and(|expr| !expr.feature_free())
     }
 
     /// Whether the paint property `name` asks the sprite for an image.

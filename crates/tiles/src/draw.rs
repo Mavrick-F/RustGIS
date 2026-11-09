@@ -924,27 +924,27 @@ fn boxes_of(known: &mut Boxes, it: &Item, layer: &StyleLayer) -> Arc<Vec<[f32; 4
 const OVERHANG: f32 = 16.0;
 
 /// How far a layer's shapes reach past their geometry at `zoom`, in points: a line's half width
-/// (twice its width at a mitred corner), a circle's radius and outline. Feature-dependent
-/// widths use the drawing's bounded 512-point margin; other widths use at least [`OVERHANG`].
+/// (twice its width at a mitred corner), a circle's radius and outline. Known expression caps
+/// narrow the reach; unbounded widths keep the 512-point margin, with at least [`OVERHANG`].
 pub(crate) fn overhang(layer: &StyleLayer, zoom: f32) -> f32 {
-    let widths: &[&str] = match layer.kind {
-        LayerKind::Line => &["line-width"],
-        LayerKind::Circle => &["circle-radius", "circle-stroke-width"],
-        _ => &[],
-    };
-    if widths.iter().any(|name| layer.paint_uses_features(name)) {
-        return 512.0;
-    }
     let ctx = FeatureCtx::zoom_only(zoom);
     let reach = match layer.kind {
         LayerKind::Line => {
-            let k = if layer.line_join(&ctx) == crate::style::LineJoin::Miter { 2.0 } else { 0.75 };
-            layer.line_width(&ctx) * k
+            let miter = layer.layout_uses_features("line-join") || layer.line_join(&ctx) == crate::style::LineJoin::Miter;
+            let Some(width) = layer.paint_width_bound("line-width", zoom, 1.0) else { return 512.0 };
+            width * if miter { 2.0 } else { 0.75 }
         }
-        LayerKind::Circle => layer.circle_radius(&ctx) + layer.circle_stroke_width(&ctx),
+        LayerKind::Circle => {
+            let (Some(radius), Some(stroke)) =
+                (layer.paint_width_bound("circle-radius", zoom, 5.0), layer.paint_width_bound("circle-stroke-width", zoom, 0.0))
+            else {
+                return 512.0;
+            };
+            radius + stroke
+        }
         _ => 0.0,
     };
-    if reach.is_finite() { reach.clamp(OVERHANG, 512.0) } else { OVERHANG }
+    if reach.is_finite() { reach.clamp(OVERHANG, 512.0) } else { 512.0 }
 }
 
 fn draw_vector(pm: &mut Pixmap, it: &Item, layer: &StyleLayer, frame: &Frame, zoom: f32, sheet: Option<&Sprite>, boxes: &[[f32; 4]]) {
@@ -1685,6 +1685,72 @@ pub(crate) mod tests {
         }
         assert_eq!(got.iter().map(|p| p.source_layer.as_str()).collect::<Vec<_>>(), vec!["pois"]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bounded_shape_widths_keep_their_conservative_reach() {
+        for (radius, expected) in [
+            (serde_json::json!(["min", 2, ["get", "radius"]]), 16.0),
+            (serde_json::json!(["max", 0, ["min", 30, ["get", "radius"]]]), 30.0),
+            (serde_json::json!(["case", ["has", "radius"], 30, 40]), 40.0),
+            (serde_json::json!(["step", ["get", "radius"], 20, 10, 30]), 30.0),
+            (serde_json::json!(["interpolate", ["linear"], ["get", "radius"], 0, 20, 100, 30]), 512.0),
+            (serde_json::json!(["get", "radius"]), 512.0),
+            // NaN is ignored by min: it must not masquerade as a finite cap on the other input.
+            (serde_json::json!(["min", ["sqrt", -1], ["get", "radius"]]), 512.0),
+        ] {
+            let layer = StyleLayer::parse(&serde_json::json!({"id":"p", "type":"circle", "paint":{"circle-radius":radius}})).unwrap();
+            assert_eq!(overhang(&layer, 4.0), expected);
+            for value in [
+                None,
+                Some(crate::mvt::Value::Number(-1.0)),
+                Some(crate::mvt::Value::Number(500.0)),
+                Some(crate::mvt::Value::String("invalid".into())),
+            ] {
+                let props = value.map(|v| vec![("radius".into(), v)]).unwrap_or_default();
+                let f = FeatureCtx { props: &props, ..FeatureCtx::zoom_only(4.0) };
+                assert!(overhang(&layer, 4.0) >= layer.circle_radius(&f).min(512.0));
+            }
+        }
+        let line = StyleLayer::parse(&serde_json::json!({"id":"r", "type":"line", "paint":{"line-width":["min", 20, ["get","width"]]},
+            "layout":{"line-join":["case", ["has","width"], "miter", "round"]}}))
+        .unwrap();
+        assert_eq!(overhang(&line, 4.0), 40.0, "a feature may choose a mitred corner");
+    }
+
+    #[test]
+    fn large_shape_caps_keep_the_full_margin() {
+        for (kind, paint) in [
+            ("line", serde_json::json!({"line-width":["min",3e38,["get","width"]]})),
+            (
+                "circle",
+                serde_json::json!({"circle-radius":["min",3e38,["get","radius"]],"circle-stroke-width":["min",3e38,["get","stroke"]]}),
+            ),
+        ] {
+            let layer = StyleLayer::parse(&serde_json::json!({"id":"p","type":kind,"paint":paint})).unwrap();
+            assert_eq!(overhang(&layer, 4.0), 512.0, "combining large caps must not shrink the margin");
+        }
+    }
+
+    #[test]
+    fn interpolated_width_caps_do_not_hide_nonfinite_outputs() {
+        let stop = serde_json::json!(["min", 2, ["/", -1, ["get", "zero"]]]);
+        let radius = serde_json::json!(["min", ["interpolate", ["linear"], ["get", "t"], 0, stop, 1, stop], ["get", "radius"]]);
+        let layer = StyleLayer::parse(&serde_json::json!({"id":"p","type":"circle","paint":{"circle-radius":radius}})).unwrap();
+        let props = vec![
+            ("zero".into(), crate::mvt::Value::Number(0.0)),
+            ("t".into(), crate::mvt::Value::Number(0.5)),
+            ("radius".into(), crate::mvt::Value::Number(100.0)),
+        ];
+        let f = FeatureCtx { props: &props, ..FeatureCtx::zoom_only(4.0) };
+        assert_eq!(layer.circle_radius(&f), 100.0, "min ignores the interpolated NaN");
+        assert!(overhang(&layer, 4.0) >= layer.circle_radius(&f), "the inferred cap must contain the actual painted radius");
+        let radius = serde_json::json!(["interpolate", ["linear"], ["get", "t"], -2e18, -2e18, 0, 150]);
+        let layer = StyleLayer::parse(&serde_json::json!({"id":"p","type":"circle","paint":{"circle-radius":radius}})).unwrap();
+        let props = vec![("t".into(), crate::mvt::Value::Number(-1.0))];
+        let f = FeatureCtx { props: &props, ..FeatureCtx::zoom_only(4.0) };
+        assert_eq!(layer.circle_radius(&f), 256.0, "finite interpolation may lose precision through cancellation");
+        assert!(overhang(&layer, 4.0) >= layer.circle_radius(&f), "finite stop values alone do not prove a conservative cap");
     }
 
     #[test]

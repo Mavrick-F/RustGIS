@@ -322,8 +322,16 @@ mod tests {
                 ("#", "https://s3.example/dir/style.json?old=1#"),
             ] {
                 let joined = join(&base, href);
-                let (plain, _) = crate::s3::split_anonymous(&joined);
-                assert_eq!(crate::logins::inner(rustgis_data::s3_address::inner(plain)), expected, "reference {href:?}");
+                let expected = if let Some(bound) = rustgis_data::s3_address::parse(&base).unwrap() {
+                    rustgis_data::s3_address::bind(bound.binding, bound.endpoint, expected).unwrap()
+                } else if let Some(bound) = rustgis_data::login_address::parse(&base).unwrap() {
+                    rustgis_data::login_address::bind(bound.binding, bound.origin, expected).unwrap()
+                } else if crate::s3::split_anonymous(&base).1 {
+                    crate::s3::anonymous(expected)
+                } else {
+                    expected.to_string()
+                };
+                assert_eq!(joined, expected, "reference {href:?} keeps the document's authority wrapper");
             }
         }
     }
