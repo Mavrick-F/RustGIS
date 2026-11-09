@@ -2334,11 +2334,22 @@ fn degenerate_geometry_and_deleted_fields() {
         };
         assert!(s.run("edit.addFeature", &json!({"layer": layer, "geometry": g})).is_err(), "{g}");
     }
+    // A field the definition query or a display filter reads isn't deleted: without it, they
+    // would stop reading and the layer would show the rows they leave out.
     s.run("layer.definitionQuery", &json!({"layer": "Countries", "where": "pop_est > 1000"})).unwrap();
+    let e = s.run("edit.deleteField", &json!({"layer": "Countries", "field": "pop_est"})).unwrap_err();
+    assert!(e.contains("definition query (pop_est > 1000) uses 'pop_est'"), "{e}");
+    s.run("layer.definitionQuery", &json!({"layer": "Countries", "where": ""})).unwrap();
+    let filters = json!({"layer": "Countries", "filters": [{"name": "Big", "where": "pop_est > 1000"}]});
+    s.run("layer.displayFilters", &filters).unwrap();
+    let e = s.run("edit.deleteField", &json!({"layer": "Countries", "field": "pop_est"})).unwrap_err();
+    assert!(e.contains("display filter 'Big' uses 'pop_est'"), "{e}");
+    let l = s.map().layer_by_name("Countries").unwrap();
+    assert!(l.dataset.field_index("pop_est").is_some() && l.display_filters.len() == 1);
+    s.run("layer.displayFilters", &json!({"layer": "Countries", "filters": []})).unwrap();
     s.run("edit.deleteField", &json!({"layer": "Countries", "field": "pop_est"})).unwrap();
     let l = s.map().layer_by_name("Countries").unwrap();
     assert_eq!(l.renderer.kind_label(), "Single Symbol");
-    assert!(l.definition_query.is_none());
     s.run("edit.deleteField", &json!({"layer": "Countries", "field": "name"})).unwrap();
     assert!(!s.map().layer_by_name("Countries").unwrap().labels.enabled);
 }
