@@ -72,9 +72,6 @@ struct Running {
     /// How many polls have found it exited with its output still coming: something it left
     /// running keeps writing. At [`DRAIN_BATCHES`] it's stopped.
     drained: usize,
-    /// What it sent before a command was written to it, set aside for the next [`poll`] to
-    /// answer as between its commands, not as part of that command.
-    before_command: std::collections::VecDeque<Line>,
     /// The last line of its error output logged so far.
     last_stderr: Option<String>,
 }
@@ -198,7 +195,6 @@ fn start(plugin: &str, spec: &Spec) -> Result<Running, String> {
         logged: (Instant::now(), 0),
         held: Vec::new(),
         drained: 0,
-        before_command: std::collections::VecDeque::new(),
         last_stderr: None,
     };
     let hello = json!({"session": {"abi": crate::manifest::ABI, "plugin": plugin, "rustgis": crate::manifest::RUSTGIS_VERSION, "lang": crate::language()}});
@@ -388,15 +384,6 @@ pub fn command(plugin: &str, spec: &Spec, host: &mut dyn Host, request: &Value, 
     };
     let id = r.next_id;
     r.next_id += 1;
-    // What it sent before this command is written isn't part of it: set aside for the next
-    // poll (as between its commands, each request its own step). What it sends from here on,
-    // until it answers, is the command's.
-    // Bounded: a program writing without pause can't keep the command from being sent; past
-    // the bound, what it sends is read with the command.
-    for _ in 0..POLL_BATCH * DRAIN_BATCHES {
-        let Ok(line) = r.rx.try_recv() else { break };
-        r.before_command.push_back(line);
-    }
     if let Err(e) = r.stdin.send(&json!({"command": request, "id": id})) {
         shut(r, Duration::ZERO);
         return Err(e);
@@ -490,9 +477,7 @@ pub fn poll(plugin: &str, host: &mut dyn Host) -> Polled {
     // runs empty to say so.
     let mut gone = process::exited(&mut r.child).then(|| Instant::now() + END_GRACE);
     for _ in 0..POLL_BATCH {
-        let line = if let Some(l) = r.before_command.pop_front() {
-            Some(l)
-        } else if let Some(until) = gone {
+        let line = if let Some(until) = gone {
             // One moment for all of it, not one a line.
             r.rx.recv_timeout(until.saturating_duration_since(Instant::now())).ok()
         } else {

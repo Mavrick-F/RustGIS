@@ -735,9 +735,10 @@ pub(crate) struct Watch {
     /// Each running program's, by plugin id.
     seen: Vec<(String, Seen)>,
     /// The layers' symbology and fields and the web tile layers, and the selection, each
-    /// fingerprinted, with the [`Session::revision`] and the time they were taken at. They're
-    /// taken again when a command bumps the revision, and at least every [`RESTYLE_EVERY`] for
-    /// what changes them without one: not every frame.
+    /// fingerprinted, with the project's [`Session::state`] and the time they were taken at.
+    /// They're taken again when an edit changes the state (a read or a move of the view
+    /// doesn't), and at least every [`RESTYLE_EVERY`] for what changes them without one: not
+    /// every frame.
     styled: Option<(u64, web_time::Instant, u64, u64)>,
 }
 
@@ -768,7 +769,7 @@ fn seen(s: &mut Session, view: &Value) -> Seen {
         h.finish()
     };
     let (styled, selection) = match s.plugin_watch.styled {
-        Some((revision, at, styled, selection)) if revision == s.revision && at.elapsed() < RESTYLE_EVERY => (styled, selection),
+        Some((state, at, styled, selection)) if state == s.state() && at.elapsed() < RESTYLE_EVERY => (styled, selection),
         _ => {
             let map = s.map();
             let styled = hash(&|h| {
@@ -789,7 +790,7 @@ fn seen(s: &mut Session, view: &Value) -> Seen {
                     (l.id, &l.selection).hash(h);
                 }
             });
-            s.plugin_watch.styled = Some((s.revision, web_time::Instant::now(), styled, selection));
+            s.plugin_watch.styled = Some((s.state(), web_time::Instant::now(), styled, selection));
             (styled, selection)
         }
     };

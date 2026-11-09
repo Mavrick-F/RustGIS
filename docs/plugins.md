@@ -717,10 +717,10 @@ its standard input and output: no port, no token, nothing another program can jo
   back as given. Requests go through the same checks as a command's, within the plugin's
   permissions. Between commands, each request that can change the project is an undo step of its
   own, named after the plugin, and an entry in the session log; `host.fetch` is refused: it would make the app wait, and the
-  program can fetch for itself. What RustGIS has read before it writes a command is answered as
-  between commands; a request read after that, until the program answers, is part of that
-  command (its undo step), so send one meant to stand alone after answering, not while a command
-  may be on its way. The desktop app answers requests as they come; `rustgis-cli` and
+  program can fetch for itself. Before one of the plugin's commands, what the program sent until then
+  is answered as between commands; a request read while the command runs, until the program
+  answers, is part of that command (its undo step), so send one meant to stand alone after
+  answering, not while a command may be on its way. The desktop app answers requests as they come; `rustgis-cli` and
   the Python package only while one of the plugin's commands runs (or as the next one starts);
   `rustgis-cli` ends the program after its last command, and what it asks after that isn't
   answered.
