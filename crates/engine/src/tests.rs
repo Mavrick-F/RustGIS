@@ -10684,6 +10684,32 @@ fn a_session_program_whose_output_kept_coming_is_said() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A program started again (the last one exited, no poll in between) takes the map as it is
+/// then: it isn't told of what changed before it started.
+#[test]
+fn a_restarted_session_program_starts_from_the_map_as_it_is() {
+    let _turn = session_plugins_turn();
+    let mut s = world();
+    let dir = std::env::temp_dir().join(format!("rustgis-test-eng-session-restart-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = rustgis_plugins::testing::child_run("tests::plugin_process_child");
+    std::fs::write(dir.join("plugin.json"), rustgis_plugins::testing::session_manifest("eng-sess-restart", &[], &run)).unwrap();
+    rustgis_plugins::load(rustgis_plugins::Package::from_dir(&dir).unwrap(), "test").unwrap();
+    s.run("plugin:eng-sess-restart/h", &Value::Null).unwrap();
+    s.poll_plugin_sessions();
+    // The view moves, and the program exits, with no poll between.
+    s.map_mut().camera.pan_px(40.0, 0.0);
+    assert_eq!(s.run("plugin:eng-sess-restart/z", &Value::Null).unwrap(), "bye");
+    wait_for_exit("eng-sess-restart");
+    // Its next command starts another, which hears nothing of the earlier move.
+    s.run("plugin:eng-sess-restart/h", &Value::Null).unwrap();
+    s.poll_plugin_sessions();
+    assert_eq!(s.run("plugin:eng-sess-restart/v", &Value::Null).unwrap()["events"], json!([]));
+    rustgis_plugins::session::stop("eng-sess-restart");
+    rustgis_plugins::unload("eng-sess-restart");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A program that failed after answering is said to have when the next command finds it, as
 /// the frame's poll would: the command line has no poll.
 #[test]

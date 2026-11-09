@@ -391,7 +391,10 @@ pub fn command(plugin: &str, spec: &Spec, host: &mut dyn Host, request: &Value, 
     // What it sent before this command is written isn't part of it: set aside for the next
     // poll (as between its commands, each request its own step). What it sends from here on,
     // until it answers, is the command's.
-    while let Ok(line) = r.rx.try_recv() {
+    // Bounded: a program writing without pause can't keep the command from being sent; past
+    // the bound, what it sends is read with the command.
+    for _ in 0..POLL_BATCH * DRAIN_BATCHES {
+        let Ok(line) = r.rx.try_recv() else { break };
         r.before_command.push_back(line);
     }
     if let Err(e) = r.stdin.send(&json!({"command": request, "id": id})) {

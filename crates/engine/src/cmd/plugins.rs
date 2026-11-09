@@ -521,6 +521,12 @@ impl Session {
         {
             self.merge = merge;
         }
+        // A program this command starts (none running, or the last one gone) takes the map as it
+        // is now, not what an earlier program was last told.
+        #[cfg(not(target_arch = "wasm32"))]
+        if plugin.manifest.session && !rustgis_plugins::session::is_running(&plugin.manifest.id) {
+            self.plugin_watch.seen.retain(|(p, _)| *p != plugin.manifest.id);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if plugin.manifest.session && !self.plugin_watch.seen.iter().any(|(p, _)| *p == plugin.manifest.id) {
             let view = view_of(self);
