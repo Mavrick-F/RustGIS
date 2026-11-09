@@ -146,7 +146,12 @@ fn composite_bands_legacy_manifest_selects_and_stages_rasters_in_order() {
     let mut f = Fixture::new();
     f.dem.bands[0].data.fill(14.3);
     // An in-memory layer and an embedded file must both be staged, in the selected order.
-    for (names, values) in [("dem;embedded", [14.3, 0.0]), ("embedded;dem", [0.0, 14.3])] {
+    for (names, values) in [
+        (json!("dem;embedded"), [14.3, 0.0]),
+        (json!("embedded;dem"), [0.0, 14.3]),
+        (json!(["dem", "embedded"]), [14.3, 0.0]),
+        (json!(["embedded", "dem"]), [0.0, 14.3]),
+    ] {
         let params = rustgis_analysis::resolve_params(&spec, &json!({"inputs": names})).unwrap();
         let job = prepare_with(&spec, &meta, &f, &params).unwrap();
         assert_eq!(job.crs, f.dem.crs);
@@ -157,6 +162,11 @@ fn composite_bands_legacy_manifest_selects_and_stages_rasters_in_order() {
         }
         let staged = job.files.iter().map(|(name, _)| format!("/work/{name}")).collect::<Vec<_>>().join(";");
         assert_eq!(job.argv("/work"), [format!("--inputs={staged}"), "--output=/work/output.tif".into()]);
+    }
+    // Refuse malformed arrays rather than silently dropping an entry or the entire input.
+    for invalid in [json!(["dem", 7]), json!([])] {
+        let error = prepare_with(&spec, &meta, &f, &json!({"inputs": invalid})).unwrap_err();
+        assert!(error.contains("input layer"), "{error}");
     }
     // Other tools' string options must not become raster inputs just because of their name.
     let mut unrelated = manifest.clone();
@@ -172,7 +182,12 @@ fn composite_bands_legacy_manifest_selects_and_stages_rasters_in_order() {
 fn composite_bands_runner_preserves_selected_band_order() {
     let Some(mut f) = setup() else { return };
     f.dem.bands[0].data.fill(14.3);
-    for (names, values) in [("dem;embedded", [14.3, 0.0]), ("embedded;dem", [0.0, 14.3])] {
+    for (names, values) in [
+        (json!("dem;embedded"), [14.3, 0.0]),
+        (json!("embedded;dem"), [0.0, 14.3]),
+        (json!(["dem", "embedded"]), [14.3, 0.0]),
+        (json!(["embedded", "dem"]), [0.0, 14.3]),
+    ] {
         let result = rustgis_analysis::run("geolibre:composite_bands", &f, &json!({"inputs": names})).unwrap();
         let Output::Layers(layers) = result.output else { panic!("layers") };
         let Some(OutputLayer::Raster { bytes, file_name, .. }) = layers.first() else { panic!("a raster: {layers:?}") };

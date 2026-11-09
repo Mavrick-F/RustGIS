@@ -583,21 +583,20 @@ pub fn prepare(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<J
     prepare_with(spec, &meta, inputs, params)
 }
 
+/// Validates input name lists before choosing a CRS or staging files, preserving their order.
 fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Value) -> Result<Job, String> {
     let id = spec.id.strip_prefix(PREFIX).ok_or("not a GeoLibre tool")?;
     let value_of = |name: &str| params.get(name).filter(|v| !v.is_null() && v.as_str() != Some(""));
-    let names = |v: &Value| -> Vec<String> {
-        v.as_str().map(|s| s.split(';').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()).unwrap_or_default()
-    };
+    let names = rustgis_analysis::layer_list;
 
     // Rasters set the coordinate system; otherwise the vector data's UTM zone.
     let mut raster_crs = Vec::new();
     let mut vector_extents = Vec::new();
     for p in meta.params.iter().filter(|p| p.role == Role::Input) {
-        for n in value_of(&p.name).map(names).unwrap_or_default() {
-            if let Some(r) = inputs.raster(&n) {
+        for n in value_of(&p.name).map(names).transpose()?.unwrap_or_default() {
+            if let Some(r) = inputs.raster(n) {
                 raster_crs.push(r.raster.crs);
-            } else if let Some(ds) = inputs.dataset(&n) {
+            } else if let Some(ds) = inputs.dataset(n) {
                 vector_extents.push(ds.extent());
             }
         }
@@ -619,7 +618,7 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
         match p.role {
             Role::Input => {
                 let Some(v) = value_of(&p.name) else { continue };
-                let files = names(v).iter().map(|n| stage(inputs, n, p.data, &tf, &mut job)).collect::<Result<Vec<_>, _>>()?;
+                let files = names(v)?.into_iter().map(|n| stage(inputs, n, p.data, &tf, &mut job)).collect::<Result<Vec<_>, _>>()?;
                 if !files.is_empty() {
                     job.args.push((p.name.clone(), Arg::Files(files)));
                 }
