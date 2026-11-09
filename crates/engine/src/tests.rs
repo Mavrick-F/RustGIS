@@ -16621,6 +16621,9 @@ fn derived_multiband_rasters_keep_every_band_in_the_project() {
     };
     let before: Vec<_> = ["half", "part", "two"].iter().map(|name| bands(&s, name)).collect();
     assert!(before.iter().all(|b| b.len() == 2));
+    // The edit set its pixel (the top-left one) in both bands and left the next one alone.
+    let pixel = |band: usize, i: usize| before[2][band][i];
+    assert_eq!([pixel(0, 0), pixel(1, 0), pixel(1, 1)], [1.0f32, 1.0, 101.0].map(f32::to_bits));
     let proj = dir.join("bands.rgis");
     s.run("project.saveAs", &json!({"path": proj})).unwrap();
     s.run("project.open", &json!({"path": proj})).unwrap();

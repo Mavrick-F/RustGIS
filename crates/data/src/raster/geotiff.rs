@@ -48,11 +48,12 @@ pub(super) fn extra_alpha<R: Read + Seek>(dec: &mut Decoder<R>) -> bool {
 }
 
 /// How `n` samples of a grey image the decoder calls multiband are shown: grey with alpha when
-/// there are two and the second is declared alpha (extra sample 1, associated, or 2, unassociated),
-/// else grey. GDAL marks the second band of an ordinary two-band file as 0, unspecified data.
+/// the second is declared alpha (extra sample 1, associated, or 2, unassociated), whatever data
+/// bands follow it, else grey. GDAL marks the second band of an ordinary two-band file as 0,
+/// unspecified data.
 pub(super) fn multiband_color<R: Read + Seek>(dec: &mut Decoder<R>, n: u16) -> ColorHint {
     let alpha =
-        n == 2 && dec.find_tag_unsigned_vec::<u16>(Tag::ExtraSamples).ok().flatten().is_some_and(|v| matches!(v.first(), Some(1 | 2)));
+        n >= 2 && dec.find_tag_unsigned_vec::<u16>(Tag::ExtraSamples).ok().flatten().is_some_and(|v| matches!(v.first(), Some(1 | 2)));
     if alpha { ColorHint::GrayAlpha } else { ColorHint::Gray }
 }
 
@@ -1736,9 +1737,16 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
         let extras: Vec<ExtraSamples> = (0..all.len() - if rgb { 3 } else { 1 })
             .map(|i| if i == 0 && alpha { ExtraSamples::UnassociatedAlpha } else { ExtraSamples::Unspecified })
             .collect();
+        // The samples interleaved, as large as the raster: reserved first, so a raster this
+        // machine can't hold twice is an error, and a cancel is heard while they are copied.
         let n = (w as usize) * (h as usize);
-        let mut data = Vec::with_capacity(n * all.len());
+        let samples = n.checked_mul(all.len()).ok_or_else(|| err("the raster is too large to write"))?;
+        let mut data = super::room(samples, w as usize, h as usize)?;
         for i in 0..n {
+            if i % (1 << 20) == 0 {
+                crate::progress::check()?;
+            }
+            // Every band holds `n` values (`Raster::new` checks), so none is NaN-filled.
             data.extend(r.bands.iter().map(|b| b.data.get(i).copied().unwrap_or(f32::NAN)));
         }
         macro_rules! wide {
@@ -2014,7 +2022,8 @@ mod tests {
     }
 
     /// `write_all` keeps the bands `write` leaves out: every band of a grey raster, grey and its
-    /// alpha, and a colour raster's bands past RGB and alpha, each read back as written.
+    /// alpha (with a data band after it too), and a colour raster's bands past RGB and alpha, each
+    /// read back as written, with its colour.
     #[test]
     fn write_all_keeps_every_band() {
         let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
@@ -2022,7 +2031,12 @@ mod tests {
             let bands = (0..n).map(|b| (0..6).map(|i| (b * 10 + i) as f32 + 0.5).collect()).collect();
             Raster::new("r", 3, 2, bands, gt, Crs::LonLat, None, color, "Float32").unwrap()
         };
-        for r in [raster(3, ColorHint::Gray), raster(2, ColorHint::GrayAlpha), raster(6, ColorHint::Rgb { alpha: true })] {
+        for r in [
+            raster(3, ColorHint::Gray),
+            raster(2, ColorHint::GrayAlpha),
+            raster(3, ColorHint::GrayAlpha),
+            raster(6, ColorHint::Rgb { alpha: true }),
+        ] {
             assert!(written_bands(&r, 0).len() < r.band_count());
             let back = read(std::io::Cursor::new(write_all(&r).unwrap()), "r").unwrap();
             assert_eq!((back.band_count(), &back.color), (r.band_count(), &r.color));
