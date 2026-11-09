@@ -4,7 +4,7 @@
 
 use rustgis_data::secrets::{Reporting, SecretStore};
 use serde_json::{Map, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub const FILE: &str = "prefs.json";
@@ -34,33 +34,69 @@ fn read_at(path: &Path) -> Result<Map<String, Value>, String> {
     }
 }
 
-/// Updates one desktop preference, preserving all others. A malformed file is moved aside to
-/// `prefs.json.bad` (kept for the user to repair) and a new one started; an unreadable one is
-/// never overwritten. A temporary file and rename avoid truncating the old file on a crash.
-pub fn write(key: &str, value: &str) -> Result<(), String> {
+/// Updates one desktop preference, preserving all others. A malformed file is set aside (see
+/// [`set_aside`]) and a new one started: returns where it was put. An unreadable one is never
+/// overwritten. The new file is written under a name of its own beside the old one, synced to
+/// disk, then renamed over it, so a crash or power cut leaves the old file or the new one, never
+/// a partly written one, and two copies of RustGIS saving at once never share a temporary file.
+pub fn write(key: &str, value: &str) -> Result<Option<PathBuf>, String> {
     let dir = rustgis_data::dirs::config_dir().ok_or("the settings folder isn't available")?;
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     write_at(&dir.join(FILE), key, value)
 }
 
-fn write_at(path: &Path, key: &str, value: &str) -> Result<(), String> {
-    let mut map = match read_at(path) {
-        Ok(map) => map,
-        Err(_) if path.is_file() && std::fs::read_to_string(path).is_ok() => {
-            std::fs::rename(path, path.with_extension("json.bad"))
-                .map_err(|error| format!("could not set aside the malformed preferences: {error}"))?;
-            Map::new()
-        }
+/// [`write`] to the file at `path` (a test folder in tests): returns where a malformed file went.
+fn write_at(path: &Path, key: &str, value: &str) -> Result<Option<PathBuf>, String> {
+    let (mut map, set_aside) = match read_at(path) {
+        Ok(map) => (map, None),
+        Err(_) if path.is_file() && std::fs::read_to_string(path).is_ok() => (Map::new(), Some(set_aside(path)?)),
         Err(error) => return Err(error),
     };
     map.insert(key.to_string(), Value::String(value.to_string()));
     let text = serde_json::to_vec(&map).map_err(|_| "could not serialize preferences")?;
     let dir = path.parent().ok_or("the settings folder isn't available")?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::create_dir_all(dir)
-        .and_then(|_| std::fs::write(&temporary, text))
-        .and_then(|_| std::fs::rename(&temporary, path))
-        .map_err(|error| format!("could not save preferences: {error}"))
+    std::fs::create_dir_all(dir).and_then(|_| rustgis_data::io::replace_atomic(path, &text)).map_err(|error| match &set_aside {
+        Some(backup) => format!("could not save preferences: {error}; malformed preferences were kept at {}", backup.display()),
+        None => format!("could not save preferences: {error}"),
+    })?;
+    Ok(set_aside)
+}
+
+/// How many malformed preference files are kept: `prefs.json.bad`, then `prefs.json.bad2` to
+/// `prefs.json.bad9`. Once all are taken, saving refuses to replace any recovery copy or the
+/// malformed current file; the user can repair or move a copy to make room.
+const KEPT_BAD: u32 = 9;
+
+/// Copies malformed preferences to an exclusively created `.bad` file, synced before saving
+/// replaces the original. Concurrent callers cannot overwrite each other's recovery files.
+/// A failed copy is removed; a failed later save leaves both original and recovery intact.
+fn set_aside(path: &Path) -> Result<PathBuf, String> {
+    let name = |n: u32| path.with_extension(if n == 1 { "json.bad".to_string() } else { format!("json.bad{n}") });
+    let mut source = std::fs::File::open(path).map_err(|error| format!("could not preserve malformed preferences: {error}"))?;
+    for target in (1..=KEPT_BAD).map(name) {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut backup = match options.open(&target) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("could not preserve malformed preferences: {error}")),
+        };
+        if let Err(error) = std::io::copy(&mut source, &mut backup).and_then(|_| backup.sync_all()) {
+            drop(backup);
+            let _ = std::fs::remove_file(&target);
+            return Err(format!("could not preserve malformed preferences: {error}"));
+        }
+        return Ok(target);
+    }
+    Err(format!(
+        "all {KEPT_BAD} preference recovery files are occupied; repair or move one before saving settings; the malformed preferences were left unchanged at {}",
+        path.display()
+    ))
 }
 
 /// Opts a native caller into the desktop's saved connections and lazy credential store, which
@@ -105,13 +141,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_recovery_slots_leave_the_malformed_file_and_every_backup_unchanged() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-full-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        std::fs::write(&path, "broken preferences").unwrap();
+        let mut kept = Vec::new();
+        for _ in 0..KEPT_BAD {
+            kept.push(set_aside(&path).unwrap());
+        }
+        assert!(write_at(&path, "theme", "dark").unwrap_err().contains("left unchanged"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken preferences");
+        for backup in kept {
+            assert_eq!(std::fs::read_to_string(backup).unwrap(), "broken preferences");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn preference_updates_preserve_other_values_and_set_malformed_files_aside() {
         let dir = std::env::temp_dir().join(format!("rustgis-preferences-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE);
         assert_eq!(read_at(&path).unwrap(), Map::new());
-        write_at(&path, "connections", "saved definitions").unwrap();
-        write_at(&path, "theme", "dark").unwrap();
+        assert_eq!(write_at(&path, "connections", "saved definitions").unwrap(), None);
+        assert_eq!(write_at(&path, "theme", "dark").unwrap(), None);
         let map = read_at(&path).unwrap();
         assert_eq!(map.get("connections"), Some(&Value::String("saved definitions".into())));
         assert_eq!(map.get("theme"), Some(&Value::String("dark".into())));
@@ -119,9 +173,19 @@ mod tests {
         std::fs::write(&path, broken).unwrap();
         let error = read_at(&path).unwrap_err();
         assert!(!error.contains("prefs-sentinel"));
-        write_at(&path, "theme", "light").unwrap();
+        assert_eq!(write_at(&path, "theme", "light").unwrap(), Some(dir.join("prefs.json.bad")));
         assert_eq!(std::fs::read_to_string(dir.join("prefs.json.bad")).unwrap(), broken);
         assert_eq!(read_at(&path).unwrap().get("theme"), Some(&Value::String("light".into())));
+        // A file cut short (as a power cut can leave one) is set aside beside the first, not over it.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(write_at(&path, "theme", "dark").unwrap(), Some(dir.join("prefs.json.bad2")));
+        assert_eq!(std::fs::read_to_string(dir.join("prefs.json.bad")).unwrap(), broken);
+        assert_eq!(write_at(&path, "theme", "light").unwrap(), None);
+        // No temporary file is left behind.
+        let mut names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["prefs.json", "prefs.json.bad", "prefs.json.bad2"]);
         std::fs::write(&path, r#"["prefs-sentinel"]"#).unwrap();
         assert!(!read_at(&path).unwrap_err().contains("prefs-sentinel"));
         assert!(read_at(&dir).is_err());

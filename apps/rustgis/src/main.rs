@@ -34,9 +34,13 @@ struct Menus {
 #[derive(Default)]
 struct Menus {}
 
-/// Preferences in `prefs.json` beside the platform's other app settings.
+/// Preferences in `prefs.json` beside the platform's other app settings. Settings that can't be
+/// read or saved are said in the window, not only logged: a setting that looks saved but isn't
+/// would be lost silently when RustGIS closes.
 mod prefs {
     use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use rustgis_ui_egui::Services;
     use serde_json::{Map, Value};
@@ -45,16 +49,84 @@ mod prefs {
         rustgis_engine::data::dirs::config_dir()
     }
 
+    /// A problem with the preferences file, waiting for the window to say it.
+    #[derive(Debug, PartialEq)]
+    pub enum Notice {
+        /// The file couldn't be read: the defaults are in use.
+        Unreadable(String),
+        /// A malformed file was moved here, and new settings started in its place.
+        SetAside(PathBuf),
+        /// A setting couldn't be saved.
+        NotSaved(String),
+    }
+
+    static NOTICES: Mutex<Vec<Notice>> = Mutex::new(Vec::new());
+    /// The last save failed and said so: later failures stay quiet until a save works again.
+    static FAILING: AtomicBool = AtomicBool::new(false);
+
+    /// The waiting notices; a panic while one was added doesn't lose the others.
+    fn notices() -> std::sync::MutexGuard<'static, Vec<Notice>> {
+        NOTICES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The saved preferences, or none when the file can't be read: said once a run.
     fn read() -> Map<String, Value> {
-        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static WARNED: AtomicBool = AtomicBool::new(false);
         rustgis_engine::prefs::read().unwrap_or_else(|error| {
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if !WARNED.swap(true, Ordering::Relaxed) {
                 log::warn!("{error}");
+                notices().push(Notice::Unreadable(error));
             }
             Map::new()
         })
     }
 
+    /// Keeps what a save came to for the window: a malformed file set aside (which also explains
+    /// an earlier read failure still waiting), or the first of a run of failed saves.
+    pub fn saved(result: Result<Option<PathBuf>, String>) {
+        match result {
+            Ok(set_aside) => {
+                FAILING.store(false, Ordering::Relaxed);
+                if let Some(path) = set_aside {
+                    log::warn!("unreadable preferences set aside as {}", path.display());
+                    let mut notices = notices();
+                    notices.retain(|n| !matches!(n, Notice::Unreadable(_)));
+                    notices.push(Notice::SetAside(path));
+                }
+            }
+            Err(error) => {
+                log::warn!("{error}");
+                if !FAILING.swap(true, Ordering::Relaxed) {
+                    notices().push(Notice::NotSaved(error));
+                }
+            }
+        }
+    }
+
+    /// The problems since the last call, oldest first.
+    pub fn take_notices() -> Vec<Notice> {
+        std::mem::take(&mut *notices())
+    }
+
+    /// A notice's text in the current language.
+    pub fn text(notice: &Notice) -> String {
+        use rustgis_ui_egui::i18n::fmt;
+        match notice {
+            Notice::Unreadable(error) => {
+                fmt("Your settings couldn't be read ({error}), so RustGIS is using its defaults.", &[("error", error)])
+            }
+            Notice::SetAside(path) => fmt(
+                "Your settings couldn't be read, so RustGIS started new ones. The old settings file was kept as {path}.",
+                &[("path", &path.display().to_string())],
+            ),
+            Notice::NotSaved(error) => {
+                fmt("Settings can't be saved ({error}): changes last only until RustGIS closes.", &[("error", error)])
+            }
+        }
+    }
+
+    /// The desktop's keychain and the preference hooks over `prefs.json`; saves report through
+    /// [`saved`].
     pub fn services() -> Services {
         let secrets: std::sync::Arc<dyn rustgis_engine::data::secrets::SecretStore> =
             std::sync::Arc::new(rustgis_keychain::Keychain::default());
@@ -62,11 +134,7 @@ mod prefs {
         rustgis_assistant::chatgpt::set_secret_store(Some(secrets.clone()));
         Services {
             load_pref: Some(Box::new(|key: &str| read().get(key).and_then(Value::as_str).map(str::to_string))),
-            save_pref: Some(Box::new(|key: &str, value: &str| {
-                if let Err(error) = rustgis_engine::prefs::write(key, value) {
-                    log::warn!("{error}");
-                }
-            })),
+            save_pref: Some(Box::new(|key: &str, value: &str| saved(rustgis_engine::prefs::write(key, value)))),
             secrets: Some(secrets),
             ..Services::default()
         }
@@ -275,6 +343,11 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
             self.0.ui.titlebar = titlebar;
+        }
+        // Settings that couldn't be read or saved, since the last frame.
+        for notice in prefs::take_notices() {
+            let text = prefs::text(&notice);
+            self.0.session.notify(text, true);
         }
         self.0.logic(ctx);
         #[cfg(target_os = "macos")]
@@ -620,7 +693,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{backends, crash, flag, running};
+    use super::{backends, crash, flag, prefs, running};
     use eframe::wgpu::Backends;
 
     #[test]
@@ -709,6 +782,29 @@ mod tests {
         assert!(blocked.contains("recovery"), "{blocked}");
         assert!(super::recovery_store(None).err().unwrap().contains("app data"));
         assert!(super::recovery_store(Some(dir.join("fresh"))).is_ok());
+    }
+
+    #[test]
+    fn settings_that_cannot_be_saved_are_said_once_until_saving_works() {
+        use prefs::Notice;
+        // Clean saves say nothing.
+        prefs::saved(Ok(None));
+        assert_eq!(prefs::take_notices(), []);
+        // A full disk: said once, not for every setting that follows.
+        prefs::saved(Err("could not save preferences: no space left".into()));
+        prefs::saved(Err("could not save preferences: no space left".into()));
+        assert_eq!(prefs::take_notices(), [Notice::NotSaved("could not save preferences: no space left".into())]);
+        // Once a save works, the next failure is news again.
+        prefs::saved(Ok(None));
+        prefs::saved(Err("could not save preferences: read-only".into()));
+        assert_eq!(prefs::take_notices(), [Notice::NotSaved("could not save preferences: read-only".into())]);
+        prefs::saved(Ok(None));
+        // A malformed file set aside says where it went.
+        let bad = std::path::PathBuf::from("prefs.json.bad");
+        prefs::saved(Ok(Some(bad.clone())));
+        assert_eq!(prefs::take_notices(), [Notice::SetAside(bad.clone())]);
+        let text = prefs::text(&Notice::SetAside(bad));
+        assert!(text.contains("prefs.json.bad"), "{text}");
     }
 
     #[test]
