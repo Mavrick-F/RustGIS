@@ -139,7 +139,12 @@ fn same_contents(source: &mut std::fs::File, target: &Path) -> std::io::Result<b
     if !std::fs::symlink_metadata(target)?.file_type().is_file() {
         return Ok(false);
     }
-    let mut copy = std::fs::OpenOptions::new().read(true).write(true).open(target)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Linux can sync a read-only descriptor; retain the other platforms' flush access.
+    #[cfg(not(target_os = "linux"))]
+    options.write(true);
+    let mut copy = options.open(target)?;
     if source.metadata()?.len() != copy.metadata()?.len() {
         return Ok(false);
     }
@@ -249,6 +254,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("prefs.json.bad")).unwrap(), broken);
         assert_eq!(write_at(&path, "theme", "light").unwrap(), None);
         // Failed replacements leave the malformed original: repeated preservation reuses its copy.
+        // Protecting the existing copy on Linux must not spend more recovery slots.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("prefs.json.bad"), std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
         std::fs::write(&path, broken).unwrap();
         for _ in 0..=KEPT_BAD {
             assert_eq!(set_aside(&path).unwrap(), dir.join("prefs.json.bad"));
