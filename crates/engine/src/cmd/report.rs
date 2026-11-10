@@ -314,7 +314,8 @@ fn add_section(s: &mut Session, p: &Value, sec: Section) -> CmdResult {
 
 /// Drops what a layer lacks from a report (fields, groups, statistics, sort, picture,
 /// attachments, chart, and a where clause it can't read), so the report draws on that layer.
-fn fit_to_layer(r: &mut Report, ds: &rustgis_data::Dataset) {
+/// Returns whether an unreadable predicate was cleared, for the importer to report.
+fn fit_to_layer(r: &mut Report, ds: &rustgis_data::Dataset) -> bool {
     let has = |n: &str| ds.field_index(n).is_some();
     r.fields.retain(|f| has(f));
     r.groups.retain(|f| has(f));
@@ -326,9 +327,11 @@ fn fit_to_layer(r: &mut Report, ds: &rustgis_data::Dataset) {
     if r.fields.is_empty() {
         r.fields = ds.fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect();
     }
-    if !r.where_clause.is_empty() && rustgis_data::query::parse_fields(&r.where_clause, ds).is_err() {
+    let cleared = !r.where_clause.is_empty() && rustgis_data::query::parse_fields(&r.where_clause, ds).is_err();
+    if cleared {
         r.where_clause.clear();
     }
+    cleared
 }
 
 /// A join key: numbers by value (so 1 and 1.0 match), anything else as text; empty for none.
@@ -541,9 +544,7 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     let repairs = r.clamp();
     import_layer(s, p, &mut r)?;
     // Drop what the layer lacks, so the report still draws.
-    if let Some(l) = find_layer(s, &r.layer) {
-        fit_to_layer(&mut r, &l.dataset);
-    }
+    let filter_cleared = find_layer(s, &r.layer).is_some_and(|l| fit_to_layer(&mut r, &l.dataset));
     r.name = unique_name(s, &r.name, None);
     let name = r.name.clone();
     if s.project.reports.len() >= crate::project::MAX_ITEMS {
@@ -554,6 +555,15 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     s.active_report = Some(i);
     for notice in crate::project::content_notices(repairs, &name) {
         s.notify_text(notice, false);
+    }
+    if filter_cleared {
+        s.notify_text(
+            crate::notice_text::NoticeText::format(
+                "{name}: 1 report filter that could not be read for its layer removed while importing; that filter no longer limits included records",
+                [("name", name.clone().into())],
+            ),
+            false,
+        );
     }
     Ok(json!({"report": i, "name": name}))
 }

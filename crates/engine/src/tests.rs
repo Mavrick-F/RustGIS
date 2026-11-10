@@ -4349,7 +4349,7 @@ fn imported_items_report_content_cuts() {
         (
             "report.open",
             json!({"name": "Survey", "layer": "Countries"}),
-            json!({"name": "Survey", "layer": "Countries", "title": "t".repeat(501)}),
+            json!({"name": "Survey", "layer": "Countries", "title": "t".repeat(501), "where": "missing_column = 1"}),
         ),
     ] {
         for (value, expected) in [(clean, 0), (damaged, 1)] {
@@ -4364,6 +4364,10 @@ fn imported_items_report_content_cuts() {
             );
             if expected == 0 {
                 assert!(s.notices.is_empty(), "{command}: {:?}", s.notices);
+            }
+            if command == "report.open" && expected == 1 {
+                assert_eq!(s.notices.iter().filter(|n| n.text.contains("1 report filter that could not be read")).count(), 1);
+                assert!(s.project.reports.last().unwrap().where_clause.is_empty());
             }
         }
     }
