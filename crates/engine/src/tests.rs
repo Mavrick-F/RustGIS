@@ -11696,6 +11696,59 @@ fn two_class_b64() -> String {
     base64::engine::general_purpose::STANDARD.encode(geotiff::write(&r, 0).unwrap())
 }
 
+/// Training read in place a view at a time: the view holds none of the training polygons, yet
+/// a model and a supervised classification learn from all of them, read from the source, and the
+/// rows the source can't give are said once.
+#[test]
+fn training_layers_read_in_place_train_from_their_whole_source() {
+    let dir = std::env::temp_dir().join(format!("rustgis-whole-training-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let square = |class: &str, x: f64| json!({"type": "Feature", "properties": {"class": class}, "geometry": {"type": "Polygon", "coordinates": [[[x, 45.002], [x + 0.013, 45.002], [x + 0.013, 45.035], [x, 45.035], [x, 45.002]]]}});
+    let bad = json!({"type": "Feature", "properties": {"class": "field"}, "geometry": {"type": "Polygon", "coordinates": "x"}});
+    let unread = |s: &Session| s.notices.iter().filter(|n| n.text.contains("couldn't be read and were left out")).count();
+    for (file, extra) in [("clean.geojson", None), ("bad.geojson", Some(bad.clone()))] {
+        let mut features = vec![square("water", 10.002), square("field", 10.025)];
+        features.extend(extra.clone());
+        let path = dir.join(file);
+        std::fs::write(&path, json!({"type": "FeatureCollection", "features": features}).to_string()).unwrap();
+        let mut s = world();
+        s.run("layer.addDataBytes", &json!({"fileName": "scene.tif", "data": two_class_b64()})).unwrap();
+        let id = s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true, "name": "training"})).unwrap()["layer"]
+            .as_u64()
+            .unwrap() as u32;
+        // The view is far from the polygons: the layer holds none of them.
+        s.map_mut().sync_sources(&rustgis_geom::Extent::new(-61.0, -11.0, -59.0, -9.0), 1000.0, true);
+        let l = s.map().layer(id).unwrap();
+        assert!(l.is_streamed() && l.dataset.features.is_empty(), "{file}: a window without the polygons");
+        let said = usize::from(extra.is_some());
+        let train = json!({"layer": "scene", "training": "training", "classField": "class", "bands": [1, 2], "epochs": 5});
+        let r = s.run("dl.train", &train).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert_eq!(r["classes"], json!(["water", "field"]), "{file}: {r}");
+        assert_eq!(unread(&s), said, "{file}: dl.train");
+        let r = s.run("dl.classify", &train).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert_eq!(r["classes"].as_array().unwrap().len(), 2, "{file}: {r}");
+        assert_eq!(unread(&s), 2 * said, "{file}: dl.classify");
+        let r = s.run("raster.classifySupervised", &json!({"layer": "scene", "training": "training", "classField": "class"})).unwrap();
+        assert_eq!(r["classes"].as_array().unwrap().len(), 2, "{file}: {r}");
+        assert_eq!(unread(&s), 3 * said, "{file}: raster.classifySupervised");
+        // The live layer still reads its view: nothing was loaded into it.
+        let l = s.map().layer(id).unwrap();
+        assert!(l.is_streamed() && l.dataset.features.is_empty(), "{file}");
+    }
+    // A class whose only polygon can't be read: the error says the rows left out, its likely cause.
+    let path = dir.join("lost-class.geojson");
+    std::fs::write(&path, json!({"type": "FeatureCollection", "features": [square("water", 10.002), bad]}).to_string()).unwrap();
+    let mut s = world();
+    s.run("layer.addDataBytes", &json!({"fileName": "scene.tif", "data": two_class_b64()})).unwrap();
+    s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true, "name": "training"})).unwrap();
+    for command in ["dl.train", "raster.classifySupervised"] {
+        let err = s.run(command, &json!({"layer": "scene", "training": "training", "classField": "class", "epochs": 5})).unwrap_err();
+        assert!(err.contains("training: 1 rows couldn't be read and were left out"), "{command}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn deep_learning_hosted_imagery_and_sharing() {
     let dir = std::env::temp_dir().join(format!("rustgis-share-{}", std::process::id()));
