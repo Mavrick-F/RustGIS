@@ -268,12 +268,26 @@ mod running {
     }
 }
 
-/// Deliver native paths and their counted loss notices in the app's selected language.
-/// Both the raw-input hook and its regression use this handoff, so draining an inbox cannot
-/// silently discard its decode/queue errors or repeat them on the next frame.
+/// Deliver native paths and counted notices in the app's selected language.
+/// A frame keeps its first project so a second clean project cannot silently replace it;
+/// other files still use the existing drop flow. This handoff only classifies path suffixes.
 #[cfg(any(target_os = "macos", test))]
 fn append_documents(app: &mut RustGisApp, inbox: &open_documents::Inbox, raw_input: &mut egui::RawInput) {
     let (unreadable, excess) = inbox.append(raw_input);
+    let mut project_seen = false;
+    let mut additional_projects = 0usize;
+    raw_input.dropped_files.retain(|file| {
+        if !file.path().to_str().is_some_and(rustgis_engine::project::opens_as_project) {
+            return true;
+        }
+        if project_seen {
+            additional_projects += 1;
+            false
+        } else {
+            project_seen = true;
+            true
+        }
+    });
     rustgis_ui_egui::i18n::set_current(app.chosen_lang());
     for (n, message) in [
         (unreadable, "macOS supplied {n} file references whose paths couldn't be read. Those files weren't opened."),
@@ -285,6 +299,15 @@ fn append_documents(app: &mut RustGisApp, inbox: &open_documents::Inbox, raw_inp
         if n != 0 {
             app.session.notify(rustgis_ui_egui::i18n::fmt(message, &[("n", &n.to_string())]), true);
         }
+    }
+    if additional_projects != 0 {
+        app.session.notify(
+            rustgis_ui_egui::i18n::fmt(
+                "Additional project files not opened: {n}. Open projects one at a time.",
+                &[("n", &additional_projects.to_string())],
+            ),
+            false,
+        );
     }
 }
 
@@ -686,6 +709,42 @@ mod tests {
         super::append_documents(&mut app, &inbox, &mut clean);
         assert_eq!(clean.dropped_files.len(), 1);
         assert!(app.session.notices.is_empty(), "accepted files must not report a loss");
+    }
+
+    /// One native frame must not open and immediately replace a clean project without warning.
+    #[test]
+    fn native_requests_keep_first_project_and_report_remaining() {
+        let dir = std::env::temp_dir().join(format!("rustgis-native-projects-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = TempDir(dir.clone());
+        let first = dir.join("first.rgis");
+        let second = dir.join("second.rgisx");
+        let mut source = rustgis_engine::Session::new(rustgis_engine::Project::default());
+        source.run("project.saveAs", &serde_json::json!({"path": first.display().to_string()})).unwrap();
+        std::fs::copy(&first, &second).unwrap();
+        let mut app = super::RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.ui.language = "en".into();
+        let inbox = super::open_documents::Inbox::default();
+        inbox.receive(super::open_documents::Batch { paths: vec![first.clone(), second.clone()], ..Default::default() });
+        let mut input = egui::RawInput::default();
+        super::append_documents(&mut app, &inbox, &mut input);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(input, |ui| app.logic(ui.ctx()));
+        output.textures_delta.clear();
+        assert_eq!(app.session.path.as_deref(), Some(first.as_path()), "the first project must remain visible");
+        let notices: Vec<_> = app.session.notices.iter().filter(|n| n.text.starts_with("Additional project files not opened:")).collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].text.contains(": 1."));
+
+        // A later, single-project request is a normal replacement and gives no omission notice.
+        app.session.notices.clear();
+        inbox.receive(super::open_documents::Batch { paths: vec![second.clone()], ..Default::default() });
+        let mut input = egui::RawInput::default();
+        super::append_documents(&mut app, &inbox, &mut input);
+        let mut output = ctx.run_ui(input, |ui| app.logic(ui.ctx()));
+        output.textures_delta.clear();
+        assert_eq!(app.session.path.as_deref(), Some(second.as_path()));
+        assert!(!app.session.notices.iter().any(|n| n.text.starts_with("Additional project files not opened:")));
     }
 
     #[test]
