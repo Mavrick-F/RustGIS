@@ -47,6 +47,8 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
         }
         None => None,
     };
+    let mut losses = Vec::new();
+    let layer = l.dataset.name.clone();
     let attrs: Result<Vec<Value>, String> = l
         .dataset
         .fields
@@ -59,7 +61,11 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
             if non_finite_input(&value, f.ty) {
                 return Err(format!("field '{}' requires a finite number", f.name));
             }
-            Ok(coerce(value, f.ty))
+            let coerced = coerce(value.clone(), f.ty);
+            if let Some(key) = numeric_loss(&value, &coerced, f.ty) {
+                losses.push((f.name.clone(), key));
+            }
+            Ok(coerced)
         })
         .collect();
     l.dataset.push(Some(g), attrs?);
@@ -67,6 +73,15 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     let row = l.dataset.features.len() - 1;
     l.selection = vec![row];
     super::design::apply(s, id, vec![super::design::Change { before: None, row: Some(row) }])?;
+    for (field, key) in losses {
+        s.notify_text(
+            crate::notice_text::NoticeText::format(
+                key,
+                [("layer", layer.clone().into()), ("field", field.into()), ("row", row.saturating_add(1).to_string().into())],
+            ),
+            false,
+        );
+    }
     Ok(json!({"row": row}))
 }
 
@@ -282,6 +297,25 @@ fn field_index(s: &Session, id: u32, name: &str) -> Result<usize, String> {
     s.map().layer(id).and_then(|l| l.dataset.field_index(name)).ok_or_else(|| format!("no field named '{name}'"))
 }
 
+/// A numeric conversion's loss, shared by edits and feature creation. Null entered explicitly is quiet.
+fn numeric_loss(input: &Value, v: &Value, ty: FieldType) -> Option<&'static str> {
+    let intentional_null =
+        input.is_null() || matches!(&input, Value::Text(t) if t.trim().is_empty() || t.trim().eq_ignore_ascii_case("<null>"));
+    if ty.is_numeric() && v.is_null() && !intentional_null {
+        Some("{layer}, field '{field}', row {row}: 1 attribute value was written as null because it isn't a number")
+    } else if ty == FieldType::Integer {
+        let (exact, cut) = coerce_cut(input.clone(), ty);
+        match cut {
+            Cut::Fraction => Some("{layer}, field '{field}', row {row}: 1 attribute value lost its fraction"),
+            Cut::Range => Some("{layer}, field '{field}', row {row}: 1 attribute value was clamped to the 64-bit integer range"),
+            Cut::None if &exact != v => Some("{layer}, field '{field}', row {row}: 1 attribute value lost integer precision"),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let row = p.get("row").and_then(Json::as_u64).ok_or("row is required")? as usize;
@@ -302,21 +336,7 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
         other => coerce(Value::from_json(&other), ty),
     };
     // Keep the existing finite coercion, but say when it discards information.
-    let intentional_null =
-        input.is_null() || matches!(&input, Value::Text(t) if t.trim().is_empty() || t.trim().eq_ignore_ascii_case("<null>"));
-    let loss = if ty.is_numeric() && v.is_null() && !intentional_null {
-        Some("{layer}, field '{field}', row {row}: 1 attribute value was written as null because it isn't a number")
-    } else if ty == FieldType::Integer {
-        let (exact, cut) = coerce_cut(input, ty);
-        match cut {
-            Cut::Fraction => Some("{layer}, field '{field}', row {row}: 1 attribute value lost its fraction"),
-            Cut::Range => Some("{layer}, field '{field}', row {row}: 1 attribute value was clamped to the 64-bit integer range"),
-            Cut::None if exact != v => Some("{layer}, field '{field}', row {row}: 1 attribute value lost integer precision"),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    let loss = numeric_loss(&input, &v, ty);
     let f = l.dataset.features.get_mut(row).ok_or("no such row")?;
     let before = f.clone();
     let cell = f.attrs.get_mut(fi).ok_or("no such row")?;

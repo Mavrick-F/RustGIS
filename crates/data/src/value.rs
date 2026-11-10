@@ -75,13 +75,14 @@ impl Value {
         matches!(self, Value::Float(value) if !value.is_finite())
     }
 
-    /// Parses a typed numeric source field without discarding a non-finite value. Its original number
-    /// stays available until output, where the counted save notice explains conversion to null.
+    /// Parses a typed numeric source field without truncating or clamping its numbers. Integer
+    /// text is kept as an integer when exact; other numeric text is kept as a float, as native
+    /// real source cells are. Non-finite values stay available until counted output conversion.
     /// Interactive edits use [`Self::parse`] and refuse non-finite input at command ingress.
     pub fn parse_source(text: &str, ty: FieldType) -> Value {
         if ty.is_numeric()
             && let Ok(number) = text.trim().parse::<f64>()
-            && (ty == FieldType::Double || !number.is_finite())
+            && (ty == FieldType::Double || text.trim().parse::<i64>().is_err())
         {
             return Value::Float(number);
         }
@@ -425,7 +426,7 @@ mod tests {
     use super::*;
 
     /// Interactive Double text rejects non-finite numbers, while source parsing preserves them
-    /// for the counted output notice. Finite numbers keep their established parsing.
+    /// for the counted output notice. Exact integer text stays integer; source decimals stay real.
     #[test]
     fn a_number_field_reads_text_that_is_not_a_finite_number_as_null() {
         for text in ["NaN", "inf", "-inf", "infinity", "1e400"] {
@@ -437,6 +438,9 @@ mod tests {
         assert_eq!(Value::parse("2.5", FieldType::Double), Value::Float(2.5));
         assert_eq!(Value::parse("2.5", FieldType::Integer), Value::Int(2));
         assert_eq!(Value::parse("1e3", FieldType::Integer), Value::Int(1000));
+        assert_eq!(Value::parse_source("3", FieldType::Integer), Value::Int(3));
+        assert_eq!(Value::parse_source("2.7", FieldType::Integer), Value::Float(2.7));
+        assert_eq!(Value::parse_source("1e30", FieldType::Integer), Value::Float(1e30));
     }
 
     /// JSON cannot represent non-finite numbers; output uses a null value with the save report.

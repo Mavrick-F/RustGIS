@@ -422,6 +422,17 @@ mod tests {
     const MID: &str = "\"A\",1,1.5\n\"B, c\",2,2.5\n\"C\",3,3.5\n\"D\",4,4.5\n\"E\",5,5.5\n\"F\",6,6.5\n\"G\",7,7.5\n";
 
     #[test]
+    fn integer_source_numbers_are_not_truncated_or_clamped() {
+        let mif = "Version 300\nCoordSys Earth Projection 1, 104\nColumns 1\n n Integer\nData\nPoint 0 0\nPoint 1 1\nPoint 2 2\n";
+        let (ds, report) = read(mif, Some("2.7\n1e30\n3\n"), "numbers").unwrap();
+        assert_eq!(ds.fields[0].ty, FieldType::Integer);
+        assert_eq!(ds.value(0, 0), &Value::Float(2.7));
+        assert_eq!(ds.value(1, 0), &Value::Float(1e30));
+        assert_eq!(ds.value(2, 0), &Value::Int(3));
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+    }
+
+    #[test]
     fn widths_with_spaces_and_bad_mid_rows() {
         // `Decimal (10, 2)` is one column; a .mid record the reader rejects keeps its place.
         let mif = "Version 300\nDelimiter \",\"\nCoordSys Earth Projection 1, 104\nColumns 2\n  area Decimal (10, 2)\n  name Char (8)\nData\nPoint 1 1\nPoint 2 2\nPoint 3 3\n";

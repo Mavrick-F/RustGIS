@@ -263,12 +263,13 @@ pub(crate) struct Prepare<'a> {
     pub(crate) report: Report,
     relative_to: Option<&'a str>,
     pub(crate) depth: usize,
+    refusal: Option<String>,
 }
 
 impl<'a> Prepare<'a> {
     /// Makes every replacement and journal allocation before the live borrow is mutated.
     fn new(relative_to: Option<&'a str>, depth: usize) -> Self {
-        Self { owners: Vec::new(), edits: Vec::new(), report: Report::default(), relative_to, depth }
+        Self { owners: Vec::new(), edits: Vec::new(), report: Report::default(), relative_to, depth, refusal: None }
     }
 
     /// Prepares one child under a fixed, typed owning location.
@@ -283,9 +284,17 @@ impl<'a> Prepare<'a> {
         self.record_numbers(dataset.unsaved_numbers(), format!("'{}'", crate::project::short_name(&dataset.name)).into());
     }
 
-    /// Counts saved design values separately from current rows so archived snapshots and
-    /// feature defaults cannot be silently changed by Value's human-readable serialization.
-    fn count_design_numbers(&mut self, layer: &rustgis_map::Layer) {
+    /// Counts saved row and design values. Editable source rows cannot be nulled in output:
+    /// their retained baseline hashes would turn the substitution into a source edit on reopen.
+    fn count_layer_numbers(&mut self, layer: &rustgis_map::Layer) {
+        let count = layer.dataset.unsaved_numbers();
+        if count > 0 && layer.edit_versions().is_some() && self.refusal.is_none() {
+            self.refusal = Some(format!(
+                "project output refused: {count} non-finite attribute value(s) in editable layer '{}' cannot be saved without creating source edits; explicitly clear or replace them first",
+                crate::project::short_name(&layer.name)
+            ));
+        }
+        self.count_numbers(&layer.dataset);
         let place = crate::notice_text::NoticeText::format(
             "{name} (design or archived values)",
             [("name", format!("'{}'", crate::project::short_name(&layer.name)).into())],
@@ -458,6 +467,9 @@ impl<T: Durable> Drop for Transaction<'_, T> {
 fn prepared<'a>(value: &impl Durable, relative_to: Option<&'a str>, depth: usize) -> Result<Prepare<'a>, String> {
     let mut p = Prepare::new(relative_to, depth);
     value.prepare(&mut p);
+    if let Some(reason) = p.refusal.take() {
+        return Err(reason);
+    }
     let mut seen = HashSet::new();
     if p.edits.iter().any(|e| !seen.insert(&e.at)) {
         return Err("internal duplicate output location".into());
@@ -805,8 +817,7 @@ impl Durable for rustgis_map::Map {
             p.string(Leaf::Map(s.at), s.value, s.address, s.local_path);
         }
         for l in &self.layers {
-            p.count_numbers(&l.dataset);
-            p.count_design_numbers(l);
+            p.count_layer_numbers(l);
         }
     }
 
@@ -826,8 +837,7 @@ impl Durable for rustgis_map::Layer {
         for (role, value, address, path) in self.output_slots() {
             p.string(Leaf::Layer(role), value, address, path);
         }
-        p.count_numbers(&self.dataset);
-        p.count_design_numbers(self);
+        p.count_layer_numbers(self);
     }
 
     /// Resolves a prepared location through owned fields, without allocation or policy.

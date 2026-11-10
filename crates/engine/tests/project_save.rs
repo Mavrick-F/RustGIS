@@ -449,3 +449,84 @@ fn set_value_reports_numeric_approximations() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[test]
+fn add_feature_reports_numeric_approximations() -> Result<(), String> {
+    use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    let mut s = Session::new(Project::default());
+    let ds = Dataset::new("Numbers", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    let id = s.map_mut().add_dataset(ds);
+    for (row, (text, expected, fragment)) in [
+        ("2.7", V::Int(2), "lost its fraction"),
+        ("1e30", V::Int(i64::MAX), "clamped"),
+        ("unknown", V::Null, "written as null"),
+        ("<NULL>", V::Null, ""),
+        ("3", V::Int(3), ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mark = s.notice_mark();
+        s.run("edit.addFeature", &json!({"layer": id, "geometry": {"type":"Point", "coordinates":[0,0]}, "attributes": {"n": text}}))?;
+        assert_eq!(s.map().layer(id).ok_or("no layer")?.dataset.value(row, 0), &expected);
+        let losses: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("1 attribute value")).collect();
+        assert_eq!(losses.len(), usize::from(!fragment.is_empty()));
+        if !fragment.is_empty() {
+            assert!(losses[0].text.contains(fragment));
+            assert!(losses[0].text.contains(&format!("Numbers, field 'n', row {}", row + 1)));
+        }
+    }
+    Ok(())
+}
+
+/// Null substitution cannot be persisted with an editable source's non-finite row baseline.
+#[test]
+fn project_output_refuses_to_manufacture_source_edits() -> Result<(), String> {
+    use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    use rustgis_engine::map::{
+        Layer,
+        source::{PostgisEdit, PostgisOrigin, RowVersion, row_hash},
+    };
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+    let path = std::env::temp_dir().join(format!("rustgis-editable-nonfinite-{}-{nonce}.rgis", std::process::id()));
+    std::fs::write(&path, b"keep destination").map_err(|e| e.to_string())?;
+    for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut s = Session::new(Project::default());
+        let mut ds = Dataset::new("Editable", GeometryType::None, vec![Field::new("n", FieldType::Double)]);
+        ds.push(None, vec![V::Float(number)]);
+        let versions = ds.features.iter().map(|f| (f.id, RowVersion { version: 7, hash: row_hash(f) })).collect();
+        let id = s.map_mut().add_dataset(ds);
+        let layer = s.map_mut().layer_mut(id).ok_or("no layer")?;
+        layer.postgis = Some(PostgisEdit {
+            origin: PostgisOrigin { database: "postgres:dbname=example".into(), table: "numbers".into(), family: None, crs: None },
+            key: "id".into(),
+            srid: 4326,
+            writable: true,
+            condition: None,
+            limit: 0,
+            versions,
+        });
+        // Demonstrate why serializing the value independently is unsafe for editable snapshots.
+        let raw = serde_json::to_string(layer).map_err(|e| e.to_string())?;
+        let back: Layer = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        assert_eq!(back.edit_versions().ok_or("no baseline")?.changes(&back.dataset.features).updates.len(), 1);
+        for error in [s.project.saved_text(None).unwrap_err(), s.project.clone().recovery_text_with_report().unwrap_err()] {
+            assert!(error.contains("1 non-finite attribute value(s)"), "{error}");
+            assert!(error.contains("editable layer 'Editable'"), "{error}");
+        }
+        assert!(s.project.save(&path).is_err());
+        assert_eq!(std::fs::read(&path).map_err(|e| e.to_string())?, b"keep destination");
+        let layer = s.map().layer(id).ok_or("no layer")?;
+        assert!(layer.dataset.value(0, 0).is_non_finite());
+        assert!(layer.edit_versions().ok_or("no baseline")?.changes(&layer.dataset.features).is_empty());
+        // Clearing it intentionally remains a real pending source edit after save and reopen.
+        s.run("edit.setValue", &json!({"layer":id,"row":0,"field":"n","value":null}))?;
+        let (text, report) = s.project.saved_text(None)?;
+        assert!(report.notices().is_empty());
+        let reopened = Project::from_json(&text)?;
+        let layer = reopened.maps[0].layer(id).ok_or("no reopened layer")?;
+        assert_eq!(layer.edit_versions().ok_or("no baseline")?.changes(&layer.dataset.features).updates.len(), 1);
+    }
+    std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
