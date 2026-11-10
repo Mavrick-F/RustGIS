@@ -20,7 +20,7 @@
     <dict>
       <key>CFBundleTypeName</key><string>RustGIS project</string>
       <key>CFBundleTypeExtensions</key><array><string>rgis</string><string>rgisx</string></array>
-      <key>LSItemContentTypes</key><array><string>org.rustgis.project</string><string>org.rustgis.project-package</string></array>
+      <key>LSItemContentTypes</key><array><string>org.rustgis.project</string></array>
       <key>CFBundleTypeRole</key><string>Editor</string>
       <key>LSHandlerRank</key><string>Owner</string>
     </dict>
@@ -39,16 +39,7 @@
       <key>UTTypeConformsTo</key><array><string>public.json</string></array>
       <key>UTTypeTagSpecification</key>
       <dict>
-        <key>public.filename-extension</key><array><string>rgis</string></array>
-      </dict>
-    </dict>
-    <dict>
-      <key>UTTypeIdentifier</key><string>org.rustgis.project-package</string>
-      <key>UTTypeDescription</key><string>RustGIS project package</string>
-      <key>UTTypeConformsTo</key><array><string>public.zip-archive</string></array>
-      <key>UTTypeTagSpecification</key>
-      <dict>
-        <key>public.filename-extension</key><array><string>rgisx</string></array>
+        <key>public.filename-extension</key><array><string>rgis</string><string>rgisx</string></array>
       </dict>
     </dict>
   </array>

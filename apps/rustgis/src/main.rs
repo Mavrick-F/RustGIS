@@ -268,6 +268,26 @@ mod running {
     }
 }
 
+/// Deliver native paths and their counted loss notices in the app's selected language.
+/// Both the raw-input hook and its regression use this handoff, so draining an inbox cannot
+/// silently discard its decode/queue errors or repeat them on the next frame.
+#[cfg(any(target_os = "macos", test))]
+fn append_documents(app: &mut RustGisApp, inbox: &open_documents::Inbox, raw_input: &mut egui::RawInput) {
+    let (unreadable, excess) = inbox.append(raw_input);
+    rustgis_ui_egui::i18n::set_current(app.chosen_lang());
+    for (n, message) in [
+        (unreadable, "macOS supplied {n} file references whose paths couldn't be read. Those files weren't opened."),
+        (
+            excess,
+            "{n} files requested by macOS weren't queued because too many requests are waiting. Open them again after the current files finish opening.",
+        ),
+    ] {
+        if n != 0 {
+            app.session.notify(rustgis_ui_egui::i18n::fmt(message, &[("n", &n.to_string())]), true);
+        }
+    }
+}
+
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // The GPU map backend draws inside egui's wgpu pass; hand over the render state.
@@ -301,19 +321,7 @@ impl eframe::App for App {
     #[cfg(target_os = "macos")]
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.0.drop_stale_clicks(raw_input);
-        let (unreadable, excess) = self.3.append(raw_input);
-        rustgis_ui_egui::i18n::set_current(self.0.chosen_lang());
-        for (n, message) in [
-            (unreadable, "macOS supplied {n} file references whose paths couldn't be read. Those files weren't opened."),
-            (
-                excess,
-                "{n} files requested by macOS weren't queued because too many requests are waiting. Open them again after the current files finish opening.",
-            ),
-        ] {
-            if n != 0 {
-                self.0.session.notify(rustgis_ui_egui::i18n::fmt(message, &[("n", &n.to_string())]), true);
-            }
-        }
+        append_documents(&mut self.0, &self.3, raw_input);
         let Some(bar) = &self.2.bar else { return };
         let capturing = self.0.capturing_shortcut();
         let press = |events: &mut Vec<egui::Event>, k: egui::KeyboardShortcut| {
@@ -483,6 +491,7 @@ fn run_installer(app: &RustGisApp) {
     }
 }
 
+/// Run the desktop event loop, retaining native document callbacks and the crash marker until exit.
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -652,6 +661,32 @@ fn main() -> eframe::Result {
 mod tests {
     use super::{backends, crash, flag, running};
     use eframe::wgpu::Backends;
+
+    /// The UI handoff reports each loss kind once, with counts, and stays quiet for clean input.
+    #[test]
+    fn native_documents_say_what_was_lost_and_clean_input_is_quiet() {
+        let mut app = super::RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.ui.language = "en".into();
+        app.session.notices.clear();
+        let inbox = super::open_documents::Inbox::default();
+        inbox.receive(super::open_documents::Batch { paths: vec!["project.rgis".into()], unreadable: 2, excess: 7 });
+        let mut input = egui::RawInput::default();
+        super::append_documents(&mut app, &inbox, &mut input);
+        assert_eq!(input.dropped_files.len(), 1);
+        assert_eq!(app.session.notices.len(), 2);
+        assert!(app.session.notices.iter().all(|notice| notice.error));
+        assert!(app.session.notices[0].text.starts_with("macOS supplied 2 file references"));
+        assert!(app.session.notices[1].text.starts_with("7 files requested by macOS"));
+
+        app.session.notices.clear();
+        super::append_documents(&mut app, &inbox, &mut egui::RawInput::default());
+        assert!(app.session.notices.is_empty(), "the drained loss counts must not be repeated");
+        inbox.receive(super::open_documents::Batch { paths: vec!["clean.csv".into()], ..Default::default() });
+        let mut clean = egui::RawInput::default();
+        super::append_documents(&mut app, &inbox, &mut clean);
+        assert_eq!(clean.dropped_files.len(), 1);
+        assert!(app.session.notices.is_empty(), "accepted files must not report a loss");
+    }
 
     #[test]
     fn windows_starts_without_vulkan_unless_asked() {
