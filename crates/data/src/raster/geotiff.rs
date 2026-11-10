@@ -1740,13 +1740,16 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
         // The samples interleaved, as large as the raster: reserved first, so a raster this
         // machine can't hold twice is an error, and a cancel is heard while they are copied.
         let n = (w as usize) * (h as usize);
+        if r.bands.iter().any(|b| b.data.len() != n) {
+            return Err(err(format!("a band of the raster doesn't hold its {w} × {h} values")));
+        }
         let samples = n.checked_mul(all.len()).ok_or_else(|| err("the raster is too large to write"))?;
         let mut data = super::room(samples, w as usize, h as usize)?;
         for i in 0..n {
             if i % (1 << 20) == 0 {
                 crate::progress::check()?;
             }
-            // Every band holds `n` values (`Raster::new` checks), so none is NaN-filled.
+            // Every band holds `n` values (checked above), so none is NaN-filled.
             data.extend(r.bands.iter().map(|b| b.data.get(i).copied().unwrap_or(f32::NAN)));
         }
         macro_rules! wide {
