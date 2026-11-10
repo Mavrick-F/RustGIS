@@ -108,6 +108,14 @@ mod prefs {
         std::mem::take(&mut *notices())
     }
 
+    /// A save during logic or UI may queue a notice after this frame's drain. Ensure another
+    /// frame delivers it even when the user stops interacting with the window.
+    pub fn repaint_if_pending(ctx: &egui::Context) {
+        if !notices().is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
     /// A notice's text in the current language.
     pub fn text(notice: &Notice) -> String {
         use rustgis_ui_egui::i18n::fmt;
@@ -353,9 +361,11 @@ impl eframe::App for App {
         if self.0.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        prefs::repaint_if_pending(ctx);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.0.ui(ui);
+        prefs::repaint_if_pending(ui.ctx());
     }
     #[cfg(not(target_os = "macos"))]
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -788,10 +798,26 @@ mod tests {
         // Clean saves say nothing.
         prefs::saved(Ok(None));
         assert_eq!(prefs::take_notices(), []);
+        // An idle window must get another frame when a save queues a notice late in a frame.
+        let ctx = egui::Context::default();
+        let frame = || {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| prefs::repaint_if_pending(ui.ctx()));
+            output.textures_delta.clear();
+        };
+        for _ in 0..4 {
+            frame();
+        }
+        assert!(!ctx.has_requested_repaint(), "clean preferences keep the window idle");
         // A full disk: said once, not for every setting that follows.
         prefs::saved(Err("could not save preferences: no space left".into()));
         prefs::saved(Err("could not save preferences: no space left".into()));
+        frame();
+        assert!(ctx.has_requested_repaint(), "the pending failure requests its delivery frame");
         assert_eq!(prefs::take_notices(), [Notice::NotSaved("could not save preferences: no space left".into())]);
+        for _ in 0..4 {
+            frame();
+        }
+        assert!(!ctx.has_requested_repaint(), "draining the notice lets the window settle");
         // Once a save works, the next failure is news again.
         prefs::saved(Ok(None));
         prefs::saved(Err("could not save preferences: read-only".into()));
