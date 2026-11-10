@@ -2547,8 +2547,9 @@ fn geopackage_keeps_rows_without_geometry() {
         c.execute("INSERT INTO \"grid \"\"q\"\"\" VALUES (601, NULL, 'no place', 7, 1)", []).unwrap();
         c.execute("INSERT INTO \"grid \"\"q\"\"\" VALUES (602, ?1, 'empty', 8, 0)", [empty]).unwrap();
         // Flagged empty but unreadable, each skipped and counted: cut off before its header ends,
-        // with an envelope code the standard doesn't define, and an envelope declared but missing.
-        for (fid, blob) in [(603, "47500011"), (604, "4750001b0f000000"), (605, "475000130f000000")] {
+        // with an envelope code the standard doesn't define, an envelope declared but missing, and a
+        // header version the standard doesn't define.
+        for (fid, blob) in [(603, "47500011"), (604, "4750001b0f000000"), (605, "475000130f000000"), (606, "475001110f000000")] {
             c.execute(&format!("INSERT INTO \"grid \"\"q\"\"\" VALUES ({fid}, X'{blob}', 'cut', 9, 1)"), []).unwrap();
         }
     }
@@ -2559,13 +2560,13 @@ fn geopackage_keeps_rows_without_geometry() {
     ];
     for src in &sources {
         let format = src.info().format;
-        assert_eq!(src.info().count, Some(605), "{format}");
+        assert_eq!(src.info().count, Some(606), "{format}");
         let whole = src.read(&Request::all()).unwrap();
-        assert_eq!((whole.features.len(), whole.skipped), (602, 3), "{format}");
+        assert_eq!((whole.features.len(), whole.skipped), (602, 4), "{format}");
         let bare: Vec<_> = whole.features.iter().filter(|f| f.geometry.is_none()).map(|f| (f.id, f.attrs[0].clone())).collect();
         assert_eq!(bare, vec![(601, Value::Text("no place".into())), (602, Value::Text("empty".into()))], "{format}");
         let (rows, summary, _) = visit_all(src.as_ref(), None, 1024);
-        assert_eq!((rows, summary.matched, summary.skipped), (whole.features, 602, 3), "{format}");
+        assert_eq!((rows, summary.matched, summary.skipped), (whole.features, 602, 4), "{format}");
         let world = Extent::new(-180.0, -85.0, 180.0, 85.0);
         let part = src.read(&Request { extent: Some(world), limit: 10_000 }).unwrap();
         assert_eq!(part.features.len(), 600, "{format}");
