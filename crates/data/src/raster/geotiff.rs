@@ -1678,6 +1678,10 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
     let tie = [0.0, 0.0, 0.0, gt.origin_x, gt.origin_y, 0.0];
     let GeoKeys { keys, custom } = geo_keys(r)?;
     let (w, h) = (r.width, r.height);
+    // Every band holds width × height values; one that doesn't is refused rather than padded.
+    if r.bands.iter().any(|b| b.data.len() != (w as usize) * (h as usize)) {
+        return Err(err(format!("a band of the raster doesn't hold its {w} × {h} values")));
+    }
     let bytes = |b: usize| -> Option<Vec<u8>> {
         let band = r.bands.get(b)?;
         // No-data pixels keep the no-data value, so the written GDAL_NODATA tag still matches.
@@ -1733,34 +1737,44 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
         // More bands than colour (or one grey band) takes: each a 32-bit float sample, the first
         // past the colour (or grey) ones alpha when the raster says it is.
         use tiff::tags::ExtraSamples;
-        let alpha = matches!(r.color, ColorHint::Rgb { alpha: true } | ColorHint::GrayAlpha);
+        // Alpha follows the colour (or grey) samples it belongs to: RGB's is the fourth band, grey's
+        // the second, so a colour hint on too few bands for colour marks none.
+        let alpha = if rgb { matches!(r.color, ColorHint::Rgb { alpha: true }) } else { matches!(r.color, ColorHint::GrayAlpha) };
         let extras: Vec<ExtraSamples> = (0..all.len() - if rgb { 3 } else { 1 })
             .map(|i| if i == 0 && alpha { ExtraSamples::UnassociatedAlpha } else { ExtraSamples::Unspecified })
             .collect();
         // The samples interleaved, as large as the raster: reserved first, so a raster this
         // machine can't hold twice is an error, and a cancel is heard while they are copied.
+        // Bytes when every band is whole bytes (and an empty cell can be written as no-data),
+        // so an 8-bit image reads back as one; otherwise 32-bit floats.
         let n = (w as usize) * (h as usize);
-        if r.bands.iter().any(|b| b.data.len() != n) {
-            return Err(err(format!("a band of the raster doesn't hold its {w} × {h} values")));
-        }
         let samples = n.checked_mul(all.len()).ok_or_else(|| err("the raster is too large to write"))?;
-        let mut data = super::room(samples, w as usize, h as usize)?;
-        for i in 0..n {
-            if i % (1 << 20) == 0 {
-                crate::progress::check()?;
-            }
-            // Every band holds `n` values (checked above), so none is NaN-filled.
-            data.extend(r.bands.iter().map(|b| b.data.get(i).copied().unwrap_or(f32::NAN)));
-        }
+        let as_bytes = all.iter().all(|b| fits_bytes(r, *b)) && (r.nodata.is_some() || r.bands.iter().all(|b| b.stats.count == n));
         macro_rules! wide {
-            ($colour:ty) => {{
+            ($colour:ty, $sample:expr) => {{
+                let mut data = super::room(samples, w as usize, h as usize)?;
+                for i in 0..n {
+                    if i % (1 << 20) == 0 {
+                        crate::progress::check()?;
+                    }
+                    // Every band holds `n` values (checked above), so none is filled in.
+                    data.extend(r.bands.iter().map(|b| $sample(b.data.get(i).copied().unwrap_or(f32::NAN))));
+                }
                 let mut img = enc.new_image::<$colour>(w, h).map_err(err)?;
                 img.extra_samples(&extras).map_err(err)?;
                 tags!(img, &all[..]);
                 img.write_data(&data).map_err(err)?;
             }};
         }
-        if rgb { wide!(colortype::RGB32Float) } else { wide!(colortype::Gray32Float) }
+        if as_bytes {
+            let nodata = r.nodata.map_or(0, |d| d as u8);
+            let byte = |v: f32| if r.is_valid(v) { v.clamp(0.0, 255.0) as u8 } else { nodata };
+            if rgb { wide!(colortype::RGB8, byte) } else { wide!(colortype::Gray8, byte) }
+        } else if rgb {
+            wide!(colortype::RGB32Float, |v: f32| v)
+        } else {
+            wide!(colortype::Gray32Float, |v: f32| v)
+        }
     } else if rgb
         && !byte_holes
         && (!written_bands(r, band).contains(&3) || fits_bytes(r, 3))
@@ -2026,7 +2040,7 @@ mod tests {
 
     /// `write_all` keeps the bands `write` leaves out: every band of a grey raster, grey and its
     /// alpha (with a data band after it too), and a colour raster's bands past RGB and alpha, each
-    /// read back as written, with its colour.
+    /// read back as written, with its colour; 8-bit bands stay 8-bit.
     #[test]
     fn write_all_keeps_every_band() {
         let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
@@ -2045,6 +2059,16 @@ mod tests {
             assert_eq!((back.band_count(), &back.color), (r.band_count(), &r.color));
             assert!((0..r.band_count()).all(|b| back.bands[b].data == r.bands[b].data), "{:?}", r.color);
         }
+        // Two bands hinted as colour with alpha are too few for colour: neither is marked alpha.
+        let two = raster(2, ColorHint::Rgb { alpha: true });
+        let back = read(std::io::Cursor::new(write_all(&two).unwrap()), "r").unwrap();
+        assert_eq!((back.band_count(), &back.color), (2, &ColorHint::Gray));
+        // An 8-bit colour image with more bands stays 8-bit, so it reads back with the same range.
+        let bytes = (0..5).map(|b| (0..6).map(|i| (b * 40 + i) as f32).collect()).collect();
+        let rgbi = Raster::new("b", 3, 2, bytes, gt, Crs::LonLat, None, ColorHint::Rgb { alpha: false }, "UInt8").unwrap();
+        let back = read(std::io::Cursor::new(write_all(&rgbi).unwrap()), "b").unwrap();
+        assert_eq!((back.band_count(), &back.color, back.data_type.as_str()), (5, &rgbi.color, "UInt8"));
+        assert!((0..5).all(|b| back.bands[b].data == rgbi.bands[b].data));
         // What `write` keeps whole is written as `write` writes it.
         let rgb = raster(3, ColorHint::Rgb { alpha: false });
         assert_eq!(write_all(&rgb).unwrap(), write(&rgb, 0).unwrap());

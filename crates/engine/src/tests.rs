@@ -16626,6 +16626,15 @@ fn derived_multiband_rasters_keep_every_band_in_the_project() {
     for (name, bands) in ["half", "part"].iter().zip(&before) {
         let values = |b: usize| bands[b].iter().map(|v| f32::from_bits(*v)).filter(|v| v.is_finite()).collect::<Vec<_>>();
         assert!(!values(1).is_empty() && values(0).iter().all(|v| *v < 16.0) && values(1).iter().all(|v| *v >= 100.0), "{name}");
+        // Clipping and resampling are linear, so each derived cell keeps band 2 = band 1 + 100.
+        let (first, second) = (&bands[0], &bands[1]);
+        assert!(
+            first.iter().zip(second).all(|(a, b)| {
+                let (a, b) = (f32::from_bits(*a), f32::from_bits(*b));
+                (a.is_nan() && b.is_nan()) || (b - a - 100.0).abs() < 1e-3
+            }),
+            "{name}"
+        );
     }
     // The edit set its pixel (the top-left one) in both bands and left the next one alone.
     let pixel = |band: usize, i: usize| before[2][band][i];
