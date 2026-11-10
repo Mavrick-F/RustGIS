@@ -27,7 +27,12 @@ fn read_at(path: &Path) -> Result<Map<String, Value>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
         Err(error) => return Err(format!("could not read preferences: {error}")),
     };
-    let value: Value = serde_json::from_slice(&bytes)
+    parse_preferences(&bytes)
+}
+
+/// Parses only bytes successfully read, keeping malformed content distinct from I/O failures.
+fn parse_preferences(bytes: &[u8]) -> Result<Map<String, Value>, String> {
+    let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid preferences JSON at line {}, column {}", error.line(), error.column()))?;
     match value {
         Value::Object(map) => Ok(map),
@@ -59,10 +64,25 @@ fn write_at_with_sync(
     value: &str,
     sync: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<Option<PathBuf>, String> {
-    let (mut map, set_aside) = match read_at(path) {
-        Ok(map) => (map, None),
-        Err(_) if path.is_file() && std::fs::read(path).is_ok() => (Map::new(), Some(set_aside(path)?)),
-        Err(error) => return Err(error),
+    write_at_with_bytes(path, key, value, std::fs::read(path), sync)
+}
+
+/// Uses one read result for a save. Only successfully read, malformed bytes permit recovery;
+/// a transient read failure cannot replace a valid file with a new one containing a single key.
+fn write_at_with_bytes(
+    path: &Path,
+    key: &str,
+    value: &str,
+    bytes: std::io::Result<Vec<u8>>,
+    sync: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<Option<PathBuf>, String> {
+    let (mut map, set_aside) = match bytes {
+        Ok(bytes) => match parse_preferences(&bytes) {
+            Ok(map) => (map, None),
+            Err(_) => (Map::new(), Some(set_aside(path)?)),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Map::new(), None),
+        Err(error) => return Err(format!("could not read preferences: {error}")),
     };
     map.insert(key.to_string(), Value::String(value.to_string()));
     let text = serde_json::to_vec(&map).map_err(|_| "could not serialize preferences")?;
@@ -230,6 +250,34 @@ pub fn use_saved_secrets(s: &mut crate::Session, prefs: &Map<String, Value>, sto
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A failed read must not be reclassified as malformed when the file is readable again.
+    #[test]
+    fn transient_read_failure_preserves_valid_preferences() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-read-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let original = br#"{"theme":"dark","other":"kept"}"#;
+        std::fs::write(&path, original).unwrap();
+        let error = write_at_with_bytes(
+            &path,
+            "theme",
+            "light",
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "transient read failure")),
+            sync_directory,
+        )
+        .unwrap_err();
+        assert!(error.contains("could not read preferences") && error.contains("transient read failure"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!path.with_extension("json.bad").exists());
+        assert_eq!(write_at(&path, "theme", "light").unwrap(), None);
+        let saved = read_at(&path).unwrap();
+        assert_eq!(saved.get("theme").and_then(Value::as_str), Some("light"));
+        assert_eq!(saved.get("other").and_then(Value::as_str), Some("kept"));
+        assert!(!path.with_extension("json.bad").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A verified copy whose durability cannot be confirmed must not spend another recovery slot.
     #[test]
