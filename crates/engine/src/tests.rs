@@ -24957,7 +24957,7 @@ fn layer_rename_keeps_references_in_their_maps() {
         }
     }
     assert_eq!(s.project.reports[0].layer, "Countries");
-    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("another map has a layer of that name")));
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("another map has a layer of the old or new name")));
 }
 
 #[test]
@@ -24978,6 +24978,47 @@ fn layer_rename_never_redirects_a_table_to_another_layer_of_the_new_name() {
     s.run("edit.undo", &Value::Null).unwrap();
     assert_eq!(renamed_project_state(&s), before);
     assert_eq!(s.map().layer_by_name("Cities").unwrap().id, cities);
+}
+
+/// A project-wide report must not begin resolving to a different map after a rename.
+#[test]
+fn layer_rename_keeps_project_references_when_another_map_has_the_new_name() {
+    let mut s = world();
+    s.run("report.new", &json!({"layer": "Countries", "name": "Report", "fields": ["name"]})).unwrap();
+    let mut second = s.map().clone();
+    second.name = "Second".into();
+    for layer in &mut second.layers {
+        if layer.name == "Countries" {
+            layer.name = "Nations".into();
+        }
+    }
+    s.project.maps.push(second);
+    let before = renamed_project_state(&s);
+    let mark = s.notice_mark();
+    s.run("layer.rename", &json!({"layer": "Countries", "name": "Nations"})).unwrap();
+    assert_eq!(s.project.reports[0].layer, "Countries");
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("1 project reference(s)") && n.text.contains("old or new name")));
+    s.project.active_map = 1;
+    assert!(s.project.maps.iter().all(|map| map.layer_by_name(&s.project.reports[0].layer).is_none()));
+    s.project.active_map = 0;
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(renamed_project_state(&s), before);
+}
+
+/// References left on a duplicate old name need a notice because the intended layer is unknown.
+#[test]
+fn layer_rename_says_when_references_keep_a_duplicate_old_name() {
+    let mut s = world();
+    let countries = s.map().layer_by_name("Countries").unwrap().id;
+    s.run("layout.new", &json!({"page": "a4"})).unwrap();
+    let table = s.run("layout.addElement", &json!({"kind": "table", "layer": "Countries"})).unwrap()["element"].as_u64().unwrap() as u32;
+    s.map_mut().layers.iter_mut().find(|layer| layer.name == "Cities").unwrap().name = "Countries".into();
+    let mark = s.notice_mark();
+    s.run("layer.rename", &json!({"layer": countries, "name": "Nations"})).unwrap();
+    let element = s.project.layouts[0].elements.iter().find(|element| element.id == table).unwrap();
+    let rustgis_map::layout::ElementKind::Table { layer, .. } = &element.kind else { panic!("not a table") };
+    assert_eq!(layer, "Countries");
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("1 layer reference(s)") && n.text.contains("another layer in this map")));
 }
 
 #[test]

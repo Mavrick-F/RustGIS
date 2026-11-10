@@ -4721,14 +4721,18 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
     use rustgis_map::design::{Elevation, TopologyRule};
     use rustgis_map::layout::ElementKind;
 
-    if s.map().layers.iter().any(|l| l.name.eq_ignore_ascii_case(old)) {
+    let old_present = s.map().layers.iter().any(|l| l.name.eq_ignore_ascii_case(old));
+    if old_present && old.eq_ignore_ascii_case(new) {
         return;
     }
+    let mut old_left = 0usize;
     let collision = s.map().layers.iter().filter(|l| l.name.eq_ignore_ascii_case(new)).count() > 1;
     let mut collision_left = 0usize;
     let mut replace = |name: &mut String| {
         if name.eq_ignore_ascii_case(old) {
-            if collision {
+            if old_present {
+                old_left += 1;
+            } else if collision {
                 collision_left += 1;
             } else {
                 *name = new.to_string();
@@ -4782,12 +4786,10 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
     }
     // These items do not record a map; changing an ambiguous name would redirect references
     // used with another map. Keep those spellings until the user chooses their intended layer.
-    let shared = s
-        .project
-        .maps
-        .iter()
-        .enumerate()
-        .any(|(i, map)| i != s.project.active_map && map.layers.iter().any(|layer| layer.name.eq_ignore_ascii_case(old)));
+    let shared = s.project.maps.iter().enumerate().any(|(i, map)| {
+        i != s.project.active_map
+            && map.layers.iter().any(|layer| layer.name.eq_ignore_ascii_case(old) || layer.name.eq_ignore_ascii_case(new))
+    });
     let mut left = 0usize;
     let mut project_reference = |name: &mut String| {
         if shared && name.eq_ignore_ascii_case(old) {
@@ -4815,8 +4817,14 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
     }
     if left > 0 {
         s.notify_text(crate::notice_text::NoticeText::format(
-            "{count} project reference(s) still name '{old}': another map has a layer of that name; choose the intended layer in those items",
+            "{count} project reference(s) still name '{old}': another map has a layer of the old or new name; choose the intended layer in those items",
             [("count", left.to_string().into()), ("old", old.to_string().into())],
+        ), false);
+    }
+    if old_left > 0 {
+        s.notify_text(crate::notice_text::NoticeText::format(
+            "{count} layer reference(s) still name '{old}': another layer in this map has that name; choose the intended layer in those items",
+            [("count", old_left.to_string().into()), ("old", old.to_string().into())],
         ), false);
     }
     if collision_left > 0 {
