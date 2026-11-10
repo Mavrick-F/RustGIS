@@ -25009,16 +25009,21 @@ fn layer_rename_keeps_project_references_when_another_map_has_the_new_name() {
 #[test]
 fn layer_rename_says_when_references_keep_a_duplicate_old_name() {
     let mut s = world();
+    s.run("layer.mask", &json!({"layer": "Rivers", "mask": "Countries"})).unwrap();
     let countries = s.map().layer_by_name("Countries").unwrap().id;
     s.run("layout.new", &json!({"page": "a4"})).unwrap();
     let table = s.run("layout.addElement", &json!({"kind": "table", "layer": "Countries"})).unwrap()["element"].as_u64().unwrap() as u32;
     s.map_mut().layers.iter_mut().find(|layer| layer.name == "Cities").unwrap().name = "Countries".into();
+    let before = renamed_project_state(&s);
     let mark = s.notice_mark();
     s.run("layer.rename", &json!({"layer": countries, "name": "Nations"})).unwrap();
     let element = s.project.layouts[0].elements.iter().find(|element| element.id == table).unwrap();
     let rustgis_map::layout::ElementKind::Table { layer, .. } = &element.kind else { panic!("not a table") };
     assert_eq!(layer, "Countries");
-    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("1 layer reference(s)") && n.text.contains("another layer in this map")));
+    assert_eq!(s.map().layer_by_name("Rivers").unwrap().mask.as_deref(), Some("Countries"));
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("2 layer reference(s)") && n.text.contains("another layer in this map")));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(renamed_project_state(&s), before);
 }
 
 #[test]

@@ -93,12 +93,6 @@ pub fn commands() -> Vec<C> {
                     s.notify(said, false);
                 }
             }
-            // Layers masked by this one follow the new name.
-            for l in &mut s.map_mut().layers {
-                if l.mask.as_deref().is_some_and(|m| m.eq_ignore_ascii_case(&old)) {
-                    l.mask = Some(n.clone());
-                }
-            }
             // So do legends that leave it out.
             legends_follow_layer(s, &old, Some(&n));
             references_follow_layer(s, &old, &n);
@@ -4721,12 +4715,10 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
     use rustgis_map::design::{Elevation, TopologyRule};
     use rustgis_map::layout::ElementKind;
 
-    let old_present = s.map().layers.iter().any(|l| l.name.eq_ignore_ascii_case(old));
-    if old_present && old.eq_ignore_ascii_case(new) {
-        return;
-    }
+    let case_only = old.eq_ignore_ascii_case(new);
+    let old_present = !case_only && s.map().layers.iter().any(|l| l.name.eq_ignore_ascii_case(old));
     let mut old_left = 0usize;
-    let collision = s.map().layers.iter().filter(|l| l.name.eq_ignore_ascii_case(new)).count() > 1;
+    let collision = !case_only && s.map().layers.iter().filter(|l| l.name.eq_ignore_ascii_case(new)).count() > 1;
     let mut collision_left = 0usize;
     let mut replace = |name: &mut String| {
         if name.eq_ignore_ascii_case(old) {
@@ -4739,6 +4731,15 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
             }
         }
     };
+    for layer in &mut s.map_mut().layers {
+        if let Some(mask) = &mut layer.mask {
+            replace(mask);
+        }
+    }
+    // Preserve the existing case-only mask spelling update; other references still resolve.
+    if case_only {
+        return;
+    }
     let map_name = s.map().name.clone();
     let editing = &mut s.map_mut().editing;
     for relation in &mut editing.relationships {
