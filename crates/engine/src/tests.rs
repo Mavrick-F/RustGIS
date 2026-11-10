@@ -1216,6 +1216,73 @@ fn qgis_measures_in_project_units_are_left_out() {
     assert!(!r["notes"].to_string().contains("project's units"), "{r}");
 }
 
+/// A QGIS diagram reaches the layer through `style.importQgis`; categories on fields the layer
+/// hasn't are left out, and a diagram left with none removed, each noted with the fields. Undo
+/// takes it back.
+#[test]
+fn qgis_diagrams_import_on_the_fields_the_layer_has() {
+    let mut s = world();
+    let qml = |attrs: &str| {
+        format!(
+            r##"<qgis version="3.40.0"><SingleCategoryDiagramRenderer diagramType="Pie"><DiagramCategory enabled="1" direction="0" width="10" sizeType="MM">{attrs}</DiagramCategory></SingleCategoryDiagramRenderer></qgis>"##
+        )
+    };
+    let notes =
+        |r: &serde_json::Value| r["notes"].as_array().unwrap().iter().map(|n| n["text"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let both = r##"<attribute field="&quot;POP_EST&quot;" color="#ff0000"/><attribute field="gdp_md" color="#0000ff"/>"##;
+    let r = s.run("style.importQgis", &json!({"layer": "Countries", "text": qml(both)})).unwrap();
+    assert!(notes(&r).is_empty(), "{:?}", notes(&r));
+    let fields = |s: &Session| {
+        s.map()
+            .layer_by_name("Countries")
+            .unwrap()
+            .diagram
+            .as_ref()
+            .map(|d| d.categories.iter().map(|c| c.field.clone()).collect::<Vec<_>>())
+    };
+    assert_eq!(fields(&s), Some(vec!["POP_EST".to_string(), "gdp_md".to_string()]));
+    // One undo step takes it back.
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(fields(&s), None);
+    // A category on a field the layer hasn't is left out.
+    let r = s
+        .run(
+            "style.importQgis",
+            &json!({"layer": "Countries", "text": qml(&format!(r##"{both}<attribute field="nosuch" color="#00ff00"/>"##))}),
+        )
+        .unwrap();
+    assert!(notes(&r).iter().any(|n| n == "its diagram categories on fields the layer hasn't (nosuch)"), "{:?}", notes(&r));
+    assert_eq!(fields(&s), Some(vec!["POP_EST".to_string(), "gdp_md".to_string()]));
+    // None left: no diagram, noted.
+    let r =
+        s.run("style.importQgis", &json!({"layer": "Countries", "text": qml(r##"<attribute field="nosuch" color="#00ff00"/>"##)})).unwrap();
+    assert!(notes(&r).iter().any(|n| n == "its diagrams, whose fields the layer hasn't (nosuch)"), "{:?}", notes(&r));
+    assert_eq!(fields(&s), None);
+    // Sized between two values, a pie losing a category is sized by the rest: noted. One of a
+    // fixed size says nothing of its size.
+    let scaled = |attrs: &str| {
+        format!(
+            r##"<qgis version="3.40.0"><LinearlyInterpolatedDiagramRenderer diagramType="Pie" lowerValue="0" upperValue="1000" lowerWidth="0" upperWidth="20" classificationAttributeExpression="&quot;pop_est&quot; + &quot;nosuch&quot;"><DiagramCategory enabled="1" direction="0">{attrs}</DiagramCategory></LinearlyInterpolatedDiagramRenderer></qgis>"##
+        )
+    };
+    let sized = "its diagrams sized by the sum of the categories left, without those on fields the layer hasn't";
+    let pair = r##"<attribute field="pop_est" color="#ff0000"/><attribute field="nosuch" color="#00ff00"/>"##;
+    let r = s.run("style.importQgis", &json!({"layer": "Countries", "text": scaled(pair)})).unwrap();
+    assert!(notes(&r).iter().any(|n| n == sized), "{:?}", notes(&r));
+    assert!(!notes(&r).iter().any(|n| n.contains("not by")), "the sum QGIS sizes by is the categories': {:?}", notes(&r));
+    let r = s.run("style.importQgis", &json!({"layer": "Countries", "text": qml(pair)})).unwrap();
+    assert!(!notes(&r).iter().any(|n| n == sized), "{:?}", notes(&r));
+    let r = s
+        .run("style.importQgis", &json!({"layer": "Countries", "text": scaled(r##"<attribute field="pop_est" color="#ff0000"/>"##)}))
+        .unwrap();
+    assert!(!notes(&r).iter().any(|n| n == sized), "nothing dropped: {:?}", notes(&r));
+    // A graphics layer takes none: noted as left out.
+    s.run("graphics.newLayer", &json!({"name": "Sketch"})).unwrap();
+    let r = s.run("style.importQgis", &json!({"layer": "Sketch", "text": qml(both)})).unwrap();
+    assert!(notes(&r).iter().any(|n| n == "its diagrams (a graphics layer draws none)"), "{:?}", notes(&r));
+    assert!(s.map().layer_by_name("Sketch").unwrap().diagram.is_none());
+}
+
 /// A QGIS categorized renderer by an expression classes by it where the expression reads on the
 /// layer; where it doesn't, every feature draws with the first category's symbol, noted, as before.
 #[test]
@@ -10393,6 +10460,96 @@ fn plugin_panels_keep_their_state_between_calls() {
     assert!(s.run("plugin.panel", &json!({"id": "eng-panel"})).unwrap_err().contains("disabled"));
     rustgis_plugins::unload("eng-panel");
     rustgis_plugins::unload("eng-nopanel");
+}
+
+/// A pick's place reaches the plugin in degrees and in the map's coordinates, worked out by the
+/// session from the map it was picked on, whatever was given for them.
+#[test]
+fn plugin_panel_picks_reach_the_plugin_in_the_maps_coordinates() {
+    let mut s = world();
+    let pkg = rustgis_plugins::Package::from_zip(&rustgis_plugins::testing::pick_package("eng-pick")).unwrap();
+    rustgis_plugins::load(pkg, "test").unwrap();
+    let near = |v: &Value, x: f64, tol: f64| v.as_f64().is_some_and(|v| (v - x).abs() < tol);
+    // Web Mercator: the map's own clicks give only degrees; given map coordinates are replaced,
+    // and said.
+    let mark = s.notice_mark();
+    let got = s.run("plugin:eng-pick/q-grow", &json!({"panel": {"seed": {"lon": -42.8, "lat": -5.09, "x": 1, "crs": "mine"}}})).unwrap();
+    let said = |s: &Session, mark: u64, what: &str| s.notices_since(mark).iter().any(|n| n.text.contains(what) && n.text.contains("seed"));
+    assert!(said(&s, mark, "replaced by the map's"), "{:?}", s.notices_since(mark));
+    let seed = &got["panel"]["values"]["seed"];
+    assert_eq!(got["panel"]["changed"], json!(["seed"]), "{got}");
+    assert_eq!((seed["lon"].as_f64(), seed["lat"].as_f64(), seed["crs"].as_str()), (Some(-42.8), Some(-5.09), Some("EPSG:3857")), "{seed}");
+    let m = crate::geom::lonlat_to_merc(crate::geom::Coord::new(-42.8, -5.09));
+    assert!(near(&seed["x"], m.x, 1e-6) && near(&seed["y"], m.y, 1e-6), "{seed}");
+    assert_eq!(s.plugin_panels["eng-pick"].values["seed"], *seed, "the panel keeps it");
+    // The map's own coordinates given back, or degrees alone, are quiet.
+    let mark = s.notice_mark();
+    let again = json!({"panel": {"seed": seed.clone()}});
+    s.run("plugin:eng-pick/q-grow", &again).unwrap();
+    s.run("plugin:eng-pick/q-grow", &json!({"panel": {"seed": {"lon": -42.8, "lat": -5.09}}})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("pick(s)")), "{:?}", s.notices_since(mark));
+    // A box: its degrees, and the box around it in the map's coordinates.
+    let got = s.run("plugin:eng-pick/q", &json!({"panel": {"area": {"bbox": [-44, -6, -42, -4]}}})).unwrap();
+    let area = &got["panel"]["values"]["area"];
+    let (sw, ne) = (
+        crate::geom::lonlat_to_merc(crate::geom::Coord::new(-44.0, -6.0)),
+        crate::geom::lonlat_to_merc(crate::geom::Coord::new(-42.0, -4.0)),
+    );
+    let e = &area["extent"];
+    assert!(near(&e[0], sw.x, 1e-3) && near(&e[1], sw.y, 1e-3) && near(&e[2], ne.x, 1e-3) && near(&e[3], ne.y, 1e-3), "{area}");
+    assert_eq!(area["bbox"], json!([-44.0, -6.0, -42.0, -4.0]));
+    assert_eq!(got["panel"]["values"]["seed"]["lon"], -42.8, "the other places go with it");
+    // An EPSG projection names its code, the coordinates in its metres.
+    s.run("map.projection", &json!({"type": "EPSG:31983"})).unwrap();
+    let got = s.run("plugin:eng-pick/q-grow", &json!({"panel": {"seed": {"lon": -43.5, "lat": -5.09}}})).unwrap();
+    let seed = &got["panel"]["values"]["seed"];
+    assert_eq!(seed["crs"], "EPSG:31983", "{seed}");
+    assert!(near(&seed["x"], 666_000.0, 5_000.0) && near(&seed["y"], 9_437_000.0, 5_000.0), "UTM 23S: {seed}");
+    // A preset names its definition.
+    s.run("map.projection", &json!({"type": "robinson"})).unwrap();
+    let got = s.run("plugin:eng-pick/q-grow", &json!({"panel": {"seed": {"lon": 10, "lat": 20}}})).unwrap();
+    let crs = got["panel"]["values"]["seed"]["crs"].as_str().unwrap_or_default().to_string();
+    assert!(crs.starts_with("+proj=robin"), "{crs}");
+    // A widget that runs nothing keeps its place for the next request, set by `plugin.panel`.
+    let st = s.run("plugin.panel", &json!({"id": "eng-pick", "values": {"spot": {"lon": 10, "lat": 20}}})).unwrap();
+    assert!(st["values"]["spot"]["x"].is_f64() && st["values"]["spot"]["crs"].is_string(), "{st}");
+    // Junk never panics, leaves the places as they were, and is said.
+    let before = s.plugin_panels["eng-pick"].values.clone();
+    for junk in [json!({"seed": {"lon": 999, "lat": 0}}), json!({"area": {"bbox": "all"}}), json!({"seed": 7}), json!("x")] {
+        let mark = s.notice_mark();
+        let _ = s.run("plugin:eng-pick/q", &json!({"panel": junk}));
+        assert_eq!(s.plugin_panels["eng-pick"].values, before);
+        assert!(s.notices_since(mark).iter().any(|n| n.text.contains("not taken")), "said: {junk}");
+    }
+    let mark = s.notice_mark();
+    let _ = s.run("plugin.panel", &json!({"id": "eng-pick", "values": {"spot": {"lon": 10, "lat": 999}}}));
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("not taken") && n.text.contains("spot")), "plugin.panel says it too");
+    let mark = s.notice_mark();
+    s.run("plugin.panel", &json!({"id": "eng-pick", "values": {"spot": {"lon": 10, "lat": 20, "crs": "mine"}}})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("replaced by the map's") && n.text.contains("spot")), "and the replacing");
+    // The globe's map coordinates are Web Mercator's: past its latitudes they are at its edge,
+    // and that is said.
+    s.run("map.projection", &json!({"type": "globe"})).unwrap();
+    let mark = s.notice_mark();
+    let got = s.run("plugin:eng-pick/q-grow", &json!({"panel": {"seed": {"lon": 10, "lat": 89}}})).unwrap();
+    assert_eq!(got["panel"]["values"]["seed"]["crs"], "EPSG:3857", "{got}");
+    assert!(said(&s, mark, "85.05"), "{:?}", s.notices_since(mark));
+    let mark = s.notice_mark();
+    s.run("plugin:eng-pick/q", &json!({"panel": {"area": {"bbox": [0, 80, 10, 88]}}})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("85.05") && n.text.contains("area")), "a box too");
+    let mark = s.notice_mark();
+    s.run("plugin:eng-pick/q-grow", &json!({"panel": {"seed": {"lon": 10, "lat": 80}}})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("pick(s)")), "inside it, quiet: {:?}", s.notices_since(mark));
+    // A plugin answering with the place held says nothing about it.
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("not taken")), "{:?}", s.notices_since(mark));
+    // Another body's map: the place keeps only its degrees, and that is said.
+    s.run("map.body", &json!({"name": "mars", "basemap": false})).unwrap();
+    let mark = s.notice_mark();
+    let got = s.run("plugin:eng-pick/q-grow", &json!({"panel": {"seed": {"lon": 10, "lat": 20, "x": 1}}})).unwrap();
+    assert!(got["panel"]["values"]["seed"].get("x").is_none(), "{got}");
+    assert!(said(&s, mark, "degrees only"), "{:?}", s.notices_since(mark));
+    assert!(!said(&s, mark, "replaced"), "a given x left out, not replaced: {:?}", s.notices_since(mark));
+    rustgis_plugins::unload("eng-pick");
 }
 
 /// Loads the panel test plugin with `edit`, its panel's state command being `state`.
@@ -33369,6 +33526,175 @@ fn a_windows_bands_are_started_within_its_wait() {
     assert_eq!(e, "2 of 4 bands read in 5 minutes, so the window is given up: take a smaller box or a larger cellSize");
 }
 
+/// A script or model the desktop app runs off the frame, as a plugin's command, leaves a window to
+/// the app: answered pending, and queued, not refused (#1330).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_script_run_by_the_app_leaves_a_window_to_it() {
+    let mut s = world();
+    let p = json!({"url": "https://x.org/scene.tif", "bbox": [10.25, 45.5, 10.5, 45.75]});
+    let answer = s.with_deferred_downloads(|s| s.run("layer.addUrl", &p)).unwrap();
+    assert_eq!(answer["pending"], true, "{answer}");
+    let asked = s.take_url_requests();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].params()["bbox"], p["bbox"]);
+}
+
+/// A command run again that asks for windows of the view in two views is answered each by the
+/// window asked in that view, not twice by the first (#1330).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_command_run_again_gets_each_view_s_own_window() {
+    let mut s = world();
+    let p = json!({"url": "https://x.org/scene.tif", "bbox": "view"});
+    let asked = s.asked_for(&p);
+    let mut views = Vec::new();
+    for (extent, marker) in [([10.0, 45.0, 11.0, 46.0], "A"), ([20.0, 45.0, 21.0, 46.0], "B")] {
+        s.run("map.zoomToExtent", &json!({"extent": extent})).unwrap();
+        let e = crate::cmd::workspace::view_extent(&s);
+        let view = [e.min_x, e.min_y, e.max_x, e.max_y];
+        s.rerun_landed.push((Session::with_view(&asked, Some(view)), Ok(json!({"marker": marker})), Default::default()));
+        views.push(extent);
+    }
+    let answer = |s: &mut Session, extent: [f64; 4]| {
+        s.run("map.zoomToExtent", &json!({"extent": extent})).unwrap();
+        s.with_deferred_downloads(|s| s.run("layer.addUrl", &p)).unwrap()["marker"].clone()
+    };
+    assert_eq!(answer(&mut s, views[1]), "B");
+    assert_eq!(answer(&mut s, views[0]), "A");
+    // A caller can't write the key the view is told apart by.
+    let written = s.asked_for(&json!({"url": "https://x.org/scene.tif", "bbox": "view", "viewAsked": [0, 0, 1, 1]}));
+    assert_eq!(written, asked);
+}
+
+/// A request for the view's window joins one queued only when it was asked in the same view:
+/// asked in another, it is another request, read for its own view (#1330).
+#[test]
+fn a_window_of_the_view_joins_only_one_asked_in_the_same_view() {
+    let mut s = Session::new(Project::default());
+    let p = json!({"url": "https://x.org/scene.tif", "bbox": "view"});
+    let (a, b) = ([10.0, 45.0, 11.0, 46.0], [20.0, 45.0, 21.0, 46.0]);
+    for view in [Some(a), Some(a), Some(b), None] {
+        s.window_view = view;
+        s.request_url(&p).unwrap();
+        s.window_view = None;
+    }
+    let views: Vec<Option<[f64; 4]>> = s.take_url_requests().iter().map(crate::UrlRequest::view_asked).collect();
+    assert_eq!(views, [Some(a), Some(b), None], "the same view's asked once");
+    assert_eq!(s.url_waits.views.len(), 2, "kept by request number");
+}
+
+/// A window of the view that is being read joins a command asking for it again in the same view;
+/// asked in another view, or with a box, it is another request (#1330).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_window_of_the_view_being_read_joins_only_the_same_view() {
+    let mut s = world();
+    plugin("eng-window-flight", &["edit", "network"]);
+    let ask = |s: &mut Session, bbox: Value| {
+        let p = json!({"op": "layer.addUrl", "params": {"url": "https://x.org/scene.tif", "bbox": bbox, "name": "Window"}});
+        s.run_leaving_downloads("plugin:eng-window-flight/f", &p).unwrap();
+        s.take_url_requests()
+    };
+    s.run("map.zoomToExtent", &json!({"extent": [10.0, 45.0, 11.0, 46.0]})).unwrap();
+    let first = ask(&mut s, json!("view"));
+    assert_eq!(first.len(), 1);
+    s.download_started_for(&first[0]).unwrap();
+    // While it is read: the same view joins it.
+    assert!(ask(&mut s, json!("view")).is_empty(), "the same view's window is read once");
+    // Another view: another request, for that view.
+    s.run("map.zoomToExtent", &json!({"extent": [20.0, 45.0, 21.0, 46.0]})).unwrap();
+    let other = ask(&mut s, json!("view"));
+    assert_eq!(other.len(), 1);
+    assert!(other[0].view_asked().is_some() && other[0].view_asked() != first[0].view_asked());
+    // A box: another request, with no view.
+    let boxed = ask(&mut s, json!([10.25, 45.5, 10.5, 45.75]));
+    assert_eq!(boxed.len(), 1);
+    assert_eq!(boxed[0].view_asked(), None);
+}
+
+/// A plugin's command asking for the view's window is read for the view it was asked in, though the
+/// app reads it on a later frame, when the map may show another (#1330): a command run again after
+/// a download sees the view it first ran with only while it runs. The box is kept beside the
+/// request, not in what it asks, so the command run again is answered the raster added.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_window_asked_for_the_view_keeps_the_view_it_was_asked_in() {
+    use crate::cmd::layer::{read_cog_window, window_asked, window_asked_in};
+    use rustgis_data::raster::cog::example;
+    let (base, _) = serve_ranges(example(1024, 256));
+    let mut s = world();
+    plugin("eng-window-view", &["edit", "network"]);
+    let layers = s.map().layers.len();
+    s.run("map.zoomToExtent", &json!({"extent": [10.3, 45.55, 10.45, 45.7]})).unwrap();
+    let seen = crate::cmd::workspace::view_extent(&s);
+    let p = json!({"op": "layer.addUrl", "params": {"url": format!("{base}/scene.tif"), "bbox": "view", "name": "Window"}});
+    s.run_leaving_downloads("plugin:eng-window-view/f", &p).unwrap();
+    let asked = s.take_url_requests();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].params()["bbox"], "view", "what it asks is as it asked it");
+    let close =
+        |a: [f64; 4], b: rustgis_geom::Extent| a.iter().zip([b.min_x, b.min_y, b.max_x, b.max_y]).all(|(a, b)| (a - b).abs() < 1e-9);
+    s.run("map.zoomToExtent", &json!({"extent": [-50.0, -20.0, -40.0, -10.0]})).unwrap();
+    let window = window_asked_in(&s, asked[0].params(), asked[0].view_asked()).unwrap();
+    assert!(close(window.bbox(), seen), "{:?} {seen:?}", window.bbox());
+    // Without the request's box, `"view"` is the view now.
+    let now = crate::cmd::workspace::view_extent(&s);
+    assert!(close(window_asked(&s, asked[0].params()).unwrap().bbox(), now));
+    // Read and added: the command run again is answered the raster added, and asks nothing more.
+    let id = s.download_started_for(&asked[0]).unwrap();
+    assert!(s.download_landed_window(id, read_cog_window(&window).unwrap()));
+    let mut add = asked[0].params().clone();
+    add["id"] = json!(id);
+    add["window"] = json!({"bbox": "view"});
+    s.complete_download(id, &add).unwrap();
+    let added = s.map().layer_by_name("Window").filter(|l| l.is_raster()).unwrap().id;
+    let ran = s.poll_plugin_retries();
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    assert_eq!(ran[0].1.as_ref().unwrap()["layer"], json!(added), "{ran:?}");
+    assert_eq!(s.map().layers.len(), layers + 1, "added once");
+    assert!(s.take_url_requests().is_empty() && !s.plugin_retries_waiting());
+}
+
+/// A plugin's command asking for a window runs again once the app has read it and added it, and
+/// its `layer.addUrl` then answers the raster added (#1330): the window it lands with is the one
+/// the command asked for, so its claim takes it.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_plugin_command_runs_again_when_its_window_is_added() {
+    use crate::cmd::layer::{read_cog_window, window_asked};
+    use rustgis_data::raster::cog::example;
+    let (base, _) = serve_ranges(example(1024, 256));
+    let mut s = world();
+    plugin("eng-window", &["edit", "network"]);
+    let layers = s.map().layers.len();
+    let url = format!("{base}/scene.tif");
+    let bbox = json!([10.25, 45.5, 10.5, 45.75]);
+    let p = json!({"op": "layer.addUrl", "params": {"url": url, "bbox": bbox, "name": "Window"}});
+    s.run_leaving_downloads("plugin:eng-window/f", &p).unwrap();
+    let asked = s.take_url_requests();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(s.map().layers.len(), layers, "nothing added while it is read");
+    // The app reads it apart from the session and adds it with the request's number, and with
+    // what a task needs to read it again, as `start_window_read` does.
+    let id = s.download_started_for(&asked[0]).unwrap();
+    let read = read_cog_window(&window_asked(&s, asked[0].params()).unwrap()).unwrap();
+    assert!(s.download_landed_window(id, read));
+    let mut add = asked[0].params().clone();
+    add["id"] = json!(id);
+    add["window"] = json!({"bbox": bbox});
+    s.complete_download(id, &add).unwrap();
+    assert_eq!(s.map().layers.len(), layers + 1);
+    let added = s.map().layer_by_name("Window").filter(|l| l.is_raster()).unwrap().id;
+    let ran = s.poll_plugin_retries();
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    let (cmd, answer) = &ran[0];
+    assert_eq!(cmd, "plugin:eng-window/f");
+    assert_eq!(answer.as_ref().unwrap()["layer"], json!(added), "{answer:?}");
+    assert_eq!(s.map().layers.len(), layers + 1, "added once");
+    assert!(s.take_url_requests().is_empty() && !s.plugin_retries_waiting());
+}
+
 /// A window's read needs no session: on a thread, as the app reads it, then added when it lands
 /// (#1330). What can't be a window is refused before the read starts, and an error names the
 /// address without its keys.
@@ -33636,11 +33962,19 @@ fn a_cog_window_comes_in_as_a_raster() {
     assert!(e.contains("names a .geojson file"), "{e}");
     let e = s.run("layer.addUrl", &json!({"url": wrapped("https://data.example.com"), "bbox": [10.25, 45.5, 10.5, 45.75]})).unwrap_err();
     assert!(!e.contains("names a .com file"), "{e}");
-    // A plugin's command run by the app doesn't wait for a window: refused, and said.
+    // A plugin's command run by the app leaves a window to the app (#1330): asked for with its
+    // box and nothing fetched; a box that can't be read is refused as the command runs.
+    let before = sent.load(std::sync::atomic::Ordering::Relaxed);
+    let asked = json!({"url": format!("{base}/scene.tif"), "bbox": [10.25, 45.5, 10.5, 45.75], "name": "Left"});
     s.leave_downloads = true;
-    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/scene.tif"), "bbox": [10.25, 45.5, 10.5, 45.75]})).unwrap_err();
+    assert_eq!(s.run("layer.addUrl", &asked).unwrap()["pending"], true);
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/scene.tif"), "bbox": "here"})).unwrap_err();
     s.leave_downloads = false;
-    assert!(e.contains("a plugin's command can't do in the app yet"), "{e}");
+    assert!(e.contains("bbox is"), "{e}");
+    assert_eq!(sent.load(std::sync::atomic::Ordering::Relaxed), before, "nothing fetched");
+    let taken = s.take_url_requests();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].params()["bbox"], asked["bbox"]);
     // Byte windows round nothing, and say nothing of it; an Int32 window of 16,777,216 plus the
     // byte value says how many `f32` rounded: the odd ones, half of its 65,536 cells.
     assert!(s.notices_since(mark0).iter().all(|n| !n.text.contains("rounded")), "{:?}", s.notices_since(mark0));
@@ -38450,4 +38784,133 @@ fn a_models_geolibre_step_runs_ahead_and_is_taken() {
     read_land(&mut s, read).unwrap();
     assert_eq!(s.tools_taken, 1, "the GeoLibre step was taken, not run again here");
     assert!(s.map().layer_by_name("Slope").is_some());
+}
+
+/// A script's zone of spectral means is read on the script's copy of the session, off the UI
+/// thread (#1562), and the run here takes it: the same answer as read here. A zone changed
+/// meanwhile is read again here, and a cancelled run looks at Cancel as it reads the zone.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_scripts_spectral_zone_is_read_on_its_copy() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use base64::Engine;
+    use rustgis_analysis::control::Control;
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let enc = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let gt = GeoTransform { origin_x: 10.0, origin_y: 45.0, pixel_width: 0.01, pixel_height: -0.01 };
+    let bands = (0..3).map(|b| (0..16).map(|i| (30 - b * 10 + i) as f32).collect()).collect();
+    let r = Raster::new("scene", 4, 4, bands, gt, Crs::LonLat, None, ColorHint::Rgb { alpha: false }, "UInt8").unwrap();
+    let tiff = enc(&geotiff::write(&r, 0).unwrap());
+    let zone = |x1: f64| {
+        enc(json!({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry":
+            {"type": "Polygon", "coordinates": [[[10.0, 45.0], [x1, 45.0], [x1, 44.98], [10.0, 44.98], [10.0, 45.0]]]}}]})
+        .to_string()
+        .as_bytes())
+    };
+    let session = || {
+        let mut s = Session::new(Project::default());
+        s.run("layer.addDataBytes", &json!({"fileName": "scene.tif", "data": tiff})).unwrap();
+        s.run("layer.addDataBytes", &json!({"fileName": "zone.geojson", "data": zone(10.02)})).unwrap();
+        s
+    };
+    let p = json!({"layer": "scene", "zone": "zone"});
+    let here = session().run("raster.spectral", &p).unwrap();
+    assert_eq!(here["pixels"], 4, "{here}");
+
+    let script = json!({"script": format!("raster.spectral {p}")});
+    let mut s = session();
+    let ahead = read_ahead(&mut s, "script.run", &script).unwrap();
+    assert!(ahead.reads(), "the script runs on a copy");
+    let read = ahead.run(&Control::stoppable()).unwrap();
+    let v = read_land(&mut s, read).unwrap();
+    assert_eq!(s.zones_taken, 1);
+    assert!(s.zones_ahead.is_none());
+    assert_eq!(v["ran"][0]["result"], here, "{v}");
+
+    // The zone changed while the copy ran: read again here, on the zone as it is now.
+    let mut s = session();
+    let read = read_ahead(&mut s, "script.run", &script).unwrap().run(&Control::stoppable()).unwrap();
+    s.run("layer.remove", &json!({"layer": "zone"})).unwrap();
+    s.run("layer.addDataBytes", &json!({"fileName": "zone.geojson", "data": zone(10.04)})).unwrap();
+    let now = read_land(&mut s, read).unwrap();
+    assert_eq!(s.zones_taken, 0);
+    let direct = s.run("raster.spectral", &p).unwrap();
+    assert_eq!(direct["pixels"], 8, "{direct}");
+    assert_eq!(now["ran"][0]["result"], direct, "the zone as it is now");
+
+    // Cancelled as the copy starts: the zone's read looks at it, and nothing lands.
+    let mut s = session();
+    let control = Control::cancelled_once_started();
+    assert!(read_ahead(&mut s, "script.run", &script).unwrap().run(&control).is_err());
+    assert!(control.looked() > 0, "the zone's read looked at Cancel");
+}
+
+/// The Error Inspector's topology check runs ahead on a thread of its own in the desktop app
+/// (#1291): the command takes it as it lands, with the same answer and errors as checked here; a
+/// layer changed meanwhile is checked again; a cancelled check looks at Cancel and lands nothing.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_topology_check_runs_ahead_and_is_taken() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    let square = |x: f64| {
+        json!({"type": "Feature", "properties": {}, "geometry": {"type": "Polygon",
+        "coordinates": [[[x, 0.0], [x + 1.0, 0.0], [x + 1.0, 1.0], [x, 1.0], [x, 0.0]]]}})
+    };
+    let parcels =
+        |xs: &[f64]| json!({"type": "FeatureCollection", "features": xs.iter().map(|x| square(*x)).collect::<Vec<_>>()}).to_string();
+    let session = || {
+        let mut s = Session::new(Project::default());
+        s.run("layer.addDataText", &json!({"fileName": "parcels.geojson", "text": parcels(&[0.0, 0.5, 3.0])})).unwrap();
+        s.run("topology.rules", &json!({"add": {"rule": "mustNotOverlap", "layer": "parcels"}})).unwrap();
+        s
+    };
+    let mut here = session();
+    let expected = here.run("topology.validate", &Value::Null).unwrap();
+    assert_eq!(expected["errors"], 1, "{expected}");
+
+    let mut s = session();
+    let ahead = read_ahead(&mut s, "topology.validate", &json!({})).unwrap();
+    assert!(ahead.reads());
+    let read = ahead.run(&Control::stoppable()).unwrap();
+    assert!(s.topology_errors.is_empty(), "nothing is kept before it lands");
+    assert_eq!(read_land(&mut s, read).unwrap(), expected);
+    assert!(s.read_ahead.is_none(), "the check was taken");
+    assert_eq!(s.topology_errors.len(), here.topology_errors.len());
+
+    // The layer changed while it was checked: said, not checked again here (which would hold the
+    // window), and the errors it had are kept.
+    let mut s = session();
+    s.topology_errors = here.topology_errors.clone();
+    let read = read_ahead(&mut s, "topology.validate", &json!({})).unwrap().run(&Control::stoppable()).unwrap();
+    s.run("layer.remove", &json!({"layer": "parcels"})).unwrap();
+    s.run("layer.addDataText", &json!({"fileName": "parcels.geojson", "text": parcels(&[0.0, 2.0, 3.0])})).unwrap();
+    let e = read_land(&mut s, read).unwrap_err();
+    assert!(e.contains("changed while they were checked"), "{e}");
+    assert!(s.read_ahead.is_none());
+    assert_eq!(s.topology_errors.len(), 1, "the errors it had are kept");
+    // Checked where it is asked (a script, the assistant), it checks the layer as it is now.
+    assert_eq!(s.run("topology.validate", &Value::Null).unwrap()["errors"], 0);
+
+    // A rule whose covering layer is gone still has its layer's latitudes checked.
+    let mut s = session();
+    s.run("layer.addDataText", &json!({"fileName": "cover.geojson", "text": parcels(&[0.0])})).unwrap();
+    let points = json!({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [0.5, 0.5]}}]});
+    s.run("layer.addDataText", &json!({"fileName": "wells.geojson", "text": points.to_string()})).unwrap();
+    s.run("topology.rules", &json!({"add": {"rule": "mustBeCoveredBy", "layer": "wells", "by": "cover"}})).unwrap();
+    s.run("layer.remove", &json!({"layer": "cover"})).unwrap();
+    let mark = s.notice_mark();
+    assert_eq!(s.run("topology.validate", &Value::Null).unwrap()["errors"], 1, "the overlap rule's error, the other rule's none");
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("1 topology rule(s) weren't checked") && t.contains("'wells'")), "{said:?}");
+
+    // Cancelled as it starts: the check looks at it, and nothing lands.
+    let mut s = session();
+    let control = Control::cancelled_once_started();
+    assert!(read_ahead(&mut s, "topology.validate", &json!({})).unwrap().run(&control).is_err());
+    assert!(control.looked() > 0, "the check looked at Cancel");
+
+    // No rules: nothing to read ahead.
+    let mut s = Session::new(Project::default());
+    assert!(!read_ahead(&mut s, "topology.validate", &json!({})).unwrap().reads());
 }

@@ -2266,6 +2266,11 @@ impl RustGisApp {
             if let Some(command) = archive {
                 return readjob::run(self, command, params);
             }
+            // The topology check's work grows with the layers: on a thread of its own (#1291).
+            if id == "topology.validate" {
+                let params = if params.is_null() { json!({}) } else { params };
+                return readjob::run(self, "topology.validate", params);
+            }
         }
         self.run_with_prepared(id, params, AppDispatch::Direct)
     }
@@ -2336,6 +2341,8 @@ impl RustGisApp {
         r = self.deliver_gp_files(r);
         if r.is_ok() && id == "tool.set" {
             self.map.cancel_sketch();
+            // Esc chooses Explore: a plugin's pick stops waiting for the map, as for any tool.
+            pluginpanel::cancel_pick(self);
         }
         // Nested commands (including scripts) can replace rows too; never retarget a chosen
         // vertex or held gesture to the replacement feature at the same row.
@@ -4514,7 +4521,7 @@ impl RustGisApp {
             }
             #[cfg(not(target_arch = "wasm32"))]
             if window {
-                return self.start_window_read(p, url, q, claim);
+                return self.start_window_read(p, url, q, claim, request.and_then(rustgis_engine::UrlRequest::view_asked));
             }
             let shown = rustgis_engine::sources::address_in_message(&url);
             self.session.notify(i18n::fmt("Downloading {url}…", &[("url", &shown)]), false);
@@ -4674,11 +4681,19 @@ impl RustGisApp {
     }
 
     /// Starts reading a window of a cloud-optimised GeoTIFF (`p`, a `ui.addUrl` with `"bbox"`) on a
-    /// thread, to add it with `q` when it lands (#1330). The command line and scripts wait for it
-    /// in `layer.addUrl` instead. What's wrong with what was asked is refused here, on the frame.
+    /// thread, to add it with `q` when it lands (#1330). The command line waits for it in
+    /// `layer.addUrl` instead; a plugin's command or a script the app runs leaves it to the app.
+    /// What's wrong with what was asked is refused here, on the frame.
     #[cfg(not(target_arch = "wasm32"))]
-    fn start_window_read(&mut self, p: &Value, url: String, mut q: Value, claim: Option<u64>) -> Result<Value, String> {
-        let asked = rustgis_engine::cmd::layer::window_asked(&self.session, p).and_then(|asked| {
+    fn start_window_read(
+        &mut self,
+        p: &Value,
+        url: String,
+        mut q: Value,
+        claim: Option<u64>,
+        seen: Option<[f64; 4]>,
+    ) -> Result<Value, String> {
+        let asked = rustgis_engine::cmd::layer::window_asked_in(&self.session, p, seen).and_then(|asked| {
             if self.ui.window_reads.len() >= MAX_WINDOW_READS {
                 return Err(i18n::fmt(
                     "{url}: {count} windows are being read already: ask again once one has been added",
