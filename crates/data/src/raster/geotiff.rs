@@ -52,9 +52,7 @@ pub(super) fn extra_alpha<R: Read + Seek>(dec: &mut Decoder<R>) -> bool {
 /// bands follow it, else grey. GDAL marks the second band of an ordinary two-band file as 0,
 /// unspecified data.
 pub(super) fn multiband_color<R: Read + Seek>(dec: &mut Decoder<R>, n: u16) -> ColorHint {
-    let alpha =
-        n >= 2 && dec.find_tag_unsigned_vec::<u16>(Tag::ExtraSamples).ok().flatten().is_some_and(|v| matches!(v.first(), Some(1 | 2)));
-    if alpha { ColorHint::GrayAlpha } else { ColorHint::Gray }
+    if n >= 2 && extra_alpha(dec) { ColorHint::GrayAlpha } else { ColorHint::Gray }
 }
 
 fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
@@ -1749,9 +1747,15 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
         // so an 8-bit image reads back as one; otherwise 32-bit floats.
         let n = (w as usize) * (h as usize);
         let samples = n.checked_mul(all.len()).ok_or_else(|| err("the raster is too large to write"))?;
-        // Only whole values: an 8-bit raster can hold fractions after resampling, kept as floats.
-        let whole = r.bands.iter().all(|b| b.data.iter().all(|v| !r.is_valid(*v) || v.fract() == 0.0));
-        let as_bytes = whole && all.iter().all(|b| fits_bytes(r, *b)) && (r.nodata.is_some() || r.bands.iter().all(|b| b.stats.count == n));
+        // Decided from the values, not the statistics (a raster read in part has none): every
+        // valid value a whole number in 0–255, and an empty cell only where no-data can mark it.
+        // An 8-bit raster can hold fractions after resampling; those stay floats.
+        let in_bytes = |v: &f32| !r.is_valid(*v) || (v.fract() == 0.0 && (0.0..=255.0).contains(v));
+        let marked = |v: &f32| r.nodata.is_some() || r.is_valid(*v);
+        // Only an 8-bit raster: a float one holding byte-range values keeps its type and range.
+        let as_bytes = r.data_type == "UInt8"
+            && all.iter().all(|b| fits_bytes(r, *b))
+            && r.bands.iter().all(|b| b.data.iter().all(|v| in_bytes(v) && marked(v)));
         macro_rules! wide {
             ($colour:ty, $sample:expr) => {{
                 let mut data = super::room(samples, w as usize, h as usize)?;
@@ -2071,11 +2075,20 @@ mod tests {
         let back = read(std::io::Cursor::new(write_all(&rgbi).unwrap()), "b").unwrap();
         assert_eq!((back.band_count(), &back.color, back.data_type.as_str()), (5, &rgbi.color, "UInt8"));
         assert!((0..5).all(|b| back.bands[b].data == rgbi.bands[b].data));
+        // A float raster holding byte-range whole values stays float, with its own range.
+        let floats = vec![vec![0.0, 1.0, 7.0, 9.0, 4.0, 3.0], vec![1.0; 6]];
+        let floats = Raster::unmeasured("f", 3, 2, floats, gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        assert_eq!(read(std::io::Cursor::new(write_all(&floats).unwrap()), "f").unwrap().data_type, "Float32");
         // An 8-bit raster holding a fraction (a resampled mean) keeps it: written as floats.
         let mean = vec![vec![0.0, 1.5, 7.0, 9.0, 0.0, 3.0], vec![1.0; 6]];
         let means = Raster::new("m", 3, 2, mean, gt, Crs::LonLat, Some(0.0), ColorHint::Gray, "UInt8").unwrap();
         let back = read(std::io::Cursor::new(write_all(&means).unwrap()), "m").unwrap();
         assert_eq!(back.value(0, 1, 0), Some(1.5));
+        // A raster without statistics (read in part) is judged by its values: 1200 isn't a byte.
+        let tall = vec![vec![1200.0, 0.0, 300.0, 1.0, 2.0, 3.0], vec![1.0; 6]];
+        let tall = Raster::unmeasured("t", 3, 2, tall, gt, Crs::LonLat, Some(0.0), ColorHint::Gray, "UInt8").unwrap();
+        let back = read(std::io::Cursor::new(write_all(&tall).unwrap()), "t").unwrap();
+        assert_eq!((back.value(0, 0, 0), back.value(0, 2, 0)), (Some(1200.0), Some(300.0)));
         // What `write` keeps whole is written as `write` writes it.
         let rgb = raster(3, ColorHint::Rgb { alpha: false });
         assert_eq!(write_all(&rgb).unwrap(), write(&rgb, 0).unwrap());
