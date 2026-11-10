@@ -33,12 +33,18 @@ pub(crate) struct Unread {
 impl Whole {
     /// `l`'s rows, to read with [`Whole::read`].
     pub(crate) fn of(l: &Layer) -> Self {
-        let rows = if l.is_streamed() {
-            let mut copy = l.clone();
+        let rows = if let Some(source) = &l.source {
+            // What a whole read needs of the layer (its source, and the name, fields, type and
+            // marks the read keeps), not the view's features and caches.
+            let ds = &l.dataset;
+            let mut header = Dataset::new(ds.name.clone(), ds.geometry_type, ds.fields.clone());
+            header.zm_dropped = ds.zm_dropped;
+            header.source = ds.source.clone();
+            let mut copy = Layer::new(l.id, header);
+            let mut source = source.clone();
             // Its own read: the live layer keeps the one under way for its view.
-            if let Some(source) = copy.source.as_mut() {
-                source.detach_read();
-            }
+            source.detach_read();
+            copy.source = Some(source);
             Rows::Source(Box::new(copy))
         } else {
             Rows::Held(l.dataset.clone())
@@ -76,7 +82,10 @@ impl Unread {
 
 /// The notice for `unread` rows of `layer`'s source that couldn't be read.
 pub(crate) fn unread_notice(layer: &str, unread: usize) -> String {
-    format!("{layer}: {unread} rows couldn't be read and were left out")
+    match unread {
+        1 => format!("{layer}: 1 row couldn't be read and was left out"),
+        n => format!("{layer}: {n} rows couldn't be read and were left out"),
+    }
 }
 
 /// The layers read in place that `command` with `params` reads whole from their sources (for its

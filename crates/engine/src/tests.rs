@@ -11701,12 +11701,22 @@ fn two_class_b64() -> String {
 /// rows the source can't give are said once.
 #[test]
 fn training_layers_read_in_place_train_from_their_whole_source() {
-    let dir = std::env::temp_dir().join(format!("rustgis-whole-training-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // Removed however the test ends.
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-whole-training-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let dir = &dir.0;
     let square = |class: &str, x: f64| json!({"type": "Feature", "properties": {"class": class}, "geometry": {"type": "Polygon", "coordinates": [[[x, 45.002], [x + 0.013, 45.002], [x + 0.013, 45.035], [x, 45.035], [x, 45.002]]]}});
     let bad = json!({"type": "Feature", "properties": {"class": "field"}, "geometry": {"type": "Polygon", "coordinates": "x"}});
-    let unread = |s: &Session| s.notices.iter().filter(|n| n.text.contains("couldn't be read and were left out")).count();
+    // The notice for the one row of the training layer its source can't give.
+    let one_unread = crate::cmd::whole::unread_notice("training", 1);
+    let unread = |s: &Session| s.notices.iter().filter(|n| n.text == one_unread).count();
     for (file, extra) in [("clean.geojson", None), ("bad.geojson", Some(bad.clone()))] {
         let mut features = vec![square("water", 10.002), square("field", 10.025)];
         features.extend(extra.clone());
@@ -11744,9 +11754,8 @@ fn training_layers_read_in_place_train_from_their_whole_source() {
     s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true, "name": "training"})).unwrap();
     for command in ["dl.train", "raster.classifySupervised"] {
         let err = s.run(command, &json!({"layer": "scene", "training": "training", "classField": "class", "epochs": 5})).unwrap_err();
-        assert!(err.contains("training: 1 rows couldn't be read and were left out"), "{command}: {err}");
+        assert!(err.contains(&one_unread), "{command}: {err}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -35639,7 +35648,7 @@ fn reads_made_ahead_are_taken_by_the_command() {
     assert_eq!(crate::cmd::reads::read_land(&mut s, read).unwrap()["features"], 2);
     assert!(s.read_ahead.is_none());
     assert!(!s.map().layer(id as u32).unwrap().is_streamed());
-    let unread = |s: &Session| s.notices.iter().filter(|n| n.text.contains("couldn't be read and were left out")).count();
+    let unread = |s: &Session| s.notices.iter().filter(|n| n.text.contains(" couldn't be read and w")).count();
     assert_eq!(unread(&s), 0, "every row read: nothing said");
 
     // A row that can't be read is left out and said, once, read ahead or here.

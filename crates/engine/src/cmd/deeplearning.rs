@@ -150,7 +150,9 @@ fn model_index(input: &impl super::InputSource, p: &Value) -> Result<usize, Stri
 /// ([`Session::stoppable`](crate::Session::stoppable)), it takes no work cap, as from the pane.
 /// It runs where it is called, reading of a layer read in place, training and all: the app's
 /// Deep Learning Tools train through `dl.classify`, which runs on a thread of its own; this is
-/// the scripts', command line's and assistant's way to train without classifying.
+/// the scripts', command line's and assistant's way to train without classifying. Called on the
+/// app's thread (by the assistant), it holds the window while it reads: a training layer read
+/// from a database or a web address is read whole first, for as long as that takes.
 fn train(s: &Session, p: &Value) -> Result<(DlModel, super::whole::Unread), String> {
     let t = training(s, p)?;
     if s.stoppable {
