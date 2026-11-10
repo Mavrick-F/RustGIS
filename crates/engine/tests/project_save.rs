@@ -313,7 +313,13 @@ fn nonfinite_design_and_archived_values_are_counted_when_output_is_prepared() ->
     s.map_mut().add_dataset(dataset);
     s.run("data.archive", &json!({"layer": "Design"}))?;
     s.run("edit.setValue", &json!({"layer": "Design", "row": 0, "field": "level", "value": 1}))?;
-    s.run("edit.template", &json!({"layer": "Design", "name": "T", "defaults": {"level": "NaN"}}))?;
+    s.run("edit.template", &json!({"layer": "Design", "name": "T", "defaults": {"level": 2}}))?;
+    for text in ["NaN", "inf", "1e400"] {
+        assert!(s.run("edit.template", &json!({"layer": "Design", "name": "T", "defaults": {"level": text}})).is_err());
+        assert_eq!(s.map().layers[0].design.templates[0].defaults[0].1, V::Float(2.0));
+    }
+    // Native callers and imported designs can still hold hostile defaults: output must count them.
+    s.map_mut().layers[0].design.templates[0].defaults[0].1 = V::Float(f64::NAN);
     assert_eq!(s.map().layers[0].dataset.unsaved_numbers(), 0);
     assert_eq!(s.map().layers[0].design.unsaved_numbers(), 2);
     for (text, report) in [s.project.saved_text(None)?, s.project.clone().recovery_text_with_report()?] {

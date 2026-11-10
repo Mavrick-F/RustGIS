@@ -181,7 +181,7 @@ pub(crate) fn coerce_cut(v: Value, ty: FieldType) -> (Value, Cut) {
 
 /// Text and native numbers that cannot be retained as numeric field values.
 /// Ordinary invalid words keep the existing parser's behavior; non-finite numbers are explicit.
-fn non_finite_input(value: &Value, ty: FieldType) -> bool {
+pub(crate) fn non_finite_input(value: &Value, ty: FieldType) -> bool {
     ty.is_numeric()
         && match value {
             Value::Float(f) => !f.is_finite(),

@@ -75,12 +75,15 @@ impl Value {
         matches!(self, Value::Float(value) if !value.is_finite())
     }
 
-    /// Parses a typed source field without discarding a non-finite Double. Its original number
+    /// Parses a typed numeric source field without discarding a non-finite value. Its original number
     /// stays available until output, where the counted save notice explains conversion to null.
     /// Interactive edits use [`Self::parse`] and refuse non-finite input at command ingress.
     pub fn parse_source(text: &str, ty: FieldType) -> Value {
-        if ty == FieldType::Double {
-            return text.trim().parse::<f64>().map(Value::Float).unwrap_or(Value::Null);
+        if ty.is_numeric()
+            && let Ok(number) = text.trim().parse::<f64>()
+            && (ty == FieldType::Double || !number.is_finite())
+        {
+            return Value::Float(number);
         }
         Self::parse(text, ty)
     }
@@ -127,9 +130,11 @@ impl Value {
             return Value::Null;
         }
         match ty {
-            FieldType::Integer => {
-                t.parse::<i64>().map(Value::Int).or_else(|_| t.parse::<f64>().map(|f| Value::Int(f as i64))).unwrap_or(Value::Null)
-            }
+            FieldType::Integer => t
+                .parse::<i64>()
+                .ok()
+                .or_else(|| t.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| f as i64))
+                .map_or(Value::Null, Value::Int),
             FieldType::Double => t.parse::<f64>().ok().filter(|f| f.is_finite()).map_or(Value::Null, Value::Float),
             FieldType::Boolean => Value::Bool(matches!(t.to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "y")),
             FieldType::Text => Value::Text(t.to_string()),
@@ -425,6 +430,8 @@ mod tests {
     fn a_number_field_reads_text_that_is_not_a_finite_number_as_null() {
         for text in ["NaN", "inf", "-inf", "infinity", "1e400"] {
             assert_eq!(Value::parse(text, FieldType::Double), Value::Null, "{text}");
+            assert_eq!(Value::parse(text, FieldType::Integer), Value::Null, "{text}");
+            assert!(matches!(Value::parse_source(text, FieldType::Integer), Value::Float(f) if !f.is_finite()));
             assert!(matches!(Value::parse_source(text, FieldType::Double), Value::Float(f) if !f.is_finite()));
         }
         assert_eq!(Value::parse("2.5", FieldType::Double), Value::Float(2.5));
