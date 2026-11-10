@@ -4349,7 +4349,10 @@ fn imported_items_report_content_cuts() {
         (
             "report.open",
             json!({"name": "Survey", "layer": "Countries"}),
-            json!({"name": "Survey", "layer": "Countries", "title": "t".repeat(501), "where": "missing_column = 1"}),
+            json!({"name": "Survey", "layer": "Countries", "title": "t".repeat(501), "where": "missing_column = 1",
+                "fields": ["missing_column"], "groups": ["missing_group"], "stats": [{"field": "missing_stat", "kind": "sum"}],
+                "sort": "missing_sort", "pictureField": "missing_picture", "attachmentsField": "missing_attachment",
+                "chart": {"category": "missing_category"}}),
         ),
     ] {
         for (value, expected) in [(clean, 0), (damaged, 1)] {
@@ -4367,7 +4370,35 @@ fn imported_items_report_content_cuts() {
             }
             if command == "report.open" && expected == 1 {
                 assert_eq!(s.notices.iter().filter(|n| n.text.contains("1 report filter that could not be read")).count(), 1);
-                assert!(s.project.reports.last().unwrap().where_clause.is_empty());
+                for text in [
+                    "1 report column(s) missing",
+                    "1 report grouping field(s) missing",
+                    "1 report statistic(s)",
+                    "4 report sort, picture, attachment or chart setting(s)",
+                    "1 report column set(s) replaced",
+                ] {
+                    assert_eq!(s.notices.iter().filter(|n| n.text.contains(text)).count(), 1, "{text}: {:?}", s.notices);
+                }
+                let report = s.project.reports.last().unwrap();
+                assert!(report.where_clause.is_empty() && report.groups.is_empty() && report.stats.is_empty());
+                assert!(
+                    report.sort.is_none() && report.picture_field.is_none() && report.attachments_field.is_none() && report.chart.is_none()
+                );
+                assert_eq!(
+                    report.fields,
+                    s.map().layer_by_name("Countries").unwrap().dataset.fields.iter().take(64).map(|f| f.name.clone()).collect::<Vec<_>>()
+                );
+                // The same fitting helper also runs after an existing report changes layer.
+                let report = s.project.reports.last_mut().unwrap();
+                report.fields = vec!["missing_again".into()];
+                report.where_clause = "missing_again = 1".into();
+                s.notices.clear();
+                s.run("report.update", &json!({"layer": "Countries"})).unwrap();
+                assert_eq!(s.notices.iter().filter(|n| n.text.contains("1 report column(s) missing")).count(), 1);
+                assert_eq!(s.notices.iter().filter(|n| n.text.contains("1 report filter that could not be read")).count(), 1);
+                s.notices.clear();
+                s.run("report.update", &json!({"layer": "Countries"})).unwrap();
+                assert!(s.notices.is_empty(), "a fitted report stays quiet: {:?}", s.notices);
             }
         }
     }
