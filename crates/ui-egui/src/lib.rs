@@ -66,6 +66,7 @@ mod panes;
 mod pluginpanel;
 mod pluginstart;
 mod pluginsui;
+mod popupmedia;
 mod portalsui;
 #[cfg(not(target_arch = "wasm32"))]
 mod readjob;
@@ -79,6 +80,8 @@ pub enum Landed {
 }
 #[cfg(not(target_arch = "wasm32"))]
 mod relayshot;
+#[cfg(not(target_arch = "wasm32"))]
+mod reloaddata;
 mod repairsource;
 mod reportpane;
 mod ribbon;
@@ -93,6 +96,7 @@ mod shortcutfile;
 mod shortcutui;
 mod showme;
 mod sourcespane;
+mod spectralui;
 mod sqlbox;
 mod sqlpane;
 mod stacui;
@@ -710,6 +714,8 @@ pub struct UiState {
     pub hidden_tabs: Vec<String>,
     /// Extra Quick Access Toolbar commands.
     pub quick_access: Vec<String>,
+    /// Whether a layout's PDF georeferences its map frames (Layout › Export › Georeference PDF).
+    pub(crate) pdf_georeference: bool,
     /// The native title bar the header is drawn into; set by the desktop app on macOS.
     pub titlebar: Option<TitlebarMetrics>,
     /// Saved pane arrangements: (name, left pane, right pane in view, ribbon tab, right panes open).
@@ -981,6 +987,7 @@ impl Default for UiState {
             geolibre_zarr: Vec::new(),
             hidden_tabs: Vec::new(),
             quick_access: Vec::new(),
+            pdf_georeference: true,
             titlebar: None,
             pane_sets: Vec::new(),
             layer_filter: String::new(),
@@ -1561,11 +1568,13 @@ impl RustGisApp {
         r
     }
 
-    /// A layout as PDF or PNG bytes, guarded like `Session::run`.
+    /// A layout as PDF or PNG bytes, guarded like `Session::run`; a PDF georeferenced as Publish ›
+    /// Export › Georeference PDF says.
     fn layout_bytes(&mut self, li: usize, pdf: bool, dpi: f64) -> Result<Vec<u8>, String> {
+        let georeference = self.ui.pdf_georeference;
         let session = &mut self.session;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rustgis_engine::cmd::layout::layout_bytes(session, li, pdf, dpi, true)
+            rustgis_engine::cmd::layout::layout_bytes_with(session, li, pdf, dpi, true, georeference)
         }))
         .unwrap_or_else(|_| Err("the layout export failed unexpectedly".into()));
         if let Err(e) = &r {
@@ -2198,6 +2207,8 @@ impl RustGisApp {
         assistantpane::peer_replaced(self);
         self.ui.web_file = None;
         self.map.deleting = None;
+        // A spectral profile's points were read on the old project's rasters.
+        self.workflow.spectral.clear();
         self.retire_cog_probes();
         if let Some(steps) = self.ws.recording.take() {
             self.session.notify(
@@ -2298,6 +2309,9 @@ impl RustGisApp {
         if r.is_ok() && id == "tool.set" {
             self.map.cancel_sketch();
         }
+        // Nested commands (including scripts) can replace rows too; never retarget a chosen
+        // vertex or held gesture to the replacement feature at the same row.
+        crate::vertexedit::cancel_stale_drag(self);
         if let Err(e) = &r {
             self.command_failed(id, e, notice_mark);
         }
@@ -2312,6 +2326,8 @@ impl RustGisApp {
             self.ui.web_file = None;
             // A deletion asked for in the old project never reaches a namesake in the new one.
             self.map.deleting = None;
+            // Nor are a spectral profile's points read on a namesake raster of the new one.
+            self.workflow.spectral.clear();
             // A recording's steps name the old project's layers: it ends here, and says so.
             if let Some(steps) = self.ws.recording.take() {
                 let n = steps.len().to_string();
@@ -2356,7 +2372,7 @@ impl RustGisApp {
         // fields stay with the old one.
         layoutview::follow_project(self);
         if r.is_ok() && matches!(id, "edit.undo" | "edit.redo") {
-            self.map.vertex = None;
+            crate::vertexedit::choose(self, None);
             if let Some(before) = steps_before
                 && task_steps(self).is_none_or(|now| now != before)
             {
@@ -2666,6 +2682,12 @@ impl RustGisApp {
         }
         let toggle_right = |ui: &mut UiState, pane: RightPane| ui.toggle_right(pane);
         match id {
+            "ui.reloadData" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                return reloaddata::request(self, p);
+                #[cfg(target_arch = "wasm32")]
+                return Err(tl!("Reload Data from local files requires the desktop app.").into());
+            }
             "ui.pane.contents" => self.ui.left = if self.ui.left == Some(LeftPane::Contents) { None } else { Some(LeftPane::Contents) },
             "ui.pane.catalog" => self.ui.left = if self.ui.left == Some(LeftPane::Catalog) { None } else { Some(LeftPane::Catalog) },
             "ui.pane.sources" => self.ui.left = if self.ui.left == Some(LeftPane::Sources) { None } else { Some(LeftPane::Sources) },
@@ -3426,10 +3448,11 @@ impl RustGisApp {
                         if pdf_only { (&["pdf"], tl!("PDF")) } else { (&["pdf", "png", "svg"], tl!("PDF, PNG or SVG")) };
                     if let Some(path) = dialogs::pick_save(&format!("{name}.pdf"), exts, kinds) {
                         // Drawn on a thread of its own, with progress and Cancel in the status bar.
+                        let params = json!({"layout": li, "path": path, "dpi": 200, "georeference": self.ui.pdf_georeference});
                         #[cfg(not(target_arch = "wasm32"))]
-                        return exportjob::start(self, "layout.export", json!({"layout": li, "path": path, "dpi": 200}));
+                        return exportjob::start(self, "layout.export", params);
                         #[cfg(target_arch = "wasm32")]
-                        return self.run("layout.export", json!({"layout": li, "path": path, "dpi": 200}));
+                        return self.run("layout.export", params);
                     }
                 }
             }
@@ -3943,8 +3966,8 @@ impl RustGisApp {
                 if matches!(ext.as_str(), "parquet" | "geoparquet") {
                     dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(ds, &name));
                 }
-                if left_out > 0 {
-                    self.session.notify(format!("{name}: {left_out} features without drawable geometry were left out"), false);
+                if let Some(note) = io::left_out_note(&name, &ext, left_out) {
+                    self.session.notify(note, false);
                 }
                 if ext == "zip" && rustgis_engine::data::raster::wkt::to_wkt(crs).is_none() {
                     self.session.notify(format!("{name}: no .prj written, as {} has no WKT form", crs.label()), false);
@@ -5628,6 +5651,7 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "data.similar",
     "layer.geocode",
     "layer.repairSource",
+    "layer.reloadData",
     "report.new",
     "report.open",
     "share.webLayer",
@@ -6332,10 +6356,13 @@ mod vertex_undo_tests {
         let id = app.session.map().layer_by_name("Paths").unwrap().id;
         let insert = json!({"layer": id, "row": row, "action": "insert", "index": 0, "lon": 0.5, "lat": 0});
         app.run("edit.vertex", insert).unwrap();
-        app.map.vertex = Some((id, row, VertexId::new(0, 0, 1)));
+        let chosen = Some((id, row, VertexId::new(0, 0, 1)));
+        crate::vertexedit::choose(&mut app, chosen);
+        assert_eq!(app.map.vertex, chosen, "chosen before undo");
         app.run("edit.undo", Value::Null).unwrap();
         assert_eq!(app.map.vertex, None, "undo");
-        app.map.vertex = Some((id, row, VertexId::new(0, 0, 1)));
+        crate::vertexedit::choose(&mut app, chosen);
+        assert_eq!(app.map.vertex, chosen, "chosen before redo");
         app.run("edit.redo", Value::Null).unwrap();
         assert_eq!(app.map.vertex, None, "redo");
     }

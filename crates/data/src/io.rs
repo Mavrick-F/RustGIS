@@ -546,6 +546,8 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             #[cfg(not(target_arch = "wasm32"))]
             {
                 crate::progress::begin(ds.features.len());
+                // Every feature is written: a layer of several kinds of geometry gets a GEOMETRY
+                // column, and one that declares no type takes its geometry's.
                 let table = crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?;
                 Ok((0, Some(table)))
             }
@@ -683,7 +685,10 @@ fn write_new_with(path: &Path, write: impl FnOnce(&mut dyn std::io::Write) -> st
 }
 
 /// Writes through a temporary file that is synced and renamed into place, so an interrupted
-/// write never truncates an existing file. The temporary file is removed on failure.
+/// write never truncates an existing file. The temporary file is removed on failure. A symbolic
+/// link is written through, and an existing file keeps its permissions. For app-managed files
+/// whose destination link must be replaced instead, use [`replace_atomic`]. On Unix, failure to
+/// inspect or preserve an existing file's permissions is an error and leaves that file unchanged.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     write_atomic_with(path, |w| w.write_all(bytes))
@@ -696,12 +701,47 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
     path: &Path,
     write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
+    let path = link_target(path)?;
+    atomic_write_at(&path, write)
+}
+
+/// Atomically replaces an app-managed file, replacing a final symbolic link rather than
+/// writing through it. Parent directories must be trusted, as for [`write_atomic`]. Existing
+/// regular files keep their permissions; a replaced link uses a new file's permissions.
+pub fn replace_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    atomic_write_at(path, |out| out.write_all(bytes))
+}
+
+/// Stages content beside the chosen destination; errors and cancellation retain the old file.
+fn atomic_write_at<T, E: From<std::io::Error>>(
+    path: &Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
     use std::io::Write;
     let tmp = temp_beside(path)?;
     // Opened before the guard, so a name already taken is never removed.
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
     // Removes the file on an error and on a panic in `write` alike, unless it was moved into place.
     let staged = Staged(&tmp);
+    // The new file takes the old one's mode before any content is written, so a private file
+    // (0600) never becomes readable by others. On Windows a new file inherits its folder's access
+    // rules, and copying a read-only flag would only make the rename fail.
+    #[cfg(unix)]
+    match std::fs::symlink_metadata(path) {
+        Ok(old) if !old.file_type().is_symlink() => {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = old.permissions();
+            // Mounts that cannot chmod need no syscall when the mode already matches.
+            // If preserving a different mode fails, refuse the save instead of widening it.
+            if file.metadata()?.permissions().mode() != permissions.mode() {
+                file.set_permissions(permissions)?;
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let mut out = std::io::BufWriter::new(file);
     let value = write(&mut out)?;
     out.flush()?;
@@ -717,6 +757,32 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
     std::mem::forget(staged);
     Ok(value)
 }
+
+/// The file a write to `path` replaces: `path` itself, or, when it is a symbolic link, the file
+/// its chain of links ends at (which need not exist yet). A link's relative target counts from
+/// the link's folder. More than [`MAX_LINKS`] links in a row, as in a loop, is an error.
+fn link_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let mut at = path.to_path_buf();
+    for _ in 0..=MAX_LINKS {
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let next = std::fs::read_link(&at)?;
+                // `join` keeps an absolute target as it is.
+                at = at.parent().map_or_else(|| next.clone(), |folder| folder.join(&next));
+            }
+            Ok(_) => return Ok(at),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(at),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{} leads through more than {MAX_LINKS} symbolic links", path.display()),
+    ))
+}
+
+/// How many symbolic links in a row [`link_target`] follows, as many as Linux does.
+const MAX_LINKS: usize = 40;
 
 /// A file being written beside its destination: removed when dropped, as an export that
 /// failed or panicked leaves it. A finished export forgets it once the file is renamed.
@@ -1156,6 +1222,8 @@ impl Collector {
         let mut unconverted = 0usize;
         // Only features kept count toward the heights dropped.
         let mut zm = 0usize;
+        // Features kept, as longitude/latitude, with a latitude past the poles.
+        let mut swapped = 0usize;
         for (n, (geom, values, had_z)) in self.features.into_iter().enumerate() {
             // A feature that can't be converted is dropped, and its id is not reused, as when the
             // file is read in place.
@@ -1176,6 +1244,9 @@ impl Collector {
                 }
             }
             zm += usize::from(had_z);
+            // Converted geometry is already within ±90.5° (or dropped above), so only what is read
+            // as longitude/latitude can be swapped.
+            swapped += usize::from(declared.is_none() && geom.as_ref().is_some_and(latitude_past_poles));
             ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
         }
         ds.geometry_type = dominant_type(&ds);
@@ -1191,6 +1262,7 @@ impl Collector {
             // What couldn't be converted can't come back by defining the projection again.
             ds.crs_incomplete = unconverted > 0;
         }
+        report.messages.extend(swapped_latitude_note(swapped));
         // Last, as a source read in place notes it.
         ds.drop_zm(&mut report, zm);
         Ok((ds, report))
@@ -1650,6 +1722,26 @@ pub(crate) fn read_rows(
         }
     }
     Ok((ds, report))
+}
+
+/// Whether a geometry has a position that could be longitude/latitude with the two swapped: its x
+/// within ±180.5° and its y past the poles (beyond ±90.5°, as the readers check). Eastings and
+/// northings, with x far past 180 too, aren't taken for that. Each position is judged on its own, so
+/// another position elsewhere doesn't hide it.
+pub(crate) fn latitude_past_poles(g: &Geometry) -> bool {
+    let mut past = false;
+    g.for_each_coord(|c| past |= c.x.abs() <= 180.5 && c.y.abs() > 90.5);
+    past
+}
+
+/// The notice for `n` features with a latitude past the poles (none for 0).
+pub(crate) fn swapped_latitude_note(n: usize) -> Option<String> {
+    let tail = "a latitude past ±90°: longitude and latitude may be swapped";
+    match n {
+        0 => None,
+        1 => Some(format!("1 feature has {tail}")),
+        n => Some(format!("{n} features have {tail}")),
+    }
 }
 
 /// Whether a geometry has coordinates outside longitude/latitude's range.
@@ -2516,6 +2608,20 @@ fn dbf_boolean(value: &Value) -> Option<bool> {
     }
 }
 
+/// The notice for the `left_out` features an export to `name` (a file of extension `ext`) left
+/// out, as [`write_path_in`] and [`write_bytes_in`] count them; `None` when none were. A
+/// Shapefile export (`.shp`, or zipped) writes only drawable geometry of the layer's one kind (it
+/// writes no null shapes, though the format has them); FlatGeobuf, KML and GPX exports write only
+/// features with geometry; the other formats leave nothing out.
+pub fn left_out_note(name: &str, ext: &str, left_out: usize) -> Option<String> {
+    (left_out > 0).then(|| match ext {
+        "shp" | "zip" => format!(
+            "{name}: {left_out} features left out of the Shapefile: without drawable geometry, or with geometry of another kind than the layer's"
+        ),
+        _ => format!("{name}: {left_out} features without drawable geometry were left out"),
+    })
+}
+
 /// Whether [`shapefile_parts_in`] writes a feature with geometry `g` to a layer of type `gt`: one
 /// of the layer's kind with something drawable (a finite point, a line part of two finite points,
 /// a polygon whose outer ring has three).
@@ -2682,6 +2788,102 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// A Shapefile export of a polygon layer holding a point and a feature without geometry writes
+    /// the polygon and counts both left out, the point for its kind; a layer of polygons loses none.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_shapefile_counts_geometry_of_another_kind_left_out() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let geojson = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","properties":{"name":"area"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}},
+            {"type":"Feature","properties":{"name":"spot"},"geometry":{"type":"Point","coordinates":[5,5]}},
+            {"type":"Feature","properties":{"name":"none"},"geometry":null}]}"#;
+        let (mixed, _) = read_geojson(geojson, "mixed")?;
+        let dir = tempfile::tempdir()?;
+        assert_eq!(write_path(&mixed, &dir.path().join("mixed.shp"))?, 2);
+        let (back, _) = read_path(&dir.path().join("mixed.shp"))?;
+        assert_eq!(back.features.len(), 1);
+        let mut areas = mixed.clone();
+        areas.features.truncate(1);
+        assert_eq!(write_path(&areas, &dir.path().join("areas.shp"))?, 0);
+        Ok(())
+    }
+
+    /// The left-out notice names what each format can't hold: a Shapefile, features without
+    /// drawable geometry or of another kind; the others, features without drawable geometry.
+    /// Nothing left out, no notice.
+    #[test]
+    fn left_out_notes_say_what_the_format_cant_hold() {
+        for ext in ["shp", "zip"] {
+            assert_eq!(
+                left_out_note("out", ext, 2).as_deref(),
+                Some(
+                    "out: 2 features left out of the Shapefile: without drawable geometry, or with geometry of another kind than the layer's"
+                )
+            );
+        }
+        for ext in ["fgb", "kml", "gpx"] {
+            assert_eq!(left_out_note("out", ext, 1).as_deref(), Some("out: 1 features without drawable geometry were left out"));
+        }
+        assert_eq!(left_out_note("out", "shp", 0), None);
+        assert_eq!(left_out_note("out", "gpkg", 0), None);
+    }
+
+    /// A GeoPackage export loses no geometry: a layer read from a GeoJSON of a polygon and a point
+    /// (declared a polygon layer, by its most common kind) gets a GEOMETRY column holding both, and
+    /// a feature without geometry stays, as a table holds it. A layer of one kind keeps its kind's
+    /// column, whether it declares its type or not.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_geopackage_of_a_mixed_layer_keeps_every_kind() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let geojson = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","properties":{"name":"area"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}},
+            {"type":"Feature","properties":{"name":"spot"},"geometry":{"type":"Point","coordinates":[5,5]}},
+            {"type":"Feature","properties":{"name":"none"},"geometry":null}]}"#;
+        let (mixed, _) = read_geojson(geojson, "mixed")?;
+        assert_eq!(mixed.geometry_type, GeometryType::Polygon);
+        let dir = tempfile::tempdir()?;
+        // The column's type, and the rows written with whether each has geometry, read with SQL.
+        let table = |path: &Path| -> std::result::Result<(String, Vec<(String, bool)>), Box<dyn std::error::Error>> {
+            let conn = rusqlite::Connection::open(path)?;
+            let kind: String = conn.query_row("SELECT geometry_type_name FROM gpkg_geometry_columns", [], |r| r.get(0))?;
+            let mut rows = conn.prepare(r#"SELECT "name", "geom" IS NOT NULL FROM "mixed" ORDER BY "fid""#)?;
+            let written = rows.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+            Ok((kind, written))
+        };
+        let all = vec![("area".to_string(), true), ("spot".to_string(), true), ("none".to_string(), false)];
+        let path = dir.path().join("mixed.gpkg");
+        assert_eq!(write_path(&mixed, &path)?, 0);
+        assert_eq!(table(&path)?, ("GEOMETRY".to_string(), all.clone()));
+        // Read back, the point and the polygon are both there.
+        let (back, _) = read_path(&path)?;
+        let mut kinds: Vec<GeometryType> = back.features.iter().filter_map(|f| f.geometry.as_ref().map(Geometry::kind)).collect();
+        kinds.sort_by_key(|k| format!("{k:?}"));
+        assert_eq!(kinds, [GeometryType::Point, GeometryType::Polygon]);
+        // A layer that declares no geometry type does the same.
+        let mut typeless = mixed.clone();
+        typeless.geometry_type = GeometryType::None;
+        let at = dir.path().join("typeless.gpkg");
+        assert_eq!(write_path(&typeless, &at)?, 0);
+        assert_eq!(table(&at)?, ("GEOMETRY".to_string(), all));
+        // Projected, every feature is written too.
+        let utm = Crs::from_epsg(32631).ok_or("no UTM zone 31N")?;
+        let projected = dir.path().join("projected.gpkg");
+        assert_eq!(write_path_in(&mixed, &projected, utm)?, 0);
+        assert_eq!(table(&projected)?.0, "GEOMETRY");
+        // One kind, declared or not: that kind's column, nothing left out.
+        let mut areas = mixed.clone();
+        areas.features.retain(|f| !matches!(f.geometry, Some(Geometry::Point(_))));
+        let one = vec![("area".to_string(), true), ("none".to_string(), false)];
+        let at = dir.path().join("areas.gpkg");
+        assert_eq!(write_path(&areas, &at)?, 0);
+        assert_eq!(table(&at)?, ("MULTIPOLYGON".to_string(), one.clone()));
+        areas.geometry_type = GeometryType::None;
+        let at = dir.path().join("typeless-areas.gpkg");
+        assert_eq!(write_path(&areas, &at)?, 0);
+        assert_eq!(table(&at)?, ("MULTIPOLYGON".to_string(), one));
+        Ok(())
+    }
+
     /// Exercises caller cleanup through the public Shapefile writer, one fresh process per collision.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -2818,6 +3020,86 @@ mod tests {
         assert!(write_atomic(&destination, b"must not replace directory").is_err());
         assert_eq!(std::fs::read(marker)?, b"keep destination contents");
         assert_eq!(std::fs::read_dir(&root)?.count(), 1, "failed install left a staging file");
+        std::fs::remove_dir_all(root)
+    }
+
+    /// Saving through a link (a project kept in a synced folder, linked from elsewhere) updates
+    /// the file it leads to, relative or dangling, and leaves the link in place; a loop is an
+    /// error that changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_writes_through_symbolic_links() -> std::io::Result<()> {
+        let root = temp_beside(&std::env::temp_dir().join("rustgis-atomic-link"))?;
+        std::fs::create_dir(&root)?;
+        let real_dir = root.join("real");
+        std::fs::create_dir(&real_dir)?;
+        let real = real_dir.join("project.rgis");
+        std::fs::write(&real, b"old")?;
+        let link = root.join("project.rgis");
+        std::os::unix::fs::symlink("real/project.rgis", &link)?;
+        let chained = root.join("chained.rgis");
+        std::os::unix::fs::symlink(&link, &chained)?;
+        write_atomic(&chained, b"new")?;
+        assert_eq!(std::fs::read(&real)?, b"new");
+        assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&chained)?.file_type().is_symlink());
+        assert_eq!(std::fs::read_dir(&real_dir)?.count(), 1, "a temp file was left behind");
+        // A dangling link gets its file created.
+        let missing = real_dir.join("missing.rgis");
+        let dangling = root.join("dangling.rgis");
+        std::os::unix::fs::symlink(&missing, &dangling)?;
+        write_atomic(&dangling, b"made")?;
+        assert_eq!(std::fs::read(&missing)?, b"made");
+        assert!(std::fs::symlink_metadata(&dangling)?.file_type().is_symlink());
+        // A loop is refused without touching anything.
+        let (a, b) = (root.join("a.rgis"), root.join("b.rgis"));
+        std::os::unix::fs::symlink(&b, &a)?;
+        std::os::unix::fs::symlink(&a, &b)?;
+        assert!(write_atomic(&a, b"loop").is_err());
+        assert!(std::fs::symlink_metadata(&a)?.file_type().is_symlink());
+        assert_eq!(std::fs::read_dir(&root)?.count(), 6, "a temp file was left behind");
+        let mut target = real.clone();
+        for i in 0..MAX_LINKS {
+            let next = root.join(format!("chain-{i}"));
+            std::os::unix::fs::symlink(&target, &next)?;
+            target = next;
+        }
+        write_atomic(&target, b"forty links")?;
+        assert_eq!(std::fs::read(&real)?, b"forty links");
+        let too_many = root.join("chain-over-limit");
+        std::os::unix::fs::symlink(&target, &too_many)?;
+        assert!(write_atomic(&too_many, b"too many").is_err());
+        assert_eq!(std::fs::read(&real)?, b"forty links");
+        // Managed files replace the link itself, retaining the target's original contents.
+        replace_atomic(&link, b"managed file")?;
+        assert!(!std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+        assert_eq!(std::fs::read(&link)?, b"managed file");
+        assert_eq!(std::fs::read(&real)?, b"forty links");
+        std::fs::remove_dir_all(root)
+    }
+
+    /// A private file stays private when saved over, and a new file still gets the usual mode.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_keeps_permissions() -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_beside(&std::env::temp_dir().join("rustgis-atomic-mode"))?;
+        std::fs::create_dir(&root)?;
+        let private = root.join("private.rgis");
+        std::fs::write(&private, b"old")?;
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600))?;
+        write_atomic(&private, b"new")?;
+        assert_eq!(std::fs::read(&private)?, b"new");
+        assert_eq!(std::fs::metadata(&private)?.permissions().mode() & 0o7777, 0o600);
+        // A read-only file is still replaced, and stays read-only.
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o400))?;
+        write_atomic(&private, b"newer")?;
+        assert_eq!(std::fs::read(&private)?, b"newer");
+        assert_eq!(std::fs::metadata(&private)?.permissions().mode() & 0o7777, 0o400);
+        // A new file is created as before: owner read-write, the rest by the umask.
+        let fresh = root.join("fresh.rgis");
+        write_atomic(&fresh, b"x")?;
+        assert_eq!(std::fs::metadata(&fresh)?.permissions().mode() & 0o600, 0o600);
         std::fs::remove_dir_all(root)
     }
 

@@ -10,6 +10,7 @@
 //! map stopped asking for is dropped unfetched ([`crate::schedule`]). Natively they are fetched on
 //! worker threads; the browser app installs its own fetcher with [`set_fetcher`].
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -164,6 +165,7 @@ fn lock() -> std::sync::MutexGuard<'static, Cache> {
 }
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+static CLEARS: AtomicU64 = AtomicU64::new(0);
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 fn fetcher() -> &'static Mutex<Option<Arc<Fetcher>>> {
@@ -377,6 +379,13 @@ pub fn generation() -> u64 {
         ring(Duration::from_millis(at.saturating_sub(now)));
     }
     GENERATION.load(Ordering::Relaxed)
+}
+
+/// How many times [`clear`] has run. What was read through the downloads before it and is kept
+/// elsewhere (the identify pop-up's pictures) goes too: it may have been read with a login that
+/// has since ended.
+pub fn clears() -> u64 {
+    CLEARS.load(Ordering::Relaxed)
 }
 
 /// Consumes every elapsed deadline together and returns the next one to rearm. Keeping the
@@ -681,7 +690,10 @@ pub fn clear() {
     crate::cog::forget();
     crate::warp::forget();
     rustgis_data::source::remote::forget();
-    GENERATION.fetch_add(1, Ordering::Relaxed);
+    CLEARS.fetch_add(1, Ordering::Relaxed);
+    // The map draws again (and the pop-up's pictures are forgotten): the waker wakes an idle app,
+    // as when a fetch ends, so a clear from a worker thread isn't left until the next input.
+    notify();
 }
 
 /// The resource a cache key reads: its address without a download budget, a byte range or a
@@ -832,42 +844,71 @@ fn forget_dropped(c: &mut Cache, dropped: &[Waiting<Job>]) {
     IN_FLIGHT.fetch_sub(dropped.len(), Ordering::Release);
 }
 
+/// Releases tiles that were selected to start but never launched (e.g. when launch is unwound
+/// by a panic). Forgets their pending cache entries, frees their host reservations, safely releases
+/// any queued jobs that would otherwise remain stranded when all active reservations empty, and
+/// balances in_flight() accounting.
+fn release_unstarted(unstarted: Vec<Waiting<Job>>) {
+    if unstarted.is_empty() {
+        return;
+    }
+    let mut stranded = Vec::new();
+    {
+        let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = lock();
+        for w in &unstarted {
+            if !crate::mbtiles::forgotten_since(&w.url, w.job.3) {
+                forget_pending(&mut c, &w.url);
+            }
+            stranded.extend(q.cancel(&w.host));
+        }
+        for s in &stranded {
+            if !crate::mbtiles::forgotten_since(&s.url, s.job.3) {
+                forget_pending(&mut c, &s.url);
+            }
+        }
+    }
+    let total_released = unstarted.len() + stranded.len();
+    IN_FLIGHT.fetch_sub(total_released, Ordering::Release);
+    notify();
+}
+
+thread_local! {
+    static TO_START: RefCell<Vec<Waiting<Job>>> = const { RefCell::new(Vec::new()) };
+    static STARTING: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Starts fetches one after another, never inside each other: a fetch can be over at once (a
 /// local read, an archive that failed), and each one over starts the next waiting tile, so a
 /// long queue would otherwise go as deep into the stack as it is long.
 fn launch(jobs: Vec<Waiting<Job>>) {
-    static TO_START: Mutex<Vec<Waiting<Job>>> = Mutex::new(Vec::new());
-    static STARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let pop = || TO_START.lock().unwrap_or_else(|e| e.into_inner()).pop();
     if !jobs.is_empty() {
         // Newest first: `pop` takes from the end.
-        TO_START.lock().unwrap_or_else(|e| e.into_inner()).extend(jobs.into_iter().rev());
+        TO_START.with(|q| q.borrow_mut().extend(jobs.into_iter().rev()));
     }
-    loop {
-        // Another call (this thread further up, or another thread) is starting them already.
-        if STARTING.swap(true, Ordering::AcqRel) {
+    STARTING.with(|starting| {
+        // Another call further up this thread is starting them already.
+        if starting.replace(true) {
             return;
         }
-        {
-            // Lowered however this ends: a fetcher that panics must not stop every later fetch.
-            struct Lower;
-            impl Drop for Lower {
-                fn drop(&mut self) {
-                    STARTING.store(false, Ordering::Release);
-                }
-            }
-            let _lower = Lower;
-            while let Some(w) = pop() {
-                let (want, capture, omit, asked_at, still, ceiling) = w.job;
-                let _scope = capture.enter();
-                with_optional_still(still, || fetch_tile(w.url, w.host, want, omit, asked_at, ceiling));
+        // Lowered however this ends: a fetcher that panics must not stop every later fetch,
+        // and any selected but unstarted jobs must be released so pending states, host slots,
+        // and in_flight() stay consistent.
+        struct Lower<'a>(&'a Cell<bool>);
+        impl Drop for Lower<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+                let unstarted = TO_START.with(|q| std::mem::take(&mut *q.borrow_mut()));
+                release_unstarted(unstarted);
             }
         }
-        // A tile queued after the last `pop` and before the flag went down is started here.
-        if TO_START.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
-            return;
+        let _lower = Lower(starting);
+        while let Some(w) = TO_START.with(|q| q.borrow_mut().pop()) {
+            let (want, capture, omit, asked_at, still, ceiling) = w.job;
+            let _scope = capture.enter();
+            with_optional_still(still, || fetch_tile(w.url, w.host, want, omit, asked_at, ceiling));
         }
-    }
+    });
 }
 
 /// A tile fetch's answer: stored once it comes, and however the fetch ends (answered, dropped
@@ -1066,6 +1107,14 @@ pub fn split_download_limit(url: &str) -> (&str, Option<usize>) {
     }
 }
 
+/// Whether the browser gives up a fetch of `url` that stalls, as an installed fetcher is handed it
+/// with `ceiling`. Tiles and documents are given up. So is a download kept to internet addresses
+/// ([`download_public_limited`]): its address comes from data, like a picture for the pop-up.
+/// A download the user named is not given up.
+pub fn gives_up_when_stalled(url: &str, ceiling: crate::address::Reach) -> bool {
+    split_download_limit(url).1.is_none() || ceiling == crate::address::Reach::Public
+}
+
 fn download_address(url: &str, max: usize) -> String {
     if max >= MAX_DOWNLOAD { format!("{DOWNLOAD}{url}") } else { format!("{LIMITED_DOWNLOAD}{max}:{url}") }
 }
@@ -1238,9 +1287,32 @@ pub fn download_detailed(url: &str, max: usize, done: DoneDetailed) {
     download_detailed_within(url, max, DOWNLOAD_TIMEOUT, &[], done);
 }
 
+/// Like [`download_limited`], connecting natively only to internet addresses (as
+/// [`download_public_within`], off the frame): a name, or a redirect to one, that resolves to this
+/// computer or the local network is refused when it is resolved. For an address that comes from
+/// data rather than the user (a picture named in a feature's values), which mustn't be able to
+/// reach local services. An installed fetcher (the browser's) is handed the internet-only ceiling.
+pub fn download_public_limited(url: &str, max: usize, done: Done) {
+    download_reaching(url, max, DOWNLOAD_TIMEOUT, &[], Reaching::Public, Box::new(move |r| done(r.map_err(|f| f.message))));
+}
+
+/// Which addresses a native download may connect to.
+#[derive(Clone, Copy)]
+enum Reaching {
+    /// Wherever the address's name resolves (the user named it).
+    Any,
+    /// Only internet addresses, judged where names resolve and redirects lead.
+    Public,
+}
+
 /// Like [`download_detailed`], giving up after `timeout` natively; a status in `omit` isn't
 /// recorded as a failure.
 fn download_detailed_within(url: &str, max: usize, timeout: std::time::Duration, omit: &'static [u16], done: DoneDetailed) {
+    download_reaching(url, max, timeout, omit, Reaching::Any, done);
+}
+
+/// [`download_detailed_within`], natively connecting only where `reaching` allows.
+fn download_reaching(url: &str, max: usize, timeout: std::time::Duration, omit: &'static [u16], reaching: Reaching, done: DoneDetailed) {
     if let Err(e) = check_current() {
         done(Err(Failure::new(url, e)));
         return;
@@ -1264,11 +1336,17 @@ fn download_detailed_within(url: &str, max: usize, timeout: std::time::Duration,
     match f {
         Some(f) => f(
             marked.clone(),
-            crate::address::Reach::Local,
+            match reaching {
+                Reaching::Any => crate::address::Reach::Local,
+                Reaching::Public => crate::address::Reach::Public,
+            },
             Box::new(move |r| done(r.map(|fetched| fetched.bytes).map_err(|e| Failure::new(&marked, e)))),
             omit,
         ),
-        None => native::download_within(marked, timeout, omit, done),
+        None => match reaching {
+            Reaching::Any => native::download_within(marked, timeout, omit, done),
+            Reaching::Public => native::download_public_within(marked, timeout, done),
+        },
     }
 }
 
@@ -2393,6 +2471,20 @@ mod native {
         });
     }
 
+    /// Like [`download_within`], connecting only to internet addresses ([`public_agent`]).
+    pub(super) fn download_public_within(url: String, timeout: std::time::Duration, done: DoneDetailed) {
+        let capture = Capture::current();
+        let still = super::current_still();
+        std::thread::spawn(move || {
+            super::with_optional_still(still, || {
+                let _scope = capture.enter();
+                let r =
+                    super::check_current().map_err(Failure::from).and_then(|_| get_detailed_omitting(&public_agent(timeout), &url, &[]));
+                done(r);
+            })
+        });
+    }
+
     /// Dispatches each queued read through the pool matching its inherited IP ceiling.
     fn work() {
         let agent = shared_agent();
@@ -2762,6 +2854,10 @@ mod native {
     pub(super) fn download_within(url: String, _timeout: std::time::Duration, _omit: &'static [u16], done: DoneDetailed) {
         let message = format!("{url}: this build has no way to fetch tiles");
         done(Err(crate::failure::Failure::new(&url, message)));
+    }
+
+    pub(super) fn download_public_within(url: String, timeout: std::time::Duration, done: DoneDetailed) {
+        download_within(url, timeout, &[], done);
     }
 
     pub(super) fn post(url: String, _body: String, done: Done) {
@@ -3333,6 +3429,84 @@ mod tests {
         let _turn = turn();
         let err = download_public_within("http://localhost:9/doc.json", 1024, std::time::Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("resolves to this computer or the local network"), "{err}");
+    }
+
+    /// The same off the frame ([`download_public_limited`] without a fetcher installed, called
+    /// directly: other tests here install theirs): one that resolves locally is refused there.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn public_downloads_off_the_frame_refuse_names_that_resolve_locally() {
+        let _turn = turn();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let url = download_address("http://localhost:9/picture.png", 1024);
+        native::download_public_within(url, std::time::Duration::from_secs(5), Box::new(move |r| drop(tx.send(r))));
+        let err = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap().unwrap_err().message;
+        assert!(err.contains("resolves to this computer or the local network"), "{err}");
+    }
+
+    /// A public download asked for by a request that has since ended sends nothing, as any
+    /// download off the frame doesn't.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn public_downloads_off_the_frame_send_nothing_once_their_request_ended() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let url = download_address("https://example.org/picture.png", 1024);
+        with_still(Arc::new(|| false), || {
+            native::download_public_within(url, std::time::Duration::from_secs(5), Box::new(move |r| drop(tx.send(r))));
+        });
+        let err = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap().unwrap_err().message;
+        assert!(err.contains("cancelled before it was sent"), "{err}");
+    }
+
+    /// An installed fetcher (the browser's) is handed the internet-only ceiling for a public
+    /// download, and an answer that came from the local network is refused.
+    #[test]
+    fn public_downloads_through_a_fetcher_keep_the_public_ceiling() {
+        use crate::address::{Origin, Reach};
+        let _turn = turn();
+        let ceilings = Arc::new(Mutex::new(Vec::new()));
+        let sent = ceilings.clone();
+        set_fetcher_with_origin(move |_, ceiling, done, _| {
+            sent.lock().unwrap().push(ceiling);
+            done(Ok(Fetched { bytes: vec![1], origin: Origin { url: "https://pictures.example/a.png".into(), reach: Reach::Local } }));
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let public = tx.clone();
+        download_public_limited("https://pictures.example/a.png", 1024, Box::new(move |r| drop(public.send(r))));
+        let err = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap().unwrap_err();
+        assert!(err.contains("exceeds its request's network reach"), "{err}");
+        download_limited("https://pictures.example/a.png", 1024, Box::new(move |r| drop(tx.send(r))));
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap().unwrap(), vec![1]);
+        assert_eq!(*ceilings.lock().unwrap(), [Reach::Public, Reach::Local]);
+    }
+
+    /// A picture for the pop-up is given up in the browser when it stalls, as a tile is; a
+    /// download the user named, with or without a smaller budget, is not.
+    #[test]
+    fn only_downloads_the_user_named_wait_out_a_stall() {
+        let _turn = turn();
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let sent = handed.clone();
+        set_fetcher_with_origin(move |url, ceiling, done, _| {
+            sent.lock().unwrap().push(gives_up_when_stalled(&url, ceiling));
+            done(Err("not fetched".into()));
+        });
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let answered = || -> Done {
+            let tx = tx.clone();
+            Box::new(move |_| {
+                let _ = tx.send(());
+            })
+        };
+        let url = "https://pictures.example/a.png";
+        download_public_limited(url, 1024, answered());
+        download_limited(url, 1024, answered());
+        download(url, answered());
+        for _ in 0..3 {
+            rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        }
+        assert_eq!(*handed.lock().unwrap(), [true, false, false]);
+        assert!(gives_up_when_stalled("https://tiles.example/1/2/3.png", crate::address::Reach::Local));
     }
 
     #[test]
@@ -4929,6 +5103,10 @@ mod tests {
         });
         let g = generation();
         assert!(matches!(get("test://cache/ok.json", Want::Json), State::Pending));
+        let t = Instant::now();
+        while generation() <= g && t.elapsed() < Duration::from_secs(5) {
+            wait_for_news(g, Duration::from_secs(5));
+        }
         assert!(generation() > g);
         assert!(matches!(get("test://cache/ok.json", Want::Json), State::Ready(_)));
         assert!(peek("test://cache/ok.json").is_some());
@@ -5106,5 +5284,267 @@ mod tests {
         assert_eq!(omit("tile.pbf"), Some(&[404, 410][..]));
         assert_eq!(omit("picture.png"), Some(&[][..]));
         assert_eq!(omit("style.json"), Some(&[][..]));
+    }
+
+    #[test]
+    fn concurrent_fetch_starts_without_waiting_for_another_threads_launch() {
+        let _turn = crate::cache::turn();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        set_fetcher(move |url, done| {
+            if url.starts_with("test://slow/") {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                done(Ok(b"{\"slow\": true}".to_vec()));
+            } else {
+                done(Ok(b"{\"fast\": true}".to_vec()));
+            }
+        });
+        let thread_a = std::thread::spawn(|| {
+            assert!(matches!(get("test://slow/1.json", Want::Json), State::Pending));
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert!(matches!(get("test://fast/1.json", Want::Json), State::Pending));
+        let fast_ready_immediately = matches!(get("test://fast/1.json", Want::Json), State::Ready(_));
+
+        release_tx.send(()).unwrap();
+        thread_a.join().unwrap();
+
+        assert!(fast_ready_immediately, "fast fetch on thread B was parked behind thread A's in-flight launch");
+        assert!(matches!(get("test://fast/1.json", Want::Json), State::Ready(_)));
+    }
+
+    #[test]
+    fn fetcher_panic_unwinds_launch_and_releases_queued_replacement() {
+        let _turn = crate::cache::turn();
+        wait(Duration::from_secs(5));
+        assert_eq!(in_flight(), 0, "prior fetches should finish after wait");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (panic_started_tx, panic_started_rx) = std::sync::mpsc::channel();
+        let (panic_trigger_tx, panic_trigger_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let panic_trigger_rx = Arc::new(Mutex::new(panic_trigger_rx));
+
+        let cap = crate::schedule::PER_HOST;
+        let rx = release_rx.clone();
+        let p_rx = panic_trigger_rx.clone();
+        set_fetcher(move |url, done| {
+            if url.contains("/slow_") {
+                started_tx.send(()).unwrap();
+                rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                done(Ok(b"{\"slow\": true}".to_vec()));
+            } else if url.contains("/panic.json") {
+                panic_started_tx.send(()).unwrap();
+                p_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                panic!("simulated fetcher panic during launch");
+            } else {
+                done(Ok(b"{\"replacement\": true}".to_vec()));
+            }
+        });
+
+        let mut threads = Vec::new();
+        for i in 0..(cap - 1) {
+            threads.push(std::thread::spawn(move || {
+                let _ = get(&format!("test://samehost/slow_{i}.json"), Want::Json);
+            }));
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        let panic_thread = std::thread::spawn(|| {
+            let _ = get("test://samehost/panic.json", Want::Json);
+        });
+        panic_started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let waiting_url = "test://samehost/waiting.json";
+        assert!(matches!(get(waiting_url, Want::Json), State::Pending));
+
+        panic_trigger_tx.send(()).unwrap();
+        let _ = panic_thread.join();
+
+        assert!(!lock().slots.contains_key(waiting_url));
+        assert_eq!(in_flight(), cap - 1);
+
+        assert!(matches!(get(waiting_url, Want::Json), State::Pending));
+        assert!(matches!(get(waiting_url, Want::Json), State::Ready(_)));
+
+        for _ in 0..(cap - 1) {
+            release_tx.send(()).unwrap();
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(in_flight(), 0);
+    }
+
+    #[test]
+    fn release_unstarted_preserves_retained_outcome_and_bytes() {
+        let _turn = crate::cache::turn();
+        wait(Duration::from_secs(5));
+        assert_eq!(in_flight(), 0, "prior fetches should finish after wait");
+        clear();
+
+        let url = "test://retained/tile.json";
+        let payload = Arc::new(Payload::Json("{\"retained\": true}".into()));
+        let initial_bytes = payload_bytes(&payload);
+        {
+            let mut c = lock();
+            keep_for(&mut c, url, Entry::Ready(payload.clone(), initial_bytes, None), crate::address::Reach::Local);
+            assert_eq!(c.bytes, initial_bytes);
+        }
+
+        {
+            let mut c = lock();
+            keep_for(&mut c, url, Entry::Pending, crate::address::Reach::Public);
+            assert_eq!(c.bytes, initial_bytes);
+            let slot = c.slots.get(url).unwrap();
+            assert!(matches!(slot.entry, Entry::Pending));
+            assert!(slot.other.is_some());
+        }
+
+        let starting_in_flight = in_flight();
+        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        let mut swept = Vec::new();
+        let waiting = {
+            let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = lock();
+            let latest = c.latest.unwrap_or_else(Instant::now);
+            let job = (Want::Json, Capture::current(), &[] as &'static [u16], 0u64, None, crate::address::Reach::Public);
+            let w = q
+                .push(url.to_string(), job, |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept)
+                .expect("job should be scheduled immediately");
+            forget_dropped(&mut c, &swept);
+            w
+        };
+        assert_eq!(in_flight(), starting_in_flight + 1);
+
+        release_unstarted(vec![waiting]);
+        assert_eq!(in_flight(), starting_in_flight);
+
+        {
+            let c = lock();
+            let slot = c.slots.get(url).expect("slot should be preserved");
+            assert!(matches!(slot.entry, Entry::Ready(..)));
+            assert_eq!(slot.ceiling, crate::address::Reach::Local);
+            assert!(slot.other.is_none());
+            assert_eq!(c.bytes, initial_bytes);
+        }
+    }
+
+    #[test]
+    fn release_unstarted_preserves_newer_pending_mbtiles_request_after_forget() {
+        let _turn = crate::cache::turn();
+        wait(Duration::from_secs(5));
+        assert_eq!(in_flight(), 0, "prior fetches should finish after wait");
+        clear();
+
+        let archive = "/race-archive.mbtiles";
+        let key = crate::mbtiles::template(archive).replace("{z}", "0").replace("{x}", "0").replace("{y}", "0");
+        let old_epoch = crate::mbtiles::epoch();
+
+        // An older unstarted job requested through the queue's normal path before the archive was forgotten
+        let starting_in_flight = in_flight();
+        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        let mut swept = Vec::new();
+        let waiting = {
+            let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = lock();
+            let latest = c.latest.unwrap_or_else(Instant::now);
+            let job = (Want::Vector, Capture::current(), &[] as &'static [u16], old_epoch, None, crate::address::Reach::Local);
+            let w = q
+                .push(key.clone(), job, |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept)
+                .expect("job should be scheduled immediately");
+            forget_dropped(&mut c, &swept);
+            w
+        };
+        assert_eq!(in_flight(), starting_in_flight + 1);
+
+        // Forget the archive: epoch increments, and old archive tiles are recorded as forgotten
+        forget(archive);
+
+        // A newer request arrives after the archive was forgotten, planting a new Pending slot
+        {
+            let mut c = lock();
+            c.slots.insert(
+                key.clone(),
+                Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Local, other: None, used: 0, asked: Instant::now() },
+            );
+        }
+
+        // Release the older unstarted job. It must NOT clear the newer Pending slot.
+        release_unstarted(vec![waiting]);
+        assert_eq!(in_flight(), starting_in_flight);
+
+        {
+            let c = lock();
+            let slot = c.slots.get(&key).expect("newer pending slot must be preserved");
+            assert!(matches!(slot.entry, Entry::Pending));
+        }
+    }
+
+    #[test]
+    fn release_unstarted_safely_releases_stranded_queued_jobs_when_active_empties() {
+        let _turn = crate::cache::turn();
+        wait(Duration::from_secs(5));
+        assert_eq!(in_flight(), 0, "prior fetches should finish after wait");
+        clear();
+
+        let starting_in_flight = in_flight();
+        let cap = crate::schedule::PER_HOST;
+        let mut swept = Vec::new();
+        let mut active_jobs = Vec::new();
+
+        let host = "strandedhost.test";
+        // Fill active reservations for this host
+        for i in 0..cap {
+            let url = format!("test://{host}/active_{i}.json");
+            IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+            let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = lock();
+            let latest = c.latest.unwrap_or_else(Instant::now);
+            let job = (Want::Json, Capture::current(), &[] as &'static [u16], 0u64, None, crate::address::Reach::Public);
+            c.slots.insert(
+                url.clone(),
+                Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Public, other: None, used: 0, asked: Instant::now() },
+            );
+            let w = q
+                .push(url, job, |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept)
+                .expect("active job should be scheduled immediately");
+            forget_dropped(&mut c, &swept);
+            active_jobs.push(w);
+        }
+
+        // Push two more jobs that exceed host capacity and become queued in waiting
+        let waiting_1 = format!("test://{host}/waiting_1.json");
+        let waiting_2 = format!("test://{host}/waiting_2.json");
+        for url in [&waiting_1, &waiting_2] {
+            IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+            let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = lock();
+            let latest = c.latest.unwrap_or_else(Instant::now);
+            let job = (Want::Json, Capture::current(), &[] as &'static [u16], 0u64, None, crate::address::Reach::Public);
+            c.slots.insert(
+                url.clone(),
+                Slot { entry: Entry::Pending, ceiling: crate::address::Reach::Public, other: None, used: 0, asked: Instant::now() },
+            );
+            let w = q.push(url.clone(), job, |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept);
+            assert!(w.is_none(), "job should be queued in waiting because host is at capacity");
+            forget_dropped(&mut c, &swept);
+        }
+
+        assert_eq!(in_flight(), starting_in_flight + cap + 2);
+        assert_eq!(queue().lock().unwrap().waiting(), 2);
+
+        // When all active unstarted jobs unwind and are released, active reservations drop to 0.
+        // The remaining queued jobs must be safely drained and released, rather than stranded.
+        release_unstarted(active_jobs);
+
+        assert_eq!(in_flight(), starting_in_flight);
+        assert_eq!(queue().lock().unwrap().waiting(), 0);
+        assert!(!lock().slots.contains_key(&waiting_1));
+        assert!(!lock().slots.contains_key(&waiting_2));
     }
 }

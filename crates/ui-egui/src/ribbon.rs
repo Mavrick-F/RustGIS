@@ -2334,6 +2334,10 @@ fn data_source_group(app: &mut RustGisApp, ui: &mut Ui) {
             false,
             false,
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        if active_layer(app).is_some_and(crate::reloaddata::supported) {
+            big(ui, app, "redo", "Reload\nData", crate::reloaddata::HELP, "ui.reloadData", Value::Null, false, false);
+        }
     });
 }
 
@@ -3208,6 +3212,16 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
             );
             small(ui, app, "save_as", "Save Layout File", "Save the layout as a layout file.", "ui.saveLayout", Value::Null, false);
             small(ui, app, "map", "Show Map", "Close the layout and show the map.", "layout.close", Value::Null, false);
+        });
+        col(ui, |ui| {
+            // A PDF's map frames carry their coordinates (a GeoPDF) unless this is turned off: a
+            // toggle, as Snap and Rulers are.
+            let on = app.ui.pdf_georeference;
+            let desc =
+                "Export and print the layout's map frames to PDF with their coordinates, so PDF readers can locate and measure in them.";
+            if small(ui, app, "globe_view", "Georeference PDF", desc, "ui.menu", Value::Null, on).clicked() {
+                app.ui.pdf_georeference = !on;
+            }
         });
     });
 }
@@ -4085,7 +4099,16 @@ fn imagery_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 wf("change"),
                 false,
             );
-            small(ui, app, "graduated", "Spectral Analysis", "Every band's value at a pixel.", "ui.pane.workflows", wf("spectral"), false);
+            small(
+                ui,
+                app,
+                "graduated",
+                "Spectral Analysis",
+                "Chart every band at points on the map, and compare them.",
+                "ui.pane.workflows",
+                wf("spectral"),
+                false,
+            );
         });
     });
     group(ui, "Image Classification", |ui| {
