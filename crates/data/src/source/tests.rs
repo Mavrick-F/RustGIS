@@ -2384,7 +2384,7 @@ fn shapefile_complete_chunks_keep_all_rows_order_attributes_and_budget() {
 
 /// GeoPackage rows without geometry (NULL, or an empty geometry) keep their row and attributes in
 /// whole reads and visits, with and without the R-tree and in the browser's reader, and are left
-/// out of a read of an extent; one flagged empty but cut off is skipped and counted.
+/// out of a read of an extent; one flagged empty with an unreadable header is skipped and counted.
 #[test]
 fn geopackage_keeps_rows_without_geometry() {
     let d = dir().join("geometryless");
@@ -2396,8 +2396,11 @@ fn geopackage_keeps_rows_without_geometry() {
         let empty = b"GP\x00\x11\x11\x0f\x00\x00".to_vec();
         c.execute("INSERT INTO \"grid \"\"q\"\"\" VALUES (601, NULL, 'no place', 7, 1)", []).unwrap();
         c.execute("INSERT INTO \"grid \"\"q\"\"\" VALUES (602, ?1, 'empty', 8, 0)", [empty]).unwrap();
-        // Flagged empty but cut off before its header ends: unreadable, skipped and counted.
-        c.execute("INSERT INTO \"grid \"\"q\"\"\" VALUES (603, X'47500011', 'cut', 9, 1)", []).unwrap();
+        // Flagged empty but unreadable, each skipped and counted: cut off before its header ends,
+        // with an envelope code the standard doesn't define, and an envelope declared but missing.
+        for (fid, blob) in [(603, "47500011"), (604, "4750001b0f000000"), (605, "475000130f000000")] {
+            c.execute(&format!("INSERT INTO \"grid \"\"q\"\"\" VALUES ({fid}, X'{blob}', 'cut', 9, 1)"), []).unwrap();
+        }
     }
     let sources: Vec<Box<dyn FeatureSource>> = vec![
         open_path(&indexed, None).unwrap(),
@@ -2406,13 +2409,13 @@ fn geopackage_keeps_rows_without_geometry() {
     ];
     for src in &sources {
         let format = src.info().format;
-        assert_eq!(src.info().count, Some(603), "{format}");
+        assert_eq!(src.info().count, Some(605), "{format}");
         let whole = src.read(&Request::all()).unwrap();
-        assert_eq!((whole.features.len(), whole.skipped), (602, 1), "{format}");
+        assert_eq!((whole.features.len(), whole.skipped), (602, 3), "{format}");
         let bare: Vec<_> = whole.features.iter().filter(|f| f.geometry.is_none()).map(|f| (f.id, f.attrs[0].clone())).collect();
         assert_eq!(bare, vec![(601, Value::Text("no place".into())), (602, Value::Text("empty".into()))], "{format}");
         let (rows, summary, _) = visit_all(src.as_ref(), None, 1024);
-        assert_eq!((rows, summary.matched, summary.skipped), (whole.features, 602, 1), "{format}");
+        assert_eq!((rows, summary.matched, summary.skipped), (whole.features, 602, 3), "{format}");
         let world = Extent::new(-180.0, -85.0, 180.0, 85.0);
         let part = src.read(&Request { extent: Some(world), limit: 10_000 }).unwrap();
         assert_eq!(part.features.len(), 600, "{format}");

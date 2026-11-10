@@ -279,7 +279,7 @@ impl FeatureSource for GpkgMemSource {
         self.db
             .rows(&self.table, |rowid, r| {
                 let blob = match r.get(self.geom_col) {
-                    Some(Val::Blob(b)) if !super::gpkg_blob::is_empty_blob(b) => b,
+                    Some(Val::Blob(b)) if !super::gpkg_blob::is_whole_empty_blob(b) => b,
                     // A row without geometry (NULL, or an empty one) is kept in a whole read; it
                     // has no place to match an extent.
                     Some(Val::Null | Val::Blob(_)) | None => {
@@ -339,7 +339,7 @@ impl FeatureSource for GpkgMemSource {
         self.db
             .rows(&self.table, |rowid, r| {
                 let geometry = match r.get(self.geom_col) {
-                    Some(Val::Blob(b)) if !super::gpkg_blob::is_empty_blob(b) => {
+                    Some(Val::Blob(b)) if !super::gpkg_blob::is_whole_empty_blob(b) => {
                         let Some((envelope, body)) = super::gpkg_blob::split_blob(b) else {
                             out.skipped += 1;
                             return ControlFlow::Continue(());

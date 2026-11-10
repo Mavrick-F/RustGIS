@@ -4,10 +4,15 @@
 use crate::FieldType;
 use rustgis_geom::Extent;
 
-/// A GeoPackage geometry blob flagged empty: valid, with nothing to draw. Its header must be
-/// whole (8 bytes and the envelope its flags give); a cut-off one is unreadable, not empty.
+/// A GeoPackage geometry blob flagged empty: valid, with nothing to draw.
 pub(crate) fn is_empty_blob(b: &[u8]) -> bool {
-    b.starts_with(b"GP") && b.get(3).is_some_and(|&f| f & 0b1_0000 != 0 && envelope_len(f).is_some_and(|n| b.len() >= 8 + n))
+    b.starts_with(b"GP") && b.get(3).is_some_and(|f| f & 0b1_0000 != 0)
+}
+
+/// A blob flagged empty whose header is whole (8 bytes and the envelope its flags give): a row
+/// the readers keep without geometry. A cut-off one is unreadable, not empty.
+pub(crate) fn is_whole_empty_blob(b: &[u8]) -> bool {
+    is_empty_blob(b) && b.get(3).and_then(|&f| envelope_len(f)).is_some_and(|n| b.len() >= 8 + n)
 }
 
 /// The length of the envelope a header's flags give; `None` for a code the standard doesn't define.
