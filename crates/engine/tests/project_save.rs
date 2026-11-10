@@ -338,3 +338,114 @@ fn nonfinite_design_and_archived_values_are_counted_when_output_is_prepared() ->
     }
     Ok(())
 }
+
+/// Both resident and streamed exports report their numeric replacements once, with the path.
+#[test]
+fn nonfinite_layer_exports_report_nulls() -> Result<(), String> {
+    use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let root = std::env::temp_dir().join(format!("rustgis-nonfinite-export-{}", std::process::id()));
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let source = root.join("source.gpkg");
+    let mut ds = Dataset::new("Readings", GeometryType::Point, vec![Field::new("level", FieldType::Double)]);
+    ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![V::Float(1.5)]);
+    rustgis_engine::data::io::write_path(&ds, &source).map_err(|e| e.to_string())?;
+    for stream in [false, true] {
+        for lossy in [false, true] {
+            let conn = rusqlite::Connection::open(&source).map_err(|e| e.to_string())?;
+            // Attribute UPDATEs also compile the R-tree triggers. This fixture's geometry is
+            // always the non-empty point (0, 0), so all five spatial functions return zero.
+            let flags = rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+                | rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS;
+            for name in ["ST_IsEmpty", "ST_MinX", "ST_MaxX", "ST_MinY", "ST_MaxY"] {
+                conn.create_scalar_function(name, 1, flags, |_| Ok(0i64)).map_err(|e| e.to_string())?;
+            }
+            conn.execute("UPDATE Readings SET level = ?1", [if lossy { "NaN" } else { "1.5" }]).map_err(|e| e.to_string())?;
+            drop(conn);
+            let mut s = Session::new(Project::default());
+            let id = s.run("layer.addData", &json!({"path": source, "stream": stream}))?["layer"].as_u64().ok_or("no id")?;
+            assert_eq!(s.map().layer(id as u32).ok_or("no layer")?.is_streamed(), stream);
+            for ext in ["geojson", "gpkg"] {
+                let out = root.join(format!("out-{stream}-{lossy}.{ext}"));
+                if out.exists() {
+                    std::fs::remove_file(&out).map_err(|e| e.to_string())?;
+                }
+                let mark = s.notice_mark();
+                s.run("share.exportLayer", &json!({"layer": id, "path": out}))?;
+                let losses: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("finite numbers")).collect();
+                assert_eq!(losses.len(), usize::from(lossy), "stream {stream}: {losses:?}");
+                if lossy {
+                    assert!(losses[0].text.contains("1 attribute value(s)"));
+                    assert!(losses[0].text.contains(out.to_str().ok_or("path")?));
+                    assert!(losses[0].translated(|key, _| key.to_string()).is_some());
+                }
+                let read = rustgis_engine::data::io::read_path(&out).map_err(|e| e.to_string())?.0;
+                assert_eq!(read.value(0, 0), if lossy { &V::Null } else { &V::Float(1.5) });
+            }
+        }
+    }
+    std::fs::remove_dir_all(root).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Interactive and previously imported subtype defaults cannot introduce a non-finite cell.
+#[test]
+fn nonfinite_subtype_defaults_are_refused_before_mutation() -> Result<(), String> {
+    use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(Dataset::new(
+        "Defaults",
+        GeometryType::Point,
+        vec![Field::new("kind", FieldType::Integer), Field::new("level", FieldType::Double)],
+    ));
+    s.run("data.subtypes", &json!({"layer": id, "field": "kind", "subtypes": [{"code": 1, "name": "One", "defaults": {"level": 2.5}}]}))?;
+    for text in ["NaN", "inf", "1e400"] {
+        assert!(
+            s.run(
+                "data.subtypes",
+                &json!({"layer": id, "field": "kind", "subtypes": [{"code": 1, "name": "One", "defaults": {"level": text}}]})
+            )
+            .is_err()
+        );
+        let sub = s.map().layer(id).ok_or("no layer")?.design.subtypes.as_ref().ok_or("no subtypes")?;
+        assert_eq!(sub.subtypes[0].defaults[0].1, V::Float(2.5));
+    }
+    let add = json!({"layer": id, "geometry": {"type": "Point", "coordinates": [0,0]}, "attributes": {"kind": 1}});
+    s.run("edit.addFeature", &add)?;
+    assert_eq!(s.map().layer(id).ok_or("no layer")?.dataset.value(0, 1), &V::Float(2.5));
+    s.map_mut().layer_mut(id).ok_or("no layer")?.design.subtypes.as_mut().ok_or("no subtypes")?.subtypes[0].defaults[0].1 =
+        V::Text("NaN".into());
+    let count = s.map().layer(id).ok_or("no layer")?.dataset.features.len();
+    assert!(s.run("edit.addFeature", &add).is_err());
+    assert_eq!(s.map().layer(id).ok_or("no layer")?.dataset.features.len(), count);
+    Ok(())
+}
+
+/// Set Value keeps its finite coercions, while reporting every lossy one and staying quiet for exact input.
+#[test]
+fn set_value_reports_numeric_approximations() -> Result<(), String> {
+    use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    let mut s = Session::new(Project::default());
+    let mut ds = Dataset::new("Numbers", GeometryType::None, vec![Field::new("n", FieldType::Integer)]);
+    ds.push(None, vec![V::Int(1)]);
+    let id = s.map_mut().add_dataset(ds);
+    for (text, expected, fragment) in [
+        ("2.7", V::Int(2), "lost its fraction"),
+        ("1e30", V::Int(i64::MAX), "clamped"),
+        ("unknown", V::Null, "written as null"),
+        ("9007199254740993.0", V::Int(9_007_199_254_740_992), "lost integer precision"),
+        ("<NULL>", V::Null, ""),
+        ("3", V::Int(3), ""),
+    ] {
+        let mark = s.notice_mark();
+        s.run("edit.setValue", &json!({"layer": id, "row": 0, "field": "n", "value": text}))?;
+        assert_eq!(s.map().layer(id).ok_or("no layer")?.dataset.value(0, 0), &expected);
+        let losses: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("1 attribute value")).collect();
+        assert_eq!(losses.len(), usize::from(!fragment.is_empty()));
+        if !fragment.is_empty() {
+            assert!(losses[0].text.contains(fragment));
+            assert!(losses[0].text.contains("Numbers, field 'n', row 1"));
+        }
+    }
+    Ok(())
+}

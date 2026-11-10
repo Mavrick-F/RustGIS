@@ -289,6 +289,9 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     let ty = l.dataset.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
     let raw = p.get("value").cloned().unwrap_or(Json::Null);
+    let input = Value::from_json(&raw);
+    let field = l.dataset.fields.get(fi).map(|f| f.name.clone()).ok_or("no field")?;
+    let layer = l.dataset.name.clone();
     let v = match raw {
         // A number that isn't finite (NaN, infinity) is no value a number field holds, nor one a
         // project can save: refused, as the attribute table refuses it.
@@ -298,11 +301,36 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
         Json::String(t) => Value::parse(&t, ty),
         other => coerce(Value::from_json(&other), ty),
     };
+    // Keep the existing finite coercion, but say when it discards information.
+    let intentional_null =
+        input.is_null() || matches!(&input, Value::Text(t) if t.trim().is_empty() || t.trim().eq_ignore_ascii_case("<null>"));
+    let loss = if ty.is_numeric() && v.is_null() && !intentional_null {
+        Some("{layer}, field '{field}', row {row}: 1 attribute value was written as null because it isn't a number")
+    } else if ty == FieldType::Integer {
+        let (exact, cut) = coerce_cut(input, ty);
+        match cut {
+            Cut::Fraction => Some("{layer}, field '{field}', row {row}: 1 attribute value lost its fraction"),
+            Cut::Range => Some("{layer}, field '{field}', row {row}: 1 attribute value was clamped to the 64-bit integer range"),
+            Cut::None if exact != v => Some("{layer}, field '{field}', row {row}: 1 attribute value lost integer precision"),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let f = l.dataset.features.get_mut(row).ok_or("no such row")?;
     let before = f.clone();
     let cell = f.attrs.get_mut(fi).ok_or("no such row")?;
     *cell = v;
     super::design::apply(s, id, vec![super::design::Change { before: Some(before), row: Some(row) }])?;
+    if let Some(key) = loss {
+        s.notify_text(
+            crate::notice_text::NoticeText::format(
+                key,
+                [("layer", layer.into()), ("field", field.into()), ("row", row.saturating_add(1).to_string().into())],
+            ),
+            false,
+        );
+    }
     Ok(Json::Null)
 }
 
