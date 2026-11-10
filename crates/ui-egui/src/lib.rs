@@ -2207,6 +2207,14 @@ impl RustGisApp {
             pluginstart::ask(self, id, params).inspect_err(|e| self.command_failed(id, e, notice_mark))?;
             return Ok(Value::Null);
         }
+        // Converting the labels of a layer read in place reads all of its source first, on a
+        // thread of its own (see `readjob`).
+        #[cfg(not(target_arch = "wasm32"))]
+        if id == "labels.convert"
+            && self.session.layer_id(&params).ok().and_then(|l| self.session.map().layer(l)).is_some_and(|l| l.is_streamed())
+        {
+            return readjob::run(self, "labels.convert", params);
+        }
         self.run(id, params)
     }
 
@@ -3505,7 +3513,13 @@ impl RustGisApp {
                     .0;
                     self.download(&format!("{name}.pdf"), bytes);
                 } else if let Some(path) = dialogs::pick_save(&format!("{name}.pdf"), &["pdf", "png"], tl!("PDF or PNG")) {
-                    return self.run("report.export", json!({"report": i, "path": path, "dpi": 200}));
+                    // Drawn on a thread of its own, with progress and Cancel in the status bar: a
+                    // layer read in place is read whole for it.
+                    let params = json!({"report": i, "path": path, "dpi": 200});
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return exportjob::start(self, "report.export", params);
+                    #[cfg(target_arch = "wasm32")]
+                    return self.run("report.export", params);
                 }
             }
             "ui.saveLayout" => {

@@ -1712,6 +1712,28 @@ fn permission_policy_training_read_whole_reaches_its_source() {
     }
 }
 
+/// Converting the labels of, or exporting a report of, a layer read in place reads it whole, so
+/// the call reaches its source; the same layer in memory reaches no network.
+#[test]
+fn permission_policy_labels_and_reports_read_whole_reach_their_source() {
+    let mut s = world();
+    s.run("report.new", &json!({"layer":"Cities"})).unwrap();
+    let (scope, _) = assistant(3603);
+    let convert = Call::command("labels.convert", json!({"layer":"Cities"}));
+    let export = Call::command("report.export", json!({"path":"/tmp/report.pdf"}));
+    let internet = |s: &Session, call: &Call| match s.review(&scope, call) {
+        Outcome::NeedsApproval(p) => p.review().why.contains("internet"),
+        _ => false,
+    };
+    assert!(!internet(&s, &convert) && !internet(&s, &export), "in memory: no network");
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let mut source = rustgis_map::source::SourceLayer::default();
+    source.path = Some("https://example.invalid/cities.fgb".into());
+    s.map_mut().layer_mut(id).unwrap().source = Some(source);
+    assert!(internet(&s, &convert), "labels.convert");
+    assert!(internet(&s, &export), "report.export");
+}
+
 /// In-memory range reads need Network, while local paths and external drivers retain Files.
 #[test]
 fn permission_policy_remote_range_reads_need_only_network() {

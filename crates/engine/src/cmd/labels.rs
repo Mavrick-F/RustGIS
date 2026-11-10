@@ -646,11 +646,27 @@ fn distance_range(s: &mut Session, p: &Value) -> CmdResult {
 /// carrying the label text and drawn with the same text symbol. Each class labelling a feature
 /// gives it a point (a hidden class none); with classes besides Default, a CLASS field keeps
 /// which, and the annotation has the same classes, each picking its points by it. The layer's
-/// own labels turn off.
+/// own labels turn off. A layer read in place converts all of its source's features, not just
+/// those of the view, and says the rows it couldn't read; it stays read in place. The app reads
+/// them ahead on a thread of its own, as for Load All Features; a script, the assistant or the
+/// command line reads them where the command runs.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let scale = s.map().scale();
-    let l = s.map().layer(id).ok_or("no such layer")?;
+    // Its features, all of them: a copy of a layer read in place holds those of its whole source.
+    let whole = if s.map().layer(id).ok_or("no such layer")?.is_streamed() {
+        let (ds, unread) = super::whole::take_or_read(s, id)?;
+        let mut copy = s.map().layer(id).ok_or("no such layer")?.clone();
+        copy.dataset = ds;
+        copy.source = None;
+        Some((copy, unread))
+    } else {
+        None
+    };
+    let l = match &whole {
+        Some((copy, _)) => copy,
+        None => s.map().layer(id).ok_or("no such layer")?,
+    };
     let fields: Vec<Option<usize>> = l.labels.in_order().map(|c| l.dataset.field_index(&c.field)).collect();
     // Its classes' expressions, as the map draws them now (at its scale).
     let exprs: Vec<Option<rustgis_map::label_by::LabelExprs>> =
@@ -792,6 +808,9 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some(note) = cut_note {
         s.notify(note, false);
+    }
+    if let Some((_, unread)) = &whole {
+        unread.say(s);
     }
     Ok(json!({"layer": new_id, "annotations": n}))
 }
