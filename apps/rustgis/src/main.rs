@@ -2,6 +2,7 @@
 //!
 //! `rustgis [project.rgis | data.geojson|csv|shp …] [--sample] [--backend dx12|vulkan|gl|metal]`
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use eframe::wgpu;
@@ -12,10 +13,14 @@ use serde_json::json;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
+mod macos_documents;
+#[cfg(target_os = "macos")]
 mod menu;
+#[cfg(any(target_os = "macos", test))]
+mod open_documents;
 
 /// The app, and this run's marker (see [`running`]), cleared when eframe closes it.
-struct App(RustGisApp, running::Shared, Menus);
+struct App(RustGisApp, running::Shared, Menus, #[cfg(target_os = "macos")] open_documents::Inbox);
 
 /// macOS: the menu bar (built once the app runs), the ids of the items chosen from it, and
 /// the commands chosen and not run yet.
@@ -296,6 +301,19 @@ impl eframe::App for App {
     #[cfg(target_os = "macos")]
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.0.drop_stale_clicks(raw_input);
+        let (unreadable, excess) = self.3.append(raw_input);
+        rustgis_ui_egui::i18n::set_current(self.0.chosen_lang());
+        for (n, message) in [
+            (unreadable, "macOS supplied {n} file references whose paths couldn't be read. Those files weren't opened."),
+            (
+                excess,
+                "{n} files requested by macOS weren't queued because too many requests are waiting. Open them again after the current files finish opening.",
+            ),
+        ] {
+            if n != 0 {
+                self.0.session.notify(rustgis_ui_egui::i18n::fmt(message, &[("n", &n.to_string())]), true);
+            }
+        }
         let Some(bar) = &self.2.bar else { return };
         let capturing = self.0.capturing_shortcut();
         let press = |events: &mut Vec<egui::Event>, k: egui::KeyboardShortcut| {
@@ -477,6 +495,10 @@ fn main() -> eframe::Result {
     // crashed, and reopening it on every launch would leave no way into Settings).
     let (marker, unclean) = running::start(prefs::dir().as_deref());
     crash::install(prefs::dir());
+    // Finder can supply documents before eframe creates the app. Keep the native target alive
+    // through run_native and attach its wakeup when the app's egui context becomes available.
+    #[cfg(target_os = "macos")]
+    let (_documents, document_inbox) = macos_documents::Registration::install().map_err(|e| eframe::Error::AppCreation(e.into()))?;
     let backend = flag(&args, "--backend");
     // Options and the value after `--backend` aren't files.
     let files: Vec<&String> = args
@@ -610,7 +632,15 @@ fn main() -> eframe::Result {
             // The menu's choices wake the app: egui draws only on events.
             #[cfg(target_os = "macos")]
             menu::listen(menus.chosen.clone(), _cc.egui_ctx.clone());
-            Ok(Box::new(App(app, held, menus)))
+            #[cfg(target_os = "macos")]
+            document_inbox.set_context(&_cc.egui_ctx);
+            Ok(Box::new(App(
+                app,
+                held,
+                menus,
+                #[cfg(target_os = "macos")]
+                document_inbox,
+            )))
         }),
     );
     running::close(&marker);
