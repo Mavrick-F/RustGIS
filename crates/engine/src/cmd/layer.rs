@@ -4720,6 +4720,7 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
     let mut old_left = 0usize;
     let collision = !case_only && s.map().layers.iter().filter(|l| l.name.eq_ignore_ascii_case(new)).count() > 1;
     let mut collision_left = 0usize;
+    let mut destination_refs = 0usize;
     let mut replace = |name: &mut String| {
         if name.eq_ignore_ascii_case(old) {
             if old_present {
@@ -4729,6 +4730,8 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
             } else {
                 *name = new.to_string();
             }
+        } else if collision && name.eq_ignore_ascii_case(new) {
+            destination_refs += 1;
         }
     };
     for layer in &mut s.map_mut().layers {
@@ -4736,8 +4739,23 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
             replace(mask);
         }
     }
-    // Preserve the existing case-only mask spelling update; other references still resolve.
+    // Elevation and Map Series selectors compare spellings exactly, even though lookup does not.
     if case_only {
+        if s.map().layers.iter().filter(|l| l.name.eq_ignore_ascii_case(old)).count() == 1 {
+            if let Elevation::Surface(layer) = &mut s.map_mut().editing.settings.elevation {
+                replace(layer);
+            }
+            let map_name = s.map().name.clone();
+            for layout in &mut s.project.layouts {
+                if let Some(series) = &mut layout.series
+                    && layout.elements.iter().any(|e| {
+                        e.id == series.frame && matches!(&e.kind, ElementKind::MapFrame { map, .. } if map.eq_ignore_ascii_case(&map_name))
+                    })
+                {
+                    replace(&mut series.layer);
+                }
+            }
+        }
         return;
     }
     let map_name = s.map().name.clone();
@@ -4792,8 +4810,17 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
             && map.layers.iter().any(|layer| layer.name.eq_ignore_ascii_case(old) || layer.name.eq_ignore_ascii_case(new))
     });
     let mut left = 0usize;
+    let shared_new = s
+        .project
+        .maps
+        .iter()
+        .enumerate()
+        .any(|(i, map)| i != s.project.active_map && map.layers.iter().any(|layer| layer.name.eq_ignore_ascii_case(new)));
+    let mut project_destination_refs = 0usize;
     let mut project_reference = |name: &mut String| {
-        if shared && name.eq_ignore_ascii_case(old) {
+        if shared_new && name.eq_ignore_ascii_case(new) {
+            project_destination_refs += 1;
+        } else if shared && name.eq_ignore_ascii_case(old) {
             left += 1;
         } else {
             replace(name);
@@ -4832,6 +4859,13 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
         s.notify_text(crate::notice_text::NoticeText::format(
             "{count} layer reference(s) still name '{old}': two layers are now called '{new}'; give the layer a unique name and choose it in those items",
             [("count", collision_left.to_string().into()), ("old", old.to_string().into()), ("new", new.to_string().into())],
+        ), false);
+    }
+    let destination_refs = destination_refs + project_destination_refs;
+    if destination_refs > 0 {
+        s.notify_text(crate::notice_text::NoticeText::format(
+            "{count} layer or project reference(s) already name '{new}': the rename created duplicate layer names and may change which layer they use; give the renamed layer a unique name",
+            [("count", destination_refs.to_string().into()), ("new", new.to_string().into())],
         ), false);
     }
 }

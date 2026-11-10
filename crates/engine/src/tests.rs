@@ -24980,6 +24980,65 @@ fn layer_rename_never_redirects_a_table_to_another_layer_of_the_new_name() {
     assert_eq!(s.map().layer_by_name("Cities").unwrap().id, cities);
 }
 
+/// Case-only renames keep exact-spelling selectors current without changing other maps.
+#[test]
+fn layer_rename_keeps_case_sensitive_selectors_current() {
+    use rustgis_map::design::Elevation;
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4"})).unwrap();
+    s.run("layout.series", &json!({"layer": "Countries", "nameField": "name"})).unwrap();
+    let mut other_layout = s.project.layouts[0].clone();
+    for element in &mut other_layout.elements {
+        if let rustgis_map::layout::ElementKind::MapFrame { map, .. } = &mut element.kind {
+            *map = "Second".into();
+        }
+    }
+    s.project.layouts.push(other_layout);
+    s.map_mut().editing.settings.elevation = Elevation::Surface("Countries".into());
+    let before = renamed_project_state(&s);
+    let mark = s.notice_mark();
+    s.run("layer.rename", &json!({"layer": "Countries", "name": "countries"})).unwrap();
+    assert_eq!(s.map().editing.settings.elevation, Elevation::Surface("countries".into()));
+    assert_eq!(s.project.layouts[0].series.as_ref().unwrap().layer, "countries");
+    assert_eq!(s.project.layouts[1].series.as_ref().unwrap().layer, "Countries");
+    assert!(s.notices_since(mark).is_empty());
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(renamed_project_state(&s), before);
+}
+
+/// References already using the destination name need a notice when lookup becomes ambiguous.
+#[test]
+fn layer_rename_reports_references_already_using_a_duplicate_destination() {
+    for other_map in [false, true] {
+        let mut s = world();
+        let (layer, new, expected) = if other_map {
+            let mut second = s.map().clone();
+            second.name = "Second".into();
+            second.layers.iter_mut().find(|l| l.name == "Countries").unwrap().name = "Nations".into();
+            s.project.maps.push(second);
+            ("Countries", "Nations", 1)
+        } else {
+            s.run("layer.mask", &json!({"layer": "Rivers", "mask": "Countries"})).unwrap();
+            s.run("layout.new", &json!({"page": "a4"})).unwrap();
+            s.run("layout.addElement", &json!({"kind": "table", "layer": "Countries"})).unwrap();
+            ("Cities", "Countries", 3)
+        };
+        s.run("report.new", &json!({"layer": new, "name": "Report", "fields": ["name"]})).unwrap();
+        let before = renamed_project_state(&s);
+        let mark = s.notice_mark();
+        s.run("layer.rename", &json!({"layer": layer, "name": new})).unwrap();
+        let notices: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("already name")).collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].text.starts_with(&format!("{expected} layer or project reference(s)")), "{}", notices[0].text);
+        assert_eq!(s.project.reports[0].layer, new);
+        s.run("edit.undo", &Value::Null).unwrap();
+        assert_eq!(renamed_project_state(&s), before);
+        let mark = s.notice_mark();
+        s.run("layer.rename", &json!({"layer": layer, "name": "Unique Name"})).unwrap();
+        assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("already name")));
+    }
+}
+
 /// A project-wide report must not begin resolving to a different map after a rename.
 #[test]
 fn layer_rename_keeps_project_references_when_another_map_has_the_new_name() {
