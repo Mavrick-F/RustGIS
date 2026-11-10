@@ -169,8 +169,10 @@ impl Engine {
             if !selected && found.is_streamed() {
                 let (ds, unread) = found.load_all_counted().map_err(|e| format!("{}: {e}", found.name))?;
                 let name = found.name.clone();
-                if unread > 0 {
-                    session.warn(format!("{name}: {unread} rows couldn't be read and were left out"));
+                match unread {
+                    0 => {}
+                    1 => session.warn(format!("{name}: 1 row couldn't be read and was left out")),
+                    n => session.warn(format!("{name}: {n} rows couldn't be read and were left out")),
                 }
                 return Ok(rustgis_engine::data::io::to_geojson(&ds).to_string());
             }

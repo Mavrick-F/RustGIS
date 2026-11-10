@@ -399,7 +399,7 @@ def test_a_layer_read_in_place_exports_its_whole_source(tmp_path):
     layer = session.add_data(path, stream=True)
     session.notices()
     assert len(layer.to_geojson()["features"]) == 2
-    assert [text for text, _ in session.notices() if "1 rows couldn't be read" in text]
+    assert [text for text, _ in session.notices() if "1 row couldn't be read and was left out" in text]
 
 
 def test_a_layer_of_another_session_is_refused(sample):

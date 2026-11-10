@@ -240,14 +240,20 @@ class Layer:
     def to_geojson(self, selected: bool = False) -> Dict[str, Any]:
         """The layer's features as a GeoJSON FeatureCollection, in longitude and latitude.
 
-        A layer read in place (a large file, a database table) is read whole from its source;
-        rows that can't be read are left out and said in ``session.notices()``.
+        A layer read in place (a large file, a database table) is read whole from its source on
+        each call, into memory, as Load All Features reads it (a source too large to read whole
+        is refused); rows that can't be read are left out and said in ``session.notices()``. To
+        write a large layer to a file, :meth:`to_file` writes a chunk at a time.
 
         Args:
             selected: Only the selected features.
 
         Returns:
             The FeatureCollection as a dict.
+
+        Raises:
+            RustGISError: When the layer isn't found, or a layer read in place can't be read
+                whole from its source.
         """
         return json.loads(self.session._layer_geojson(self.id, selected))
 
