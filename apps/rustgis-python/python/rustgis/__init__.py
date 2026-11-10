@@ -240,9 +240,10 @@ class Layer:
     def to_geojson(self, selected: bool = False) -> Dict[str, Any]:
         """The layer's features as a GeoJSON FeatureCollection, in longitude and latitude.
 
-        A layer read in place (a large file, a database table) is read whole from its source on
-        each call, into memory, as Load All Features reads it (a source too large to read whole
-        is refused); rows that can't be read are left out and said in ``session.notices()``.
+        All of a layer read in place (a large file, a database table) is read from its source on
+        each call, into memory, as Load All Features reads it and within its limits; rows that
+        can't be read are left out and said in ``session.notices()``. With ``selected``, only the
+        selected features are returned, from memory.
         :meth:`to_file` can be cheaper for a large layer: to GeoJSON, CSV, FlatGeobuf, GeoPackage
         or GeoParquet it writes a chunk at a time where the source allows; otherwise it reads the
         layer whole too.
