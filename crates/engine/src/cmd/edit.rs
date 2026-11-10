@@ -313,9 +313,16 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     // A definition query or display filter that reads the field would stop reading without it,
     // and the layer would then draw and export the rows it leaves out: refused, naming it.
-    let mut kept = l.dataset.fields.clone();
-    let name = kept.remove(fi).name;
-    let without = rustgis_data::Dataset::new(l.dataset.name.clone(), l.dataset.geometry_type, kept);
+    // A name reads the first field it matches, ignoring case: one that reads this field reads no
+    // field once it, and the fields after it with the same name but for case, are out of reach.
+    let mut masked = l.dataset.fields.clone();
+    let name = masked.get(fi).map(|f| f.name.clone()).unwrap_or_default();
+    for (i, f) in masked.iter_mut().enumerate().skip(fi) {
+        if f.name.eq_ignore_ascii_case(&name) {
+            f.name = format!("\u{1}{i}");
+        }
+    }
+    let without = rustgis_data::Dataset::new(l.dataset.name.clone(), l.dataset.geometry_type, masked);
     let needs =
         |q: &str| rustgis_data::query::parse_fields(q, &l.dataset).is_ok() && rustgis_data::query::parse_fields(q, &without).is_err();
     if let Some(q) = l.definition_query.as_deref().filter(|q| needs(q)) {

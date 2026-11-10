@@ -2339,6 +2339,13 @@ fn degenerate_geometry_and_deleted_fields() {
     s.run("layer.definitionQuery", &json!({"layer": "Countries", "where": "pop_est > 1000"})).unwrap();
     let e = s.run("edit.deleteField", &json!({"layer": "Countries", "field": "pop_est"})).unwrap_err();
     assert!(e.contains("definition query (pop_est > 1000) uses 'pop_est'"), "{e}");
+    assert_eq!(s.map().layer_by_name("Countries").unwrap().definition_query.as_deref(), Some("pop_est > 1000"));
+    // A field the query doesn't read is deleted, and the query keeps the same rows.
+    let shown = |s: &Session| s.map().layer_by_name("Countries").unwrap().visible_rows().iter().filter(|v| **v).count();
+    let rows = shown(&s);
+    s.run("edit.addField", &json!({"layer": "Countries", "name": "spare", "type": "text"})).unwrap();
+    s.run("edit.deleteField", &json!({"layer": "Countries", "field": "spare"})).unwrap();
+    assert_eq!(shown(&s), rows);
     s.run("layer.definitionQuery", &json!({"layer": "Countries", "where": ""})).unwrap();
     let filters = json!({"layer": "Countries", "filters": [{"name": "Big", "where": "pop_est > 1000"}]});
     s.run("layer.displayFilters", &filters).unwrap();
@@ -2347,6 +2354,12 @@ fn degenerate_geometry_and_deleted_fields() {
     let l = s.map().layer_by_name("Countries").unwrap();
     assert!(l.dataset.field_index("pop_est").is_some() && l.display_filters.len() == 1);
     s.run("layer.displayFilters", &json!({"layer": "Countries", "filters": []})).unwrap();
+    // Two fields named the same but for case: the query reads the first, which deleting `pop`
+    // removes; it would otherwise go on to read the second without a word.
+    s.run("layer.addDataText", &json!({"fileName": "twins.csv", "text": "lon,lat,Pop,pop\n1,2,5,0\n3,4,0,5\n"})).unwrap();
+    s.run("layer.definitionQuery", &json!({"layer": "twins", "where": "pop > 1"})).unwrap();
+    let e = s.run("edit.deleteField", &json!({"layer": "twins", "field": "pop"})).unwrap_err();
+    assert!(e.contains("definition query (pop > 1) uses 'Pop'"), "{e}");
     s.run("edit.deleteField", &json!({"layer": "Countries", "field": "pop_est"})).unwrap();
     let l = s.map().layer_by_name("Countries").unwrap();
     assert_eq!(l.renderer.kind_label(), "Single Symbol");
