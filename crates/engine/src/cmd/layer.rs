@@ -101,6 +101,7 @@ pub fn commands() -> Vec<C> {
             }
             // So do legends that leave it out.
             legends_follow_layer(s, &old, Some(&n));
+            references_follow_layer(s, &old, &n);
             Ok(r)
         }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?, "name": string}"#)
         .when(need_layer),
@@ -4709,6 +4710,120 @@ pub(crate) fn legends_follow_layer(s: &mut Session, old: &str, new: Option<&str>
                 }
             }
         }
+    }
+}
+
+/// Carries typed references to a renamed layer along with it. Map-local references and layout
+/// frames stay in their map. A name still present there keeps its references, as legends do;
+/// project-wide references without a map stay unchanged when another map still has that name.
+/// Script text, tool parameters and history are not rewritten.
+fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
+    use rustgis_map::design::{Elevation, TopologyRule};
+    use rustgis_map::layout::ElementKind;
+
+    if s.map().layers.iter().any(|l| l.name.eq_ignore_ascii_case(old)) {
+        return;
+    }
+    let collision = s.map().layers.iter().filter(|l| l.name.eq_ignore_ascii_case(new)).count() > 1;
+    let mut collision_left = 0usize;
+    let mut replace = |name: &mut String| {
+        if name.eq_ignore_ascii_case(old) {
+            if collision {
+                collision_left += 1;
+            } else {
+                *name = new.to_string();
+            }
+        }
+    };
+    let map_name = s.map().name.clone();
+    let editing = &mut s.map_mut().editing;
+    for relation in &mut editing.relationships {
+        replace(&mut relation.origin);
+        replace(&mut relation.destination);
+    }
+    for rule in &mut editing.topology {
+        match rule {
+            TopologyRule::MustNotOverlap { layer }
+            | TopologyRule::MustNotHaveGaps { layer }
+            | TopologyRule::MustNotSelfIntersect { layer }
+            | TopologyRule::MustNotHaveDangles { layer } => replace(layer),
+            TopologyRule::MustBeCoveredBy { layer, by } => {
+                replace(layer);
+                replace(by);
+            }
+        }
+    }
+    if let Elevation::Surface(layer) = &mut editing.settings.elevation {
+        replace(layer);
+    }
+    for layout in &mut s.project.layouts {
+        let frames: Vec<u32> = layout
+            .elements
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ElementKind::MapFrame { map, .. } if map.eq_ignore_ascii_case(&map_name) => Some(e.id),
+                _ => None,
+            })
+            .collect();
+        for element in &mut layout.elements {
+            match &mut element.kind {
+                ElementKind::Table { frame, layer, .. } | ElementKind::Chart { frame, layer, .. } if frames.contains(frame) => {
+                    replace(layer)
+                }
+                ElementKind::Colorbar { frame, layer: Some(layer), .. } if frames.contains(frame) => replace(layer),
+                _ => {}
+            }
+        }
+        if let Some(series) = &mut layout.series
+            && frames.contains(&series.frame)
+        {
+            replace(&mut series.layer);
+        }
+    }
+    // These items do not record a map; changing an ambiguous name would redirect references
+    // used with another map. Keep those spellings until the user chooses their intended layer.
+    let shared = s
+        .project
+        .maps
+        .iter()
+        .enumerate()
+        .any(|(i, map)| i != s.project.active_map && map.layers.iter().any(|layer| layer.name.eq_ignore_ascii_case(old)));
+    let mut left = 0usize;
+    let mut project_reference = |name: &mut String| {
+        if shared && name.eq_ignore_ascii_case(old) {
+            left += 1;
+        } else {
+            replace(name);
+        }
+    };
+    for report in &mut s.project.reports {
+        project_reference(&mut report.layer);
+    }
+    for model in &mut s.project.models {
+        if let Some(graph) = &mut model.graph {
+            for node in &mut graph.nodes {
+                if let Some(layer) = &mut node.layer {
+                    project_reference(layer);
+                }
+            }
+        }
+    }
+    for workspace in &mut s.project.workspaces {
+        for image in &mut workspace.images {
+            project_reference(image);
+        }
+    }
+    if left > 0 {
+        s.notify_text(crate::notice_text::NoticeText::format(
+            "{count} project reference(s) still name '{old}': another map has a layer of that name; choose the intended layer in those items",
+            [("count", left.to_string().into()), ("old", old.to_string().into())],
+        ), false);
+    }
+    if collision_left > 0 {
+        s.notify_text(crate::notice_text::NoticeText::format(
+            "{count} layer reference(s) still name '{old}': two layers are now called '{new}'; give the layer a unique name and choose it in those items",
+            [("count", collision_left.to_string().into()), ("old", old.to_string().into()), ("new", new.to_string().into())],
+        ), false);
     }
 }
 
