@@ -242,8 +242,10 @@ class Layer:
 
         A layer read in place (a large file, a database table) is read whole from its source on
         each call, into memory, as Load All Features reads it (a source too large to read whole
-        is refused); rows that can't be read are left out and said in ``session.notices()``. To
-        write a large layer to a file, :meth:`to_file` writes a chunk at a time.
+        is refused); rows that can't be read are left out and said in ``session.notices()``.
+        :meth:`to_file` can be cheaper for a large layer: to GeoJSON, CSV, FlatGeobuf, GeoPackage
+        or GeoParquet it writes a chunk at a time where the source allows; otherwise it reads the
+        layer whole too.
 
         Args:
             selected: Only the selected features.
