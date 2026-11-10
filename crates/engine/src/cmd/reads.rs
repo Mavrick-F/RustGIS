@@ -101,7 +101,11 @@ pub(crate) fn prepare(s: &Session, op: Authorized<CommandOp>, owner: Continuatio
         }
         "labels.convert" => {
             let layer = s.map().layer(s.layer_id(params)?).ok_or("no such layer")?;
-            ("Convert To Annotation", super::whole::ahead(s, params, "Convert To Annotation"), layer.source.clone())
+            // Nothing to convert: the command says so at once, with no read.
+            let work = super::labels::has_label_text(layer, s.map().scale())
+                .then(|| super::whole::ahead(s, params, "Convert To Annotation"))
+                .flatten();
+            ("Convert To Annotation", work, layer.source.clone())
         }
         "layer.reloadData" => {
             #[cfg(not(target_arch = "wasm32"))]

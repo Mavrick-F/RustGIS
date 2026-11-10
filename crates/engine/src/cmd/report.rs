@@ -1026,11 +1026,13 @@ fn whole_bytes(
 /// does: between the chunks of a source read so, not during one read at once.
 pub(crate) fn whole_copy(copy: &mut Session, i: usize) -> Result<(), String> {
     for (m, id) in reported_layers(copy, i) {
+        // Cancelled after one layer's read: the next isn't started.
+        rustgis_data::progress::check().map_err(|e| e.to_string())?;
         let Some(l) = copy.project.maps.get_mut(m).and_then(|map| map.layer_mut(id)) else { continue };
         let unread = super::whole::load_into(l)?;
         unread.say(copy);
     }
-    Ok(())
+    rustgis_data::progress::check().map_err(|e| e.to_string())
 }
 
 /// The layers report `i` lists records of, by map and id: its own, its subreports' related

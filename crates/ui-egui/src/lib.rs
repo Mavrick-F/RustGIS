@@ -2207,14 +2207,6 @@ impl RustGisApp {
             pluginstart::ask(self, id, params).inspect_err(|e| self.command_failed(id, e, notice_mark))?;
             return Ok(Value::Null);
         }
-        // Converting the labels of a layer read in place reads all of its source first, on a
-        // thread of its own (see `readjob`).
-        #[cfg(not(target_arch = "wasm32"))]
-        if id == "labels.convert"
-            && self.session.layer_id(&params).ok().and_then(|l| self.session.map().layer(l)).is_some_and(|l| l.is_streamed())
-        {
-            return readjob::run(self, "labels.convert", params);
-        }
         self.run(id, params)
     }
 
@@ -2270,6 +2262,13 @@ impl RustGisApp {
             if id == "topology.validate" {
                 let params = if params.is_null() { json!({}) } else { params };
                 return readjob::run(self, "topology.validate", params);
+            }
+            // Converting the labels of a layer read in place reads all of its source first, on a
+            // thread of its own, whoever asks (a click, the assistant).
+            if id == "labels.convert"
+                && self.session.layer_id(&params).ok().and_then(|l| self.session.map().layer(l)).is_some_and(|l| l.is_streamed())
+            {
+                return readjob::run(self, "labels.convert", params);
             }
         }
         self.run_with_prepared(id, params, AppDispatch::Direct)

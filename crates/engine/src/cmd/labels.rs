@@ -642,19 +642,32 @@ fn distance_range(s: &mut Session, p: &Value) -> CmdResult {
     })
 }
 
+/// Whether layer `l` has text to convert into annotations at `scale`: a class's label field, or a
+/// text expression. Decided on its fields, so before a layer read in place is read whole.
+pub(crate) fn has_label_text(l: &rustgis_map::Layer, scale: f64) -> bool {
+    l.labels.in_order().any(|c| {
+        l.dataset.field_index(&c.field).is_some()
+            || rustgis_map::label_by::LabelExprs::new(&c.by, &l.dataset, Some(scale)).is_some_and(|e| e.has_text())
+    })
+}
+
 /// Converts a layer's labels into an annotation layer: one point per label, at the label point,
 /// carrying the label text and drawn with the same text symbol. Each class labelling a feature
 /// gives it a point (a hidden class none); with classes besides Default, a CLASS field keeps
 /// which, and the annotation has the same classes, each picking its points by it. The layer's
 /// own labels turn off. A layer read in place converts all of its source's features, not just
 /// those of the view, and says the rows it couldn't read; it stays read in place. The app reads
-/// them ahead on a thread of its own, as for Load All Features; a script, the assistant or the
-/// command line reads them where the command runs. The conversion itself runs on the app's
-/// thread: it adds the annotation layer and turns the layer's labels off in one undoable step,
-/// a pass over features already in memory.
+/// them ahead on a thread of its own, as for Load All Features, whatever asks for the conversion
+/// there; a script or the command line reads them where the command runs. The conversion itself
+/// runs on the app's thread: it adds the annotation layer and turns the layer's labels off in one
+/// undoable step, a pass over features already in memory.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let scale = s.map().scale();
+    // Refused before a layer read in place is read whole for nothing.
+    if !has_label_text(s.map().layer(id).ok_or("no such layer")?, scale) {
+        return Err("the layer has no label field".into());
+    }
     // Its features, all of them: a copy of a layer read in place holds those of its whole source.
     let whole = if s.map().layer(id).ok_or("no such layer")?.is_streamed() {
         let (ds, unread) = super::whole::take_or_read(s, id)?;
