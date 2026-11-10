@@ -48,6 +48,17 @@ pub fn write(key: &str, value: &str) -> Result<Option<PathBuf>, String> {
 
 /// [`write`] to the file at `path` (a test folder in tests): returns where a malformed file went.
 fn write_at(path: &Path, key: &str, value: &str) -> Result<Option<PathBuf>, String> {
+    write_at_with_sync(path, key, value, sync_directory)
+}
+
+/// Separates replacement from its final directory flush; an unconfirmed flush must not claim
+/// that the already-visible file was left unchanged. The callback permits a post-rename fault test.
+fn write_at_with_sync(
+    path: &Path,
+    key: &str,
+    value: &str,
+    sync: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<Option<PathBuf>, String> {
     let (mut map, set_aside) = match read_at(path) {
         Ok(map) => (map, None),
         Err(_) if path.is_file() && std::fs::read(path).is_ok() => (Map::new(), Some(set_aside(path)?)),
@@ -56,12 +67,17 @@ fn write_at(path: &Path, key: &str, value: &str) -> Result<Option<PathBuf>, Stri
     map.insert(key.to_string(), Value::String(value.to_string()));
     let text = serde_json::to_vec(&map).map_err(|_| "could not serialize preferences")?;
     let dir = path.parent().ok_or("the settings folder isn't available")?;
-    std::fs::create_dir_all(dir).and_then(|_| rustgis_data::io::replace_atomic(path, &text)).and_then(|_| sync_directory(path)).map_err(
-        |error| match &set_aside {
-            Some(backup) => format!("could not save preferences: {error}; malformed preferences were kept at {}", backup.display()),
-            None => format!("could not save preferences: {error}"),
-        },
-    )?;
+    std::fs::create_dir_all(dir).and_then(|_| rustgis_data::io::replace_atomic(path, &text)).map_err(|error| match &set_aside {
+        Some(backup) => format!("could not save preferences: {error}; malformed preferences were kept at {}", backup.display()),
+        None => format!("could not save preferences: {error}"),
+    })?;
+    sync(path).map_err(|error| match &set_aside {
+        Some(backup) => format!(
+            "preferences were replaced, but their durability could not be confirmed: {error}; malformed preferences were kept at {}",
+            backup.display()
+        ),
+        None => format!("preferences were replaced, but their durability could not be confirmed: {error}"),
+    })?;
     Ok(set_aside)
 }
 
@@ -241,6 +257,13 @@ mod tests {
         let map = read_at(&path).unwrap();
         assert_eq!(map.get("connections"), Some(&Value::String("saved definitions".into())));
         assert_eq!(map.get("theme"), Some(&Value::String("dark".into())));
+        // A failed final flush leaves the replacement visible, with an honest durability error.
+        let error = write_at_with_sync(&path, "theme", "light", |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "directory sync unavailable"))
+        })
+        .unwrap_err();
+        assert!(error.contains("preferences were replaced") && error.contains("durability could not be confirmed"), "{error}");
+        assert_eq!(read_at(&path).unwrap().get("theme"), Some(&Value::String("light".into())));
         let broken = r#"{"sensitive-pref":"prefs-sentinel", broken}"#;
         std::fs::write(&path, broken).unwrap();
         let error = read_at(&path).unwrap_err();

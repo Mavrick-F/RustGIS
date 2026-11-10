@@ -119,9 +119,7 @@ mod prefs {
                 "Your settings couldn't be read, so RustGIS started new ones. The old settings file was kept as {path}.",
                 &[("path", &path.display().to_string())],
             ),
-            Notice::NotSaved(error) => {
-                fmt("Settings can't be saved ({error}): changes last only until RustGIS closes.", &[("error", error)])
-            }
+            Notice::NotSaved(error) => fmt("Settings could not be saved reliably ({error}).", &[("error", error)]),
         }
     }
 
@@ -805,6 +803,12 @@ mod tests {
         assert_eq!(prefs::take_notices(), [Notice::SetAside(bad.clone())]);
         let text = prefs::text(&Notice::SetAside(bad));
         assert!(text.contains("prefs.json.bad"), "{text}");
+        // Both a failed replacement and an unconfirmed final flush give an accurate notice.
+        for error in ["could not save preferences: read-only", "preferences were replaced, but their durability could not be confirmed"] {
+            let text = prefs::text(&Notice::NotSaved(error.into()));
+            assert!(text.contains("Settings could not be saved reliably") && text.contains(error), "{text}");
+            assert!(!text.contains("changes last only until"), "{text}");
+        }
     }
 
     #[test]
