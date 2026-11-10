@@ -61,8 +61,8 @@ mod prefs {
     }
 
     static NOTICES: Mutex<Vec<Notice>> = Mutex::new(Vec::new());
-    /// The last save failed and said so: later failures stay quiet until a save works again.
-    static FAILING: AtomicBool = AtomicBool::new(false);
+    /// Repeated equivalent failures stay quiet; changed recovery details must reach the window.
+    static LAST_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 
     /// The waiting notices; a panic while one was added doesn't lose the others.
     fn notices() -> std::sync::MutexGuard<'static, Vec<Notice>> {
@@ -82,11 +82,11 @@ mod prefs {
     }
 
     /// Keeps what a save came to for the window: a malformed file set aside (which also explains
-    /// an earlier read failure still waiting), or the first of a run of failed saves.
+    /// an earlier read failure still waiting), or a failure whose outcome changed since last time.
     pub fn saved(result: Result<Option<PathBuf>, String>) {
         match result {
             Ok(set_aside) => {
-                FAILING.store(false, Ordering::Relaxed);
+                *LAST_FAILURE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 if let Some(path) = set_aside {
                     log::warn!("unreadable preferences set aside as {}", path.display());
                     let mut notices = notices();
@@ -96,7 +96,9 @@ mod prefs {
             }
             Err(error) => {
                 log::warn!("{error}");
-                if !FAILING.swap(true, Ordering::Relaxed) {
+                let mut last = LAST_FAILURE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if last.as_deref() != Some(error.as_str()) {
+                    *last = Some(error.clone());
                     notices().push(Notice::NotSaved(error));
                 }
             }
@@ -818,6 +820,13 @@ mod tests {
             frame();
         }
         assert!(!ctx.has_requested_repaint(), "draining the notice lets the window settle");
+        // Recovery can advance during a failure episode: do not retain obsolete instructions.
+        let changed =
+            "preferences were replaced, but their durability could not be confirmed; malformed preferences were kept at prefs.json.bad";
+        prefs::saved(Err(changed.into()));
+        assert_eq!(prefs::take_notices(), [Notice::NotSaved(changed.into())]);
+        prefs::saved(Err(changed.into()));
+        assert!(prefs::take_notices().is_empty(), "equivalent recovery outcomes stay quiet");
         // Once a save works, the next failure is news again.
         prefs::saved(Ok(None));
         prefs::saved(Err("could not save preferences: read-only".into()));

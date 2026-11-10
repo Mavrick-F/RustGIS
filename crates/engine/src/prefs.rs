@@ -88,9 +88,16 @@ const KEPT_BAD: u32 = 9;
 
 /// Copies malformed preferences to an exclusively created `.bad` file, synced before saving
 /// replaces the original. Concurrent callers cannot overwrite each other's recovery files.
-/// A failed copy is removed; a failed later save leaves both original and recovery intact.
+/// Failed copies remain reserved: another process may already have verified and reused one.
+/// A copy or sync failure stops replacement and reports the possibly incomplete recovery path.
 /// Retries reuse an identical regular recovery file, without spending another recovery slot.
 fn set_aside(path: &Path) -> Result<PathBuf, String> {
+    set_aside_with_sync(path, |backup, target| backup.sync_all().and_then(|_| sync_directory(target)))
+}
+
+/// Copies into an exclusive recovery name and confirms it before returning. A failing creator
+/// never deletes the name, because another writer can independently sync and reuse its bytes.
+fn set_aside_with_sync(path: &Path, sync: impl FnOnce(&std::fs::File, &Path) -> std::io::Result<()>) -> Result<PathBuf, String> {
     let name = |n: u32| path.with_extension(if n == 1 { "json.bad".to_string() } else { format!("json.bad{n}") });
     let mut source = std::fs::File::open(path).map_err(|error| format!("could not preserve malformed preferences: {error}"))?;
     let targets: Vec<PathBuf> = (1..=KEPT_BAD).map(name).collect();
@@ -118,15 +125,11 @@ fn set_aside(path: &Path) -> Result<PathBuf, String> {
             }
             Err(error) => return Err(format!("could not preserve malformed preferences: {error}")),
         };
-        if let Err(error) = source
-            .rewind()
-            .and_then(|_| std::io::copy(&mut source, &mut backup))
-            .and_then(|_| backup.sync_all())
-            .and_then(|_| sync_directory(&target))
-        {
-            drop(backup);
-            let _ = std::fs::remove_file(&target);
-            return Err(format!("could not preserve malformed preferences: {error}"));
+        if let Err(error) = source.rewind().and_then(|_| std::io::copy(&mut source, &mut backup)).and_then(|_| sync(&backup, &target)) {
+            return Err(format!(
+                "could not confirm recovery of malformed preferences: {error}; recovery copy retained at {} and may be incomplete",
+                target.display()
+            ));
         }
         return Ok(target);
     }
@@ -224,6 +227,27 @@ pub fn use_saved_secrets(s: &mut crate::Session, prefs: &Map<String, Value>, sto
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A second writer can finish a save while the recovery creator is still confirming it.
+    /// A later creator error must not remove the recovery copy that the successful writer used.
+    #[test]
+    fn a_creator_sync_error_keeps_a_recovery_copy_another_writer_reused() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-reused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        std::fs::write(&path, "malformed original").unwrap();
+        let error = set_aside_with_sync(&path, |_, target| {
+            let reused = write_at(&path, "theme", "dark").map_err(std::io::Error::other)?;
+            assert_eq!(reused.as_deref(), Some(target));
+            Err(std::io::Error::other("creator sync failed"))
+        })
+        .unwrap_err();
+        assert!(error.contains("recovery copy retained") && error.contains("creator sync failed"), "{error}");
+        assert_eq!(read_at(&path).unwrap().get("theme").and_then(Value::as_str), Some("dark"));
+        assert_eq!(std::fs::read_to_string(path.with_extension("json.bad")).unwrap(), "malformed original");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn full_recovery_slots_leave_the_malformed_file_and_every_backup_unchanged() {
