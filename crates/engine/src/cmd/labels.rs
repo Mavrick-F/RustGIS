@@ -649,7 +649,9 @@ fn distance_range(s: &mut Session, p: &Value) -> CmdResult {
 /// own labels turn off. A layer read in place converts all of its source's features, not just
 /// those of the view, and says the rows it couldn't read; it stays read in place. The app reads
 /// them ahead on a thread of its own, as for Load All Features; a script, the assistant or the
-/// command line reads them where the command runs.
+/// command line reads them where the command runs. The conversion itself runs on the app's
+/// thread: it adds the annotation layer and turns the layer's labels off in one undoable step,
+/// a pass over features already in memory.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let scale = s.map().scale();

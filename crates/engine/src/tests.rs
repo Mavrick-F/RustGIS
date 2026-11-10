@@ -11952,6 +11952,27 @@ fn two_class_b64() -> String {
     base64::engine::general_purpose::STANDARD.encode(geotiff::write(&r, 0).unwrap())
 }
 
+/// The layers a report export reads whole are those its pages list: its own, and those of the
+/// reports it appends as far as they are drawn, not one appended past the depth drawn.
+#[test]
+fn a_report_export_reads_only_the_layers_it_draws() {
+    let mut s = world();
+    let point = json!({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"name": "a"}, "geometry": {"type": "Point", "coordinates": [0, 0]}}]});
+    s.run("layer.addDataText", &json!({"fileName": "deep.geojson", "text": point.to_string()})).unwrap();
+    let layers = ["Cities", "Countries", "Rivers", "Lakes", "deep"];
+    for (k, layer) in layers.iter().enumerate() {
+        s.run("report.new", &json!({"layer": layer, "name": format!("r{k}")})).unwrap();
+    }
+    // Each appends the next: r0 draws r1 to r3, and r3 is too deep to draw r4.
+    for k in 0..4 {
+        s.run("report.relatedReport", &json!({"report": format!("r{k}"), "related": format!("r{}", k + 1)})).unwrap();
+    }
+    let mut read: Vec<_> =
+        crate::cmd::report::reported_layers(&s, 0).into_iter().map(|(m, id)| s.project.maps[m].layer(id).unwrap().name.clone()).collect();
+    read.sort();
+    assert_eq!(read, ["Cities", "Countries", "Lakes", "Rivers"]);
+}
+
 /// A layer read in place a view at a time, its view holding one of its three points: its labels
 /// convert to an annotation for every point, read here or ahead as the app reads it, and a
 /// report's export lists every record (its selection kept by feature) while its preview says it
@@ -11967,8 +11988,9 @@ fn labels_and_reports_of_a_layer_read_in_place_use_its_whole_source() {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    let dir = Dir(std::env::temp_dir().join(format!("rustgis-whole-labels-{}", std::process::id())));
-    let _ = std::fs::remove_dir_all(&dir.0);
+    // Its own each run (the process id alone can repeat).
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-whole-labels-{}-{nanos}", std::process::id())));
     std::fs::create_dir_all(&dir.0).unwrap();
     let dir = &dir.0;
     let point = |name: &str, x: f64, y: f64| json!({"type": "Feature", "properties": {"name": name}, "geometry": {"type": "Point", "coordinates": [x, y]}});

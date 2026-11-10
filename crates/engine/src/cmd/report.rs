@@ -1034,40 +1034,43 @@ pub(crate) fn whole_copy(copy: &mut Session, i: usize) -> Result<(), String> {
 }
 
 /// The layers report `i` lists records of, by map and id: its own, its subreports' related
-/// layers, and those of the reports it appends, however deep (a report appended too deep to be
-/// drawn only costs a read).
+/// layers, and those of the reports it appends, as far as [`blocks`] draws them (the same
+/// reports, in the same order, to the same depth), so an export reads no layer it doesn't list.
 pub(crate) fn reported_layers(input: &impl super::InputSource, i: usize) -> Vec<(usize, u32)> {
-    let context = input.input_context();
-    let s = &context;
-    let place = |name: &str| {
-        let (map, l) = find_layer_map(input, name)?;
-        Some((s.project.maps.iter().position(|m| std::ptr::eq(m, map))?, l.id, l.name.clone()))
-    };
-    let (mut out, mut seen, mut todo) = (Vec::new(), vec![i], vec![i]);
-    while let Some(i) = todo.pop() {
-        let Some(r) = s.project.reports.get(i) else { continue };
-        let Some((m, id, name)) = place(&r.layer) else { continue };
+    /// Report `i`'s layers at `depth`, then those of the reports it appends, as `blocks` walks
+    /// them (sharing its `seen`).
+    fn walk(input: &impl super::InputSource, i: usize, depth: usize, seen: &mut Vec<usize>, out: &mut Vec<(usize, u32)>) {
+        let context = input.input_context();
+        let s = &context;
+        let place = |name: &str| {
+            let (map, l) = find_layer_map(input, name)?;
+            Some((s.project.maps.iter().position(|m| std::ptr::eq(m, map))?, l.id, l.name.clone()))
+        };
+        let Some(r) = s.project.reports.get(i) else { return };
+        // A report whose layer is gone draws nothing (`blocks` fails), nor the reports it appends.
+        let Some((m, id, name)) = place(&r.layer) else { return };
         out.push((m, id));
         for sec in &r.sections {
-            match sec {
-                Section::Subreport { relationship, .. } => {
-                    let other = relationships(input)
-                        .find(|x| x.name.eq_ignore_ascii_case(relationship))
-                        .and_then(|rel| opposite(rel, &name).map(str::to_string));
-                    out.extend(other.and_then(|other| place(&other)).map(|(m, id, _)| (m, id)));
-                }
-                Section::Related { report } => {
-                    if let Some(j) = s.project.reports.iter().position(|x| x.name.eq_ignore_ascii_case(report))
-                        && !seen.contains(&j)
-                    {
-                        seen.push(j);
-                        todo.push(j);
-                    }
-                }
-                _ => {}
+            if let Section::Subreport { relationship, .. } = sec {
+                let other = relationships(input)
+                    .find(|x| x.name.eq_ignore_ascii_case(relationship))
+                    .and_then(|rel| opposite(rel, &name).map(str::to_string));
+                out.extend(other.and_then(|other| place(&other)).map(|(m, id, _)| (m, id)));
+            }
+        }
+        for sec in &r.sections {
+            if let Section::Related { report } = sec
+                && depth < MAX_DEPTH
+                && let Some(j) = s.project.reports.iter().position(|x| x.name.eq_ignore_ascii_case(report))
+                && !seen.contains(&j)
+            {
+                seen.push(j);
+                walk(input, j, depth + 1, seen, out);
             }
         }
     }
+    let mut out = Vec::new();
+    walk(input, i, 0, &mut vec![i], &mut out);
     out.sort_unstable();
     out.dedup();
     out
