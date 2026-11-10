@@ -548,13 +548,15 @@ mod tests {
         assert_eq!(Failure::TooLarge(4000, 3000).line(), "Picture unavailable: 4000 × 3000 pixels is larger than 2048 × 2048");
         assert_eq!(decode(b"<html>Not found</html>"), Err(Failure::NotPicture));
         assert_eq!(decode(&[]), Err(Failure::NotPicture));
-        // A picture whose format isn't read here says so, not that it isn't a picture.
-        let mut bmp = b"BM".to_vec();
-        bmp.resize(64, 0);
-        assert_eq!(decode(&bmp), Err(Failure::Unsupported("BMP".into())));
-        let mut tiff = b"II*\0".to_vec();
-        tiff.resize(64, 0);
-        assert_eq!(decode(&tiff), Err(Failure::Unsupported("TIFF".into())));
+        // Platform clipboard dependencies can enable BMP or TIFF through feature unification.
+        // These invalid headers are unsupported without a decoder, and malformed with one.
+        for (format, signature) in [(image::ImageFormat::Bmp, b"BM".as_slice()), (image::ImageFormat::Tiff, b"II*\0".as_slice())] {
+            let mut bytes = signature.to_vec();
+            bytes.resize(64, 0);
+            let error =
+                if format.reading_enabled() { Failure::NotPicture } else { Failure::Unsupported(format!("{format:?}").to_uppercase()) };
+            assert_eq!(decode(&bytes), Err(error), "{format:?}");
+        }
         assert_eq!(Failure::Unsupported("BMP".into()).line(), "Picture unavailable: BMP pictures aren't supported");
         // A picture cut short doesn't decode.
         let whole = png(64, 64);
