@@ -4,7 +4,7 @@
 
 use rustgis_data::secrets::{Reporting, SecretStore};
 use serde_json::{Map, Value};
-use std::io::{Read, Seek};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -79,7 +79,7 @@ fn write_at_with_bytes(
     let (mut map, set_aside) = match bytes {
         Ok(bytes) => match parse_preferences(&bytes) {
             Ok(map) => (map, None),
-            Err(_) => (Map::new(), Some(set_aside(path)?)),
+            Err(_) => (Map::new(), Some(set_aside(path, &bytes)?)),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Map::new(), None),
         Err(error) => return Err(format!("could not read preferences: {error}")),
@@ -106,18 +106,18 @@ fn write_at_with_bytes(
 /// saving refuses to replace any recovery copy or the malformed current file.
 const KEPT_BAD: u32 = 9;
 
-/// Copies malformed preferences to an exclusively created `.bad` file, synced before saving
+/// Copies the exact bytes that failed parsing to an exclusively created `.bad` file, synced before saving
 /// replaces the original. Concurrent callers cannot overwrite each other's recovery files.
 /// Failed copies remain reserved: another process may already have verified and reused one.
 /// A copy or sync failure stops replacement and reports the possibly incomplete recovery path.
 /// Retries reuse an identical regular recovery file, without spending another recovery slot.
-fn set_aside(path: &Path) -> Result<PathBuf, String> {
-    set_aside_with_sync(path, |backup, target| backup.sync_all().and_then(|_| sync_directory(target)))
+fn set_aside(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    set_aside_with_sync(path, bytes, |backup, target| backup.sync_all().and_then(|_| sync_directory(target)))
 }
 
 /// Copies into an exclusive recovery name and confirms it before returning. A failing creator
 /// never deletes the name, because another writer can independently sync and reuse its bytes.
-fn set_aside_with_sync(path: &Path, sync: impl Fn(&std::fs::File, &Path) -> std::io::Result<()>) -> Result<PathBuf, String> {
+fn set_aside_with_sync(path: &Path, bytes: &[u8], sync: impl Fn(&std::fs::File, &Path) -> std::io::Result<()>) -> Result<PathBuf, String> {
     let name = |n: u32| path.with_extension(if n == 1 { "json.bad".to_string() } else { format!("json.bad{n}") });
     let retained = |error: std::io::Error, target: &Path| {
         format!(
@@ -127,10 +127,9 @@ fn set_aside_with_sync(path: &Path, sync: impl Fn(&std::fs::File, &Path) -> std:
     };
     let confirm =
         |copy: &std::fs::File, target: &Path| sync(copy, target).map(|()| target.to_path_buf()).map_err(|error| retained(error, target));
-    let mut source = std::fs::File::open(path).map_err(|error| format!("could not preserve malformed preferences: {error}"))?;
     let targets: Vec<PathBuf> = (1..=KEPT_BAD).map(name).collect();
     for target in &targets {
-        if let Ok(Some(copy)) = same_contents(&mut source, target) {
+        if let Ok(Some(copy)) = same_contents(bytes, target) {
             return confirm(&copy, target);
         }
     }
@@ -146,14 +145,14 @@ fn set_aside_with_sync(path: &Path, sync: impl Fn(&std::fs::File, &Path) -> std:
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Another process may have completed this copy after the first scan.
-                if let Ok(Some(copy)) = same_contents(&mut source, &target) {
+                if let Ok(Some(copy)) = same_contents(bytes, &target) {
                     return confirm(&copy, &target);
                 }
                 continue;
             }
             Err(error) => return Err(format!("could not preserve malformed preferences: {error}")),
         };
-        if let Err(error) = source.rewind().and_then(|_| std::io::copy(&mut source, &mut backup)) {
+        if let Err(error) = backup.write_all(bytes) {
             return Err(retained(error, &target));
         }
         return confirm(&backup, &target);
@@ -179,7 +178,7 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
 
 /// Returns the open copy when its bytes match, so the caller can confirm its durability.
 /// Symlink paths and read errors do not establish a match; sync failures remain distinct.
-fn same_contents(source: &mut std::fs::File, target: &Path) -> std::io::Result<Option<std::fs::File>> {
+fn same_contents(source: &[u8], target: &Path) -> std::io::Result<Option<std::fs::File>> {
     if !std::fs::symlink_metadata(target)?.file_type().is_file() {
         return Ok(None);
     }
@@ -189,25 +188,20 @@ fn same_contents(source: &mut std::fs::File, target: &Path) -> std::io::Result<O
     #[cfg(not(target_os = "linux"))]
     options.write(true);
     let mut copy = options.open(target)?;
-    if source.metadata()?.len() != copy.metadata()?.len() {
+    if source.len() as u64 != copy.metadata()?.len() {
         return Ok(None);
     }
-    source.rewind()?;
-    let mut left = [0u8; 8192];
     let mut right = [0u8; 8192];
-    loop {
-        let n = source.read(&mut left)?;
-        if n == 0 {
-            if copy.read(&mut right[..1])? != 0 {
-                return Ok(None);
-            }
-            return Ok(Some(copy));
-        }
-        copy.read_exact(&mut right[..n])?;
-        if left[..n] != right[..n] {
+    for left in source.chunks(right.len()) {
+        copy.read_exact(&mut right[..left.len()])?;
+        if left != &right[..left.len()] {
             return Ok(None);
         }
     }
+    if copy.read(&mut right[..1])? != 0 {
+        return Ok(None);
+    }
+    Ok(Some(copy))
 }
 
 /// Opts a native caller into the desktop's saved connections and lazy credential store, which
@@ -251,6 +245,25 @@ pub fn use_saved_secrets(s: &mut crate::Session, prefs: &Map<String, Value>, sto
 mod tests {
     use super::*;
 
+    /// Recovery preserves the malformed snapshot, even if the path now contains another save.
+    #[test]
+    fn recovery_keeps_the_bytes_that_failed_parsing() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let malformed = b"malformed original";
+        assert!(parse_preferences(malformed).is_err());
+        let current = br#"{"theme":"dark","other":"kept"}"#;
+        std::fs::write(&path, current).unwrap();
+        let backup = set_aside(&path, malformed).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), malformed);
+        assert_eq!(std::fs::read(&path).unwrap(), current);
+        assert_eq!(set_aside(&path, malformed).unwrap(), backup);
+        assert!(!path.with_extension("json.bad2").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A failed read must not be reclassified as malformed when the file is readable again.
     #[test]
     fn transient_read_failure_preserves_valid_preferences() {
@@ -288,12 +301,13 @@ mod tests {
         let path = dir.join(FILE);
         std::fs::write(&path, "malformed original").unwrap();
         for _ in 0..2 {
-            let error = set_aside_with_sync(&path, |_, _| Err(std::io::Error::other("directory sync failed"))).unwrap_err();
+            let error =
+                set_aside_with_sync(&path, b"malformed original", |_, _| Err(std::io::Error::other("directory sync failed"))).unwrap_err();
             assert!(error.contains("directory sync failed") && error.contains("recovery copy retained"), "{error}");
             assert!(!path.with_extension("json.bad2").exists());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "malformed original");
         }
-        assert_eq!(set_aside(&path).unwrap(), path.with_extension("json.bad"));
+        assert_eq!(set_aside(&path, &std::fs::read(&path).unwrap()).unwrap(), path.with_extension("json.bad"));
         assert!(!path.with_extension("json.bad2").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -307,7 +321,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE);
         std::fs::write(&path, "malformed original").unwrap();
-        let error = set_aside_with_sync(&path, |_, target| {
+        let error = set_aside_with_sync(&path, b"malformed original", |_, target| {
             let reused = write_at(&path, "theme", "dark").map_err(std::io::Error::other)?;
             assert_eq!(reused.as_deref(), Some(target));
             Err(std::io::Error::other("creator sync failed"))
@@ -329,7 +343,7 @@ mod tests {
         for n in 0..KEPT_BAD {
             let text = format!("broken preferences {n}");
             std::fs::write(&path, &text).unwrap();
-            kept.push((set_aside(&path).unwrap(), text));
+            kept.push((set_aside(&path, &std::fs::read(&path).unwrap()).unwrap(), text));
         }
         std::fs::write(&path, "broken preferences").unwrap();
         assert!(write_at(&path, "theme", "dark").unwrap_err().contains("left unchanged"));
@@ -379,7 +393,7 @@ mod tests {
         }
         std::fs::write(&path, broken).unwrap();
         for _ in 0..=KEPT_BAD {
-            assert_eq!(set_aside(&path).unwrap(), dir.join("prefs.json.bad"));
+            assert_eq!(set_aside(&path, &std::fs::read(&path).unwrap()).unwrap(), dir.join("prefs.json.bad"));
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
         assert_eq!(write_at(&path, "theme", "light").unwrap(), Some(dir.join("prefs.json.bad")));
