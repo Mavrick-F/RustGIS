@@ -1749,7 +1749,9 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
         // so an 8-bit image reads back as one; otherwise 32-bit floats.
         let n = (w as usize) * (h as usize);
         let samples = n.checked_mul(all.len()).ok_or_else(|| err("the raster is too large to write"))?;
-        let as_bytes = all.iter().all(|b| fits_bytes(r, *b)) && (r.nodata.is_some() || r.bands.iter().all(|b| b.stats.count == n));
+        // Only whole values: an 8-bit raster can hold fractions after resampling, kept as floats.
+        let whole = r.bands.iter().all(|b| b.data.iter().all(|v| !r.is_valid(*v) || v.fract() == 0.0));
+        let as_bytes = whole && all.iter().all(|b| fits_bytes(r, *b)) && (r.nodata.is_some() || r.bands.iter().all(|b| b.stats.count == n));
         macro_rules! wide {
             ($colour:ty, $sample:expr) => {{
                 let mut data = super::room(samples, w as usize, h as usize)?;
@@ -2069,6 +2071,11 @@ mod tests {
         let back = read(std::io::Cursor::new(write_all(&rgbi).unwrap()), "b").unwrap();
         assert_eq!((back.band_count(), &back.color, back.data_type.as_str()), (5, &rgbi.color, "UInt8"));
         assert!((0..5).all(|b| back.bands[b].data == rgbi.bands[b].data));
+        // An 8-bit raster holding a fraction (a resampled mean) keeps it: written as floats.
+        let mean = vec![vec![0.0, 1.5, 7.0, 9.0, 0.0, 3.0], vec![1.0; 6]];
+        let means = Raster::new("m", 3, 2, mean, gt, Crs::LonLat, Some(0.0), ColorHint::Gray, "UInt8").unwrap();
+        let back = read(std::io::Cursor::new(write_all(&means).unwrap()), "m").unwrap();
+        assert_eq!(back.value(0, 1, 0), Some(1.5));
         // What `write` keeps whole is written as `write` writes it.
         let rgb = raster(3, ColorHint::Rgb { alpha: false });
         assert_eq!(write_all(&rgb).unwrap(), write(&rgb, 0).unwrap());

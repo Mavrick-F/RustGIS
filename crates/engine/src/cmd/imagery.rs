@@ -1376,12 +1376,12 @@ fn mosaic_matches(first: &Raster, r: &Raster) -> Result<(), String> {
     if r.band_count() != first.band_count() {
         return Err(format!("{} has {} bands, {} {}", r.name, r.band_count(), first.name, first.band_count()));
     }
-    // The mosaic takes the first input's colour, so a last band that is alpha in one input and
-    // data in another (RGBA and RGB with near-infrared) would take one role for both.
+    // The mosaic takes the first input's colour, so a band that is alpha in one input and data in
+    // another (RGBA and RGB with near-infrared) would take one role for both.
     let alpha = |r: &Raster| matches!(r.color, ColorHint::Rgb { alpha: true } | ColorHint::GrayAlpha);
     if alpha(r) != alpha(first) {
         let (with, without) = if alpha(r) { (r, first) } else { (first, r) };
-        return Err(format!("{}'s last band is transparency, {}'s is data: use rasters with matching band roles", with.name, without.name));
+        return Err(format!("{} has a transparency band and {} doesn't: use rasters with matching band roles", with.name, without.name));
     }
     Ok(())
 }
