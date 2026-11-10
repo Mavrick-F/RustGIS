@@ -97,13 +97,21 @@ fn set_aside(path: &Path) -> Result<PathBuf, String> {
 
 /// Copies into an exclusive recovery name and confirms it before returning. A failing creator
 /// never deletes the name, because another writer can independently sync and reuse its bytes.
-fn set_aside_with_sync(path: &Path, sync: impl FnOnce(&std::fs::File, &Path) -> std::io::Result<()>) -> Result<PathBuf, String> {
+fn set_aside_with_sync(path: &Path, sync: impl Fn(&std::fs::File, &Path) -> std::io::Result<()>) -> Result<PathBuf, String> {
     let name = |n: u32| path.with_extension(if n == 1 { "json.bad".to_string() } else { format!("json.bad{n}") });
+    let retained = |error: std::io::Error, target: &Path| {
+        format!(
+            "could not confirm recovery of malformed preferences: {error}; recovery copy retained at {} and may be incomplete",
+            target.display()
+        )
+    };
+    let confirm =
+        |copy: &std::fs::File, target: &Path| sync(copy, target).map(|()| target.to_path_buf()).map_err(|error| retained(error, target));
     let mut source = std::fs::File::open(path).map_err(|error| format!("could not preserve malformed preferences: {error}"))?;
     let targets: Vec<PathBuf> = (1..=KEPT_BAD).map(name).collect();
     for target in &targets {
-        if same_contents(&mut source, target).unwrap_or(false) {
-            return Ok(target.clone());
+        if let Ok(Some(copy)) = same_contents(&mut source, target) {
+            return confirm(&copy, target);
         }
     }
     for target in targets {
@@ -118,20 +126,17 @@ fn set_aside_with_sync(path: &Path, sync: impl FnOnce(&std::fs::File, &Path) -> 
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Another process may have completed this copy after the first scan.
-                if same_contents(&mut source, &target).unwrap_or(false) {
-                    return Ok(target);
+                if let Ok(Some(copy)) = same_contents(&mut source, &target) {
+                    return confirm(&copy, &target);
                 }
                 continue;
             }
             Err(error) => return Err(format!("could not preserve malformed preferences: {error}")),
         };
-        if let Err(error) = source.rewind().and_then(|_| std::io::copy(&mut source, &mut backup)).and_then(|_| sync(&backup, &target)) {
-            return Err(format!(
-                "could not confirm recovery of malformed preferences: {error}; recovery copy retained at {} and may be incomplete",
-                target.display()
-            ));
+        if let Err(error) = source.rewind().and_then(|_| std::io::copy(&mut source, &mut backup)) {
+            return Err(retained(error, &target));
         }
-        return Ok(target);
+        return confirm(&backup, &target);
     }
     Err(format!(
         "all {KEPT_BAD} preference recovery files are occupied; repair or move one before saving settings; the malformed preferences were left unchanged at {}",
@@ -152,11 +157,11 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Compares regular recovery files in bounded chunks, syncing an identical copy before reuse.
-/// Symlink paths and read or sync errors do not establish a reusable recovery copy.
-fn same_contents(source: &mut std::fs::File, target: &Path) -> std::io::Result<bool> {
+/// Returns the open copy when its bytes match, so the caller can confirm its durability.
+/// Symlink paths and read errors do not establish a match; sync failures remain distinct.
+fn same_contents(source: &mut std::fs::File, target: &Path) -> std::io::Result<Option<std::fs::File>> {
     if !std::fs::symlink_metadata(target)?.file_type().is_file() {
-        return Ok(false);
+        return Ok(None);
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -165,7 +170,7 @@ fn same_contents(source: &mut std::fs::File, target: &Path) -> std::io::Result<b
     options.write(true);
     let mut copy = options.open(target)?;
     if source.metadata()?.len() != copy.metadata()?.len() {
-        return Ok(false);
+        return Ok(None);
     }
     source.rewind()?;
     let mut left = [0u8; 8192];
@@ -174,15 +179,13 @@ fn same_contents(source: &mut std::fs::File, target: &Path) -> std::io::Result<b
         let n = source.read(&mut left)?;
         if n == 0 {
             if copy.read(&mut right[..1])? != 0 {
-                return Ok(false);
+                return Ok(None);
             }
-            copy.sync_all()?;
-            sync_directory(target)?;
-            return Ok(true);
+            return Ok(Some(copy));
         }
         copy.read_exact(&mut right[..n])?;
         if left[..n] != right[..n] {
-            return Ok(false);
+            return Ok(None);
         }
     }
 }
@@ -227,6 +230,25 @@ pub fn use_saved_secrets(s: &mut crate::Session, prefs: &Map<String, Value>, sto
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A verified copy whose durability cannot be confirmed must not spend another recovery slot.
+    #[test]
+    fn repeated_recovery_sync_failures_keep_one_slot() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-sync-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        std::fs::write(&path, "malformed original").unwrap();
+        for _ in 0..2 {
+            let error = set_aside_with_sync(&path, |_, _| Err(std::io::Error::other("directory sync failed"))).unwrap_err();
+            assert!(error.contains("directory sync failed") && error.contains("recovery copy retained"), "{error}");
+            assert!(!path.with_extension("json.bad2").exists());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "malformed original");
+        }
+        assert_eq!(set_aside(&path).unwrap(), path.with_extension("json.bad"));
+        assert!(!path.with_extension("json.bad2").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A second writer can finish a save while the recovery creator is still confirming it.
     /// A later creator error must not remove the recovery copy that the successful writer used.
