@@ -221,3 +221,114 @@ fn file_compatibility_resaves_declare_the_current_writer() -> Result<(), String>
     }
     Ok(())
 }
+
+/// A number that isn't finite (NaN, infinity) can't make a project unopenable: Set Value refuses
+/// one, and one a reader put in a layer is saved as null with a count and dataset location.
+/// A project of finite numbers saves and opens without a loss notice.
+#[test]
+fn numbers_that_are_not_finite_never_make_a_project_unopenable() -> Result<(), String> {
+    use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(Dataset::new("Readings", GeometryType::None, vec![Field::new("level", FieldType::Double)]));
+    let ds = &mut s.map_mut().layer_mut(id).ok_or("no layer")?.dataset;
+    ds.push(None, vec![V::Float(1.5)]);
+    ds.push(None, vec![V::Float(2.5)]);
+    for typed in ["NaN", " inf ", "-infinity", "1e400"] {
+        let e = s.run("edit.setValue", &json!({"layer": id, "row": 0, "field": "level", "value": typed})).err().ok_or(typed)?;
+        assert!(e.contains("isn't a finite number"), "{typed}: {e}");
+    }
+    assert_eq!(s.map().layer(id).ok_or("no layer")?.dataset.value(0, 0), &V::Float(1.5), "a refused value changes nothing");
+    let losses = |notices: Vec<String>| notices.into_iter().filter(|n| n.contains("finite numbers")).collect::<Vec<_>>();
+
+    // Clean: no notice, and the numbers open as they were.
+    let (text, report) = s.project.saved_text(None)?;
+    assert!(losses(report.notices()).is_empty(), "{:?}", report.notices());
+    assert_eq!(Project::from_json(&text)?.maps[0].layers[0].dataset.value(1, 0), &V::Float(2.5));
+
+    // As a reader leaves them (a NaN REAL in a GeoPackage): saved as null, and counted.
+    let ds = &mut s.map_mut().layer_mut(id).ok_or("no layer")?.dataset;
+    ds.features[0].attrs[0] = V::Float(f64::NAN);
+    ds.features[1].attrs[0] = V::Float(f64::NEG_INFINITY);
+    let (text, report) = s.project.saved_text(None)?;
+    assert_eq!(
+        losses(report.notices()),
+        ["2 attribute value(s) that aren't finite numbers (NaN or infinity) were written as null; affected datasets include 'Readings'"]
+    );
+    let mark = s.notice_mark();
+    report.notify(&mut s);
+    let notice = s.notices_since(mark).last().ok_or("no counted output notice")?;
+    assert_eq!(
+        notice
+            .translated(|key, args| {
+                assert!(key.starts_with("{count} attribute value(s)"));
+                assert!(args.contains(&("places", "'Readings'")));
+                "translated loss notice".to_string()
+            })
+            .as_deref(),
+        Some("translated loss notice")
+    );
+    let opened = Project::from_json(&text)?;
+    assert_eq!(opened.maps[0].layers[0].dataset.value(0, 0), &V::Null);
+    assert_eq!(opened.maps[0].layers[0].dataset.value(1, 0), &V::Null);
+
+    // Opened clean: no notice.
+    let mark = s.notice_mark();
+    s.run("project.openText", &json!({"text": Project::from_json(&text).and_then(|mut p| p.saved_text(None))?.0}))?;
+    assert!(losses(s.notices_since(mark).iter().map(|n| n.text.clone()).collect()).is_empty());
+    // Other interactive ingress either rejects a non-finite value or reports its conversion.
+    let before = s.map().layers[0].dataset.features.len();
+    assert!(
+        s.run(
+            "edit.addFeature",
+            &json!({"layer": "Readings", "geometry": {"type": "Point", "coordinates": [0, 0]}, "attributes": {"level": "NaN"}})
+        )
+        .is_err()
+    );
+    assert_eq!(s.map().layers[0].dataset.features.len(), before);
+    let mark = s.notice_mark();
+    s.run("edit.calculateField", &json!({"layer": "Readings", "field": "level", "expression": "'NaN'"}))?;
+    assert_eq!(s.notices_since(mark).iter().filter(|n| n.text.contains("'level' is null for 2 results that aren't numbers")).count(), 1);
+
+    // A declared Double in MIF/MID retains its non-finite source number until counted output.
+    // CSV inference deliberately keeps a mixed NaN/numeric column as lossless text.
+    let mif = "Version 300\nCoordSys Earth Projection 1, 104\nColumns 1\n level Float\nData\nPoint 0 0\nPoint 1 1\n";
+    let (dataset, _) = rustgis_engine::data::mapinfo::read(mif, Some("NaN\n1.5\n"), "Imported").map_err(|e| e.to_string())?;
+    assert!(matches!(dataset.value(0, 0), V::Float(f) if f.is_nan()));
+    s.map_mut().add_dataset(dataset);
+    let (_, report) = s.project.saved_text(None)?;
+    assert_eq!(
+        losses(report.notices()),
+        ["1 attribute value(s) that aren't finite numbers (NaN or infinity) were written as null; affected datasets include 'Imported'"]
+    );
+    Ok(())
+}
+
+/// Finite current rows must not hide non-finite values kept in saved design and edit history.
+#[test]
+fn nonfinite_design_and_archived_values_are_counted_when_output_is_prepared() -> Result<(), String> {
+    use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    let mut s = Session::new(Project::default());
+    let mut dataset = Dataset::new("Design", GeometryType::None, vec![Field::new("level", FieldType::Double)]);
+    dataset.push(None, vec![V::Float(f64::NAN)]);
+    s.map_mut().add_dataset(dataset);
+    s.run("data.archive", &json!({"layer": "Design"}))?;
+    s.run("edit.setValue", &json!({"layer": "Design", "row": 0, "field": "level", "value": 1}))?;
+    s.run("edit.template", &json!({"layer": "Design", "name": "T", "defaults": {"level": "NaN"}}))?;
+    assert_eq!(s.map().layers[0].dataset.unsaved_numbers(), 0);
+    assert_eq!(s.map().layers[0].design.unsaved_numbers(), 2);
+    for (text, report) in [s.project.saved_text(None)?, s.project.clone().recovery_text_with_report()?] {
+        assert_eq!(
+            report
+                .notices()
+                .iter()
+                .filter(|notice| notice.contains("2 attribute value(s)") && notice.contains("'Design' (design or archived values)"))
+                .count(),
+            1
+        );
+        let opened = Project::from_json(&text)?;
+        let design = &opened.maps[0].layers[0].design;
+        assert_eq!(design.templates[0].defaults[0].1, V::Null);
+        assert_eq!(design.archive.as_ref().ok_or("no archive")?[0].before.as_ref().ok_or("no archived feature")?.attrs[0], V::Null);
+    }
+    Ok(())
+}

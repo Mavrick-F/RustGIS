@@ -403,7 +403,7 @@ pub fn read(mif: &str, mid: Option<&str>, name: &str) -> Result<(Dataset, ReadRe
             .fields
             .iter()
             .enumerate()
-            .map(|(c, f)| Value::parse(row.and_then(|r| r.get(c)).map(String::as_str).unwrap_or(""), f.ty))
+            .map(|(c, f)| Value::parse_source(row.and_then(|r| r.get(c)).map(String::as_str).unwrap_or(""), f.ty))
             .collect();
         ds.push_next(g, attrs);
     }

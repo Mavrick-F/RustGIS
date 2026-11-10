@@ -47,20 +47,22 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
         }
         None => None,
     };
-    let attrs: Vec<Value> = l
+    let attrs: Result<Vec<Value>, String> = l
         .dataset
         .fields
         .iter()
         .map(|f| {
-            let given = p.get("attributes").and_then(|a| a.get(&f.name)).map(|v| coerce(Value::from_json(v), f.ty));
-            let default = template
-                .as_ref()
-                .and_then(|t| t.defaults.iter().find(|(k, _)| k.eq_ignore_ascii_case(&f.name)))
-                .map(|(_, v)| coerce(v.clone(), f.ty));
-            given.or(default).unwrap_or(Value::Null)
+            let given = p.get("attributes").and_then(|a| a.get(&f.name)).map(Value::from_json);
+            let default =
+                template.as_ref().and_then(|t| t.defaults.iter().find(|(k, _)| k.eq_ignore_ascii_case(&f.name))).map(|(_, v)| v.clone());
+            let value = given.or(default).unwrap_or(Value::Null);
+            if non_finite_input(&value, f.ty) {
+                return Err(format!("field '{}' requires a finite number", f.name));
+            }
+            Ok(coerce(value, f.ty))
         })
         .collect();
-    l.dataset.push(Some(g), attrs);
+    l.dataset.push(Some(g), attrs?);
     l.touch_geometry();
     let row = l.dataset.features.len() - 1;
     l.selection = vec![row];
@@ -170,8 +172,22 @@ impl Cuts {
 /// [`coerce`], with a number past the 64-bit range null, and what it took from a number to put it
 /// in a whole-number field.
 pub(crate) fn coerce_cut(v: Value, ty: FieldType) -> (Value, Cut) {
+    if ty == FieldType::Double && non_finite_input(&v, ty) {
+        return (Value::Null, Cut::NotANumber);
+    }
     let (v, cut, _) = convert(v, ty);
     (v, cut)
+}
+
+/// Text and native numbers that cannot be retained as numeric field values.
+/// Ordinary invalid words keep the existing parser's behavior; non-finite numbers are explicit.
+fn non_finite_input(value: &Value, ty: FieldType) -> bool {
+    ty.is_numeric()
+        && match value {
+            Value::Float(f) => !f.is_finite(),
+            Value::Text(text) => text.trim().parse::<f64>().is_ok_and(|f| !f.is_finite()),
+            _ => false,
+        }
 }
 
 /// [`coerce_cut`], and for a number past the range the decimal it was read as.
@@ -195,7 +211,8 @@ fn convert(v: Value, ty: FieldType) -> (Value, Cut, Option<f64>) {
                 _ => (Value::parse(&t, ty), Cut::None, None),
             },
         },
-        (Value::Text(t), _) => (Value::parse(&t, ty), Cut::None, None),
+        // Uncounted coercion retains source numbers until output can explain any loss.
+        (Value::Text(t), _) => (Value::parse_source(&t, ty), Cut::None, None),
         (other, _) => (Value::parse(&other.to_string(), ty), Cut::None, None),
     }
 }
@@ -273,6 +290,11 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     let ty = l.dataset.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
     let raw = p.get("value").cloned().unwrap_or(Json::Null);
     let v = match raw {
+        // A number that isn't finite (NaN, infinity) is no value a number field holds, nor one a
+        // project can save: refused, as the attribute table refuses it.
+        Json::String(t) if ty.is_numeric() && t.trim().parse::<f64>().is_ok_and(|f| !f.is_finite()) => {
+            return Err(format!("'{}' isn't a finite number, which a {} field holds", t.trim(), ty.label()));
+        }
         Json::String(t) => Value::parse(&t, ty),
         other => coerce(Value::from_json(&other), ty),
     };

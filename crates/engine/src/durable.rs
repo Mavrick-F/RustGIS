@@ -23,6 +23,10 @@ pub struct Report {
     pub(crate) not_retained: u32,
     pub(crate) executable_changes: u32,
     pub(crate) reconnect: u32,
+    /// Attribute values written as null: numbers that aren't finite, which JSON can't hold.
+    pub(crate) numbers: u32,
+    /// First affected dataset names; the total count still covers every dataset.
+    pub(crate) number_places: Vec<crate::notice_text::NoticeText>,
 }
 
 impl Report {
@@ -40,6 +44,20 @@ impl Report {
 
     /// One notice for each kind of loss, and none for a clean output.
     pub fn notices(&self) -> Vec<String> {
+        self.notice_texts().into_iter().map(|text| text.english()).collect()
+    }
+
+    /// Publishes counted output losses, retaining new templates for translation in the interface.
+    /// Stored recovery diagnostics and non-interactive callers keep [`Self::notices`] in English.
+    pub fn notify(&self, session: &mut crate::Session) {
+        for text in self.notice_texts() {
+            session.notify_text(text, false);
+        }
+    }
+
+    /// Keeps typed count/name arguments separate from the trusted text of each new notice.
+    fn notice_texts(&self) -> Vec<crate::notice_text::NoticeText> {
+        use crate::notice_text::NoticeText;
         let mut out = Vec::new();
         for (n, text) in [
             (
@@ -60,11 +78,21 @@ impl Report {
             ),
         ] {
             if n > 0 {
-                out.push(format!("{n} {text}"));
+                out.push(format!("{n} {text}").into());
             }
         }
+        if self.numbers > 0 {
+            out.push(NoticeText::format(
+                "{count} attribute value(s) that aren't finite numbers (NaN or infinity) were written as null; affected datasets include {places}",
+                [("count", self.numbers.to_string().into()), ("places", NoticeText::list(self.number_places.clone()))],
+            ));
+        }
         if self.not_remembered {
-            out.push("This output's credential restoration exceeds the memory limit; reopening it will not bring its keys back".into());
+            out.push(
+                "This output's credential restoration exceeds the memory limit; reopening it will not bring its keys back"
+                    .to_string()
+                    .into(),
+            );
         }
         out
     }
@@ -90,6 +118,12 @@ impl Report {
         self.not_retained = self.not_retained.saturating_add(other.not_retained);
         self.executable_changes = self.executable_changes.saturating_add(other.executable_changes);
         self.reconnect = self.reconnect.saturating_add(other.reconnect);
+        self.numbers = self.numbers.saturating_add(other.numbers);
+        for place in &other.number_places {
+            if self.number_places.len() < 3 && !self.number_places.contains(place) {
+                self.number_places.push(place.clone());
+            }
+        }
     }
 }
 
@@ -242,6 +276,30 @@ impl<'a> Prepare<'a> {
         self.owners.push(owner);
         value.prepare(self);
         self.owners.pop();
+    }
+
+    /// Counts the values `dataset` is written without ([`rustgis_data::Dataset::unsaved_numbers`]).
+    pub(crate) fn count_numbers(&mut self, dataset: &rustgis_data::Dataset) {
+        self.record_numbers(dataset.unsaved_numbers(), format!("'{}'", crate::project::short_name(&dataset.name)).into());
+    }
+
+    /// Counts saved design values separately from current rows so archived snapshots and
+    /// feature defaults cannot be silently changed by Value's human-readable serialization.
+    fn count_design_numbers(&mut self, layer: &rustgis_map::Layer) {
+        let place = crate::notice_text::NoticeText::format(
+            "{name} (design or archived values)",
+            [("name", format!("'{}'", crate::project::short_name(&layer.name)).into())],
+        );
+        self.record_numbers(layer.design.unsaved_numbers(), place);
+    }
+
+    /// Aggregates every value while retaining only a bounded list of affected locations.
+    fn record_numbers(&mut self, count: usize, place: crate::notice_text::NoticeText) {
+        let n = u32::try_from(count).unwrap_or(u32::MAX);
+        self.report.numbers = self.report.numbers.saturating_add(n);
+        if n > 0 && self.report.number_places.len() < 3 && !self.report.number_places.contains(&place) {
+            self.report.number_places.push(place);
+        }
     }
 
     /// Records a single replacement of a whole owning field, never a subfield of an edit.
@@ -686,8 +744,8 @@ fn split_look(address: &str) -> (&str, &str) {
 /// Emits preparation losses after the durable projection's journal has restored live fields.
 /// This does not confirm delivery or commit the enclosing command's notices.
 pub(crate) fn notify(s: &mut crate::Session, report: &Report) {
-    for text in report.notices() {
-        s.notify(format!("Prepared output: {text}"), false);
+    for text in report.notice_texts() {
+        s.notify_text(crate::notice_text::NoticeText::format("Prepared output: {message}", [("message", text)]), false);
     }
 }
 
@@ -746,6 +804,10 @@ impl Durable for rustgis_map::Map {
         for s in self.slots() {
             p.string(Leaf::Map(s.at), s.value, s.address, s.local_path);
         }
+        for l in &self.layers {
+            p.count_numbers(&l.dataset);
+            p.count_design_numbers(l);
+        }
     }
 
     /// Resolves a prepared location through owned fields, without allocation or policy.
@@ -764,6 +826,8 @@ impl Durable for rustgis_map::Layer {
         for (role, value, address, path) in self.output_slots() {
             p.string(Leaf::Layer(role), value, address, path);
         }
+        p.count_numbers(&self.dataset);
+        p.count_design_numbers(self);
     }
 
     /// Resolves a prepared location through owned fields, without allocation or policy.
