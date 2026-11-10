@@ -116,6 +116,9 @@ Every screenshot is RustGIS itself, rendered offscreen by `cargo run -p rustgis-
 | **Python** | The [`rustgis` package](docs/python.md) on PyPI: the engine in-process, `rustgis.Map` in Jupyter and `rustgis.qt.MapWidget` in Qt applications |
 | **Interface** | Layers, Browser and Data Sources panes as tabs, command search (Ctrl+K), keyboard shortcuts, dark mode, custom themes (desktop) and an interface scale, a customizable ribbon and Quick Access Toolbar, linked side-by-side maps, a History pane of tool runs and the session log, autosave and crash recovery (desktop), Check for Updates (desktop), 21 languages |
 
+_(desktop)_ marks what the web app doesn't do; most of these also work from the command line and
+Python.
+
 The [user guide](https://rustgis.app/user-guide/) covers each area in detail,
 [Comparison](https://rustgis.app/comparison/) sets RustGIS beside GeoLibre, QGIS and ArcGIS, and
 [ROADMAP.md](ROADMAP.md) lists what's next.
