@@ -51,7 +51,7 @@ pub struct Workflow {
     pub spectral: crate::spectralui::Spectral,
     pub selected_only: Option<bool>,
     /// The projected coordinate system the Geostatistical Wizard's surface is made in; empty: the
-    /// environment's, or degrees.
+    /// environment's, else the projected one the layer was read in, else degrees.
     pub crs: String,
     /// The system the Wizard's surface was last to be made in (its own, else the environment's):
     /// when it changes, the cell size typed for it is cleared.
@@ -718,12 +718,20 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             heading(ui, "Interpolate a surface from points (IDW)");
             combo(ui, "wf_i", "Layer", &mut app.workflow.layer, &points);
             combo(ui, "wf_if", "Field", &mut app.workflow.field, &numeric);
-            // Empty: the environment's system, or degrees without one.
-            let degrees = app.workflow.crs.trim().is_empty() && app.session.project.gp_env.projected.is_none();
+            // Empty: the environment's system, else the projected one the layer was read in, else
+            // degrees; the hint shows which.
+            let layer_crs = app
+                .session
+                .map()
+                .layer_by_name(&app.workflow.layer)
+                .and_then(|l| l.dataset.crs)
+                .filter(|c| !c.is_geographic() && !c.is_geocentric());
+            let empty_crs = app.session.project.gp_env.projected.map(|g| g.crs).or(layer_crs);
+            let degrees = app.workflow.crs.trim().is_empty() && empty_crs.is_none();
             ui.add(
                 egui::TextEdit::singleline(&mut app.workflow.crs)
-                    .hint_text(match app.session.project.gp_env.projected {
-                        Some(g) => g.crs.label(),
+                    .hint_text(match empty_crs {
+                        Some(c) => c.label(),
                         None => tl!("projected system (EPSG:32616), or degrees").to_string(),
                     })
                     .desired_width(f32::INFINITY),
@@ -731,7 +739,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             // A cell size typed for one system means nothing in another: when the system the surface
             // will be made in changes (typed here, or the environment's), the size is cleared.
             let system = match app.workflow.crs.trim() {
-                "" => app.session.project.gp_env.projected.map(|g| g.crs.code()).unwrap_or_default(),
+                "" => empty_crs.map(|c| c.code()).unwrap_or_default(),
                 typed => typed.to_string(),
             };
             if system != app.workflow.wizard_system {

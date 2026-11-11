@@ -39502,8 +39502,8 @@ fn interpolation_says_the_features_it_leaves_out() {
 }
 
 /// The Geostatistical Wizard makes its surface in a projected system (#1743): the one given as
-/// `crs`, else the environment's (`gp.env` `crs`, with a cell size in its units). Without either it
-/// stays in degrees, and says so for a layer read in a projected system. The environment keeps its
+/// `crs`, else the environment's (`gp.env` `crs`, with a cell size in its units), else the projected
+/// one the layer was read in, and says so; `EPSG:4326` asks for degrees. The environment keeps its
 /// system apart from the degree cell size an older RustGIS reads, and saves it with the project.
 #[test]
 fn interpolation_in_a_projected_coordinate_system() {
@@ -39525,14 +39525,20 @@ fn interpolation_in_a_projected_coordinate_system() {
         let r = s.map().layer(v["layer"].as_u64().unwrap() as u32).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
         (r.crs, r.transform.pixel_width, notices)
     };
-    let in_degrees = |notices: &[String]| notices.iter().any(|n| n.contains("made in degrees") && n.contains(&Crs::Epsg(32616).label()));
+    let assumed = |notices: &[String]| {
+        notices.iter().any(|n| n.contains(&format!("made in {}, the coordinate system wells was read in", Crs::Epsg(32616).label())))
+    };
 
     let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:32616", "cellSize": 500}));
     assert_eq!((crs, cell), (Crs::Epsg(32616), 500.0));
-    assert!(!in_degrees(&notices), "{notices:?}");
-    let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "cellSize": 0.01}));
+    assert!(!assumed(&notices), "{notices:?}");
+    // Without a system, the layer's (#1743 question 1), and said; EPSG:4326 asks for degrees.
+    let (crs, _, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
+    assert_eq!(crs, Crs::Epsg(32616));
+    assert!(assumed(&notices), "{notices:?}");
+    let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326", "cellSize": 0.01}));
     assert_eq!((crs, cell), (Crs::LonLat, 0.01));
-    assert!(in_degrees(&notices), "{notices:?}");
+    assert!(!assumed(&notices), "{notices:?}");
 
     // The environment's system, with its cell size in metres; its degree cell size stays apart.
     let env = s.run("gp.env", &json!({"crs": "EPSG:32616", "cellSize": 250})).unwrap();
@@ -39540,7 +39546,7 @@ fn interpolation_in_a_projected_coordinate_system() {
     assert_eq!(env["projected"]["crs"], "EPSG:32616", "{env}");
     let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
     assert_eq!((crs, cell), (Crs::Epsg(32616), 250.0));
-    assert!(!in_degrees(&notices), "{notices:?}");
+    assert!(!assumed(&notices), "{notices:?}");
     // An empty `crs` is none given: the environment's still applies.
     let (crs, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": ""}));
     assert_eq!((crs, cell), (Crs::Epsg(32616), 250.0));
@@ -39587,7 +39593,8 @@ fn interpolation_in_a_projected_coordinate_system() {
     let beyond = format!("polar: 1 point(s) beyond what {label} can hold (past 85.05° of latitude) were left out");
     assert!(notices.contains(&beyond), "{notices:?}");
 
-    // Degrees are refused as a system; clearing the environment's goes back to degrees.
+    // A geographic system other than EPSG:4326 is refused, and the environment takes none;
+    // clearing the environment's goes back to the layer's.
     assert!(s.run("analysis.interpolate", &json!({"layer": "wells", "field": "depth", "crs": "EPSG:4269"})).is_err());
     assert!(s.run("gp.env", &json!({"crs": "EPSG:4326"})).is_err());
     assert!(s.run("gp.env", &json!({"crs": 32616})).is_err());

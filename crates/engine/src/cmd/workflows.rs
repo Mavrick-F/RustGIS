@@ -15,7 +15,7 @@ use crate::{CmdResult, CommandSpec as C, Session};
 pub fn commands() -> Vec<C> {
     vec![
         C::new("gp.env", "Environments", "Analyze › Geoprocessing", environments).inputs(environment_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"extent"?: "view"|"full"|layer name|[minLon, minLat, maxLon, maxLat]|null, "crs"?: projected coordinate system ("EPSG:32616") rasters are made in|null (degrees), "cellSize"?: in degrees, or in the units of the crs when one is set|null}"#,
+            r#"{"extent"?: "view"|"full"|layer name|[minLon, minLat, maxLon, maxLat]|null, "crs"?: projected coordinate system ("EPSG:32616") rasters are made in|null (none: the layer's projected system, else degrees), "cellSize"?: in degrees, or in the units of the crs when one is set|null}"#,
         ),
         // A setting of the whole process, not of the project: no undo step, and `Reserved`, so the
         // assistant asks first and agents, plugins and imported items can't change it.
@@ -65,7 +65,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": elevation raster, "from": [lon, lat], "to": [lon, lat], "band"?: 1-based, "observerHeight"?: m, "targetHeight"?: m, "name"?: output}"#,
         ),
         C::new("analysis.interpolate", "Geostatistical Wizard", "Analyze › Workflows", interpolate).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer": points, "field": numeric field, "crs"?: projected coordinate system ("EPSG:32616") to make it in (default the environment's; degrees without one), "cellSize"?: in degrees, or in the units of the crs, "power"?: 2, "neighbors"?: 12, "name"?: output, "ran"?: (internal: a surface the app has worked out)}"#,
+            r#"{"layer": points, "field": numeric field, "crs"?: projected coordinate system ("EPSG:32616") to make it in (default the environment's, else the layer's projected system, else degrees; "EPSG:4326" for degrees), "cellSize"?: in degrees, or in the units of the crs, "power"?: 2, "neighbors"?: 12, "name"?: output, "ran"?: (internal: a surface the app has worked out)}"#,
         ),
         C::new("analysis.route", "Network Analysis", "Analyze › Workflows", route).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layer": line network, "from": [lon, lat], "to": [lon, lat], "costField"?: field, "snapDistance"?: metres, "name"?: output}"#,
@@ -1189,7 +1189,8 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
         pts.push((c, v));
     }
     let (layer_name, field_name) = (ds.name.clone(), field.to_string());
-    // The system: the one given, else the environment's, else degrees as before either was there.
+    // The system: the one given, else the environment's, else the projected one the layer was read
+    // in, else degrees.
     let env = &s.project.gp_env;
     // An empty `crs` is none given, as `null` is: the environment's system still applies.
     let given = p.get("crs").is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
