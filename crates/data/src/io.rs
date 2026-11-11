@@ -1862,11 +1862,8 @@ const FORMULA_START: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
 /// A cell's text; text that a spreadsheet would run as a formula is prefixed with `'`.
 fn csv_cell(v: &Value) -> String {
     match v {
-        Value::Null => String::new(),
         Value::Text(t) if t.starts_with(FORMULA_START) => format!("'{t}"),
-        // The shortest text that reads back as the same number: `Display` rounds to 6 decimals.
-        Value::Float(f) => f.to_string(),
-        other => other.to_string(),
+        other => other.to_file_text(),
     }
 }
 
