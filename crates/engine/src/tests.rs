@@ -39267,9 +39267,13 @@ fn interpolation_in_a_projected_coordinate_system() {
     // The environment's system, with its cell size in metres; its degree cell size stays apart.
     let env = s.run("gp.env", &json!({"crs": "EPSG:32616", "cellSize": 250})).unwrap();
     assert_eq!((env["cellSize"].clone(), env["projected"]["cellSize"].clone()), (Value::Null, json!(250.0)), "{env}");
+    assert_eq!(env["projected"]["crs"], "EPSG:32616", "{env}");
     let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
     assert_eq!((crs, cell), (Crs::Epsg(32616), 250.0));
     assert!(!in_degrees(&notices), "{notices:?}");
+    // EPSG:4326 asks for degrees over the environment's system.
+    let (crs, _, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326", "cellSize": 0.01}));
+    assert_eq!(crs, Crs::LonLat);
     // The run's own cell size wins over the environment's.
     let (_, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "cellSize": 500}));
     assert_eq!(cell, 500.0);
@@ -39311,9 +39315,10 @@ fn interpolation_in_a_projected_coordinate_system() {
     assert!(notices.contains(&beyond), "{notices:?}");
 
     // Degrees are refused as a system; clearing the environment's goes back to degrees.
-    assert!(s.run("analysis.interpolate", &json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326"})).is_err());
+    assert!(s.run("analysis.interpolate", &json!({"layer": "wells", "field": "depth", "crs": "EPSG:4269"})).is_err());
     assert!(s.run("gp.env", &json!({"crs": "EPSG:4326"})).is_err());
     assert!(s.run("gp.env", &json!({"crs": 32616})).is_err());
+    assert!(s.run("gp.env", &json!({"crs": "EPSG:4978"})).is_err(), "geocentric");
     s.run("gp.env", &json!({"crs": null})).unwrap();
     assert_eq!(s.project.gp_env.projected, None);
     // The run in another system above took its own cell size, as it does with no environment.

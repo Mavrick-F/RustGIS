@@ -428,7 +428,7 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
         "threads": rustgis_data::threads::max(),
         "cores": rustgis_data::threads::cores(),
     });
-    let projected = env.projected.map(|g| json!({"crs": g.crs.label(), "cellSize": g.cell_size}));
+    let projected = env.projected.map(|g| json!({"crs": g.crs.code(), "label": g.crs.label(), "cellSize": g.cell_size}));
     Ok(
         json!({"extent": env.extent.map(|e| [e.min_x, e.min_y, e.max_x, e.max_y]), "cellSize": env.cell_size, "projected": projected, "limits": limits}),
     )

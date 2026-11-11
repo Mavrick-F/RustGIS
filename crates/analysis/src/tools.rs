@@ -3947,6 +3947,8 @@ pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<Str
     }
     match s(p, "crs").trim() {
         "" => Ok((Crs::LonLat, degrees_note(ds, tool))),
+        // Asked for by name: degrees, with nothing to say.
+        text if Crs::parse(text).is_ok_and(|c| c == Crs::LonLat) => Ok((Crs::LonLat, None)),
         text => {
             let (crs, note) = projected_crs(text)?;
             Ok((crs, note.map(|note| format!("{tool}: its coordinate system: {note}"))))
@@ -3958,6 +3960,9 @@ pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<Str
 /// in degrees: a raster's cells are measured in a projected system's units.
 pub fn projected_crs(text: &str) -> Result<(Crs, Option<&'static str>), String> {
     let (crs, note) = crs_with_compatibility_note(text)?;
+    if crs.is_geocentric() {
+        return Err("crs must be a projected coordinate system, not a geocentric one (X, Y and Z from the Earth's centre)".into());
+    }
     if crs.is_geographic() {
         return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618); leave it empty to work in degrees".into());
     }
@@ -9554,7 +9559,7 @@ mod tests {
             assert!(d.iter().all(|v| (1.0..=4.0).contains(v)), "{tool}: {d:?}");
             assert!(d[d.len() - g.width as usize] < d[g.width as usize - 1], "{tool}: south-west below north-east");
 
-            for (crs, why) in [(serde_json::json!("EPSG:4326"), "geographic"), (serde_json::json!(32616), "not text")] {
+            for (crs, why) in [(serde_json::json!("EPSG:4269"), "geographic, not WGS 84"), (serde_json::json!(32616), "not text")] {
                 let p = serde_json::json!({"input": "wells", "field": "v", "crs": crs});
                 assert!(crate::run(tool, &m, &p).is_err(), "{tool}: {why}");
             }

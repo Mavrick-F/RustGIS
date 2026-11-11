@@ -517,11 +517,11 @@ pub struct GpEnvironment {
 
 impl GpEnvironment {
     /// The cell size set for rasters made in `crs`: the projected one's in its own system, the
-    /// degree one in longitude/latitude, none in another system.
+    /// degree one in longitude/latitude (whether or not a system is set), none in another system.
     pub fn cell_in(&self, crs: rustgis_data::raster::Crs) -> Option<f64> {
         match self.projected {
             Some(g) if g.crs == crs => g.cell_size,
-            None if crs == rustgis_data::raster::Crs::LonLat => self.cell_size,
+            _ if crs == rustgis_data::raster::Crs::LonLat => self.cell_size,
             _ => None,
         }
     }

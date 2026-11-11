@@ -312,6 +312,14 @@ impl Crs {
         }
     }
 
+    /// Text [`Crs::parse`] reads back as this system: `EPSG:32645`, or a custom one's definition.
+    pub fn code(self) -> String {
+        match self.custom_def() {
+            Some(d) => d.proj4.clone(),
+            None => format!("EPSG:{}", self.epsg()),
+        }
+    }
+
     /// `EPSG:32645`, or a custom system's name.
     pub fn label(self) -> String {
         match self.custom_def() {
@@ -331,7 +339,7 @@ impl Crs {
     }
 
     /// Whether its coordinates are geocentric (X, Y and Z from the Earth's centre), not a map's.
-    pub(crate) fn is_geocentric(self) -> bool {
+    pub fn is_geocentric(self) -> bool {
         match self {
             Crs::LonLat | Crs::WebMercator => false,
             Crs::Epsg(c) => epsg_proj4(c).is_some_and(|d| d.contains("+proj=geocent")),
@@ -419,7 +427,7 @@ pub(crate) fn transformer_of(def: &str) -> Result<Transformer, String> {
         return eqc;
     }
     let native = proj4rs::Proj::from_proj_string(def).map_err(|e| e.to_string())?;
-    let geographic = def.contains("+proj=longlat");
+    let geographic = geographic_def(def);
     Ok(Transformer { kind: Kind::Proj { native: Box::new(native), wgs84: Box::new(wgs84()?), geographic } })
 }
 
@@ -440,6 +448,10 @@ mod datum_tests {
         }
         assert!(!geographic_def("+proj=utm +zone=16 +datum=WGS84"));
         assert!(!geographic_def("+proj=longlatx"));
+        // Read as degrees too: a corner comes back where it was, not off by the radian factor.
+        let to = transformer_of("+proj=latlong +datum=WGS84 +no_defs").unwrap();
+        let c = to.from_lonlat(Coord::new(-90.0, 35.0)).unwrap();
+        assert!((c.x + 90.0).abs() < 1e-9 && (c.y - 35.0).abs() < 1e-9, "{c:?}");
     }
 
     /// A corner on a datum shifted from WGS 84 (SAD69) moves by the shift, tens of metres; on one

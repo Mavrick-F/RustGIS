@@ -1246,9 +1246,11 @@ The environment can also set a projected coordinate system for the Geostatistica
 (`gp.env={"crs": "EPSG:32616"}`, or **Set Coordinate System**; `null` goes back to degrees), and
 `cellSize` is then in its units. That cell size is kept apart from the cell size in degrees, so an
 older RustGIS opening the project keeps making rasters in degrees; `gp.env` returns the system and
-its cell size as `projected`, and `cellSize` stays the one in degrees. The Geostatistical Wizard
+its cell size as `projected` (`crs` there is the text to give it back), and `cellSize` stays the one
+in degrees. The Geostatistical Wizard
 uses the environment's extent, coordinate system and cell size; its own `crs` and `cellSize` win
-over them (an empty `crs` means degrees), and without a system it works in degrees, as before. IDW Interpolation and Ordinary Kriging
+over them (`EPSG:4326` asks for degrees, with the degree cell size), and without a system it works
+in degrees, as before. IDW Interpolation and Ordinary Kriging
 instead use their own `extent`, `pixelSize` and `crs` parameters; the environment does not set
 their output grids.
 
