@@ -313,7 +313,8 @@ or `both`, with the names of the parts that changed. It doesn't compare the laye
 as it is now: the same edit made to both shows as `both`. Only the bytes count: writing the
 same bytes again isn't a change, while a copy that puts back the file's size and time with other
 bytes is one.
-Undoing an edit makes the layer `inSync` again. A number that isn't finite (NaN, infinity), which a
+Undoing every edit makes the layer match its record again, so it reads `inSync` if the file
+hasn't changed either. A number that isn't finite (NaN, infinity), which a
 project saves as empty, shows the layer as `edited` once its project is opened again. On the desktop the file and the rows are hashed
 in the background, with progress and Cancel in the status bar.
 

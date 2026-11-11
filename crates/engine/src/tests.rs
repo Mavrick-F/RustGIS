@@ -39356,7 +39356,13 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
     }
     // Windows' long form of a path on a drive is a file on this computer: checked (and missing here).
     let id = s.map().layer_by_name("towns.shp").unwrap().id;
-    s.map_mut().layer_mut(id).unwrap().dataset.source = Some(r"\\?\C:\data\towns.shp".into());
+    // In the test's own folder on Windows (a file there by chance can't match); elsewhere it's
+    // just a name no file has.
+    #[cfg(windows)]
+    let long = format!(r"\\?\{}", dir.join("missing").join("towns.shp").display());
+    #[cfg(not(windows))]
+    let long = r"\\?\C:\missing\towns.shp".to_string();
+    s.map_mut().layer_mut(id).unwrap().dataset.source = Some(long);
     let v = s.run("source.syncState", &json!({"layer": id})).unwrap();
     assert!(v["changed"].as_array().unwrap().iter().any(|c| c.as_str().is_some_and(|c| c.ends_with("towns.shp"))), "{v}");
     // A part that can't be read to record it (a folder where the .prj would be): the layer is
