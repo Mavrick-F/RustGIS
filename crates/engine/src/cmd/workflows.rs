@@ -1404,8 +1404,8 @@ fn similar(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Converts a layer to GeoJSON, CSV, KML, GPX or WKT text, written to `path` or returned; says when
-/// the layer's Z or M values were dropped on import, or its positions are approximate or aren't
-/// longitude/latitude.
+/// the layer's Z or M values were dropped on import, its positions are approximate or aren't
+/// longitude/latitude, or CSV or GPX couldn't hold some of it.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let ds = feature_ds(s, p)?;
     let name_field =
@@ -1419,7 +1419,14 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         f => return Err(format!("unknown format '{f}'")),
     };
     // Every format here is longitude/latitude.
-    let notes = rustgis_data::export_notes([(ds, ds.extent())], ps(p, "path").unwrap_or(&ds.name), rustgis_data::raster::Crs::LonLat);
+    let target = ps(p, "path").unwrap_or(&ds.name);
+    let mut notes = rustgis_data::export_notes([(ds, ds.extent())], target, rustgis_data::raster::Crs::LonLat);
+    // CSV holds a point a row, GPX a name for each feature and no areas.
+    match ps(p, "format") {
+        Some("csv") => notes.extend(rustgis_data::io::CsvLosses::of(&ds.features, ds.geometry_type).notes(ds.geometry_type, target)),
+        Some("gpx") => notes.extend(rustgis_data::io::gpx_notes(ds, name_field, target)),
+        _ => {}
+    }
     let out = match ps(p, "path") {
         Some(path) => {
             rustgis_data::io::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
