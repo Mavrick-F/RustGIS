@@ -53,6 +53,9 @@ pub struct Workflow {
     /// The projected coordinate system the Geostatistical Wizard's surface is made in; empty: the
     /// environment's, or degrees.
     pub crs: String,
+    /// The system the Wizard's surface was last to be made in (its own, else the environment's):
+    /// when it changes, the cell size typed for it is cleared.
+    pub wizard_system: String,
     /// The projected coordinate system typed for the environment's Set Coordinate System.
     pub env_crs: String,
     /// The cell size typed for the environment, apart from the Wizard's, which is the run's own.
@@ -690,7 +693,6 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             combo(ui, "wf_if", "Field", &mut app.workflow.field, &numeric);
             // Empty: the environment's system, or degrees without one.
             let degrees = app.workflow.crs.trim().is_empty() && app.session.project.gp_env.projected.is_none();
-            let before = app.workflow.crs.trim().to_string();
             ui.add(
                 egui::TextEdit::singleline(&mut app.workflow.crs)
                     .hint_text(match app.session.project.gp_env.projected {
@@ -699,10 +701,15 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     })
                     .desired_width(f32::INFINITY),
             );
-            // A cell size typed for one system means nothing in another: changing the system, or
-            // clearing it, clears the size.
-            if app.workflow.crs.trim() != before {
+            // A cell size typed for one system means nothing in another: when the system the surface
+            // will be made in changes (typed here, or the environment's), the size is cleared.
+            let system = match app.workflow.crs.trim() {
+                "" => app.session.project.gp_env.projected.map(|g| g.crs.code()).unwrap_or_default(),
+                typed => typed.to_string(),
+            };
+            if system != app.workflow.wizard_system {
                 app.workflow.number.clear();
+                app.workflow.wizard_system = system;
             }
             ui.horizontal(|ui| {
                 let hint = if degrees { tl!("cell size °") } else { tl!("cell size") };
@@ -849,9 +856,10 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     // Empty clears the size; text that isn't a number is refused, not taken as empty.
                     let typed = app.workflow.env_cell.trim().to_string();
                     match typed.parse::<f64>() {
-                        Ok(v) => run(app, "gp.env", json!({"cellSize": v})),
+                        // `inf` and `NaN` parse, but aren't sizes (and go out as null, which clears).
+                        Ok(v) if v.is_finite() => run(app, "gp.env", json!({"cellSize": v})),
                         Err(_) if typed.is_empty() => run(app, "gp.env", json!({"cellSize": null})),
-                        Err(_) => {
+                        _ => {
                             app.workflow.error = Some(crate::i18n::fmt("'{size}' isn't a cell size: give a number", &[("size", &typed)]));
                         }
                     }
