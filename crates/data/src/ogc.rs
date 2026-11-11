@@ -2923,13 +2923,12 @@ pub fn resolve_tiles(list: &str, doc: &str, body: &[u8], vector: bool) -> Option
     let links = |v: &serde_json::Value| v.get("links").and_then(|l| l.as_array()).cloned().unwrap_or_default();
     let Some(sets) = v.get("tilesets").and_then(|t| t.as_array()) else {
         // A tileset: its tile template.
+        if !tile_data_type(&v, vector) {
+            return None;
+        }
         return item_template(doc, &links(&v), vector).map(|t| advertised_tiles(list, &t, false));
     };
-    let kind_fits = |t: &serde_json::Value| match t.get("dataType").and_then(|d| d.as_str()) {
-        Some(d) => (d == "vector") == vector,
-        None => true,
-    };
-    let t = sets.iter().take(200).find(|t| web_mercator_tileset(t) && kind_fits(t))?;
+    let t = sets.iter().take(200).find(|t| web_mercator_tileset(t) && tile_data_type(t, vector))?;
     let ls = links(t);
     if let Some(template) = item_template(doc, &ls, vector) {
         return Some(advertised_tiles(list, &template, false));
@@ -2939,6 +2938,17 @@ pub fn resolve_tiles(list: &str, doc: &str, body: &[u8], vector: bool) -> Option
         .find(|l| l.get("rel").and_then(|r| r.as_str()).is_some_and(|r| r == "self" || r.ends_with("/tileset")))
         .and_then(|l| resolve(doc, l.get("href")?.as_str()?))?;
     Some(advertised_tiles(list, &next, true))
+}
+
+/// Keeps an absent declaration compatible with older services, but never treats coverage or
+/// an unknown declared type as a map. OGC API Tiles 1.0 distinguishes map, vector and coverage.
+fn tile_data_type(t: &serde_json::Value, vector: bool) -> bool {
+    match t.get("dataType").and_then(serde_json::Value::as_str) {
+        None => true,
+        Some("map") => !vector,
+        Some("vector") => vector,
+        Some(_) => false,
+    }
 }
 
 /// Recognizes the supported global tile pyramid from declared tileset metadata. A canonical
@@ -6819,6 +6829,22 @@ mod tests {
             resolve_tiles(list, doc, tileset, false).map(|r| r.step),
             Some(TilesStep::Template("https://x.org/c/roads/tiles/smerc/{z}/{y}/{x}.png".into()))
         );
+        // A PNG link cannot turn a declared coverage (or unknown type) into a map offer.
+        for kind in ["map", "vector", "coverage", "unknown"] {
+            let mut declared: serde_json::Value = serde_json::from_slice(tileset).unwrap();
+            declared["dataType"] = serde_json::json!(kind);
+            declared["tileMatrixSetId"] = serde_json::json!("WebMercatorQuad");
+            for document in [declared.clone(), serde_json::json!({"tilesets":[declared]})] {
+                let body = document.to_string();
+                for vector in [false, true] {
+                    assert_eq!(
+                        resolve_tiles(list, doc, body.as_bytes(), vector).is_some(),
+                        kind == if vector { "vector" } else { "map" },
+                        "{kind}, vector={vector}: {document}"
+                    );
+                }
+            }
+        }
         // A list that carries its tilesets' item links needs no second document.
         let inline = br#"{"tilesets": [{"tileMatrixSetId": "WebMercatorQuad", "links": [
             {"rel": "item", "type": "image/png", "href": "https://x.org/t/{tileMatrix}/{tileRow}/{tileCol}"}]}]}"#;

@@ -1,7 +1,10 @@
 //! Dataset tile discovery: advertised Web Mercator templates establish which style sources
 //! are safe to draw. Fetching and the total document budget belong to the caller.
 
-use super::{Offer, Service, ServiceLayer, TilesStep, discovery_link, representation_link, resolve, resolve_tiles, web_mercator_tileset};
+use super::{
+    Offer, Service, ServiceLayer, TilesStep, discovery_link, representation_link, resolve, resolve_tiles, tile_data_type,
+    web_mercator_tileset,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -246,9 +249,7 @@ impl DatasetDiscovery {
         if let Some(sets) = value.get("tilesets").and_then(Value::as_array) {
             let mut skipped = sets.len().saturating_sub(MAX_PARTS);
             for set in sets.iter().take(MAX_PARTS) {
-                if web_mercator_tileset(set)
-                    && set.get("dataType").and_then(Value::as_str).is_none_or(|t| (t == "vector") == context.vector)
-                {
+                if web_mercator_tileset(set) && tile_data_type(set, context.vector) {
                     self.tile(doc, set, context, true, service);
                 } else {
                     skipped += 1;
@@ -259,10 +260,8 @@ impl DatasetDiscovery {
                 skipped,
                 "tilesets were left out: unsupported tile matrix set or data type, or past the 200-tileset limit",
             );
-        } else if ((!context.metadata || declares_grid(value)) && !web_mercator_tileset(value))
-            || value.get("dataType").and_then(Value::as_str).is_some_and(|t| (t == "vector") != context.vector)
-        {
-            self.omitted(service, 1, "tilesets were left out: unsupported or undeclared tile matrix set");
+        } else if ((!context.metadata || declares_grid(value)) && !web_mercator_tileset(value)) || !tile_data_type(value, context.vector) {
+            self.omitted(service, 1, "tilesets were left out: unsupported or undeclared tile matrix set, or unsupported data type");
         } else {
             self.tile(doc, value, context, false, service);
         }

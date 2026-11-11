@@ -486,3 +486,65 @@ fn ogc_dataset_metadata_bytes_are_bounded_without_discarding_valid_tiles() {
     assert!(partial.get("next").is_none());
     assert!(partial["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("metadata budget")));
 }
+
+#[test]
+fn ogc_dataset_failed_discovery_keeps_prior_omission_counts() {
+    for omitted in [false, true] {
+        let mut sets = vec![json!({"tileMatrixSetId":"WebMercatorQuad","links":[{"rel":"self","href":"/metadata?f=json"}]})];
+        if omitted {
+            sets.insert(0, json!({"tileMatrixSetId":"Unsupported"}));
+        }
+        let params = json!({"url":"https://maps.example.org/dataset","type":"ogcapi","layer":"map",
+        "text":json!({"links":[{"rel":"tilesets-map","href":"/tiles?f=json"}]}).to_string(),
+        "documents":[
+            {"url":"https://maps.example.org/tiles?f=json","text":json!({"tilesets":sets}).to_string()},
+            {"url":"https://maps.example.org/metadata?f=json","text":" ".repeat(crate::cmd::service::MAX_DATASET_BYTES)}
+        ]});
+        let mut session = Session::new(Project::default());
+        for command in ["service.layers", "service.add"] {
+            let error = session.run(command, &params).unwrap_err();
+            assert!(error.contains("metadata budget"), "{error}");
+            assert_eq!(error.contains("1 tilesets were left out"), omitted, "{error}");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                use crate::cmd::reads::{read_ahead, read_land};
+                let read = read_ahead(&mut session, command, &params).unwrap().run(&crate::analysis::control::Control::new()).unwrap();
+                assert_eq!(read_land(&mut session, read).unwrap_err(), error, "worker errors must retain the same counts after rollback");
+            }
+        }
+    }
+}
+
+#[test]
+fn ogc_dataset_map_tiles_reject_declared_coverage_and_unknown_types() {
+    for listed in [false, true] {
+        for kind in [None, Some("map"), Some("vector"), Some("coverage"), Some("unknown")] {
+            let mut tileset = json!({"tileMatrixSetId":"WebMercatorQuad","links":[
+                {"rel":"item","type":"image/png","href":"/tiles/{tileMatrix}/{tileRow}/{tileCol}.png"}
+            ]});
+            if let Some(kind) = kind {
+                tileset["dataType"] = json!(kind);
+            }
+            let document = if listed { json!({"tilesets":[tileset]}) } else { tileset };
+            let listing = Session::new(Project::default())
+                .run(
+                    "service.layers",
+                    &json!({
+                        "url":"https://maps.example.org/dataset","type":"ogcapi",
+                        "text":json!({"links":[{"rel":"tilesets-map","href":"/tiles?f=json"}]}).to_string(),
+                        "documents":[{"url":"https://maps.example.org/tiles?f=json","text":document.to_string()}]
+                    }),
+                )
+                .unwrap();
+            let supported = kind.is_none_or(|k| k == "map");
+            assert_eq!(listing["count"], usize::from(supported), "{kind:?}: {listing}");
+            let notes = listing["notes"].as_array().unwrap();
+            if supported {
+                assert!(notes.is_empty(), "{listing}");
+            } else {
+                assert_eq!(notes.len(), 1, "{listing}");
+                assert!(notes[0].as_str().unwrap().starts_with("1 tilesets were left out"), "{listing}");
+            }
+        }
+    }
+}

@@ -117,7 +117,9 @@ impl Discovery {
         self.dataset_notes(dataset);
         if self.service.layers.is_empty() {
             notify_withheld(s, self.service.withheld_addresses);
-            Err(error)
+            // An unusable result is an error; keep its counted omissions in that error too.
+            // Ordinary notices would be withdrawn when a mutating add rolls back.
+            if self.service.notes.is_empty() { Err(error) } else { Err(format!("{error}; {}", self.service.notes.join("; "))) }
         } else {
             self.error = Some(error.clone());
             self.service.notes.push(error);
