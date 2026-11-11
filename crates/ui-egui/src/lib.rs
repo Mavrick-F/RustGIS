@@ -2334,6 +2334,9 @@ impl RustGisApp {
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         #[cfg(not(target_arch = "wasm32"))]
         if self.reads_off_frame {
+            if id == "service.add" && params.get("text").and_then(Value::as_str).is_some() {
+                return readjob::run(self, "service.add", params);
+            }
             let archive = match id {
                 "map.reloadTiles" => Some("map.reloadTiles"),
                 "map.repairTiles" => Some("map.repairTiles"),
@@ -6944,6 +6947,9 @@ mod download_service_tests {
             if cancel {
                 assert!(conn.error.as_ref().is_some_and(|e| e.contains("cancelled")));
                 assert!(conn.listing.is_none());
+                let conn = app.ui.service.as_mut().unwrap();
+                super::serviceui::listed(conn, Ok(json!({"count":0,"layers":[]})), None);
+                assert!(conn.error.is_none(), "a successful retry clears the cancellation error");
             } else {
                 assert!(conn.error.is_none(), "{:?}", conn.error);
                 assert_eq!(conn.listing.as_ref().unwrap()["count"], 2);

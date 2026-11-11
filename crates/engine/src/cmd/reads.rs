@@ -101,6 +101,13 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
             let work = None;
             ("List Service Layers", work, None)
         }
+        "service.add" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let work = super::service::adding_ahead(s, params)?;
+            #[cfg(target_arch = "wasm32")]
+            let work = None;
+            ("Add Service Layer", work, None)
+        }
         "layer.addData" => ("Add Data", super::layer::add_data_ahead(params), None),
         "layer.loadAll" => {
             let layer = s.map().layer(s.layer_id(params)?).ok_or("no such layer")?;

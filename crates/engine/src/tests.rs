@@ -40497,10 +40497,12 @@ fn long_commands_stop_when_cancelled_while_they_run() {
 
     // The Add Service dialog replays supplied metadata off the desktop frame too.
     let params = json!({"url":"https://maps.example.org/dataset","type":"ogcapi","text":"{\"collections\":[]}"});
-    let read = crate::cmd::reads::read_ahead(&mut s, "service.layers", &params).unwrap();
-    assert!(read.reads());
-    let control = Control::cancelled_once_started();
-    note("service.layers", read.run(&control).map(|_| ()), &control);
+    for command in ["service.layers", "service.add"] {
+        let read = crate::cmd::reads::read_ahead(&mut s, command, &params).unwrap();
+        assert!(read.reads());
+        let control = Control::cancelled_once_started();
+        note(command, read.run(&control).map(|_| ()), &control);
+    }
 
     // The tools whose work grows past a second or two on real data: buffers, overlays, joins,
     // hulls, densities and interpolation. Run in the background as the Analysis pane runs them; a

@@ -202,13 +202,24 @@ impl DatasetDiscovery {
     /// Omits a document refused by the caller's address policy without losing independent
     /// offers. A refused TileJSON source stays unusable if another style references it.
     pub fn reject_address(&mut self) -> Service {
+        self.reject("dataset documents were left out: disallowed addresses")
+    }
+
+    /// Omits an already visited document without ending independent discovery. Multiple
+    /// offers may advertise the same address; the caller retains its ordinary loop checks.
+    pub fn reject_repeated(&mut self) -> Service {
+        self.reject("dataset documents were left out: repeated addresses")
+    }
+
+    /// Consumes one unusable candidate and prevents its source from being reused as valid.
+    fn reject(&mut self, reason: &'static str) -> Service {
         if let Some(doc) = self.pending.pop_front()
             && matches!(doc.kind, Kind::Source(_))
         {
             self.sources.insert(doc.url, Vec::new());
         }
         let mut service = Service { kind: "OGC API Tiles".into(), ..Service::default() };
-        self.omitted(&mut service, 1, "dataset documents were left out: disallowed addresses");
+        self.omitted(&mut service, 1, reason);
         self.finish(&mut service);
         service
     }

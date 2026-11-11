@@ -119,7 +119,79 @@ fn ogc_dataset_styles_use_advertised_projection_and_native_web_parity() {
     session.run("service.add", &params).unwrap();
     assert_eq!(session.map().tiles.len(), 1);
     assert_eq!(session.map().tiles[0].url, format!("{}/good?f=mapbox", server.base));
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::cmd::reads::{read_ahead, read_land};
+        let mut copy = Session::new(Project::default());
+        let connection =
+            copy.run("connection.new", &json!({"kind":"ogcapi","address":server.base,"auth":"header","keyName":"X-Key"})).unwrap();
+        copy.run("connection.login", &json!({"id":connection["id"],"apiKey":"synthetic-service-add","allowInsecure":true})).unwrap();
+        params["connection"] = connection["id"].clone();
+        let read = read_ahead(&mut copy, "service.add", &params).unwrap();
+        assert!(read.reads());
+        let done = read.run(&crate::analysis::control::Control::new()).unwrap();
+        assert!(copy.map().tiles.is_empty(), "discovery cannot install a layer before landing");
+        read_land(&mut copy, done).unwrap();
+        let tile = &copy.map().tiles[0];
+        assert_eq!(tile.connection, connection["id"].as_str().unwrap());
+        assert!(crate::render::rustgis_tiles::logins::apply(&tile.url).unwrap().is_some());
+        assert_eq!(crate::render::rustgis_tiles::logins::inner(&tile.url), format!("{}/good?f=mapbox", server.base));
+    }
     assert_eq!(server.requests().len(), requests, "supplied discovery and add never refetch documents");
+}
+
+#[test]
+fn ogc_dataset_shared_documents_keep_independent_offers() {
+    for metadata in [false, true] {
+        let mut docs = documents();
+        if metadata {
+            docs[0].1["links"].as_array_mut().unwrap().truncate(1);
+            docs[1].1 = json!({"tilesets":[
+                {"tileMatrixSetId":"WebMercatorQuad","vector_layers":[{"id":"roads"}],"links":[{"rel":"self","type":"application/json","href":"/shared?f=json"}]},
+                {"tileMatrixSetId":"WebMercatorQuad","vector_layers":[{"id":"roads"}],"links":[{"rel":"self","type":"application/json","href":"/shared?f=json"}]},
+                {"tileMatrixSetId":"WebMercatorQuad","title":"Independent","vector_layers":[{"id":"roads"}],"links":[{"rel":"self","type":"application/json","href":"/later?f=json"}]}
+            ]});
+            let body = json!({"links":[{"rel":"item","type":"application/vnd.mapbox-vector-tile","href":"/wm/{tileMatrix}/{tileRow}/{tileCol}?f=mvt"}]});
+            docs.extend([("/shared", body.clone()), ("/later", body)]);
+        } else {
+            docs[2].1 = json!({"styles":[
+                {"id":"first","links":[{"rel":"stylesheet","type":"application/vnd.mapbox.style+json","href":"/good?f=mapbox"}]},
+                {"id":"alias","links":[{"rel":"stylesheet","type":"application/vnd.mapbox.style+json","href":"/good?f=mapbox"}]},
+                {"id":"later","links":[{"rel":"stylesheet","type":"application/vnd.mapbox.style+json","href":"/later?f=mapbox"}]}
+            ]});
+            docs.push(("/later", docs[3].1.clone()));
+        }
+        let server = Server::new(docs.iter().map(|(path, body)| Route::new(path, &body.to_string())).collect());
+        let mut session = Session::new(Project::default());
+        let mut params = json!({"url":format!("{}/dataset", server.base),"type":"ogcapi"});
+        let native = session.run("service.layers", &params).unwrap();
+        assert_eq!(native["count"], 2, "{native}");
+        assert!(native["layers"].as_array().unwrap().iter().any(|l| l["name"] == "later" || l["title"] == "Independent"), "{native}");
+        assert!(
+            native["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_str().unwrap().starts_with("1 dataset documents were left out: repeated addresses")),
+            "{native}"
+        );
+        let requests = server.requests();
+        assert_eq!(requests.iter().filter(|r| r.path.starts_with(if metadata { "/shared" } else { "/good" })).count(), 1);
+        params["text"] = json!(docs[0].1.to_string());
+        params["documents"] = json!(
+            requests
+                .iter()
+                .skip(1)
+                .map(|r| {
+                    let body = &docs.iter().find(|(p, _)| *p == r.path).unwrap().1;
+                    let mut address = url::Url::parse(&format!("{}{}", server.base, r.path)).unwrap();
+                    address.query_pairs_mut().extend_pairs(r.query.iter().map(|(k, v)| (k, v)));
+                    json!({"url":address.as_str(),"text":body.to_string()})
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(session.run("service.layers", &params).unwrap(), native);
+    }
 }
 
 #[test]

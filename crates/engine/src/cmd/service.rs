@@ -259,7 +259,8 @@ fn read_documents(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(
             Err(_) if dataset_document => true,
             Err(e) => return result.failed(s, e, dataset.as_ref()),
         };
-        if seen.contains(&address) {
+        let repeated = seen.contains(&address);
+        if repeated && !dataset_document {
             return result.failed(s, "the service's discovery links form a loop".into(), dataset.as_ref());
         }
         if seen.len() >= MAX_SERVICE_DOCUMENTS {
@@ -278,6 +279,8 @@ fn read_documents(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(
         };
         let parsed = if rejected {
             Ok(dataset.as_mut().ok_or_else(|| "missing dataset discovery plan".to_string())?.reject_address())
+        } else if repeated {
+            Ok(dataset.as_mut().ok_or_else(|| "missing dataset discovery plan".to_string())?.reject_repeated())
         } else if let Some(root) = supplied {
             let text = if seen.is_empty() {
                 Some(root)
@@ -787,7 +790,7 @@ pub fn service_json(svc: &Service) -> Value {
 
 /// A prepared supplied-document discovery and any loss notice emitted before an error.
 #[cfg(not(target_arch = "wasm32"))]
-type ListingRead = (Result<Discovery, String>, Vec<crate::Notice>);
+type DiscoveryRead = (Result<Discovery, String>, Vec<crate::Notice>);
 
 /// Prepares only supplied-document parsing. Login binding happens on the initiating session;
 /// the worker replays those exact documents without another login lookup or network fetch.
@@ -805,6 +808,35 @@ pub(crate) fn listing_ahead(s: &mut Session, p: &Value) -> Result<Option<super::
         let result = discover_matching(&mut copy, &p, false, &words, None);
         (result, copy.notices)
     })))
+}
+
+/// Prepares supplied metadata for an add under its initiating login. Only discovery runs on
+/// the worker; the admitted command selects and installs the layer on the original session.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn adding_ahead(s: &mut Session, p: &Value) -> Result<Option<super::reads::ReadWork>, String> {
+    if ps(p, "text").is_none() {
+        return Ok(None);
+    }
+    let owned = without_token(p)?;
+    let p = owned.as_ref().unwrap_or(p);
+    let p = crate::service_logins::request_params(s, p)?.into_owned();
+    Ok(Some(super::reads::ahead("Add Service Layer", "service.add".into(), move || {
+        let mut copy = Session::new(crate::Project::default());
+        let explicit_map = ps(&p, "tiles").filter(|_| ps(&p, "layer").map(str::trim) == Some("map")).map(|t| (t, ps(&p, "source_url")));
+        let result = discover(&mut copy, &p, false, explicit_map);
+        (result, copy.notices)
+    })))
+}
+
+/// Takes only this command's admitted discovery and forwards its error-path notices.
+#[cfg(not(target_arch = "wasm32"))]
+fn prepared_discovery(s: &mut Session, command: &str) -> Option<Result<Discovery, String>> {
+    super::reads::take::<DiscoveryRead>(s, command).map(|(result, notices)| {
+        for notice in notices {
+            s.notify(notice.text, notice.error);
+        }
+        result
+    })
 }
 
 /// Normalizes the filter once for both synchronous and prepared discovery.
@@ -831,13 +863,8 @@ pub(crate) fn layers(s: &mut Session, p: &Value) -> CmdResult {
     let p = bound.as_ref();
     let words = filter_words(p)?;
     #[cfg(not(target_arch = "wasm32"))]
-    let mut found = match super::reads::take::<ListingRead>(s, "service.layers") {
-        Some((result, notices)) => {
-            for notice in notices {
-                s.notify(notice.text, notice.error);
-            }
-            result?
-        }
+    let mut found = match prepared_discovery(s, "service.layers") {
+        Some(result) => result?,
         None => discover_matching(s, p, false, &words, None)?,
     };
     #[cfg(target_arch = "wasm32")]
@@ -932,7 +959,8 @@ fn notify_withheld(s: &mut Session, count: u32) {
 }
 
 /// Adds one of a service's layers: map layers as tiles (an overlay), a style as a style, features
-/// downloaded.
+/// downloaded. The desktop prepares supplied-document discovery off the frame before this
+/// command selects and applies its layer; CLI and browser calls discover synchronously.
 pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     let owned = without_token(p)?;
     let p = owned.as_ref().unwrap_or(p);
@@ -943,6 +971,12 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     let leaving = leaves_waits(s);
     let reads_off_frame = leaving && ps(p, "text").is_none();
     let explicit_map = ps(p, "tiles").filter(|_| want == "map").map(|tiles| (tiles, ps(p, "source_url")));
+    #[cfg(not(target_arch = "wasm32"))]
+    let found = match prepared_discovery(s, "service.add") {
+        Some(result) => result?,
+        None => discover(s, p, reads_off_frame, explicit_map)?,
+    };
+    #[cfg(target_arch = "wasm32")]
     let found = discover(s, p, reads_off_frame, explicit_map)?;
     let mut withheld = found.service.withheld_addresses;
     let result = match found.next.as_deref().filter(|_| reads_off_frame) {

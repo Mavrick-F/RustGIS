@@ -53,6 +53,8 @@ pub fn listed(conn: &mut crate::ServiceConn, result: rustgis_engine::CmdResult, 
     }
     match result {
         Ok(value) => {
+            conn.error = None;
+            conn.failure = None;
             conn.pending = value.get("next").and_then(Value::as_str).map(str::to_string);
             if let Some(next) = &conn.pending {
                 conn.slot = crate::fetch_detailed_into(next);
@@ -95,6 +97,11 @@ pub struct ServiceSource {
 /// Uses the same translated tileset progress text when discovery starts and when it retires.
 pub(crate) fn reading_tileset(name: &str) -> String {
     i18n::fmt("Reading the tileset of {name}", &[("name", name)])
+}
+
+/// The line a queued add owns until it succeeds, fails or is cancelled.
+pub(crate) fn adding(name: &str) -> String {
+    i18n::fmt("Adding {name}…", &[("name", name)])
 }
 
 /// Uses the same translated coverage progress text when discovery starts and when it retires.
@@ -266,7 +273,13 @@ pub(crate) fn add_layer_from(
             app.ui.service_steps.push(crate::ServiceStep::Tiles { resolve, dialog, origin, opened: app.session.opened });
             Ok(reading_tileset(&title))
         }
-        None => crate::connectiontree::run_named(app, "service.add", p, origin.as_deref()).map(|_| added(&title)),
+        None => {
+            #[cfg(not(target_arch = "wasm32"))]
+            if app.reads_off_frame {
+                return crate::readjob::run_service(app, p, &title, origin.as_deref()).map(|_| adding(&title));
+            }
+            crate::connectiontree::run_named(app, "service.add", p, origin.as_deref()).map(|_| added(&title))
+        }
     }
 }
 
