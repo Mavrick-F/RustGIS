@@ -683,7 +683,9 @@ pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
 /// the file saying `crs`.
 pub fn write_in(ds: &crate::Dataset, crs: Crs) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    write_features(&ds.name, ds.geometry_type, &ds.fields, crs, &mut out, &mut |add| add(&ds.features))?;
+    let has =
+        |multi: bool| ds.features.iter().filter_map(|f| f.geometry.as_ref()).any(|g| matches!(g, crate::Geometry::MultiPoint(_)) == multi);
+    write_features_typed(&ds.name, ds.geometry_type, &ds.fields, crs, has(true) && has(false), &mut out, &mut |add| add(&ds.features))?;
     Ok(out)
 }
 
@@ -711,6 +713,23 @@ pub(crate) fn write_features(
     out: &mut dyn std::io::Write,
     feed: &mut dyn FnMut(&mut dyn FnMut(&[Feature]) -> Result<()>) -> Result<()>,
 ) -> Result<usize> {
+    write_features_typed(name, geometry_type, fields, crs, false, out, feed)
+}
+
+/// [`write_features`], each feature's geometry type in the file when `mixed_points`: a point
+/// layer holding both points and multipoints, which a file of one geometry type can't (its type
+/// is the first feature's). Otherwise the file has one type, as readers expect of a layer. A
+/// layer read in place isn't looked over first, so one that mixes them still fails.
+#[allow(clippy::too_many_arguments)]
+fn write_features_typed(
+    name: &str,
+    geometry_type: GeometryType,
+    fields: &[Field],
+    crs: Crs,
+    mixed_points: bool,
+    out: &mut dyn std::io::Write,
+    feed: &mut dyn FnMut(&mut dyn FnMut(&[Feature]) -> Result<()>) -> Result<()>,
+) -> Result<usize> {
     use flatgeobuf::geozero::wkb::Wkb;
     use flatgeobuf::{FgbCrs, FgbWriter, FgbWriterOptions, GeometryType as G};
     writable(cfg!(target_arch = "wasm32"))?;
@@ -724,6 +743,7 @@ pub(crate) fn write_features(
     let code = i32::from(crs.epsg());
     let options = FgbWriterOptions {
         crs: FgbCrs { org: (code > 0).then_some("EPSG"), code, wkt: wkt.as_deref(), ..Default::default() },
+        detect_type: !(mixed_points && geometry_type == GeometryType::Point),
         ..Default::default()
     };
     let mut w = FgbWriter::create_with_options(name, ty, options).map_err(err)?;
@@ -781,5 +801,25 @@ mod write_tests {
     fn flatgeobuf_is_refused_in_the_browser_and_written_on_the_desktop() {
         assert!(matches!(writable(true), Err(DataError::Unsupported(m)) if m.contains("browser")));
         assert!(writable(false).is_ok());
+    }
+
+    /// A point layer with points and multipoints (as a GeoJSON file gives) is written whole,
+    /// each feature its own kind; a layer of points alone keeps its one geometry type.
+    #[test]
+    fn a_point_layer_mixing_points_and_multipoints_is_written() {
+        use crate::{Coord, Dataset, Geometry};
+        let mut ds = Dataset::new("m", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Int(1)]);
+        ds.push(Some(Geometry::MultiPoint(vec![Coord::new(3.0, 4.0), Coord::new(5.0, 6.0)])), vec![Value::Int(2)]);
+        let bytes = write_in(&ds, Crs::LonLat).unwrap();
+        let (back, _) = crate::io::read_bytes("m.fgb", &bytes).unwrap();
+        let mut got: Vec<(Value, Option<Geometry>)> = back.features.iter().map(|f| (f.attrs[0].clone(), f.geometry.clone())).collect();
+        got.sort_by_key(|(n, _)| n.as_f64().map(|n| n as i64));
+        let want: Vec<(Value, Option<Geometry>)> = ds.features.iter().map(|f| (f.attrs[0].clone(), f.geometry.clone())).collect();
+        assert_eq!(got, want);
+        let mut points = Dataset::new("p", GeometryType::Point, vec![]);
+        points.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![]);
+        let header = flatgeobuf::FgbReader::open(std::io::Cursor::new(write_in(&points, Crs::LonLat).unwrap())).unwrap();
+        assert_eq!(header.header().geometry_type(), flatgeobuf::GeometryType::Point);
     }
 }
