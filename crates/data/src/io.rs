@@ -2674,8 +2674,8 @@ pub struct CsvLosses {
     /// Features of a point layer with more than one point (a multipoint), or another shape,
     /// written as one point.
     pub as_one_point: usize,
-    /// Features of a line or polygon layer (or one that declares no type) whose geometry isn't
-    /// written.
+    /// Features whose geometry isn't written: in a line or polygon layer (or one that declares
+    /// no type), and in a point layer those with no point to write (an empty multipoint).
     pub unwritten: usize,
 }
 
@@ -2686,6 +2686,8 @@ impl CsvLosses {
         for g in features.iter().filter_map(|f| f.geometry.as_ref()) {
             match (gt, g) {
                 (GeometryType::Point, Geometry::Point(_)) => {}
+                // No point to write: its coordinate cells are left empty.
+                (GeometryType::Point, g) if g.label_point().is_none() => out.unwritten += 1,
                 (GeometryType::Point, Geometry::MultiPoint(v)) if v.len() <= 1 => {}
                 (GeometryType::Point, _) => out.as_one_point += 1,
                 // A layer of lines or polygons, or one that declares no type: no coordinates.
@@ -2707,7 +2709,7 @@ impl CsvLosses {
         }
         if self.unwritten > 0 {
             let what = if self.unwritten == 1 { "1 feature".to_string() } else { format!("{} features", self.unwritten) };
-            notes.push(format!("{target}: CSV holds points, so the geometry of {what} wasn't written, only the attributes"));
+            notes.push(format!("{target}: CSV holds a point a row, so the geometry of {what} wasn't written, only the attributes"));
         }
         notes
     }
@@ -2718,6 +2720,17 @@ impl std::ops::AddAssign for CsvLosses {
     fn add_assign(&mut self, other: Self) {
         self.as_one_point += other.as_one_point;
         self.unwritten += other.unwritten;
+    }
+}
+
+/// What a CSV or GPX file (extension `ext`) of the whole dataset `ds` can't hold, written to
+/// `target`: [`CsvLosses`]' notices, or [`gpx_notes`] with each feature named from `name_field`;
+/// none for another format. A streamed export counts CSV's a chunk at a time instead.
+pub fn export_losses_notes(ds: &Dataset, ext: &str, name_field: Option<usize>, target: &str) -> Vec<String> {
+    match ext {
+        "csv" => CsvLosses::of(&ds.features, ds.geometry_type).notes(target),
+        "gpx" => gpx_notes(ds, name_field, target),
+        _ => Vec::new(),
     }
 }
 
@@ -4065,6 +4078,9 @@ mod tests {
         assert!(!to_csv(&ds).unwrap().contains("longitude"));
         let points = [crate::Feature { id: 0, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![] }];
         assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses::default());
+        // A multipoint without a point in a point layer gets empty coordinate cells.
+        let empty = [crate::Feature { id: 1, geometry: Some(Geometry::MultiPoint(vec![])), attrs: vec![] }];
+        assert_eq!(CsvLosses::of(&empty, GeometryType::Point), CsvLosses { as_one_point: 0, unwritten: 1 });
     }
 
     /// GPX leaves out a feature without geometry and a multipoint without a point (no waypoint

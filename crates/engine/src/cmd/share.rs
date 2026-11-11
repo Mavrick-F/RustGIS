@@ -52,6 +52,9 @@ pub fn commands() -> Vec<C> {
             if matches!(ext.as_str(), "parquet" | "geoparquet") {
                 dbf_notes.extend(rustgis_data::source::parquet::values_note(&t.dataset, path));
             }
+            // CSV holds a point a row, GPX a name for each feature and no areas.
+            let name_field = rustgis_data::io::name_field(&t.dataset);
+            dbf_notes.extend(rustgis_data::io::export_losses_notes(&t.dataset, &ext, name_field, path));
             let (left_out, table) =
                 rustgis_data::io::write_path_to(&t.dataset, Path::new(path), Crs::LonLat, &gpkg).map_err(|e| e.to_string())?;
             s.check_continuation(&owner).map_err(|why| super::exports::completion_refused(Some(path), why))?;

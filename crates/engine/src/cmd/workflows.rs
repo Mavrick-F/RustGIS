@@ -1422,11 +1422,7 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let target = ps(p, "path").unwrap_or(&ds.name);
     let mut notes = rustgis_data::export_notes([(ds, ds.extent())], target, rustgis_data::raster::Crs::LonLat);
     // CSV holds a point a row, GPX a name for each feature and no areas.
-    match ps(p, "format") {
-        Some("csv") => notes.extend(rustgis_data::io::CsvLosses::of(&ds.features, ds.geometry_type).notes(target)),
-        Some("gpx") => notes.extend(rustgis_data::io::gpx_notes(ds, name_field, target)),
-        _ => {}
-    }
+    notes.extend(rustgis_data::io::export_losses_notes(ds, ps(p, "format").unwrap_or(""), name_field, target));
     // KML and GPX hold features with geometry only.
     if let Some(ext @ ("kml" | "gpx")) = ps(p, "format") {
         let without =
