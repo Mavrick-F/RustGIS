@@ -1401,8 +1401,11 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
             let src = rustgis_data::source::shp::ShpSource::open_path_in(Path::new(path), name, Some(crs)).map_err(|e| e.to_string())?;
             return add_source_with(s, p, Origin::Path(path), Some(Box::new(src)), None);
         }
-        let mut read = rustgis_data::io::read_shapefile_in(Path::new(path), name, Some(crs)).map_err(|e| e.to_string())?;
+        let (read, synced) =
+            rustgis_data::sync::FileSync::around(Path::new(path), || rustgis_data::io::read_shapefile_in(Path::new(path), name, Some(crs)));
+        let mut read = read.map_err(|e| e.to_string())?;
         read.0.source = Some(path.to_string());
+        read.1 = unsynced_note(read.1, synced, path);
         return add_read(s, p, read, None);
     }
     // A large Shapefile is read in place, as a GeoPackage is; smaller ones are loaded whole.
@@ -1580,10 +1583,34 @@ fn read_whole(p: &Value, path: &str) -> WholeRead {
         }
         std::fs::read(path).map_err(|e| format!("{path}: {e}"))
     })?;
-    match delimited {
-        Some(read) => Ok(read),
-        None => rustgis_data::io::read_path(Path::new(path)).map_err(|e| format!("{path}: {e}")),
+    if let Some(read) = delimited {
+        return Ok(read);
     }
+    let read = || rustgis_data::io::read_path(Path::new(path)).map_err(|e| format!("{path}: {e}"));
+    // A file its edits can be written back to: the files as read, to compare with before then.
+    #[cfg(not(target_arch = "wasm32"))]
+    if rustgis_data::sync::is_syncable(path) {
+        let (read, synced) = rustgis_data::sync::FileSync::around(Path::new(path), read);
+        return read.map(|(ds, report)| (ds, unsynced_note(report, synced, path)));
+    }
+    read()
+}
+
+/// `report` with the files as read, or, when they couldn't be recorded, a note saying that the
+/// layer can't be compared with its file later.
+#[cfg(not(target_arch = "wasm32"))]
+fn unsynced_note(
+    mut report: rustgis_data::ReadReport,
+    synced: Option<rustgis_data::sync::FileSync>,
+    path: &str,
+) -> rustgis_data::ReadReport {
+    if synced.is_none() {
+        report.messages.push(format!(
+            "{path}: changed while it was read, or a part of it couldn't be read, so RustGIS can't tell later whether the file changed since; add it again to compare it"
+        ));
+    }
+    report.synced = synced;
+    report
 }
 
 /// Add Data's read of the file `p` names, made before it runs ([`super::reads`]): a raster read
@@ -4731,7 +4758,11 @@ pub(crate) fn add_read(
     }
     let n = ds.features.len();
     let empty_before = super::map_is_empty(s);
+    let synced = report.synced.map(|files| rustgis_map::source::Synced { files, rows: rustgis_map::source::rows_digest(&ds) });
     let id = add_dataset(s, ds);
+    if let Some(l) = s.map_mut().layer_mut(id) {
+        l.synced = synced;
+    }
     if zoom.unwrap_or(empty_before)
         && let Some(e) = s.map().layer(id).map(|l| l.extent())
     {

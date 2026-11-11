@@ -238,6 +238,14 @@ pub struct GpkgEdit {
     pub versions: Versions,
 }
 
+/// FNV-1a's starting value.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a over `bytes`, from `h`.
+fn fnv1a(h: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(h, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+}
+
 /// How a loaded row is told apart from the same row edited: a hash of its geometry and
 /// attributes (FNV-1a over their JSON, the same in every build). Non-finite attributes also
 /// contribute their position and native bits, since output JSON substitutes Null for them.
@@ -247,7 +255,7 @@ pub fn row_hash(f: &rustgis_data::Feature) -> u64 {
     impl Fnv {
         /// Feeds bytes without buffering; also used for values JSON cannot distinguish.
         fn bytes(&mut self, buf: &[u8]) {
-            self.0 = buf.iter().fold(self.0, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+            self.0 = fnv1a(self.0, buf);
         }
     }
     impl std::io::Write for Fnv {
@@ -259,10 +267,10 @@ pub fn row_hash(f: &rustgis_data::Feature) -> u64 {
             Ok(())
         }
     }
-    let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+    let mut h = Fnv(FNV_OFFSET);
     // As before, a row that can't be written hashes as no bytes.
     if serde_json::to_writer(&mut h, &(&f.geometry, &f.attrs)).is_err() {
-        return 0xcbf2_9ce4_8422_2325;
+        return FNV_OFFSET;
     }
     for (index, value) in f.attrs.iter().enumerate() {
         if let rustgis_data::Value::Float(number) = value
@@ -274,6 +282,25 @@ pub fn row_hash(f: &rustgis_data::Feature) -> u64 {
         }
     }
     h.0
+}
+
+/// A layer kept in the project that was read whole from a file it can be written back to (a
+/// Shapefile or GeoJSON file), as it and the file were at their last sync, when it was read: so
+/// it can tell whether it has edits the file lacks and whether the file changed since (#1385).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Synced {
+    /// The files, as they were.
+    pub files: rustgis_data::sync::FileSync,
+    /// The layer's [`rows_digest`] then.
+    pub rows: u64,
+}
+
+/// A hash of what a dataset holds: its fields, coordinate system, and each row's [`row_hash`]
+/// in order. Not its name or where it came from, which are no edit to the file.
+pub fn rows_digest(ds: &rustgis_data::Dataset) -> u64 {
+    let schema = serde_json::to_vec(&(&ds.fields, &ds.crs)).unwrap_or_default();
+    let h = fnv1a(fnv1a(FNV_OFFSET, &schema), &(ds.features.len() as u64).to_le_bytes());
+    ds.features.iter().fold(h, |h, f| fnv1a(h, &row_hash(f).to_le_bytes()))
 }
 
 /// A loaded row: its source version or fingerprint and [`row_hash`] as read.

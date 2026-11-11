@@ -302,6 +302,19 @@ the default and discarding edits defaults to false. Only an explicit
 `{"layer":42,"path":"/data/cities.fgb","table":null}`; `table` is a string for a selected table
 or raster subdataset.
 
+### Source file state
+
+A layer read whole from a Shapefile or a `.geojson` file keeps its features in the project, so
+edits change the project, not the file. It also remembers the file as it was read: each part's
+size, modification time and SHA-256 hash, and a hash of the layer's rows. `source.syncState`
+compares the two and answers `inSync`, `edited` (the layer has edits the file lacks),
+`sourceChanged` (the file changed since it was read) or `both`, with the names of the parts
+that changed. Writing the same bytes again isn't a change, and undoing an edit makes the layer
+`inSync` again. A file written to while it was being read, a layer read in place and a `.json`
+file have no record. The record is saved with the project; the web app can't check it.
+
+CLI and Python: `source.syncState` with `{"layer":"parcels"}`.
+
 ## Keyboard shortcuts
 
 | Keys | Action |

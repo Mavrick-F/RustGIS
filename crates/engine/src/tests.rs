@@ -39253,3 +39253,46 @@ fn a_model_trained_within_the_work_limit_says_so() {
         .unwrap();
     assert_eq!(r["epochs"], 3, "{r}");
 }
+
+/// A layer read whole from a Shapefile or GeoJSON file remembers the files and its rows as read
+/// (#1385): `source.syncState` says when it has edits the file lacks, when the file changed
+/// since, and neither once an edit is undone. The record is saved with the project.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-sync-state-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = world();
+    for file in ["towns.shp", "towns.geojson"] {
+        let path = dir.join(file);
+        s.run("share.exportLayer", &json!({"layer": "Cities", "path": path})).unwrap();
+        let id = s.run("layer.addData", &json!({"path": path, "name": file})).unwrap()["layer"].as_u64().unwrap();
+        let state = |s: &mut Session| s.run("source.syncState", &json!({"layer": id})).unwrap();
+        assert_eq!(state(&mut s)["state"], "inSync", "{file}");
+        s.run("edit.setValue", &json!({"layer": id, "row": 0, "field": "name", "value": "Renamed"})).unwrap();
+        assert_eq!(state(&mut s)["state"], "edited", "{file}");
+        s.run("edit.undo", &Value::Null).unwrap();
+        assert_eq!(state(&mut s)["state"], "inSync", "{file}");
+        // Saved and opened again, it still knows the file as read.
+        let l = s.map().layer(id as u32).unwrap();
+        let reopened: rustgis_map::Layer = serde_json::from_value(serde_json::to_value(l).unwrap()).unwrap();
+        assert_eq!(reopened.synced, l.synced);
+        assert!(l.synced.is_some());
+    }
+    // The same bytes written again is no change; other bytes are, named by file.
+    let dbf = dir.join("towns.dbf");
+    let bytes = std::fs::read(&dbf).unwrap();
+    std::fs::write(&dbf, &bytes).unwrap();
+    assert_eq!(s.run("source.syncState", &json!({"layer": "towns.shp"})).unwrap()["state"], "inSync");
+    let mut other = bytes.clone();
+    *other.last_mut().unwrap() ^= 1;
+    std::fs::write(&dbf, other).unwrap();
+    let state = s.run("source.syncState", &json!({"layer": "towns.shp"})).unwrap();
+    assert_eq!((state["state"].as_str(), state["changed"].clone()), (Some("sourceChanged"), json!(["towns.dbf"])));
+    s.run("edit.setValue", &json!({"layer": "towns.shp", "row": 0, "field": "name", "value": "Renamed"})).unwrap();
+    assert_eq!(s.run("source.syncState", &json!({"layer": "towns.shp"})).unwrap()["state"], "both");
+    // A layer that wasn't read from such a file has nothing to compare with.
+    assert!(s.run("source.syncState", &json!({"layer": "Cities"})).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}

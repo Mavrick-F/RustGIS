@@ -44,6 +44,7 @@ pub mod sheets;
 pub mod source;
 pub mod source_layers;
 pub mod sqlite;
+pub mod sync;
 pub mod threads;
 pub mod time;
 pub mod topojson;
@@ -377,6 +378,9 @@ impl Serialize for Dataset {
 pub struct ReadReport {
     pub skipped: usize,
     pub messages: Vec<String>,
+    /// The files read, as they were, when the reader recorded them ([`sync::FileSync::around`]):
+    /// what a layer kept in the project compares with its source before writing edits back.
+    pub synced: Option<sync::FileSync>,
 }
 
 /// What a read says when it drops Z or M values (see [`Dataset::zm_dropped`]): from `features` of

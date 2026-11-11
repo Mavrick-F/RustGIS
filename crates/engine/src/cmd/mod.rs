@@ -36,6 +36,7 @@ pub mod plugins;
 pub mod portals;
 pub mod presentation;
 pub mod project;
+pub mod publish;
 pub mod qgis;
 pub mod raster;
 pub mod reads;
@@ -112,6 +113,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(sql::commands());
     v.extend(pg::commands());
     v.extend(gpkg::commands());
+    v.extend(publish::commands());
     v.extend(plugins::commands());
     v.extend(sharing::commands());
     v.extend(stac::commands());
