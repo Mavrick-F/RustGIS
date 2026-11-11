@@ -506,6 +506,35 @@ pub struct GpEnvironment {
     /// The cell size (degrees) of rasters tools create, when they don't say.
     #[serde(default)]
     pub cell_size: Option<f64>,
+    /// The projected coordinate system the Geostatistical Wizard makes its surface in, and the cell
+    /// size in its units, when the run doesn't say; `None`: degrees, with `cell_size`. Kept apart
+    /// from `cell_size` so an older RustGIS, which reads only that, still makes it in degrees rather
+    /// than reading this system's units as degrees: losing it costs that version the setting, not
+    /// the raster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected: Option<ProjectedCells>,
+}
+
+impl GpEnvironment {
+    /// The cell size set for rasters made in `crs`: the projected one's in its own system, the
+    /// degree one in longitude/latitude, none in another system.
+    pub fn cell_in(&self, crs: rustgis_data::raster::Crs) -> Option<f64> {
+        match self.projected {
+            Some(g) if g.crs == crs => g.cell_size,
+            None if crs == rustgis_data::raster::Crs::LonLat => self.cell_size,
+            _ => None,
+        }
+    }
+}
+
+/// A projected coordinate system for the rasters the environment sets ([`GpEnvironment::projected`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedCells {
+    /// The system, never one in degrees (`gp.env` refuses those).
+    pub crs: rustgis_data::raster::Crs,
+    /// The cell size in the system's units; `None`: the tool's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_size: Option<f64>,
 }
 
 /// A model: geoprocessing steps run in order. A parameter value `%n` stands for the output layer

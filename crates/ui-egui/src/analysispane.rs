@@ -50,6 +50,11 @@ pub struct Workflow {
     /// The Spectral Analysis section's profile: the points read and charted.
     pub spectral: crate::spectralui::Spectral,
     pub selected_only: Option<bool>,
+    /// The projected coordinate system the Geostatistical Wizard's surface is made in; empty: the
+    /// environment's, or degrees.
+    pub crs: String,
+    /// The projected coordinate system typed for the environment, until it is set.
+    pub env_crs: String,
     pub zonal_stats: ZonalStatsForm,
     /// A workflow running on a thread of its own: its progress and Cancel show, and what it made
     /// lands through [`land_job`].
@@ -681,14 +686,28 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             heading(ui, "Interpolate a surface from points (IDW)");
             combo(ui, "wf_i", "Layer", &mut app.workflow.layer, &points);
             combo(ui, "wf_if", "Field", &mut app.workflow.field, &numeric);
+            // Empty: the environment's system, or degrees without one.
+            let degrees = app.workflow.crs.trim().is_empty() && app.session.project.gp_env.projected.is_none();
+            ui.add(
+                egui::TextEdit::singleline(&mut app.workflow.crs)
+                    .hint_text(match app.session.project.gp_env.projected {
+                        Some(g) => g.crs.label(),
+                        None => tl!("projected system (EPSG:32616), or degrees").to_string(),
+                    })
+                    .desired_width(f32::INFINITY),
+            );
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("cell size °")).desired_width(80.0));
+                let hint = if degrees { tl!("cell size °") } else { tl!("cell size") };
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0));
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number2).hint_text(tl!("power 2")).desired_width(60.0));
             });
             if ui.button(tl!("Run")).clicked() {
                 let mut p = json!({"layer": app.workflow.layer, "field": app.workflow.field, "power": num(&app.workflow.number2, 2.0)});
                 if let Ok(c) = app.workflow.number.trim().parse::<f64>() {
                     p["cellSize"] = json!(c);
+                }
+                if !app.workflow.crs.trim().is_empty() {
+                    p["crs"] = json!(app.workflow.crs.trim());
                 }
                 run(app, "analysis.interpolate", p);
             }
@@ -796,8 +815,23 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 }
             });
+            let system = env.projected.map(|g| g.crs.label()).unwrap_or_else(|| tl!("Degrees").to_string());
+            let cells = env.cell_in(env.projected.map_or(rustgis_engine::data::raster::Crs::LonLat, |g| g.crs));
+            let cells = cells.map(|c| c.to_string()).unwrap_or_else(|| tl!("the tool's own").to_string());
+            ui.label(
+                egui::RichText::new(crate::i18n::fmt("Rasters: {system}, cell size {cells}", &[("system", &system), ("cells", &cells)]))
+                    .small(),
+            );
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("cell size °")).desired_width(80.0));
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.env_crs).hint_text("EPSG:32616").desired_width(110.0));
+                if ui.button(tl!("Set Coordinate System")).clicked() {
+                    let v = Some(app.workflow.env_crs.trim()).filter(|t| !t.is_empty());
+                    run(app, "gp.env", json!({"crs": v}));
+                }
+            });
+            ui.horizontal(|ui| {
+                let hint = if env.projected.is_some() { tl!("cell size") } else { tl!("cell size °") };
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0));
                 if ui.button(tl!("Set Cell Size")).clicked() {
                     let v = app.workflow.number.trim().parse::<f64>().ok();
                     run(app, "gp.env", json!({"cellSize": v}));

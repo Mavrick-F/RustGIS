@@ -39231,6 +39231,79 @@ fn interpolation_says_the_features_it_leaves_out() {
     assert!(e.contains("(2 features with no geometry or no usable point, 1 whose value isn't a number left out)"), "{e}");
 }
 
+/// The Geostatistical Wizard makes its surface in a projected system (#1743): the one given as
+/// `crs`, else the environment's (`gp.env` `crs`, with a cell size in its units). Without either it
+/// stays in degrees, and says so for a layer read in a projected system. The environment keeps its
+/// system apart from the degree cell size an older RustGIS reads, and saves it with the project.
+#[test]
+fn interpolation_in_a_projected_coordinate_system() {
+    use rustgis_data::raster::Crs;
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    use rustgis_geom::Coord;
+    let mut s = world();
+    // Wells around Memphis, read in UTM zone 16N.
+    let mut wells = Dataset::new("wells", GeometryType::Point, vec![Field::new("depth", FieldType::Double)]);
+    for (x, y, depth) in [(-90.05, 35.10, 10.0), (-89.95, 35.10, 20.0), (-90.05, 35.20, 30.0), (-89.95, 35.20, 40.0)] {
+        wells.push(Some(Geometry::Point(Coord::new(x, y))), vec![V::Float(depth)]);
+    }
+    wells.crs = Some(Crs::Epsg(32616));
+    crate::cmd::layer::add_dataset(&mut s, wells);
+    let surface = |s: &mut Session, p: Value| {
+        let mark = s.notice_mark();
+        let v = s.run("analysis.interpolate", &p).unwrap_or_else(|e| panic!("{p}: {e}"));
+        let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        let r = s.map().layer(v["layer"].as_u64().unwrap() as u32).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+        (r.crs, r.transform.pixel_width, notices)
+    };
+    let in_degrees = |notices: &[String]| notices.iter().any(|n| n.contains("made in degrees") && n.contains(&Crs::Epsg(32616).label()));
+
+    let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:32616", "cellSize": 500}));
+    assert_eq!((crs, cell), (Crs::Epsg(32616), 500.0));
+    assert!(!in_degrees(&notices), "{notices:?}");
+    let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "cellSize": 0.01}));
+    assert_eq!((crs, cell), (Crs::LonLat, 0.01));
+    assert!(in_degrees(&notices), "{notices:?}");
+
+    // The environment's system, with its cell size in metres; its degree cell size stays apart.
+    let env = s.run("gp.env", &json!({"crs": "EPSG:32616", "cellSize": 250})).unwrap();
+    assert_eq!((env["cellSize"].clone(), env["projected"]["cellSize"].clone()), (Value::Null, json!(250.0)), "{env}");
+    let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
+    assert_eq!((crs, cell), (Crs::Epsg(32616), 250.0));
+    assert!(!in_degrees(&notices), "{notices:?}");
+    let saved = serde_json::to_value(&s.project.gp_env).unwrap();
+    assert_eq!(saved["cell_size"], Value::Null, "{saved}");
+    assert_eq!(serde_json::from_value::<crate::project::GpEnvironment>(saved).unwrap(), s.project.gp_env);
+    // A system given to the run wins, and the environment's cell size isn't read in another one.
+    let (crs, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:3857"}));
+    assert_eq!(crs, Crs::WebMercator);
+    assert_ne!(cell, 250.0);
+
+    // The same system again keeps its cell size; a bad call changes nothing.
+    s.run("gp.env", &json!({"crs": "EPSG:32616"})).unwrap();
+    assert_eq!(s.project.gp_env.cell_in(Crs::Epsg(32616)), Some(250.0));
+    let before = s.project.gp_env.clone();
+    assert!(s.run("gp.env", &json!({"crs": "EPSG:3857", "cellSize": -1})).is_err());
+    assert_eq!(s.project.gp_env, before);
+
+    // A point Web Mercator can't hold is left out and counted; the others make the surface.
+    let mut polar = Dataset::new("polar", GeometryType::Point, vec![Field::new("depth", FieldType::Double)]);
+    for (x, y, depth) in [(-90.05, 35.10, 10.0), (-89.95, 35.20, 20.0), (0.0, 89.0, 30.0)] {
+        polar.push(Some(Geometry::Point(Coord::new(x, y))), vec![V::Float(depth)]);
+    }
+    crate::cmd::layer::add_dataset(&mut s, polar);
+    let (crs, _, notices) = surface(&mut s, json!({"layer": "polar", "field": "depth", "crs": "EPSG:3857"}));
+    assert_eq!(crs, Crs::WebMercator);
+    assert!(notices.iter().any(|n| n.starts_with("polar: 1 point(s) beyond what")), "{notices:?}");
+
+    // Degrees are refused as a system; clearing the environment's goes back to degrees.
+    assert!(s.run("analysis.interpolate", &json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326"})).is_err());
+    assert!(s.run("gp.env", &json!({"crs": "EPSG:4326"})).is_err());
+    assert!(s.run("gp.env", &json!({"crs": 32616})).is_err());
+    s.run("gp.env", &json!({"crs": null})).unwrap();
+    assert_eq!(s.project.gp_env.projected, None);
+    assert!(s.run("gp.env", &json!({"cellSize": 500})).is_err(), "500 degrees");
+}
+
 /// `share.exportMap` to a `.tif` writes the view placed on the ground (#1561): in the map's
 /// projection, each pixel where the view drew it, RGB; a turned view north up over its box, and
 /// says so; a tilted view, the globe and junk refused.
