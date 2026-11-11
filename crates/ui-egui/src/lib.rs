@@ -1147,9 +1147,9 @@ fn sync_state_said(app: &mut RustGisApp, landed: Landed) {
     let args = [("layer", layer.as_str()), ("file", file.as_str()), ("parts", parts.as_str())];
     let text = match v.get("state").and_then(Value::as_str) {
         Some("inSync") => i18n::fmt("{layer} is in step with {file}", &args),
-        Some("edited") => i18n::fmt("{layer} has edits {file} doesn't have", &args),
+        Some("edited") => i18n::fmt("{layer} was edited since it was read from {file}", &args),
         Some("sourceChanged") => i18n::fmt("{file} changed since {layer} was read from it ({parts})", &args),
-        _ => i18n::fmt("{layer} has edits {file} doesn't have, and the file changed since it was read ({parts})", &args),
+        _ => i18n::fmt("{layer} was edited, and {file} changed, since the layer was read from it ({parts})", &args),
     };
     app.session.notify(text, false);
 }
@@ -3359,6 +3359,10 @@ impl RustGisApp {
                     self.ui.pending_shapefile = Some(json!({"crs": text}));
                     open("shapefile");
                 } else if let Some(path) = dialogs::pick_open(&["shp", "zip"], tl!("Shapefile")) {
+                    // Read on a thread of its own, as Add Data's other files are.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return readjob::run(self, "layer.addData", json!({"path": path, "crs": text}));
+                    #[cfg(target_arch = "wasm32")]
                     return self.run("layer.addData", json!({"path": path, "crs": text}));
                 }
             }

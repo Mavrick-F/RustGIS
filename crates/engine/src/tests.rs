@@ -39329,6 +39329,23 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
         let read = ahead.run(&rustgis_analysis::control::Control::stoppable()).unwrap();
         read_land(&mut s, read).unwrap();
         assert!(s.map().layer_by_name("ahead").unwrap().synced.is_some());
+        assert_eq!(s.run("source.syncState", &json!({"layer": "ahead"})).unwrap()["state"], "inSync");
+    }
+    // A copy (pasted, or an offline area's part of the rows) isn't the layer read from the file:
+    // it has no record.
+    s.run("layer.copy", &json!({"layer": "towns.shp"})).unwrap();
+    s.run("layer.paste", &Value::Null).unwrap();
+    let pasted = s.map().layers.iter().filter(|l| l.dataset.source.as_deref().is_some_and(|p| p.ends_with("towns.shp"))).count();
+    assert!(pasted >= 2 && s.map().layers.iter().filter(|l| l.synced.is_some()).count() == 3, "only the layers read hold one");
+    s.run("offline.download", &json!({"name": "Here", "extent": [-180.0, -90.0, 180.0, 90.0]})).unwrap();
+    assert!(s.project.offline_areas[0].data.layers.iter().all(|l| l.synced.is_none()));
+    // A project from elsewhere names the path: a network share or a file no record is made for
+    // is refused without being opened.
+    for path in [r"\\host\share\towns.shp", "//host/share/towns.shp", "towns.json"] {
+        let id = s.map().layer_by_name("towns.shp").unwrap().id;
+        s.map_mut().layer_mut(id).unwrap().dataset.source = Some(path.into());
+        let e = s.run("source.syncState", &json!({"layer": id})).unwrap_err();
+        assert!(e.contains("isn't a Shapefile or .geojson file on this computer"), "{path}: {e}");
     }
     // A layer that wasn't read from such a file has nothing to compare with.
     assert!(s.run("source.syncState", &json!({"layer": "Cities"})).is_err());

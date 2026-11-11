@@ -302,6 +302,26 @@ mod tests {
         assert_ne!(rows_digest(&edited).unwrap(), rows_digest(&ds).unwrap());
     }
 
+    /// The digest is saved in projects with no version: a change in how fields, coordinate
+    /// systems, geometry or values serialize changes every saved one, and each layer of an older
+    /// project would then show as edited. This pins it; a change needs a way to read the old one.
+    #[test]
+    fn a_rows_digest_is_pinned() {
+        use crate::{Coord, Dataset, Feature, Field, FieldType, Geometry, GeometryType, Value};
+        let mut ds = Dataset::new(
+            "a".to_string(),
+            GeometryType::Point,
+            vec![Field::new("name", FieldType::Text), Field::new("n", FieldType::Integer)],
+        );
+        ds.features = vec![Feature {
+            id: 1,
+            geometry: Some(Geometry::Point(Coord { x: -90.05, y: 35.15 })),
+            attrs: vec![Value::Text("Main St".into()), Value::Int(4)],
+        }]
+        .into();
+        assert_eq!(rows_digest(&ds).unwrap(), 1_724_049_670_388_433_092);
+    }
+
     #[test]
     fn a_record_round_trips() {
         let sync = FileSync { files: vec![("a.geojson".into(), Some(FileStamp { len: 2, sha256: "ab".into() })), ("a.prj".into(), None)] };

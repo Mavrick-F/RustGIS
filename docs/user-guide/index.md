@@ -320,7 +320,8 @@ shows as changed, unless the write was undone before RustGIS looked again. A lay
 place and a `.json` file have no record. The record is saved with the project; the web app
 can't check it.
 
-CLI and Python: `source.syncState` with `{"layer":"parcels"}`.
+On the desktop, make the layer active and choose **Source File State** in Command Search; what it
+found shows in the status bar. CLI and Python: `source.syncState` with `{"layer":"parcels"}`.
 
 ## Keyboard shortcuts
 

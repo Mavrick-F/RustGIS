@@ -49,7 +49,7 @@ impl Checked {
 pub(crate) fn sync_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
     let id = s.layer_id(p).ok()?;
     let l = s.map().layer(id)?;
-    let (synced, path, dataset) = (l.synced.clone()?, l.dataset.source.clone()?, l.dataset.clone());
+    let (synced, path, dataset) = (l.synced.clone()?, l.dataset.source.clone().filter(|p| local_file(p))?, l.dataset.clone());
     Some(super::reads::ahead("Source File State", ahead_key(id), move || {
         let changed = synced.files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string());
         let rows = rustgis_data::sync::rows_digest(&dataset).map_err(|e| e.to_string());
@@ -83,6 +83,11 @@ fn sync_state(s: &mut Session, p: &Value) -> CmdResult {
         }
         return Err(format!("{} wasn't read whole from a Shapefile or .geojson file, so there's no file to compare it with", l.name));
     };
+    // A project from elsewhere names the path: only a local file of a kind a record is made for
+    // is opened, never a network share (opening one can send the user's login to its host).
+    if !local_file(path) {
+        return Err(format!("{}: {path} isn't a Shapefile or .geojson file on this computer, so it isn't checked", l.name));
+    }
     #[cfg(target_arch = "wasm32")]
     {
         let _ = (synced, path);
@@ -111,4 +116,11 @@ fn sync_state(s: &mut Session, p: &Value) -> CmdResult {
         };
         Ok(serde_json::json!({"layer": id, "path": path, "state": state, "edited": edited, "changed": changed}))
     }
+}
+
+/// Whether `path` names a file on this computer a record is made for: a Shapefile or `.geojson`
+/// file, not an address, a database or a network share (`\\host\share`, `//host/share`).
+fn local_file(path: &str) -> bool {
+    let local = rustgis_map::paths::local_path(path);
+    rustgis_map::paths::is_local(path) && rustgis_data::sync::is_syncable(path) && !local.starts_with("//") && !local.starts_with("\\\\")
 }

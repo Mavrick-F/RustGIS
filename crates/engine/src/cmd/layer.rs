@@ -1633,9 +1633,8 @@ fn read_synced(path: &str, read: impl FnOnce() -> WholeRead) -> WholeRead {
 /// whole or converted by GDAL, a GeoJSON read whole, delimited text, a spreadsheet or a city model
 /// (CityJSON or CityGML) read into its layers, a Shapefile read whole. `None` for
 /// any other file, which [`add_data`] reads as it adds it. Each is picked only where `add_data`
-/// takes that read, so a read made is never wasted; a few it makes whole are left to it (a GeoJSON
-/// with `"stream"` given, a `.json` with a coordinate system or layer given, a large GeoJSON that
-/// isn't a FeatureCollection).
+/// takes that read, so a read made is never wasted; a few it makes whole are left to it (a `.json`
+/// with a coordinate system or layer given, a large GeoJSON that isn't a FeatureCollection).
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
     use super::reads::ahead;
@@ -1659,13 +1658,16 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
     }
     let given = |k: &str| ps(p, k).is_some_and(|v| !v.trim().is_empty());
     let lower = path.to_ascii_lowercase();
-    // A GeoJSON read whole: small, with no "stream" given (which add_data decides by), and not a
+    // A GeoJSON read whole: small with no "stream" given (which add_data decides by), or with
+    // `"stream": false`, and not a
     // CityJSON model (named so, or a .json with a coordinate system or a layer given).
+    // `"stream": false` reads one whole however large (within the reader's limit).
     let geojson = is_geojson(&path)
         && !rustgis_data::cityjson::is_cityjson_name(&path)
-        && b(p, "stream").is_none()
+        && b(p, "stream") != Some(true)
         && !(lower.ends_with(".json") && (given("crs") || given("layer")))
-        && std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= rustgis_data::source::geojson::IN_PLACE_ABOVE);
+        && std::fs::metadata(&path)
+            .is_ok_and(|m| m.is_file() && (b(p, "stream") == Some(false) || m.len() <= rustgis_data::source::geojson::IN_PLACE_ABOVE));
     // A city model: its layers, read whole. A model named `.json` (not `.city.json`) is a file of
     // several layers only with a coordinate system or a layer given, which Add Data reads as it runs.
     if rustgis_data::io::is_multi_layer_name(&path) && is_city_model_path(&path) {
