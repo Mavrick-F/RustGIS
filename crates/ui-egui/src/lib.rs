@@ -6507,6 +6507,7 @@ mod download_service_tests {
 
     /// Real UI discovery never restores a login after a foreign hop, while a public saved
     /// connection on a same-origin chain can still gain its legitimate login later.
+    /// Empty supplied collections retain the legacy map offer and its UI tile-resolver path.
     #[test]
     fn tile_discovery_keeps_foreign_lineage_and_same_origin_connections() {
         use rustgis_engine::render::rustgis_tiles::{cache, logins};
@@ -6552,9 +6553,18 @@ mod download_service_tests {
                     connection = c["id"].as_str().unwrap().to_string();
                 }
             }
-            let text = json!({"title":"Lineage","links":[{"rel":"tilesets-map","href":format!("{a}/list")}]}).to_string();
-            let source = crate::serviceui::ServiceSource { url: a.into(), kind: "ogcapi", text: text.clone(), documents: Vec::new() };
-            let listing = app.session.run("service.layers", &json!({"url":a,"type":"ogcapi","text":text,"connection":connection})).unwrap();
+            let text = json!({"title":"Lineage","links":[
+                {"rel":"tilesets-map","href":format!("{a}/list")},
+                {"rel":"data","type":"application/json","href":format!("{a}/collections")}
+            ]})
+            .to_string();
+            let documents = vec![json!({"url":format!("{a}/collections"),"text":"{\"collections\":[]}"})];
+            let source =
+                crate::serviceui::ServiceSource { url: a.into(), kind: "ogcapi", text: text.clone(), documents: documents.clone() };
+            let listing = app
+                .session
+                .run("service.layers", &json!({"url":a,"type":"ogcapi","text":text,"documents":documents,"connection":connection}))
+                .unwrap();
             crate::serviceui::add_layer_from(&mut app, &source, &listing["layers"][0], "", None, false, None, Some(&connection)).unwrap();
             app.ws.recording = Some(Vec::new());
             for _ in 0..3 {

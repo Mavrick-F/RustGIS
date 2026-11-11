@@ -27035,6 +27035,8 @@ fn copied_history_replays_public_structured_parameters_without_changing_results(
 #[path = "../../../tests/support/ogc_server.rs"]
 mod ogc_server;
 
+mod ogc_dataset;
+
 #[path = "../../../tests/support/esripbf.rs"]
 mod esripbf_answers;
 
@@ -27130,7 +27132,7 @@ fn ogc_landing_discovery_is_bounded_and_checks_addresses() {
     }
     let error = session.run("service.layers", &json!({"url":root,"text":link(&format!("{root}?f=json"))})).unwrap_err();
     assert!(error.contains("loop"), "{error}");
-    let docs: Vec<Value> = (1..=3)
+    let docs: Vec<Value> = (1..=31)
         .map(|n| {
             json!({
                 "url":format!("https://example.org/ogc/{n}"),
@@ -27139,7 +27141,7 @@ fn ogc_landing_discovery_is_bounded_and_checks_addresses() {
         })
         .collect();
     let error = session.run("service.layers", &json!({"url":root,"text":link("https://example.org/ogc/1"),"documents":docs})).unwrap_err();
-    assert!(error.contains("four documents"), "{error}");
+    assert!(error.contains("32 documents"), "{error}");
     let docs = json!([
         {"url":"https://example.org/ogc/a","text":link("https://example.org/ogc/b")},
         {"url":"https://example.org/ogc/b","text":link("https://example.org/ogc/a")}
