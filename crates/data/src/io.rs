@@ -2674,7 +2674,8 @@ pub struct CsvLosses {
     /// Features of a point layer with more than one point (a multipoint), or another shape,
     /// written as one point.
     pub as_one_point: usize,
-    /// Features of a line or polygon layer whose geometry isn't written.
+    /// Features of a line or polygon layer (or one that declares no type) whose geometry isn't
+    /// written.
     pub unwritten: usize,
 }
 
@@ -2687,7 +2688,7 @@ impl CsvLosses {
                 (GeometryType::Point, Geometry::Point(_)) => {}
                 (GeometryType::Point, Geometry::MultiPoint(v)) if v.len() <= 1 => {}
                 (GeometryType::Point, _) => out.as_one_point += 1,
-                (GeometryType::None, _) => {}
+                // A layer of lines or polygons, or one that declares no type: no coordinates.
                 _ => out.unwritten += 1,
             }
         }
@@ -2704,7 +2705,11 @@ impl CsvLosses {
             ));
         }
         if self.unwritten > 0 {
-            let kind = if gt == GeometryType::Polygon { "polygon" } else { "line" };
+            let kind = match gt {
+                GeometryType::Polygon => "polygon",
+                GeometryType::Polyline => "line",
+                _ => "feature",
+            };
             let what = if self.unwritten == 1 { format!("1 {kind}") } else { format!("{} {kind}s", self.unwritten) };
             notes.push(format!(
                 "{target}: CSV holds points, so the geometry of {what} wasn't written, only the attributes; CSV with WKT (Data Interop, data.convert \"format\": \"wkt\") keeps it"
@@ -4038,6 +4043,23 @@ mod tests {
         assert_eq!(rep.skipped, 1);
         assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(20.0, 10.0))));
         assert!(to_csv(&ds).unwrap().contains("longitude"));
+    }
+
+    /// A layer that declares no geometry type gets no coordinate columns, so geometry it holds
+    /// is counted as not written, as for a line or polygon layer; a point layer's points aren't.
+    #[test]
+    fn csv_losses_count_geometry_a_layer_without_a_type_holds() {
+        let square =
+            Geometry::Polygon(vec![vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 0.0)]]]);
+        let mut ds = Dataset::new("t", GeometryType::None, vec![]);
+        ds.push(Some(square), vec![]);
+        ds.push(None, vec![]);
+        let losses = CsvLosses::of(&ds.features, ds.geometry_type);
+        assert_eq!(losses, CsvLosses { as_one_point: 0, unwritten: 1 });
+        assert!(losses.notes(ds.geometry_type, "t.csv")[0].contains("the geometry of 1 feature wasn't written"));
+        assert!(!to_csv(&ds).unwrap().contains("longitude"));
+        let points = [crate::Feature { id: 0, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![] }];
+        assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses::default());
     }
 
     #[test]

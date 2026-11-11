@@ -1405,7 +1405,7 @@ fn similar(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Converts a layer to GeoJSON, CSV, KML, GPX or WKT text, written to `path` or returned; says when
 /// the layer's Z or M values were dropped on import, its positions are approximate or aren't
-/// longitude/latitude, or CSV or GPX couldn't hold some of it.
+/// longitude/latitude, or CSV, KML or GPX couldn't hold some of it.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let ds = feature_ds(s, p)?;
     let name_field =
@@ -1426,6 +1426,11 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         Some("csv") => notes.extend(rustgis_data::io::CsvLosses::of(&ds.features, ds.geometry_type).notes(ds.geometry_type, target)),
         Some("gpx") => notes.extend(rustgis_data::io::gpx_notes(ds, name_field, target)),
         _ => {}
+    }
+    // KML and GPX hold features with geometry only.
+    if let Some(ext @ ("kml" | "gpx")) = ps(p, "format") {
+        let without = ds.features.iter().filter(|f| f.geometry.is_none()).count();
+        notes.extend(rustgis_data::io::left_out_note(target, ext, without));
     }
     let out = match ps(p, "path") {
         Some(path) => {

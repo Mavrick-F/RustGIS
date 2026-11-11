@@ -18191,8 +18191,9 @@ fn blank_project_starts_in_a_projected_crs() {
 }
 
 /// CSV and GPX exports say what the format couldn't hold (a line layer's geometry and a
-/// multipoint's other points in CSV; other fields, polygons' holes and multipoints in GPX); a
-/// layer each holds whole gets no such notice.
+/// multipoint's other points in CSV; other fields, polygons' holes and multipoints in GPX), and
+/// Data Interop's KML and GPX the rows without geometry; a layer each holds whole gets no such
+/// notice.
 #[test]
 fn csv_and_gpx_exports_say_what_they_leave_out() {
     use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
@@ -18247,6 +18248,14 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
     assert!(n.iter().any(|t| t.contains("'height'")) && n.iter().any(|t| t.contains("tracks")), "{n:?}");
     let n = said(&mut s, "data.convert", json!({"layer": "Areas", "format": "csv"}));
     assert!(n.iter().any(|t| t.contains("CSV holds points")), "{n:?}");
+    // A row without geometry, which KML and GPX can't hold, is counted.
+    let mut rows = layer("Rows", GeometryType::Point, vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])]);
+    rows.push(None, vec![V::Text("no place".into()), V::Null]);
+    s.map_mut().add_dataset(rows);
+    for format in ["kml", "gpx"] {
+        let n = said(&mut s, "data.convert", json!({"layer": "Rows", "format": format}));
+        assert!(n.len() == 1 && n[0].contains("1 features without drawable geometry were left out"), "{format}: {n:?}");
+    }
     // Points alone, their other field empty: CSV and GPX hold them whole.
     for ext in ["csv", "gpx"] {
         assert_eq!(
