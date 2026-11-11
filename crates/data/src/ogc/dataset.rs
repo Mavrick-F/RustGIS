@@ -172,12 +172,31 @@ impl DatasetDiscovery {
 
     /// Consumes the next advertised document. Callers fetch it or replay supplied bytes through
     /// this same path; invalid candidate styles are omitted without losing valid tile offers.
-    pub fn read(&mut self, body: &[u8]) -> Result<Service, String> {
+    /// `allowed` applies the caller's address policy to a template and its supplying document.
+    pub fn read(&mut self, body: &[u8], allowed: impl Fn(&str, &str) -> bool) -> Result<Service, String> {
         let doc = self.pending.pop_front().ok_or("no dataset discovery document is pending")?;
         let mut service = Service { kind: "OGC API Tiles".into(), incomplete: !self.omissions.is_empty(), ..Service::default() };
+        let mut contexts = Vec::new();
+        if let Kind::Tiles(context) = &doc.kind {
+            contexts.push(context.clone());
+            // A mixed list may be advertised by both relations. Consume both root contexts
+            // together, so the caller fetches the document once and keeps both kinds of offer.
+            if !context.metadata {
+                let shared = self.pending.iter().position(|next| {
+                    next.url == doc.url
+                        && next.parent == doc.parent
+                        && matches!(&next.kind, Kind::Tiles(other) if !other.metadata && other.vector != context.vector)
+                });
+                if let Some(at) = shared
+                    && let Some(Document { kind: Kind::Tiles(other), .. }) = self.pending.remove(at)
+                {
+                    contexts.push(other);
+                }
+            }
+        }
         match serde_json::from_slice::<Value>(body) {
             Ok(value) => match doc.kind.clone() {
-                Kind::Tiles(context) => self.tiles(&doc, &value, &context, &mut service),
+                Kind::Tiles(_) => self.tiles(&doc, &value, &contexts, &allowed, &mut service),
                 Kind::Styles => self.styles(&doc, &value, &mut service),
                 Kind::Style { id, title } => self.style(&doc, &value, id, title, &mut service),
                 Kind::Source(candidate) => {
@@ -244,14 +263,20 @@ impl DatasetDiscovery {
     }
 
     /// Reads the advertised template using the existing OGC resolver. A list may lead to one
-    /// metadata document; unknown projections and entries beyond the bound are counted.
-    fn tiles(&mut self, doc: &Document, value: &Value, context: &Tileset, service: &mut Service) {
+    /// metadata document; unknown projections and entries beyond the bound are counted. A
+    /// shared map/vector list checks each entry against both advertised contexts before omitting it.
+    fn tiles(&mut self, doc: &Document, value: &Value, contexts: &[Tileset], allowed: &impl Fn(&str, &str) -> bool, service: &mut Service) {
         if let Some(sets) = value.get("tilesets").and_then(Value::as_array) {
             let mut skipped = sets.len().saturating_sub(MAX_PARTS);
             for set in sets.iter().take(MAX_PARTS) {
-                if web_mercator_tileset(set) && tile_data_type(set, context.vector) {
-                    self.tile(doc, set, context, true, service);
-                } else {
+                let mut accepted = false;
+                if web_mercator_tileset(set) {
+                    for context in contexts.iter().filter(|c| tile_data_type(set, c.vector)) {
+                        accepted = true;
+                        self.tile(doc, set, context, true, allowed, service);
+                    }
+                }
+                if !accepted {
                     skipped += 1;
                 }
             }
@@ -260,16 +285,31 @@ impl DatasetDiscovery {
                 skipped,
                 "tilesets were left out: unsupported tile matrix set or data type, or past the 200-tileset limit",
             );
-        } else if ((!context.metadata || declares_grid(value)) && !web_mercator_tileset(value)) || !tile_data_type(value, context.vector) {
-            self.omitted(service, 1, "tilesets were left out: unsupported or undeclared tile matrix set, or unsupported data type");
         } else {
-            self.tile(doc, value, context, false, service);
+            let mut accepted = false;
+            for context in contexts {
+                if (context.metadata && !declares_grid(value) || web_mercator_tileset(value)) && tile_data_type(value, context.vector) {
+                    accepted = true;
+                    self.tile(doc, value, context, false, allowed, service);
+                }
+            }
+            if !accepted {
+                self.omitted(service, 1, "tilesets were left out: unsupported or undeclared tile matrix set, or unsupported data type");
+            }
         }
     }
 
     /// Resolves one selected tileset; a list entry can advertise its template inline or link
     /// to metadata. A metadata document cannot start another unbounded tileset traversal.
-    fn tile(&mut self, doc: &Document, value: &Value, context: &Tileset, listed: bool, service: &mut Service) {
+    fn tile(
+        &mut self,
+        doc: &Document,
+        value: &Value,
+        context: &Tileset,
+        listed: bool,
+        allowed: &impl Fn(&str, &str) -> bool,
+        service: &mut Service,
+    ) {
         let vector = context.vector;
         let metadata = context.metadata;
         let mut names = context.names.clone();
@@ -328,6 +368,11 @@ impl DatasetDiscovery {
             TilesStep::Template(template) => {
                 if template.len() > 2 * MAX_ADDRESS {
                     self.omitted(service, 1, "tilesets were left out: template addresses exceed 16384 bytes");
+                    return;
+                }
+                // Only templates accepted from their own document can validate later styles.
+                if !allowed(&template, &doc.url) {
+                    self.omitted(service, 1, "tilesets were left out: disallowed template addresses");
                     return;
                 }
                 self.templates.push((template.clone(), vector));

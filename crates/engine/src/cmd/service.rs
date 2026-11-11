@@ -274,7 +274,10 @@ fn read_documents(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(
                 if dataset_bytes > MAX_DATASET_BYTES {
                     return Err(format!("the dataset discovery exceeds its {MAX_DATASET_BYTES}-byte metadata budget"));
                 }
-                dataset.as_mut().ok_or_else(|| "missing dataset discovery plan".to_string())?.read(bytes)
+                dataset
+                    .as_mut()
+                    .ok_or_else(|| "missing dataset discovery plan".to_string())?
+                    .read(bytes, |template, from| crate::render::rustgis_tiles::address::check(template, Some(from)).is_ok())
             } else {
                 rustgis_data::ogc::parse(&address, bytes)
             }

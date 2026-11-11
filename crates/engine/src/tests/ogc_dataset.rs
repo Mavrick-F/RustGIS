@@ -173,6 +173,72 @@ fn ogc_dataset_styles_use_advertised_projection_and_native_web_parity() {
 }
 
 #[test]
+fn ogc_dataset_styles_require_templates_allowed_from_the_tileset_document() {
+    for (origin, template, allowed) in [
+        ("https://maps.example.org", "http://127.0.0.1/{z}/{y}/{x}.pbf", false),
+        ("https://maps.example.org", "https://tiles.example.org/{z}/{y}/{x}.pbf", true),
+        ("http://127.0.0.1", "http://127.0.0.1/{z}/{y}/{x}.pbf", true),
+    ] {
+        let root = json!({"links":[{"rel":"tilesets-vector","href":"/tiles?f=json"},{"rel":"styles","href":"/styles?f=json"}]});
+        let item = template.replace("{z}", "{tileMatrix}").replace("{y}", "{tileRow}").replace("{x}", "{tileCol}");
+        let tiles = json!({"tilesets":[{"dataType":"vector","tileMatrixSetId":"WebMercatorQuad","links":[
+            {"rel":"item","type":"application/vnd.mapbox-vector-tile","href":item}]}]});
+        let styles = json!({"styles":[{"id":"roads","links":[
+            {"rel":"stylesheet","type":"application/vnd.mapbox.style+json","href":"/style?f=mapbox"}]}]});
+        let style = json!({"version":8,"sources":{"tiles":{"type":"vector","tiles":[template]}},
+            "layers":[{"id":"roads","type":"line","source":"tiles","source-layer":"roads"}]});
+        let mut params = json!({"url":format!("{origin}/dataset"),"type":"ogcapi","text":root.to_string(),
+            "documents":[{"url":format!("{origin}/tiles?f=json"),"text":tiles.to_string()},
+                {"url":format!("{origin}/styles?f=json"),"text":styles.to_string()},
+                {"url":format!("{origin}/style?f=mapbox"),"text":style.to_string()}]});
+        let mut session = Session::new(Project::default());
+        let listing = session.run("service.layers", &params).unwrap();
+        assert!(listing["next"].is_null(), "all fixture documents must be consumed: {listing}");
+        assert_eq!(listing["count"], usize::from(allowed), "{listing}");
+        let notes = listing["notes"].as_array().unwrap();
+        if allowed {
+            assert!(notes.is_empty(), "{listing}");
+        } else {
+            assert!(
+                notes.iter().any(|n| n.as_str().unwrap().starts_with("1 tilesets were left out: disallowed template addresses")),
+                "{listing}"
+            );
+            params["layer"] = json!("roads");
+            assert!(session.run("service.add", &params).is_err());
+            assert!(session.map().tiles.is_empty());
+        }
+    }
+}
+
+#[test]
+fn ogc_dataset_shared_map_vector_list_is_read_once_for_both_offers() {
+    let root = json!({"links":[
+        {"rel":"tilesets-vector","href":"/tiles?f=json"},
+        {"rel":"tilesets-map","href":"/tiles?f=json"}
+    ]});
+    let tiles = json!({"tilesets":[
+        {"dataType":"vector","tileMatrixSetId":"WebMercatorQuad","vector_layers":[{"id":"roads"}],"links":[
+            {"rel":"item","type":"application/vnd.mapbox-vector-tile","href":"/vector/{tileMatrix}/{tileRow}/{tileCol}.pbf"}]},
+        {"dataType":"map","tileMatrixSetId":"WebMercatorQuad","links":[
+            {"rel":"item","type":"image/png","href":"/map/{tileMatrix}/{tileRow}/{tileCol}.png"}]}
+    ]});
+    let server = Server::new(vec![Route::new("/dataset", &root.to_string()), Route::new("/tiles", &tiles.to_string())]);
+    let mut session = Session::new(Project::default());
+    let mut params = json!({"url":format!("{}/dataset", server.base),"type":"ogcapi"});
+    let native = session.run("service.layers", &params).unwrap();
+    assert_eq!(native["count"], 2, "{native}");
+    let layers = native["layers"].as_array().unwrap();
+    assert!(layers.iter().any(|l| l["offer"]["type"] == "vectorTiles"), "{native}");
+    assert!(layers.iter().any(|l| l["offer"]["type"] == "tiles"), "{native}");
+    assert!(native["notes"].as_array().unwrap().is_empty(), "{native}");
+    assert_eq!(server.requests().len(), 2, "the shared list must be fetched only once");
+    params["text"] = json!(root.to_string());
+    params["documents"] = json!([{"url":format!("{}/tiles?f=json",server.base),"text":tiles.to_string()}]);
+    assert_eq!(session.run("service.layers", &params).unwrap(), native);
+    assert_eq!(server.requests().len(), 2, "supplied replay must not fetch anything");
+}
+
+#[test]
 fn ogc_dataset_shared_documents_keep_independent_offers() {
     for metadata in [false, true] {
         let mut docs = documents();
