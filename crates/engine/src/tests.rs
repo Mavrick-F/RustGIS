@@ -39341,12 +39341,33 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
     assert!(s.project.offline_areas[0].data.layers.iter().all(|l| l.synced.is_none()));
     // A project from elsewhere names the path: a network share or a file no record is made for
     // is refused without being opened.
-    for path in [r"\\host\share\towns.shp", "//host/share/towns.shp", "towns.json"] {
+    let shares = [r"\\host\share\towns.shp", "//host/share/towns.shp", r"/\host\share\towns.shp", r"\/host/share/towns.shp"];
+    for path in shares.into_iter().chain([r"file:///\\host\share\towns.shp", "towns.json"]) {
         let id = s.map().layer_by_name("towns.shp").unwrap().id;
         s.map_mut().layer_mut(id).unwrap().dataset.source = Some(path.into());
         let e = s.run("source.syncState", &json!({"layer": id})).unwrap_err();
         assert!(e.contains("isn't a Shapefile or .geojson file on this computer"), "{path}: {e}");
+        // Nor read on a thread of its own: the desktop's check makes no read, and refuses as it lands.
+        let ahead = crate::cmd::reads::read_ahead(&mut s, "source.syncState", &json!({"layer": id})).unwrap();
+        assert!(!ahead.reads(), "{path}");
+        let read = ahead.run(&rustgis_analysis::control::Control::stoppable()).unwrap();
+        assert!(crate::cmd::reads::read_land(&mut s, read).is_err(), "{path}");
     }
+    // A part that can't be read to record it (a folder where the .prj would be): the layer is
+    // added without a record, and says so; one read cleanly says nothing of it.
+    let said = |s: &Session, mark: u64| s.notices_since(mark).iter().filter(|n| n.text.contains("couldn't be read to record it")).count();
+    let odd = dir.join("odd");
+    std::fs::create_dir_all(odd.join("odd.prj")).unwrap();
+    for ext in ["shp", "shx", "dbf"] {
+        std::fs::copy(dir.join(format!("towns.{ext}")), odd.join(format!("odd.{ext}"))).unwrap();
+    }
+    let mark = s.notice_mark();
+    let id = s.run("layer.addData", &json!({"path": odd.join("odd.shp")})).unwrap()["layer"].as_u64().unwrap();
+    assert!(s.map().layer(id as u32).unwrap().synced.is_none());
+    assert_eq!(said(&s, mark), 1);
+    let mark = s.notice_mark();
+    s.run("layer.addData", &json!({"path": dir.join("towns.geojson"), "name": "clean"})).unwrap();
+    assert_eq!(said(&s, mark), 0);
     // A layer that wasn't read from such a file has nothing to compare with.
     assert!(s.run("source.syncState", &json!({"layer": "Cities"})).is_err());
     std::fs::remove_dir_all(dir).unwrap();

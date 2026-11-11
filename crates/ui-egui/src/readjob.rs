@@ -1129,12 +1129,20 @@ mod tests {
         app.reads_off_frame = true;
         for (p, name) in [
             (json!({"path": shp, "crs": "EPSG:4326", "name": "towns"}), "towns"),
+            // Another system than the file's: the rows recorded are the rows as read in it.
+            (json!({"path": shp, "crs": "EPSG:3857", "name": "projected"}), "projected"),
             (json!({"path": geojson, "stream": false, "name": "whole"}), "whole"),
         ] {
             assert_eq!(run(&mut app, "layer.addData", p).unwrap()["started"], "Add Data", "{name}");
             landed(&mut app, 60);
             let id = app.session.map().layer_by_name(name).unwrap().id;
             assert!(app.session.map().layer(id).unwrap().synced.is_some(), "{name}");
+            if name == "projected" {
+                assert_eq!(app.session.map().layer(id).unwrap().dataset.crs, rustgis_engine::data::raster::Crs::parse("EPSG:3857").ok());
+            }
+            app.reads_off_frame = false;
+            assert_eq!(app.run("source.syncState", json!({"layer": id})).unwrap()["state"], "inSync", "{name}");
+            app.reads_off_frame = true;
         }
     }
 

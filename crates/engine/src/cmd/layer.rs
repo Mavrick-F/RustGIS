@@ -1614,7 +1614,14 @@ fn read_shapefile_with(path: &str, name: &str, crs: rustgis_data::raster::Crs) -
 #[cfg(not(target_arch = "wasm32"))]
 fn read_synced(path: &str, read: impl FnOnce() -> WholeRead) -> WholeRead {
     let (read, files) = rustgis_data::sync::FileSync::around(Path::new(path), read).map_err(|e| format!("{path}: {e}"))?;
-    let (ds, mut report) = read?;
+    let (mut ds, mut report) = read?;
+    // Kept whole, as the record checks it later: a relative path would be taken from wherever
+    // RustGIS runs then, not where the file was read.
+    if files.is_some()
+        && let Ok(full) = std::path::absolute(path)
+    {
+        ds.source = Some(full.display().to_string());
+    }
     report.synced = match files {
         Some(files) => {
             Some(rustgis_data::sync::Synced { files, rows: rustgis_data::sync::rows_digest(&ds).map_err(|e| format!("{path}: {e}"))? })
@@ -1658,10 +1665,9 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
     }
     let given = |k: &str| ps(p, k).is_some_and(|v| !v.trim().is_empty());
     let lower = path.to_ascii_lowercase();
-    // A GeoJSON read whole: small with no "stream" given (which add_data decides by), or with
-    // `"stream": false`, and not a
-    // CityJSON model (named so, or a .json with a coordinate system or a layer given).
-    // `"stream": false` reads one whole however large (within the reader's limit).
+    // A GeoJSON read whole: small with no "stream" given (which add_data decides by), or any size
+    // (within the reader's limit) with `"stream": false`; and not a CityJSON model (named so, or a
+    // .json with a coordinate system or a layer given).
     let geojson = is_geojson(&path)
         && !rustgis_data::cityjson::is_cityjson_name(&path)
         && b(p, "stream") != Some(true)

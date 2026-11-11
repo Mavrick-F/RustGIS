@@ -311,7 +311,8 @@ the layer with the rows read, and the file with the parts read, and answers `inS
 (the layer has edits since it was read), `sourceChanged` (the file changed since it was read)
 or `both`, with the names of the parts that changed. It doesn't compare the layer with the file
 as it is now: the same edit made to both shows as `both`. Only the bytes count: writing the
-same bytes again isn't a change, and a copy that puts back the file's size and time is.
+same bytes again isn't a change, while a copy that puts back the file's size and time with other
+bytes is one.
 Undoing an edit makes the layer `inSync` again. On the desktop the file and the rows are hashed
 in the background, with progress and Cancel in the status bar.
 

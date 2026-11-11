@@ -119,8 +119,10 @@ fn sync_state(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Whether `path` names a file on this computer a record is made for: a Shapefile or `.geojson`
-/// file, not an address, a database or a network share (`\\host\share`, `//host/share`).
+/// file, not an address, a database or a network share (`\\host\share`, `//host/share`,
+/// `/\host\share`).
 fn local_file(path: &str) -> bool {
-    let local = rustgis_map::paths::local_path(path);
-    rustgis_map::paths::is_local(path) && rustgis_data::sync::is_syncable(path) && !local.starts_with("//") && !local.starts_with("\\\\")
+    // Windows takes any two leading separators, of either kind, for a network share.
+    let share = rustgis_map::paths::local_path(path).as_bytes().get(..2).is_some_and(|p| p.iter().all(|&b| matches!(b, b'/' | b'\\')));
+    rustgis_map::paths::is_local(path) && rustgis_data::sync::is_syncable(path) && !share
 }
