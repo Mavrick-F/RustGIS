@@ -327,6 +327,13 @@ list each repeating a somewhat shorter one. An ArcGIS service or directory is an
 A dynamic MapServer offers each of those layers twice, as features and as a
 map, so its list can be twice as long. A note says how many are left out past either limit.
 
+When a list stops short of the layers read, Add From Service's filter searches every layer
+read, not only those listed: once typing pauses, the documents it already has are read again
+for the layers whose title or name contains each word (`service.layers` with `"filter"`), and
+the first 2,000 matches are listed, with how many match and a note when more match. Layers past
+the read limits above, and an ArcGIS service's past its first 2,000, aren't read, so the filter
+doesn't find them either.
+
 A WMS or WMTS layer's tiles are asked for down to the detail its service gives, and stretched
 only past it: a WMTS layer's over the zooms of its tile matrix set (or those its
 `TileMatrixSetLimits` name; swisstopo's SWISSIMAGE goes to zoom 20), a WMS layer's between the
@@ -590,7 +597,7 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 | GeoJSON (`.geojson`, `.json`), CSV | Data › Export (`share.exportLayer`) | The Export Features dialog picks the format; the chosen extension is appended when needed. In the web app it downloads any vector format below except GeoPackage and FlatGeobuf (a Shapefile as one zip). A streamed layer exports its whole source: on the desktop, to GeoJSON, CSV, FlatGeobuf, GeoPackage or GeoParquet a chunk at a time with no limit on its size (a GeoParquet source's row groups are read whole, so on the desktop each holds at most 16,777,216 rows; a layer read in place from the GeoPackage it goes into is read whole first), otherwise loaded whole (see [Streamed layers](data.md)); remote sources on the web must be downloaded first. |
 | GeoPackage | Data › Export to `.gpkg` (desktop) | A new file with one feature table (an attributes table for a layer without geometry) in the layer's coordinate system (see below), with an R-tree and GeoPackage 1.4 triggers to maintain it. An existing destination is refused unless the export adds a table to it or replaces one of its feature or attribute tables (`mode`, see [Exporting](sharing.md)), leaving its other tables as they were. A layer holding more than one kind of geometry (a GeoJSON of points and polygons, say) is written whole, in a `GEOMETRY` column, which holds any kind; a layer of one kind gets that kind's column. Unique feature ids that fit signed 64-bit integers are kept; otherwise SQLite assigns new ids. |
 | GeoParquet (`.parquet`, `.geoparquet`) | Data › Export | GeoParquet 1.1: WKB geometry in WGS 84, Zstd level 9 compression, row groups of up to 65,536 features and a `bbox` covering column with byte-stream-split encoding. The covering keeps spatial range reads available; compression favours smaller files over export speed. Reading the file needs Zstd support, and reading its `bbox` column needs byte-stream-split support, which current GDAL, PyArrow and DuckDB have and some older readers lack (some of those refuse the file). A standalone table without geometry writes plain Parquet. |
-| Shapefile | Data › Export to `.shp` (or `.zip` for the files zipped) | Writes `.shp`, `.shx`, `.dbf`, `.prj` (the coordinate system, see below) and `.cpg` (UTF-8). Field names are cut to 10 bytes (made unique ignoring case, and reported), text to at most 254 bytes, and numbers that do not fit their dBase field are left empty. Export notices count shortened text, non-null values left empty (including incompatible types), and numbers rounded to the field's precision, and name the affected source fields; features without geometry, and lines of a single point, are left out (and reported). |
+| Shapefile | Data › Export to `.shp` (or `.zip` for the files zipped) | Writes `.shp`, `.shx`, `.dbf`, `.prj` (the coordinate system, see below) and `.cpg` (UTF-8). Field names are cut to 10 bytes (made unique ignoring case, and reported), text to at most 254 bytes, and numbers that do not fit their dBase field are left empty. Export notices count shortened text, non-null values left empty (including incompatible types), and numbers rounded to the field's precision, and name the affected source fields; features without geometry, and lines of a single point, are left out (and reported). An export in longitude/latitude leaves out vertices with a missing (NaN) or infinite coordinate; an export in a projected system refuses any coordinate that doesn't project to a finite one, naming its feature. In either, line parts and polygon rings too short to draw (fewer than 2 or 3 drawable vertices, whether written so or left so) and the holes of a polygon whose outer ring goes are left out. The export counts the vertices, and the parts or rings, in the features it writes; a feature with nothing drawable left is counted with the features left out. |
 | FlatGeobuf | Data › Export to `.fgb` | In the layer's coordinate system (see below), with a spatial index; features without geometry are left out (and reported). Desktop only: the writer needs a temporary file, which the browser doesn't have. |
 | KML, KMZ, GPX | Data › Export to `.kml`, `.kmz` or `.gpx` | Placemarks named by a `name` field, if there is one; features without geometry are left out. |
 | GeoJSON, KML, GPX, CSV, CSV with WKT | Analyze › Workflows › Data Interop (`data.convert`; `"format": "geojson"`, `"kml"`, `"gpx"`, `"csv"` or `"wkt"`) | Returns text when `"path"` is omitted; writes a file on desktop when it is given. |
@@ -627,7 +634,10 @@ coordinate system defined in a file whose datum has no shift to WGS 84 (a NAD 27
 another system says so; written back in that same system they are exact, and nothing is said.
 Coordinates beyond ±180.5° longitude or ±90.5° latitude (a CSV of eastings and northings without its
 `"crs"`, a Shapefile without its `.prj`) aren't longitude/latitude: an export says they're out of
-place, and Define Projection, below, places them.
+place, and Define Projection, below, places them. Web Mercator (EPSG:3857) ends at 85.05° north and
+south: an export in it writes a latitude beyond (Antarctica near the South Pole, say, or an infinite
+one) at 85.05°, and says how many of the vertices the file holds it moved; a layer read in place and
+written a chunk at a time is counted as it's written.
 
 Coordinate systems of other bodies than the Earth (Mars, the Moon and the rest of the IAU's
 `IAU_2015` codes, or any datum whose ellipsoid isn't the Earth's) aren't read as such yet: every

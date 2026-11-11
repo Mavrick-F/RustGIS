@@ -474,7 +474,7 @@ pub struct Service {
 /// between answers (#1519). Reading stops at [`MAX_READ_LAYERS`], or sooner when the layers'
 /// request addresses are long ([`read_limit`], [`MAX_COPIED_ADDRESS_BYTES`]); past that none is
 /// read. An ArcGIS list is read only as far as it is listed.
-const MAX_LISTED_LAYERS: usize = 2_000;
+pub const MAX_LISTED_LAYERS: usize = 2_000;
 /// Most layers or collections read from one document, which is hostile input.
 const MAX_READ_LAYERS: usize = if cfg!(test) { 3_000 } else { 100_000 };
 /// Most bytes of a document's own request addresses (its GetMap's, GetFeature's…) copied into
@@ -2941,13 +2941,15 @@ pub fn resolve_tiles(list: &str, doc: &str, body: &[u8], vector: bool) -> Option
     Some(advertised_tiles(list, &next, true))
 }
 
-/// Recognizes the supported global tile pyramid from declared tileset metadata.
+/// Recognizes the supported global tile pyramid from declared tileset metadata. A canonical
+/// declaration identifies the grid; a tiling-scheme link locates a definition and may use an
+/// arbitrary server path (OGC API Tiles 1.0, section 5.2).
 fn web_mercator_tileset(t: &serde_json::Value) -> bool {
     let links = t.get("links").and_then(|l| l.as_array());
-    let mut named: Vec<&str> = ["tileMatrixSetURI", "tileMatrixSetId", "tileMatrixSet"]
-        .iter()
-        .filter_map(|k| t.get(*k).and_then(|x| x.as_str()))
-        .chain(
+    let mut named: Vec<&str> =
+        ["tileMatrixSetURI", "tileMatrixSetId", "tileMatrixSet"].iter().filter_map(|k| t.get(*k).and_then(|x| x.as_str())).collect();
+    if named.is_empty() {
+        named.extend(
             links
                 .into_iter()
                 .flatten()
@@ -2957,8 +2959,8 @@ fn web_mercator_tileset(t: &serde_json::Value) -> bool {
                         .is_some_and(|r| r == "tiling-scheme" || r == "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme")
                 })
                 .filter_map(|l| l.get("href").and_then(|h| h.as_str())),
-        )
-        .collect();
+        );
+    }
     if named.is_empty()
         && let Some(id) = t.get("id").and_then(|id| id.as_str())
     {

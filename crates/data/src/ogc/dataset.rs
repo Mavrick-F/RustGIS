@@ -61,7 +61,6 @@ fn relation(link: &Value, name: &str) -> bool {
 /// list entry supplies it; a contradictory declaration must not override that selection.
 fn declares_grid(value: &Value) -> bool {
     ["tileMatrixSetURI", "tileMatrixSetId", "tileMatrixSet"].iter().any(|k| value.get(*k).is_some())
-        || value.get("links").and_then(Value::as_array).is_some_and(|links| links.iter().any(|l| relation(l, "tiling-scheme")))
 }
 
 /// Keeps an advertised destination authoritative and counts settings omitted on this hop.
@@ -107,7 +106,12 @@ impl DatasetDiscovery {
     /// projection, and a collection id is never used as a dataset's vector layer name.
     pub(super) fn landing(from: &str, links: &[Value], withheld: &mut u32) -> Option<Self> {
         let mut out = Self::default();
+        let mut advertised_tiles = false;
         for (rel, vector) in [("tilesets-vector", true), ("tilesets-map", false)] {
+            if !links.iter().any(|link| relation(link, rel)) {
+                continue;
+            }
+            advertised_tiles = true;
             if let Some((url, lost)) = discovery_link(from, links, |l| relation(l, rel)) {
                 *withheld = withheld.saturating_add(u32::from(lost));
                 if url.len() > MAX_ADDRESS {
@@ -119,10 +123,23 @@ impl DatasetDiscovery {
                     url,
                     kind: Kind::Tiles(Tileset { vector, metadata: false, names: Vec::new(), title: String::new() }),
                 });
+            } else {
+                let reason = if links
+                    .iter()
+                    .any(|l| relation(l, rel) && l.get("href").and_then(Value::as_str).is_some_and(|h| h.len() > MAX_ADDRESS))
+                {
+                    "tileset documents were left out: addresses exceed 8192 bytes"
+                } else {
+                    "tileset documents were left out: no usable JSON link"
+                };
+                *out.omissions.entry(reason).or_default() += 1;
             }
         }
-        if out.pending.is_empty() {
+        if !advertised_tiles {
             return None;
+        }
+        if out.pending.is_empty() {
+            return Some(out);
         }
         if let Some((url, lost)) = discovery_link(from, links, |l| relation(l, "styles")) {
             *withheld = withheld.saturating_add(u32::from(lost));
@@ -178,6 +195,26 @@ impl DatasetDiscovery {
                 self.omitted(&mut service, 1, "dataset documents were left out: invalid JSON");
             }
         }
+        self.finish(&mut service);
+        Ok(service)
+    }
+
+    /// Omits a document refused by the caller's address policy without losing independent
+    /// offers. A refused TileJSON source stays unusable if another style references it.
+    pub fn reject_address(&mut self) -> Service {
+        if let Some(doc) = self.pending.pop_front()
+            && matches!(doc.kind, Kind::Source(_))
+        {
+            self.sources.insert(doc.url, Vec::new());
+        }
+        let mut service = Service { kind: "OGC API Tiles".into(), ..Service::default() };
+        self.omitted(&mut service, 1, "dataset documents were left out: disallowed addresses");
+        self.finish(&mut service);
+        service
+    }
+
+    /// Reports unnamed vector tilesets once all candidate styles have been considered.
+    fn finish(&mut self, service: &mut Service) {
         if self.pending.is_empty() {
             let missing = self
                 .unnamed
@@ -185,12 +222,11 @@ impl DatasetDiscovery {
                 .filter(|t| !self.styled.iter().any(|known| crate::login_address::inner(known) == crate::login_address::inner(t)))
                 .count();
             self.omitted(
-                &mut service,
+                service,
                 missing,
                 "vector tilesets were left out: neither named vector-layer metadata nor a supported style supplies their layer names",
             );
         }
-        Ok(service)
     }
 
     /// Reads the advertised template using the existing OGC resolver. A list may lead to one
@@ -255,7 +291,10 @@ impl DatasetDiscovery {
         };
         let body = match serde_json::to_vec(document) {
             Ok(body) => body,
-            Err(_) => return,
+            Err(_) => {
+                self.omitted(service, 1, "dataset tileset documents were left out: metadata could not be encoded");
+                return;
+            }
         };
         let Some(resolved) = resolve_tiles(&doc.url, &doc.url, &body, vector) else {
             self.omitted(service, 1, "dataset tileset documents were left out: no usable Web Mercator tileset");
@@ -264,11 +303,12 @@ impl DatasetDiscovery {
         service.withheld_addresses = service.withheld_addresses.saturating_add(resolved.withheld_addresses);
         match resolved.step {
             TilesStep::Next(url) if !metadata && url.len() <= MAX_ADDRESS => {
-                self.pending.push_front(Document {
-                    parent: doc.url.clone(),
-                    url,
-                    kind: Kind::Tiles(Tileset { vector, metadata: true, names, title }),
-                });
+                // Keep advertised order, with every tileset ahead of the style catalogue.
+                let at = self.pending.iter().position(|d| !matches!(d.kind, Kind::Tiles(_))).unwrap_or(self.pending.len());
+                self.pending.insert(
+                    at,
+                    Document { parent: doc.url.clone(), url, kind: Kind::Tiles(Tileset { vector, metadata: true, names, title }) },
+                );
             }
             TilesStep::Next(_) => self.omitted(
                 service,

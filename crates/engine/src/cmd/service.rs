@@ -31,7 +31,7 @@ const DOCUMENT_ROLES: &[crate::ParamRole] = &[
 pub fn commands() -> Vec<C> {
     let mut commands = vec![
         C::new("service.layers", "Service Layers", "Home › Add", layers).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).view().params(
-            r#"{"url": "a WMS, WMTS or WFS address (GetCapabilities is added), an OGC API collections address or landing page (its dataset tiles, supported styles and linked collections), or an ArcGIS FeatureServer, MapServer, ImageServer or VectorTileServer, or an ArcGIS services directory or folder (its folders and services, each listed by its own url)", "type"?: "wms"|"wmts"|"wfs"|"ogcapi"|"arcgis" (guessed from the address), "text"?: "the capabilities document, when already fetched", "documents"?: [{"url": "a discovered document address", "text": "its fetched JSON"}], "connection"?: "the saved web-service connection id whose login the requests use"} → layers with source_url, and next when supplied documents need another fetch"#,
+            r#"{"url": "a WMS, WMTS or WFS address (GetCapabilities is added), an OGC API collections address or landing page (its dataset tiles, supported styles and linked collections), or an ArcGIS FeatureServer, MapServer, ImageServer or VectorTileServer, or an ArcGIS services directory or folder (its folders and services, each listed by its own url)", "type"?: "wms"|"wmts"|"wfs"|"ogcapi"|"arcgis" (guessed from the address), "text"?: "the capabilities document, when already fetched", "documents"?: [{"url": "a discovered document address", "text": "its fetched JSON"}], "connection"?: "the saved web-service connection id whose login the requests use", "filter"?: "words a layer's title or name must all contain, in any case: every layer read is searched, not only those a listing shows, and the first 2000 that match are listed; what a listing says in a notice, a search says only in its notes"} → layers with source_url (with filter, total: the layers read, and matched: how many match), and next when supplied documents need another fetch"#,
         ),
         C::new("service.add", "Add Service Layer", "Home › Add", add).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"url": "as service.layers", "type"?, "layer": "the layer's name (service.layers lists them)", "name"?: text, "time"?: "a time-enabled WMS or WMTS layer: by default (or \"slider\", true) it follows the time slider, turned on with the layer's times when it is off; or one of its dates (2024-06-01), or \"default\" (false): its service's default", "text"?: "the capabilities document, when already fetched", "documents"?: "additional fetched documents, as service.layers", "source_url"?: "the listed layer's source_url", "describe"?: "a WCS coverage's DescribeCoverage document, when already fetched", "tiles"?: "an OGC API layer's tile template, when already read from its tileset (the app's)", "bbox"?: [west, south, east, north] | "view" | "full": a WCS coverage's area (the view by default); for a WFS, OGC API or ArcGIS feature layer, only the features that cross it (the whole layer, "full", by default), "connection"?: "the id of the saved web-service connection it comes from (connection.browse gives it): the layer records it, and is read with its login"}"#,
@@ -108,6 +108,8 @@ struct Discovery {
     excluded_layers: bool,
     /// A document left collections out (past its listing limit, or unreadable items links).
     incomplete: bool,
+    /// How many layers were read, before a filter kept those matching it ([`discover_matching`]).
+    read: usize,
 }
 
 impl Discovery {
@@ -134,7 +136,8 @@ impl Discovery {
 
 const MAX_SERVICE_DOCUMENTS: usize = 32;
 /// Linked dataset metadata is retained by the app for replay. Its total stays bounded as
-/// well as its document count; ordinary collections discovery keeps its existing allowance.
+/// well as its document count. The 32-document count is shared by all discovery kinds;
+/// this byte budget applies only to the linked dataset documents.
 pub(crate) const MAX_DATASET_BYTES: usize = if cfg!(test) { 64 << 10 } else { 64 << 20 };
 /// A notice for legend pictures a service listed that its layer cannot keep (an address too long).
 const LEGENDS_LEFT_OUT_NOTICE: &str = "{n} legend picture(s) the service listed were left out: their addresses are too long";
@@ -163,9 +166,39 @@ fn capabilities(s: &mut Session, p: &Value) -> Result<Discovery, String> {
 /// Reads a service's documents, fetching what `p` doesn't give: waiting for them, or with `left`,
 /// off the frame ([`Session::left_document`]), when a document not in yet is its `next`. Long
 /// document addresses list fewer layers ([`MAX_LISTED_ADDRESS_BYTES`]), said in a note.
-/// Only adding a map supplies a pre-resolved tile template and its optional source address.
 fn discover(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(&str, Option<&str>)>) -> Result<Discovery, String> {
+    discover_matching(s, p, left, &[], explicit_map)
+}
+
+/// [`discover`], keeping only the layers whose title or name contains each of `words` (lower
+/// case), when there are any: every layer read is searched, and the first
+/// [`rustgis_data::ogc::MAX_LISTED_LAYERS`] matches are listed (#1577).
+fn discover_matching(
+    s: &mut Session,
+    p: &Value,
+    left: bool,
+    words: &[String],
+    explicit_map: Option<(&str, Option<&str>)>,
+) -> Result<Discovery, String> {
     let mut found = read_documents(s, p, left, explicit_map)?;
+    found.read = found.service.layers.len();
+    if !words.is_empty() {
+        let keep: Vec<bool> = found
+            .service
+            .layers
+            .iter()
+            .map(|l| {
+                rustgis_data::progress::check().map_err(|e| e.to_string())?;
+                Ok(matches_words(l, words))
+            })
+            .collect::<Result<_, String>>()?;
+        let mut kept = keep.iter();
+        found.service.layers.retain(|_| kept.next().copied().unwrap_or(false));
+        let mut kept = keep.iter();
+        found.sources.retain(|_| kept.next().copied().unwrap_or(false));
+        let max = rustgis_data::ogc::MAX_LISTED_LAYERS;
+        found.service.listed = (found.service.layers.len() > max).then_some(max);
+    }
     let listed = found.service.listed.unwrap_or(usize::MAX).min(found.sources.len());
     let mut bytes = 0usize;
     let cut = found.sources[..listed].iter().position(|source| {
@@ -185,7 +218,16 @@ fn discover(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(&str, 
     Ok(found)
 }
 
+/// Whether a layer's title or name contains each of `words` (lower case): Add From Service's
+/// filter, which matched the listed layers in the dialog before #1577.
+fn matches_words(layer: &rustgis_data::ogc::ServiceLayer, words: &[String]) -> bool {
+    let (title, name) = (layer.title.to_lowercase(), layer.name.to_lowercase());
+    words.iter().all(|w| title.contains(w.as_str()) || name.contains(w.as_str()))
+}
+
 /// Replays the same bounded discovery traversal for blocking, deferred and supplied documents.
+/// Cancel is checked between documents; parsing a single bounded JSON document cannot stop
+/// partway through serde's read.
 fn read_documents(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(&str, Option<&str>)>) -> Result<Discovery, String> {
     let original = url_of(p)?;
     let mut address =
@@ -210,10 +252,13 @@ fn read_documents(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(
     let mut dataset_document = false;
     let mut dataset_bytes = 0usize;
     loop {
+        rustgis_data::progress::check().map_err(|e| e.to_string())?;
         let crossed_origin = histories.get(&parent).copied().unwrap_or(false) || crosses_origin(&parent, &address);
-        if let Err(e) = crate::render::rustgis_tiles::address::check(&address, Some(&parent)) {
-            return result.failed(s, e, dataset.as_ref());
-        }
+        let rejected = match crate::render::rustgis_tiles::address::check(&address, Some(&parent)) {
+            Ok(()) => false,
+            Err(_) if dataset_document => true,
+            Err(e) => return result.failed(s, e, dataset.as_ref()),
+        };
         if seen.contains(&address) {
             return result.failed(s, "the service's discovery links form a loop".into(), dataset.as_ref());
         }
@@ -231,7 +276,9 @@ fn read_documents(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(
                 rustgis_data::ogc::parse(&address, bytes)
             }
         };
-        let parsed = if let Some(root) = supplied {
+        let parsed = if rejected {
+            Ok(dataset.as_mut().ok_or_else(|| "missing dataset discovery plan".to_string())?.reject_address())
+        } else if let Some(root) = supplied {
             let text = if seen.is_empty() {
                 Some(root)
             } else {
@@ -267,6 +314,7 @@ fn read_documents(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(
             Err(e) => return result.failed(s, e, dataset.as_ref()),
         };
         if let Some(plan) = service.dataset.take() {
+            result.incomplete |= !plan.notes().is_empty();
             let hint =
                 explicit_map.filter(|(_, source)| source.is_none_or(|source| same_address(source, &address))).map(|(tiles, _)| tiles);
             let explicit = if let Some(template) = hint {
@@ -737,17 +785,74 @@ pub fn service_json(svc: &Service) -> Value {
     json!({"kind": svc.kind, "title": svc.title, "count": layers.len(), "layers": layers, "notes": notes})
 }
 
+/// A prepared supplied-document discovery and any loss notice emitted before an error.
+#[cfg(not(target_arch = "wasm32"))]
+type ListingRead = (Result<Discovery, String>, Vec<crate::Notice>);
+
+/// Prepares only supplied-document parsing. Login binding happens on the initiating session;
+/// the worker replays those exact documents without another login lookup or network fetch.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn listing_ahead(s: &mut Session, p: &Value) -> Result<Option<super::reads::ReadWork>, String> {
+    if ps(p, "text").is_none() {
+        return Ok(None);
+    }
+    let owned = without_token(p)?;
+    let p = owned.as_ref().unwrap_or(p);
+    let p = crate::service_logins::request_params(s, p)?.into_owned();
+    let words = filter_words(&p)?;
+    Ok(Some(super::reads::ahead("List Service Layers", "service.layers".into(), move || {
+        let mut copy = Session::new(crate::Project::default());
+        let result = discover_matching(&mut copy, &p, false, &words, None);
+        (result, copy.notices)
+    })))
+}
+
+/// Normalizes the filter once for both synchronous and prepared discovery.
+fn filter_words(p: &Value) -> Result<Vec<String>, String> {
+    Ok(match p.get("filter") {
+        None | Some(Value::Null) => Vec::new(),
+        // Each word once: a repeated one would be looked for again in every layer it's in.
+        Some(Value::String(f)) => {
+            let mut words: Vec<String> = f.split_whitespace().map(str::to_lowercase).collect();
+            words.sort_unstable();
+            words.dedup();
+            words
+        }
+        Some(_) => return Err("filter must be text: the words a layer's title or name must all contain".into()),
+    })
+}
+
+/// Lists bounded capabilities, consuming the desktop's prepared parse when present. Supplied
+/// documents replay identically on the browser; omission notices survive either path.
 pub(crate) fn layers(s: &mut Session, p: &Value) -> CmdResult {
     let owned = without_token(p)?;
     let p = owned.as_ref().unwrap_or(p);
     let bound = crate::service_logins::request_params(s, p)?;
     let p = bound.as_ref();
-    let mut found = capabilities(s, p)?;
-    notify_withheld(s, found.service.withheld_addresses);
-    let of = layer_count(&found.service);
-    let total = found.service.layers.len();
+    let words = filter_words(p)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut found = match super::reads::take::<ListingRead>(s, "service.layers") {
+        Some((result, notices)) => {
+            for notice in notices {
+                s.notify(notice.text, notice.error);
+            }
+            result?
+        }
+        None => discover_matching(s, p, false, &words, None)?,
+    };
+    #[cfg(target_arch = "wasm32")]
+    let mut found = discover_matching(s, p, false, &words, None)?;
+    // A search reads again what a listing read (Add From Service's, once per pause in typing),
+    // so the listing's notice isn't repeated; the answer's notes still say it (#1577).
+    if words.is_empty() {
+        notify_withheld(s, found.service.withheld_addresses);
+    }
+    let searched = !words.is_empty();
+    // The layers read, or with a filter those matching it.
+    let found_layers = found.service.layers.len();
+    let of = if searched { format!("{found_layers} matching layers") } else { layer_count(&found.service) };
     let mut cut = None;
-    if let Some(listed) = found.service.listed.filter(|&listed| listed < total) {
+    if let Some(listed) = found.service.listed.filter(|&listed| listed < found_layers) {
         found.service.layers.truncate(listed);
         let note = format!("only the first {listed} of {of} are listed; service.add takes any of them by name");
         found.service.notes.push(note.clone());
@@ -755,11 +860,15 @@ pub(crate) fn layers(s: &mut Session, p: &Value) -> CmdResult {
     }
     let mut out = service_json(&found.service);
     // How many there are, for a window that says it its own way: `listedNote` says the list
-    // stops (Add From Service: its filter searches only those listed), and `atLeast` that the
-    // document has more than were read.
+    // stops (Add From Service searches past it with `filter`), and `atLeast` that the document
+    // has more than were read.
     let past_limit = found.service.past_read_limit.is_some();
-    if cut.is_some() || past_limit {
-        out["total"] = json!(total);
+    if cut.is_some() || past_limit || searched {
+        out["total"] = json!(found.read);
+    }
+    // (With a filter, `total` counts every layer read, and `matched` those matching it.)
+    if searched {
+        out["matched"] = json!(found_layers);
     }
     if past_limit {
         out["atLeast"] = json!(true);

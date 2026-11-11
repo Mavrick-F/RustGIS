@@ -4796,6 +4796,7 @@ dependencies = [
  "iana-time-zone",
  "image",
  "log",
+ "miniz_oxide 0.9.1",
  "postgres",
  "rusqlite",
  "rustgis-analysis",
@@ -4875,6 +4876,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "unicode-normalization",
  "ureq",
  "wasmi",
  "wat",
@@ -4961,7 +4963,6 @@ dependencies = [
  "sha2 0.11.1",
  "sys-locale",
  "tempfile",
- "unicode-normalization",
  "web-time",
 ]
 
