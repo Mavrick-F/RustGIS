@@ -3977,7 +3977,8 @@ fn degrees_note(ds: &Dataset, tool: &str) -> Option<String> {
 }
 
 /// `pts` (longitude/latitude) in `crs`, and a note counting those left out because the system
-/// can't hold them (see [`in_projected`]).
+/// can't hold them (see [`in_projected`]). One short step without a Cancel check: a point costs a
+/// projection and its round trip, far less than the interpolation that follows.
 pub fn points_in(crs: Crs, pts: Vec<(Coord, f64)>) -> Result<(Vec<(Coord, f64)>, Option<String>), String> {
     if crs == Crs::LonLat {
         return Ok((pts, None));

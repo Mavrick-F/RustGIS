@@ -39274,15 +39274,16 @@ fn interpolation_in_a_projected_coordinate_system() {
     assert_eq!(saved["cell_size"], Value::Null, "{saved}");
     assert_eq!(serde_json::from_value::<crate::project::GpEnvironment>(saved).unwrap(), s.project.gp_env);
     // A system given to the run wins, and the environment's cell size isn't read in another one.
-    let (crs, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:3857"}));
+    let (crs, mercator_cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:3857"}));
     assert_eq!(crs, Crs::WebMercator);
-    assert_ne!(cell, 250.0);
 
     // The same system again keeps its cell size; a bad call changes nothing.
     s.run("gp.env", &json!({"crs": "EPSG:32616"})).unwrap();
     assert_eq!(s.project.gp_env.cell_in(Crs::Epsg(32616)), Some(250.0));
     let before = s.project.gp_env.clone();
     assert!(s.run("gp.env", &json!({"crs": "EPSG:3857", "cellSize": -1})).is_err());
+    assert_eq!(s.project.gp_env, before);
+    assert!(s.run("gp.env", &json!({"crs": "EPSG:4326", "cellSize": 100})).is_err());
     assert_eq!(s.project.gp_env, before);
 
     // A point Web Mercator can't hold is left out and counted; the others make the surface.
@@ -39293,7 +39294,9 @@ fn interpolation_in_a_projected_coordinate_system() {
     crate::cmd::layer::add_dataset(&mut s, polar);
     let (crs, _, notices) = surface(&mut s, json!({"layer": "polar", "field": "depth", "crs": "EPSG:3857"}));
     assert_eq!(crs, Crs::WebMercator);
-    assert!(notices.iter().any(|n| n.starts_with("polar: 1 point(s) beyond what")), "{notices:?}");
+    let label = Crs::WebMercator.label();
+    let beyond = format!("polar: 1 point(s) beyond what {label} can hold (past 85.05° of latitude) were left out");
+    assert!(notices.contains(&beyond), "{notices:?}");
 
     // Degrees are refused as a system; clearing the environment's goes back to degrees.
     assert!(s.run("analysis.interpolate", &json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326"})).is_err());
@@ -39301,7 +39304,22 @@ fn interpolation_in_a_projected_coordinate_system() {
     assert!(s.run("gp.env", &json!({"crs": 32616})).is_err());
     s.run("gp.env", &json!({"crs": null})).unwrap();
     assert_eq!(s.project.gp_env.projected, None);
+    // The run in another system above took its own cell size, as it does with no environment.
+    let (_, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:3857"}));
+    assert_eq!(cell, mercator_cell);
     assert!(s.run("gp.env", &json!({"cellSize": 500})).is_err(), "500 degrees");
+
+    // A hand-edited project whose environment system is in degrees opens without it, and says so.
+    let mut env = serde_json::to_value(crate::project::GpEnvironment::default()).unwrap();
+    env["projected"] = json!({"crs": "LonLat", "cell_size": 250.0});
+    let mut text = serde_json::to_value(&s.project).unwrap();
+    text["gp_env"] = env;
+    let mut opened = Project::from_json(&text.to_string()).unwrap();
+    assert_eq!(opened.gp_env.projected, None);
+    let said = opened.take_read_notices(&[crate::project::ReadPart::Items]);
+    assert!(format!("{said:?}").contains("environment's coordinate system"), "{said:?}");
+    let clean = Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
+    assert!(clean.read_notices.is_empty(), "{:?}", clean.read_notices);
 }
 
 /// `share.exportMap` to a `.tif` writes the view placed on the ground (#1561): in the map's

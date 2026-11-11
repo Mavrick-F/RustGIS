@@ -530,7 +530,8 @@ impl GpEnvironment {
 /// A projected coordinate system for the rasters the environment sets ([`GpEnvironment::projected`]).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectedCells {
-    /// The system, never one in degrees (`gp.env` refuses those).
+    /// The system, never one in degrees: `gp.env` refuses those, and opening a project leaves one
+    /// out.
     pub crs: rustgis_data::raster::Crs,
     /// The cell size in the system's units; `None`: the tool's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1331,6 +1332,18 @@ impl Project {
         p.read_notices =
             label_losses::notices_for_maps(text, &p, map_limit.is_some())?.into_iter().map(|(part, text)| (part, text.into())).collect();
         p.read_notices.extend(repair_notices);
+        // A system in degrees for the environment's rasters, which only a hand-edited file holds:
+        // its cell size would be read as degrees, so it is left out, and said.
+        if let Some(g) = p.gp_env.projected.filter(|g| g.crs.is_geographic()) {
+            p.gp_env.projected = None;
+            p.read_notices.push((
+                ReadPart::Items,
+                NoticeText::format(
+                    "the environment's coordinate system {crs} is in degrees, not projected, so it was left out",
+                    [("crs", g.crs.label().into())],
+                ),
+            ));
+        }
         if excluded_maps > 0 {
             p.read_notices.push((
                 ReadPart::Maps,

@@ -824,9 +824,14 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             );
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.env_crs).hint_text("EPSG:32616").desired_width(110.0));
-                if ui.button(tl!("Set Coordinate System")).clicked() {
-                    let v = Some(app.workflow.env_crs.trim()).filter(|t| !t.is_empty());
-                    run(app, "gp.env", json!({"crs": v}));
+                // An empty box sets nothing; going back to degrees is its own button, so a click
+                // never clears the system and its cell size by accident.
+                let typed = app.workflow.env_crs.trim().to_string();
+                if ui.add_enabled(!typed.is_empty(), egui::Button::new(tl!("Set Coordinate System"))).clicked() {
+                    run(app, "gp.env", json!({"crs": typed}));
+                }
+                if ui.add_enabled(env.projected.is_some(), egui::Button::new(tl!("Degrees"))).clicked() {
+                    run(app, "gp.env", json!({"crs": null}));
                 }
             });
             ui.horizontal(|ui| {
