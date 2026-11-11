@@ -1097,6 +1097,23 @@ mod tests {
         assert!(l.is_streamed() && !l.labels.enabled);
     }
 
+    /// Source File State hashes the file on a thread of its own and says what it found once
+    /// it lands: Command Search shows no answer.
+    #[test]
+    fn a_source_file_state_check_runs_on_a_thread_and_says_what_it_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("places.geojson");
+        publish_point(&path, 1.0);
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let id = app.run("layer.addData", json!({"path": path})).unwrap()["layer"].as_u64().unwrap();
+        app.reads_off_frame = true;
+        let mark = app.session.notice_mark();
+        assert_eq!(app.run_by_user("source.syncState", json!({"layer": id})).unwrap()["started"], "Source File State");
+        landed(&mut app, 60);
+        let said: Vec<String> = app.session.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|t| t == "places is in step with places.geojson"), "{said:?}");
+    }
+
     fn reload_fixture() -> (tempfile::TempDir, RustGisApp, u32, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("streamed.geojson");

@@ -23,6 +23,52 @@ pub struct FileStamp {
     pub sha256: String,
 }
 
+/// A layer kept in the project that was read whole from a file it can be written back to (a
+/// Shapefile or GeoJSON file), as it and the file were at their last sync, when it was read: so
+/// it can tell whether it has edits the file lacks and whether the file changed since.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Synced {
+    /// The files, as they were.
+    pub files: FileSync,
+    /// The layer's [`rows_digest`] then.
+    pub rows: u64,
+}
+
+/// A hash of what a dataset holds, as a project saves it: its fields, coordinate system, and
+/// each row's geometry and attributes in order (FNV-1a over their JSON, written to the hash as
+/// it is made). Not its name or where it came from, which are no edit to the file. A number that
+/// isn't finite hashes as the null a project saves it as, so a layer is the same before and
+/// after its project is saved and opened again. Its work grows with the rows: each is counted
+/// as progress ([`crate::progress`]), and it stops once the run is cancelled; the desktop app
+/// runs it off the UI thread.
+pub fn rows_digest(ds: &crate::Dataset) -> crate::Result<u64> {
+    /// FNV-1a over the bytes written to it.
+    struct Fnv(u64);
+    impl std::io::Write for Fnv {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = buf.iter().fold(self.0, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    /// Writes `value`'s JSON to the hash (nothing, should it not write), then a byte JSON never
+    /// writes, so values can't run into each other.
+    fn put(h: &mut Fnv, value: &impl serde::Serialize) {
+        let _ = serde_json::to_writer(&mut *h, value);
+        h.0 = (h.0 ^ 0xff).wrapping_mul(0x0100_0000_01b3);
+    }
+    let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+    put(&mut h, &(&ds.fields, &ds.crs));
+    crate::progress::begin(ds.features.len());
+    for f in ds.features.iter() {
+        put(&mut h, &(&f.geometry, &f.attrs));
+        crate::progress::step(1)?;
+    }
+    Ok(h.0)
+}
+
 /// Whether `path` names a source whose files a [`FileSync`] records: a Shapefile or a
 /// `.geojson` file. A `.json` file isn't one yet: it may hold a city model or a topology, which
 /// can't be written back as they were read.
@@ -108,14 +154,19 @@ mod native {
         }
 
         /// Runs `read`, which reads the source at `path`, and returns with its result the files
-        /// as it read them: hashed before and after, so a write while it ran is caught. `None`
-        /// when they can't be read or were written to: what was read may then be a mix, and
-        /// there is nothing to compare with later.
-        pub fn around<R>(path: &Path, read: impl FnOnce() -> R) -> (R, Option<FileSync>) {
-            let before = FileSync::read(path).ok();
-            let out = read();
-            let sync = before.and_then(|before| FileSync::read(path).ok().filter(|after| *after == before));
-            (out, sync)
+        /// as they were just before it ran (`None` when a part couldn't be read). Hashed before
+        /// the read, the record can only be older than what was read: a write while it ran, or
+        /// after, leaves the file unlike the record, so it shows as changed and is never written
+        /// over. That costs one more pass over the files than the read, about a second for a
+        /// part of the largest a reader takes (256 MiB) where SHA-256 runs at 250 MB/s. Errs,
+        /// without reading, when the run is cancelled while the files are hashed.
+        pub fn around<R>(path: &Path, read: impl FnOnce() -> R) -> Result<(R, Option<FileSync>)> {
+            let before = match FileSync::read(path) {
+                Ok(sync) => Some(sync),
+                Err(DataError::Cancelled) => return Err(DataError::Cancelled),
+                Err(_) => None,
+            };
+            Ok((read(), before))
         }
 
         /// The names of the files that differ now from this record: changed, added, removed or
@@ -229,15 +280,26 @@ mod tests {
     }
 
     #[test]
-    fn a_write_while_reading_leaves_no_record() {
+    fn a_write_while_reading_shows_as_a_change() {
         let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        let path = d.join("a.geojson");
+        let path = dir.path().join("a.geojson");
         std::fs::write(&path, "{}").unwrap();
-        let ((), sync) = FileSync::around(&path, || std::fs::write(&path, "{ }").unwrap());
-        assert_eq!(sync, None);
-        let ((), sync) = FileSync::around(&path, || ());
-        assert_eq!(sync.map(|s| s.files.len()), Some(1));
+        let ((), sync) = FileSync::around(&path, || std::fs::write(&path, "[]").unwrap()).unwrap();
+        assert_eq!(sync.unwrap().changed(&path).unwrap(), ["a.geojson"]);
+        let ((), sync) = FileSync::around(&path, || ()).unwrap();
+        assert!(sync.unwrap().changed(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_rows_digest_is_the_same_after_a_project_round_trip() {
+        use crate::{Dataset, Feature, Field, FieldType, GeometryType, Value};
+        let mut ds = Dataset::new("a".to_string(), GeometryType::None, vec![Field::new("v", FieldType::Double)]);
+        ds.features = vec![Feature { id: 1, geometry: None, attrs: vec![Value::Float(f64::NAN)] }].into();
+        let reopened: Dataset = serde_json::from_value(serde_json::to_value(&ds).unwrap()).unwrap();
+        assert_eq!(rows_digest(&reopened).unwrap(), rows_digest(&ds).unwrap());
+        let mut edited = ds.clone();
+        edited.features = vec![Feature { id: 1, geometry: None, attrs: vec![Value::Float(1.0)] }].into();
+        assert_ne!(rows_digest(&edited).unwrap(), rows_digest(&ds).unwrap());
     }
 
     #[test]

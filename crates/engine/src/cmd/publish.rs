@@ -18,24 +18,42 @@ fn ahead_key(id: u32) -> String {
     format!("syncState:{id}")
 }
 
-/// A check of a layer's files made ahead: the record and path checked, and what changed.
+/// A check of a layer made ahead: the record, path and rows checked (the rows shared with the
+/// layer, not copied), the rows' digest and what changed in the files.
 #[cfg(not(target_arch = "wasm32"))]
 struct Checked {
-    files: rustgis_data::sync::FileSync,
+    synced: rustgis_data::sync::Synced,
     path: String,
+    dataset: rustgis_data::Dataset,
+    rows: Result<u64, String>,
     changed: Result<Vec<String>, String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl Checked {
+    /// Whether it checked layer `l` as it is: the same record and path, and the same rows (the
+    /// same allocation: an edit copies them), fields and coordinate system.
+    fn of(&self, l: &rustgis_map::Layer) -> bool {
+        l.synced.as_ref() == Some(&self.synced)
+            && l.dataset.source.as_deref() == Some(self.path.as_str())
+            && l.dataset.features.shares(&self.dataset.features)
+            && l.dataset.fields == self.dataset.fields
+            && l.dataset.crs == self.dataset.crs
+    }
+}
+
 /// The check `source.syncState` makes before it runs in the desktop app: every part of the
-/// file read and hashed on a thread of its own, with progress and Cancel.
+/// file read and hashed, and the layer's rows hashed, on a thread of its own with progress and
+/// Cancel.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn sync_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
     let id = s.layer_id(p).ok()?;
     let l = s.map().layer(id)?;
-    let (files, path) = (l.synced.as_ref()?.files.clone(), l.dataset.source.clone()?);
+    let (synced, path, dataset) = (l.synced.clone()?, l.dataset.source.clone()?, l.dataset.clone());
     Some(super::reads::ahead("Source File State", ahead_key(id), move || {
-        let changed = files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string());
-        Checked { files, path, changed }
+        let changed = synced.files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string());
+        let rows = rustgis_data::sync::rows_digest(&dataset).map_err(|e| e.to_string());
+        Checked { synced, path, dataset, rows, changed }
     }))
 }
 
@@ -44,40 +62,47 @@ pub(crate) fn sync_ahead(_: &Session, _: &Value) -> Option<super::reads::ReadWor
     None
 }
 
-/// Compares the layer with the files it was read from: each part of the size recorded is read
-/// and hashed, so the work grows with the file. The desktop app checks them on a thread of its
-/// own first ([`sync_ahead`]), with progress and **Cancel**, and the command takes that check as
-/// it lands; when the layer's record changed meanwhile it says so rather than check again here,
-/// which would hold the window. The assistant, scripts and the command line check where they
-/// ask. Edits are found by hashing the layer's rows here, as `gpkg.pendingEdits` does: no more
-/// rows than a layer read whole from a file of at most [`rustgis_data::io::MAX_BYTES`] holds.
+/// Compares the layer and the file it was read from, each with the record of them made when it
+/// was read: whether the layer's rows differ from the rows read (edits the file lacks), and which
+/// parts of the file differ from the parts read. It doesn't compare the layer with the file as
+/// it is now, so the same edit made to both shows as `both`. Each part of the size recorded is
+/// read and hashed, and the rows are hashed, so the work grows with the file. The desktop app
+/// does it on a thread of its own first ([`sync_ahead`]), with progress and **Cancel**, and the
+/// command takes that check as it lands; when the layer changed meanwhile it says so rather than
+/// check again here, which would hold the window. The assistant, scripts and the command line
+/// check where they ask.
 fn sync_state(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("the layer no longer exists")?;
     let (Some(synced), Some(path)) = (&l.synced, &l.dataset.source) else {
         if l.dataset.source.as_deref().is_some_and(rustgis_data::sync::is_syncable) && !l.is_streamed() {
             return Err(format!(
-                "{} has no record of its file as it was read (it was added before RustGIS kept one, the file changed while it was read, or an older RustGIS saved the project): add the file again to compare it",
+                "{} has no record of its file as it was read (it was added before RustGIS kept one, a part of the file couldn't be read, or an older RustGIS saved the project): add the file again to compare it",
                 l.name
             ));
         }
         return Err(format!("{} wasn't read whole from a Shapefile or .geojson file, so there's no file to compare it with", l.name));
     };
-    let edited = rustgis_map::source::rows_digest(&l.dataset) != synced.rows;
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (edited, path);
+        let _ = (synced, path);
         Err("the web app can't read files on this computer".into())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let (files, path) = (synced.files.clone(), path.clone());
-        let changed = match super::reads::take::<Checked>(s, &ahead_key(id)) {
-            Some(checked) if checked.files == files && checked.path == path => checked.changed?,
+        let (was, files, path) = (synced.rows, synced.files.clone(), path.clone());
+        let ahead = super::reads::take::<Checked>(s, &ahead_key(id));
+        let l = s.map().layer(id).ok_or("the layer no longer exists")?;
+        let (rows, changed) = match ahead {
+            Some(checked) if checked.of(l) => (checked.rows?, checked.changed?),
             // Checking again here would hold the window: the check made on its thread is dropped.
-            Some(_) => return Err("the layer's file or its record changed while it was checked: check again".into()),
-            None => files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string())?,
+            Some(_) => return Err("the layer or its file's record changed while it was checked: check again".into()),
+            None => (
+                rustgis_data::sync::rows_digest(&l.dataset).map_err(|e| e.to_string())?,
+                files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string())?,
+            ),
         };
+        let edited = rows != was;
         let state = match (edited, !changed.is_empty()) {
             (false, false) => "inSync",
             (true, false) => "edited",

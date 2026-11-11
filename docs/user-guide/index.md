@@ -305,14 +305,20 @@ or raster subdataset.
 ### Source file state
 
 A layer read whole from a Shapefile or a `.geojson` file keeps its features in the project, so
-edits change the project, not the file. It also remembers the file as it was read: each part's
-size and SHA-256 hash, and a hash of the layer's rows. `source.syncState` compares the two and
-answers `inSync`, `edited` (the layer has edits the file lacks), `sourceChanged` (the file
-changed since it was read) or `both`, with the names of the parts that changed. Only the bytes
-count: writing the same bytes again isn't a change, and a copy that puts back the file's size
-and time is. Undoing an edit makes the layer `inSync` again. On the desktop the file is hashed
-in the background, with progress and Cancel in the status bar. A file written to while it was being read, a layer read in place and a `.json`
-file have no record. The record is saved with the project; the web app can't check it.
+edits change the project, not the file. It also keeps a record of what was read: each part of
+the file's size and SHA-256 hash, and a hash of the layer's rows. `source.syncState` compares
+the layer with the rows read, and the file with the parts read, and answers `inSync`, `edited`
+(the layer has edits since it was read), `sourceChanged` (the file changed since it was read)
+or `both`, with the names of the parts that changed. It doesn't compare the layer with the file
+as it is now: the same edit made to both shows as `both`. Only the bytes count: writing the
+same bytes again isn't a change, and a copy that puts back the file's size and time is.
+Undoing an edit makes the layer `inSync` again. On the desktop the file and the rows are hashed
+in the background, with progress and Cancel in the status bar.
+
+The record is made just before the file is read, so a file written to while it was being read
+shows as changed, unless the write was undone before RustGIS looked again. A layer read in
+place and a `.json` file have no record. The record is saved with the project; the web app
+can't check it.
 
 CLI and Python: `source.syncState` with `{"layer":"parcels"}`.
 

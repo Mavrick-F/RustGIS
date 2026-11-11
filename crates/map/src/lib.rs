@@ -233,7 +233,7 @@ pub struct Layer {
     /// file and the layer as they were when last in step, to tell edits the file lacks and
     /// changes made to the file since.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub synced: Option<source::Synced>,
+    pub synced: Option<rustgis_data::sync::Synced>,
     /// The saved connection it was added from (its id, in the app's preferences): a layer whose
     /// source is read again logs in with that connection's login, and a project opened where
     /// the connection or its login is missing asks for one. Empty for a layer that came from no

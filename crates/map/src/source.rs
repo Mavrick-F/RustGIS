@@ -284,30 +284,6 @@ pub fn row_hash(f: &rustgis_data::Feature) -> u64 {
     h.0
 }
 
-/// A layer kept in the project that was read whole from a file it can be written back to (a
-/// Shapefile or GeoJSON file), as it and the file were at their last sync, when it was read: so
-/// it can tell whether it has edits the file lacks and whether the file changed since (#1385).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Synced {
-    /// The files, as they were.
-    pub files: rustgis_data::sync::FileSync,
-    /// The layer's [`rows_digest`] then.
-    pub rows: u64,
-}
-
-/// A hash of what a dataset holds, as a project saves it: its fields, coordinate system, and
-/// each row's geometry and attributes in order. Not its name or where it came from, which are
-/// no edit to the file. A number that isn't finite hashes as the null a project saves it as, so
-/// a layer is the same before and after its project is saved and opened again.
-pub fn rows_digest(ds: &rustgis_data::Dataset) -> u64 {
-    let schema = serde_json::to_vec(&(&ds.fields, &ds.crs)).unwrap_or_default();
-    let h = fnv1a(fnv1a(FNV_OFFSET, &schema), &(ds.features.len() as u64).to_le_bytes());
-    ds.features.iter().fold(h, |h, f| {
-        let row = serde_json::to_vec(&(&f.geometry, &f.attrs)).unwrap_or_default();
-        fnv1a(fnv1a(h, &(row.len() as u64).to_le_bytes()), &row)
-    })
-}
-
 /// A loaded row: its source version or fingerprint and [`row_hash`] as read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowVersion {
@@ -1731,18 +1707,6 @@ mod tests {
     }
 
     /// The hash is FNV-1a over the row's JSON, the same as the projects saved with it hold.
-    #[test]
-    fn a_rows_digest_is_the_same_after_a_project_round_trip() {
-        use rustgis_data::{Dataset, Feature, Field, FieldType, GeometryType, Value};
-        let mut ds = Dataset::new("a".to_string(), GeometryType::None, vec![Field::new("v", FieldType::Double)]);
-        ds.features = vec![Feature { id: 1, geometry: None, attrs: vec![Value::Float(f64::NAN)] }].into();
-        let reopened: Dataset = serde_json::from_value(serde_json::to_value(&ds).unwrap()).unwrap();
-        assert_eq!(super::rows_digest(&reopened), super::rows_digest(&ds));
-        let mut edited = ds.clone();
-        edited.features = vec![Feature { id: 1, geometry: None, attrs: vec![Value::Float(1.0)] }].into();
-        assert_ne!(super::rows_digest(&edited), super::rows_digest(&ds));
-    }
-
     #[test]
     fn row_hashes_are_fnv_over_the_rows_json() {
         use rustgis_data::{Coord, Feature, Geometry, Value};

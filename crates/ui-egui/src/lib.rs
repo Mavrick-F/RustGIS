@@ -1133,6 +1133,27 @@ pub struct RustGisApp {
     seen_project: Option<std::path::PathBuf>,
 }
 
+/// Says what `source.syncState` found, once its check lands: whether the layer and its file are
+/// in step, and which parts of the file changed. A check that failed was said already.
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_state_said(app: &mut RustGisApp, landed: Landed) {
+    let Landed::Ran(Ok(v)) = landed else { return };
+    let layer = v.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok());
+    let layer = layer.and_then(|id| app.session.map().layer(id)).map(|l| l.name.clone()).unwrap_or_default();
+    let path = v.get("path").and_then(Value::as_str).unwrap_or_default();
+    let file = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
+    let parts: Vec<&str> = v.get("changed").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    let parts = parts.join(", ");
+    let args = [("layer", layer.as_str()), ("file", file.as_str()), ("parts", parts.as_str())];
+    let text = match v.get("state").and_then(Value::as_str) {
+        Some("inSync") => i18n::fmt("{layer} is in step with {file}", &args),
+        Some("edited") => i18n::fmt("{layer} has edits {file} doesn't have", &args),
+        Some("sourceChanged") => i18n::fmt("{file} changed since {layer} was read from it ({parts})", &args),
+        _ => i18n::fmt("{layer} has edits {file} doesn't have, and the file changed since it was read ({parts})", &args),
+    };
+    app.session.notify(text, false);
+}
+
 impl RustGisApp {
     /// The layer to export: `layer` (an id or name, as commands take it; the dialog's is checked
     /// against its `instance`, so a reused id isn't taken for it), else the active layer.
@@ -2261,9 +2282,10 @@ impl RustGisApp {
                 let params = if params.is_null() { json!({}) } else { params };
                 return readjob::run(self, "topology.validate", params);
             }
-            // Comparing a layer with its file hashes the file: on a thread of its own.
+            // Comparing a layer with its file hashes the file: on a thread of its own, and what
+            // it found said once it lands (Command Search shows no answer).
             if id == "source.syncState" {
-                return readjob::run(self, "source.syncState", params);
+                return readjob::run_then(self, "source.syncState", params, Some(sync_state_said));
             }
             // Converting the labels of a layer read in place reads all of its source first, on a
             // thread of its own, whoever asks (a click, the assistant).

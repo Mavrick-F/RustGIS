@@ -1401,11 +1401,11 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
             let src = rustgis_data::source::shp::ShpSource::open_path_in(Path::new(path), name, Some(crs)).map_err(|e| e.to_string())?;
             return add_source_with(s, p, Origin::Path(path), Some(Box::new(src)), None);
         }
-        let (read, synced) =
-            rustgis_data::sync::FileSync::around(Path::new(path), || rustgis_data::io::read_shapefile_in(Path::new(path), name, Some(crs)));
-        let mut read = read.map_err(|e| e.to_string())?;
-        read.0.source = Some(path.to_string());
-        read.1 = unsynced_note(read.1, synced, path);
+        // Read ahead in the desktop app ([`add_data_ahead`]).
+        let read = match super::reads::take(s, &whole_key(path)) {
+            Some(read) => read,
+            None => read_shapefile_with(path, name, crs),
+        }?;
         return add_read(s, p, read, None);
     }
     // A large Shapefile is read in place, as a GeoPackage is; smaller ones are loaded whole.
@@ -1590,32 +1590,48 @@ fn read_whole(p: &Value, path: &str) -> WholeRead {
     // A file its edits can be written back to: the files as read, to compare with before then.
     #[cfg(not(target_arch = "wasm32"))]
     if rustgis_data::sync::is_syncable(path) {
-        let (read, synced) = rustgis_data::sync::FileSync::around(Path::new(path), read);
-        return read.map(|(ds, report)| (ds, unsynced_note(report, synced, path)));
+        return read_synced(path, read);
     }
     read()
 }
 
-/// `report` with the files as read, or, when they couldn't be recorded, a note saying that the
-/// layer can't be compared with its file later.
+/// A Shapefile read whole in coordinate system `crs`, which replaces its `.prj`, with the record
+/// of what was read ([`read_synced`]).
 #[cfg(not(target_arch = "wasm32"))]
-fn unsynced_note(
-    mut report: rustgis_data::ReadReport,
-    synced: Option<rustgis_data::sync::FileSync>,
-    path: &str,
-) -> rustgis_data::ReadReport {
-    if synced.is_none() {
-        report.messages.push(format!(
-            "{path}: changed while it was read, or a part of it couldn't be read, so RustGIS can't tell later whether the file changed since; add it again to compare it"
-        ));
-    }
-    report.synced = synced;
-    report
+fn read_shapefile_with(path: &str, name: &str, crs: rustgis_data::raster::Crs) -> WholeRead {
+    read_synced(path, || {
+        let mut read = rustgis_data::io::read_shapefile_in(Path::new(path), name, Some(crs)).map_err(|e| e.to_string())?;
+        read.0.source = Some(path.to_string());
+        Ok(read)
+    })
+}
+
+/// `read`, the read of the file at `path`, with the record of what it read: the files hashed
+/// just before ([`rustgis_data::sync::FileSync::around`]) and the digest of the rows read. Its
+/// work grows with the file, so the desktop app makes it off the UI thread ([`add_data_ahead`]).
+/// When the files couldn't be hashed the layer has no record, and a note says it can't be
+/// compared with its file later.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_synced(path: &str, read: impl FnOnce() -> WholeRead) -> WholeRead {
+    let (read, files) = rustgis_data::sync::FileSync::around(Path::new(path), read).map_err(|e| format!("{path}: {e}"))?;
+    let (ds, mut report) = read?;
+    report.synced = match files {
+        Some(files) => {
+            Some(rustgis_data::sync::Synced { files, rows: rustgis_data::sync::rows_digest(&ds).map_err(|e| format!("{path}: {e}"))? })
+        }
+        None => {
+            report.messages.push(format!(
+                "{path}: a part of it couldn't be read to record it, so RustGIS can't tell later whether the file changed since; add it again to compare it"
+            ));
+            None
+        }
+    };
+    Ok((ds, report))
 }
 
 /// Add Data's read of the file `p` names, made before it runs ([`super::reads`]): a raster read
 /// whole or converted by GDAL, a GeoJSON read whole, delimited text, a spreadsheet or a city model
-/// (CityJSON or CityGML) read into its layers. `None` for
+/// (CityJSON or CityGML) read into its layers, a Shapefile read whole. `None` for
 /// any other file, which [`add_data`] reads as it adds it. Each is picked only where `add_data`
 /// takes that read, so a read made is never wasted; a few it makes whole are left to it (a GeoJSON
 /// with `"stream"` given, a `.json` with a coordinate system or layer given, a large GeoJSON that
@@ -1655,6 +1671,27 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
     if rustgis_data::io::is_multi_layer_name(&path) && is_city_model_path(&path) {
         let (key, q) = (city_key(&path), p.clone());
         return Some(ahead(NAME, key, move || read_city_file(&q, &path)));
+    }
+    // A Shapefile read whole, in the coordinate system given if one is: as add_data reads it (one
+    // past the whole-file reader's cap, or with more records than it takes, is read in place).
+    if lower.ends_with(".shp") {
+        let q = past_cap_shapefile(&path, p).unwrap_or_else(|| p.clone());
+        let stream = b(&q, "stream").unwrap_or_else(|| {
+            rustgis_data::source::shp::record_count(Path::new(&path)).is_some_and(|n| n > rustgis_map::source::STREAM_ABOVE)
+        });
+        if stream {
+            return None;
+        }
+        let key = whole_key(&path);
+        return match ps(&q, "crs").map(str::trim).filter(|c| !c.is_empty()) {
+            Some(text) => {
+                // One add_data can't parse it refuses as it runs.
+                let crs = rustgis_data::raster::Crs::parse(text).ok()?;
+                let name = Path::new(&path).file_stem().and_then(|n| n.to_str()).unwrap_or("layer").to_string();
+                Some(ahead(NAME, key, move || read_shapefile_with(&path, &name, crs)))
+            }
+            None => Some(ahead(NAME, key, move || read_whole(&q, &path))),
+        };
     }
     let (key, q) = (whole_key(&path), p.clone());
     if rustgis_data::sheets::is_sheet_name(&path) {
@@ -4758,7 +4795,7 @@ pub(crate) fn add_read(
     }
     let n = ds.features.len();
     let empty_before = super::map_is_empty(s);
-    let synced = report.synced.map(|files| rustgis_map::source::Synced { files, rows: rustgis_map::source::rows_digest(&ds) });
+    let synced = report.synced;
     let id = add_dataset(s, ds);
     if let Some(l) = s.map_mut().layer_mut(id) {
         l.synced = synced;

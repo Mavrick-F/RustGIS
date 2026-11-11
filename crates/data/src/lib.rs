@@ -378,9 +378,10 @@ impl Serialize for Dataset {
 pub struct ReadReport {
     pub skipped: usize,
     pub messages: Vec<String>,
-    /// The files read, as they were, when the reader recorded them ([`sync::FileSync::around`]):
-    /// what a layer kept in the project compares with its source before writing edits back.
-    pub synced: Option<sync::FileSync>,
+    /// The files read and the rows read from them, when the read recorded them
+    /// ([`sync::FileSync::around`]): what a layer kept in the project compares with its source
+    /// before writing edits back.
+    pub synced: Option<sync::Synced>,
 }
 
 /// What a read says when it drops Z or M values (see [`Dataset::zm_dropped`]): from `features` of
