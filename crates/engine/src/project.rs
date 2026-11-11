@@ -1332,15 +1332,28 @@ impl Project {
         p.read_notices =
             label_losses::notices_for_maps(text, &p, map_limit.is_some())?.into_iter().map(|(part, text)| (part, text.into())).collect();
         p.read_notices.extend(repair_notices);
-        // A system in degrees for the environment's rasters, which only a hand-edited file holds:
-        // its cell size would be read as degrees, so it is left out, and said.
-        if let Some(g) = p.gp_env.projected.filter(|g| g.crs.is_geographic()) {
+        // What `gp.env` refuses, which only a hand-edited file holds, is left out, and said: a system
+        // in degrees or geocentric (its cell size would be read in the wrong units), and a cell size
+        // that isn't above 0.
+        if let Some(g) = p.gp_env.projected.filter(|g| g.crs.is_geographic() || g.crs.is_geocentric()) {
             p.gp_env.projected = None;
             p.read_notices.push((
                 ReadPart::Items,
                 NoticeText::format(
-                    "the environment's coordinate system {crs} is in degrees, not projected, so it was left out",
+                    "the environment's coordinate system {crs} isn't a projected one, so it was left out",
                     [("crs", g.crs.label().into())],
+                ),
+            ));
+        }
+        if let Some(g) = p.gp_env.projected.as_mut()
+            && let Some(c) = g.cell_size.filter(|c| !(c.is_finite() && *c > 0.0))
+        {
+            g.cell_size = None;
+            p.read_notices.push((
+                ReadPart::Items,
+                NoticeText::format(
+                    "the environment's cell size {size} isn't above 0, so it was left out",
+                    [("size", c.to_string().into())],
                 ),
             ));
         }

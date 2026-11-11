@@ -538,8 +538,9 @@ IDW Interpolation and Ordinary Kriging make their raster in the projected coordi
 as `crs` (such as `EPSG:32616` for UTM zone 16N, or a State Plane code), and then take the
 extent, pixel size and Kriging's `range` in its units, usually metres or feet. Without `crs`
 they work in longitude and latitude, with all three in degrees, as they did before `crs` was
-there; for a layer read from a projected file they then say so, naming its system. A geographic
-`crs` is refused, and points the system can't hold are left out and counted.
+there; for a layer read from a projected file they then say so, naming its system. `EPSG:4326`
+also means degrees; another geographic `crs` is refused, and points the system can't hold are left
+out and counted.
 
 **Ordinary Kriging** (`kriging`) estimates both a value and its uncertainty. Set `input` and a
 numeric `field`, then choose a `model`: **Spherical** (default), **Exponential** or **Gaussian**.

@@ -690,6 +690,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             combo(ui, "wf_if", "Field", &mut app.workflow.field, &numeric);
             // Empty: the environment's system, or degrees without one.
             let degrees = app.workflow.crs.trim().is_empty() && app.session.project.gp_env.projected.is_none();
+            let was_empty = app.workflow.crs.trim().is_empty();
             ui.add(
                 egui::TextEdit::singleline(&mut app.workflow.crs)
                     .hint_text(match app.session.project.gp_env.projected {
@@ -698,6 +699,11 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     })
                     .desired_width(f32::INFINITY),
             );
+            // A cell size typed for one system means nothing in another: typing a system into an
+            // empty box, or clearing it, clears the size.
+            if app.workflow.crs.trim().is_empty() != was_empty {
+                app.workflow.number.clear();
+            }
             ui.horizontal(|ui| {
                 let hint = if degrees { tl!("cell size °") } else { tl!("cell size") };
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0));
