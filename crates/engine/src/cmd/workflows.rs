@@ -378,17 +378,16 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
         }
         s.project.gp_env.extent = e;
     }
-    // Both read before either is set, so a bad one changes nothing; a cell size given with a system
-    // is in its units.
+    // Both read before either is set, so a bad one changes nothing and says nothing; a cell size
+    // given with a system is in its units.
+    let mut note = None;
     let projected = match p.get("crs") {
         None => s.project.gp_env.projected,
         Some(Value::Null) => None,
         Some(Value::String(t)) if t.trim().is_empty() => None,
         Some(Value::String(t)) => {
-            let (crs, note) = rustgis_analysis::projected_crs(t.trim())?;
-            if let Some(note) = note {
-                s.notify(format!("Environments: its coordinate system: {note}"), false);
-            }
+            let (crs, compatibility) = rustgis_analysis::projected_crs(t.trim())?;
+            note = compatibility;
             // The same system again keeps its cell size; another one starts without one.
             let cell_size = s.project.gp_env.projected.filter(|g| g.crs == crs).and_then(|g| g.cell_size);
             Some(crate::project::ProjectedCells { crs, cell_size })
@@ -402,6 +401,9 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
     };
     if projected.is_none() && size.flatten().is_some_and(|c| c >= 10.0) {
         return Err("cellSize is degrees, above 0 and below 10, without a crs".into());
+    }
+    if let Some(note) = note {
+        s.notify(format!("Environments: its coordinate system: {note}"), false);
     }
     s.project.gp_env.projected = projected;
     if let Some(size) = size {

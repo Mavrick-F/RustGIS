@@ -55,6 +55,8 @@ pub struct Workflow {
     pub crs: String,
     /// The projected coordinate system typed for the environment, until it is set.
     pub env_crs: String,
+    /// The cell size typed for the environment, apart from the Wizard's, which is the run's own.
+    pub env_cell: String,
     pub zonal_stats: ZonalStatsForm,
     /// A workflow running on a thread of its own: its progress and Cancel show, and what it made
     /// lands through [`land_job`].
@@ -822,7 +824,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 egui::RichText::new(crate::i18n::fmt("Rasters: {system}, cell size {cells}", &[("system", &system), ("cells", &cells)]))
                     .small(),
             );
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.env_crs).hint_text("EPSG:32616").desired_width(110.0));
                 // An empty box sets nothing; going back to degrees is its own button, so a click
                 // never clears the system and its cell size by accident.
@@ -836,9 +838,9 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             });
             ui.horizontal(|ui| {
                 let hint = if env.projected.is_some() { tl!("cell size") } else { tl!("cell size °") };
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0));
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.env_cell).hint_text(hint).desired_width(80.0));
                 if ui.button(tl!("Set Cell Size")).clicked() {
-                    let v = app.workflow.number.trim().parse::<f64>().ok();
+                    let v = app.workflow.env_cell.trim().parse::<f64>().ok();
                     run(app, "gp.env", json!({"cellSize": v}));
                 }
             });

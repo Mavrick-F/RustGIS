@@ -39270,9 +39270,16 @@ fn interpolation_in_a_projected_coordinate_system() {
     let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
     assert_eq!((crs, cell), (Crs::Epsg(32616), 250.0));
     assert!(!in_degrees(&notices), "{notices:?}");
+    // The run's own cell size wins over the environment's.
+    let (_, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "cellSize": 500}));
+    assert_eq!(cell, 500.0);
     let saved = serde_json::to_value(&s.project.gp_env).unwrap();
     assert_eq!(saved["cell_size"], Value::Null, "{saved}");
     assert_eq!(serde_json::from_value::<crate::project::GpEnvironment>(saved).unwrap(), s.project.gp_env);
+    // A whole project opened again keeps the system and its cell size, with nothing to say.
+    let mut reopened = Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
+    assert_eq!(reopened.gp_env, s.project.gp_env);
+    assert!(reopened.take_read_notices(&[crate::project::ReadPart::Items]).is_empty());
     // A system given to the run wins, and the environment's cell size isn't read in another one.
     let (crs, mercator_cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:3857"}));
     assert_eq!(crs, Crs::WebMercator);
@@ -39294,6 +39301,11 @@ fn interpolation_in_a_projected_coordinate_system() {
     crate::cmd::layer::add_dataset(&mut s, polar);
     let (crs, _, notices) = surface(&mut s, json!({"layer": "polar", "field": "depth", "crs": "EPSG:3857"}));
     assert_eq!(crs, Crs::WebMercator);
+    // Both points left make it: its values reach from near one's to near the other's.
+    let polar = s.map().layer_by_name("polar_depth_idw").unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+    let values: Vec<f32> = polar.bands[0].data.iter().copied().filter(|v| polar.is_valid(*v)).collect();
+    let (low, high) = values.iter().fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+    assert!(low < 12.0 && high > 18.0 && high <= 20.0, "{low}..{high}");
     let label = Crs::WebMercator.label();
     let beyond = format!("polar: 1 point(s) beyond what {label} can hold (past 85.05° of latitude) were left out");
     assert!(notices.contains(&beyond), "{notices:?}");
