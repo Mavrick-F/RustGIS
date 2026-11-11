@@ -540,6 +540,11 @@ mod tests {
         assert!(k.contains("<Placemark><name></name>") && !k.contains("Null"), "{k}");
         let g = to_gpx(&ds, Some(0)).unwrap();
         assert!(g.contains("<name></name>") && g.contains("<name>B</name>") && !g.contains("Null"), "{g}");
+        // Named by a number: in full too.
+        let mut numbered = Dataset::new("n", GeometryType::Point, vec![Field::new("id", FieldType::Double)]);
+        numbered.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Float(0.1234567891)]);
+        assert!(to_kml(&numbered, Some(0)).unwrap().contains("<name>0.1234567891</name>"));
+        assert!(to_gpx(&numbered, Some(0)).unwrap().contains("<name>0.1234567891</name>"));
         let c = to_wkt_csv(&ds);
         assert!(c.contains("POINT (1 2),,0.1234567891\n") && c.contains(",B,0.000000001\n"), "{c}");
     }
