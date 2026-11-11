@@ -1333,14 +1333,14 @@ impl Project {
             label_losses::notices_for_maps(text, &p, map_limit.is_some())?.into_iter().map(|(part, text)| (part, text.into())).collect();
         p.read_notices.extend(repair_notices);
         // What `gp.env` refuses, which only a hand-edited file holds, is left out, and said: a system
-        // in degrees or geocentric (its cell size would be read in the wrong units), and a cell size
-        // that isn't above 0.
-        if let Some(g) = p.gp_env.projected.filter(|g| g.crs.is_geographic() || g.crs.is_geocentric()) {
+        // in degrees or geocentric (its cell size would be read in the wrong units) or one this
+        // version can't project to, and a cell size that isn't above 0.
+        if let Some(g) = p.gp_env.projected.filter(|g| g.crs.is_geographic() || g.crs.is_geocentric() || g.crs.transformer().is_err()) {
             p.gp_env.projected = None;
             p.read_notices.push((
                 ReadPart::Items,
                 NoticeText::format(
-                    "the environment's coordinate system {crs} isn't a projected one, so it was left out",
+                    "the environment's coordinate system {crs} isn't a projected one this version can use, so it was left out",
                     [("crs", g.crs.label().into())],
                 ),
             ));

@@ -1188,7 +1188,8 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let (layer_name, field_name) = (ds.name.clone(), field.to_string());
     // The system: the one given, else the environment's, else degrees as before either was there.
     let env = &s.project.gp_env;
-    let given = p.get("crs").is_some_and(|v| !v.is_null());
+    // An empty `crs` is none given, as `null` is: the environment's system still applies.
+    let given = p.get("crs").is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
     let (crs, crs_note) = match env.projected {
         Some(g) if !given => (g.crs, None),
         _ => rustgis_analysis::raster_crs(ds, p, "Geostatistical Wizard")?,

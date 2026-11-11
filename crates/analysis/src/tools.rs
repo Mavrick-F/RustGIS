@@ -3939,7 +3939,8 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
 }
 
 /// The coordinate system an interpolation (`tool`) makes its grid in: the projected system given as
-/// `p`'s `crs`, or longitude/latitude in degrees when it is empty, as before `crs` was there. The note says what the run used where that could surprise: the compatibility note on
+/// `p`'s `crs`, or longitude/latitude in degrees when it is empty or `EPSG:4326`, as before `crs`
+/// was there. The note says what the run used where that could surprise: the compatibility note on
 /// the system given, or degrees for a layer read from a projected file.
 pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<String>), String> {
     if p.get("crs").is_some_and(|v| !v.is_null() && !v.is_string()) {

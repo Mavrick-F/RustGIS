@@ -53,7 +53,7 @@ pub struct Workflow {
     /// The projected coordinate system the Geostatistical Wizard's surface is made in; empty: the
     /// environment's, or degrees.
     pub crs: String,
-    /// The projected coordinate system typed for the environment, until it is set.
+    /// The projected coordinate system typed for the environment's Set Coordinate System.
     pub env_crs: String,
     /// The cell size typed for the environment, apart from the Wizard's, which is the run's own.
     pub env_cell: String,
@@ -690,7 +690,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             combo(ui, "wf_if", "Field", &mut app.workflow.field, &numeric);
             // Empty: the environment's system, or degrees without one.
             let degrees = app.workflow.crs.trim().is_empty() && app.session.project.gp_env.projected.is_none();
-            let was_empty = app.workflow.crs.trim().is_empty();
+            let before = app.workflow.crs.trim().to_string();
             ui.add(
                 egui::TextEdit::singleline(&mut app.workflow.crs)
                     .hint_text(match app.session.project.gp_env.projected {
@@ -699,9 +699,9 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     })
                     .desired_width(f32::INFINITY),
             );
-            // A cell size typed for one system means nothing in another: typing a system into an
-            // empty box, or clearing it, clears the size.
-            if app.workflow.crs.trim().is_empty() != was_empty {
+            // A cell size typed for one system means nothing in another: changing the system, or
+            // clearing it, clears the size.
+            if app.workflow.crs.trim() != before {
                 app.workflow.number.clear();
             }
             ui.horizontal(|ui| {
@@ -846,8 +846,15 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let hint = if env.projected.is_some() { tl!("cell size") } else { tl!("cell size °") };
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.env_cell).hint_text(hint).desired_width(80.0));
                 if ui.button(tl!("Set Cell Size")).clicked() {
-                    let v = app.workflow.env_cell.trim().parse::<f64>().ok();
-                    run(app, "gp.env", json!({"cellSize": v}));
+                    // Empty clears the size; text that isn't a number is refused, not taken as empty.
+                    let typed = app.workflow.env_cell.trim().to_string();
+                    match typed.parse::<f64>() {
+                        Ok(v) => run(app, "gp.env", json!({"cellSize": v})),
+                        Err(_) if typed.is_empty() => run(app, "gp.env", json!({"cellSize": null})),
+                        Err(_) => {
+                            app.workflow.error = Some(crate::i18n::fmt("'{size}' isn't a cell size: give a number", &[("size", &typed)]));
+                        }
+                    }
                 }
             });
         }

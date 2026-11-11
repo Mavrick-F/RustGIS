@@ -39271,6 +39271,9 @@ fn interpolation_in_a_projected_coordinate_system() {
     let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
     assert_eq!((crs, cell), (Crs::Epsg(32616), 250.0));
     assert!(!in_degrees(&notices), "{notices:?}");
+    // An empty `crs` is none given: the environment's still applies.
+    let (crs, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": ""}));
+    assert_eq!((crs, cell), (Crs::Epsg(32616), 250.0));
     // EPSG:4326 asks for degrees over the environment's system.
     let (crs, _, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326", "cellSize": 0.01}));
     assert_eq!(crs, Crs::LonLat);
@@ -39292,8 +39295,8 @@ fn interpolation_in_a_projected_coordinate_system() {
     s.run("gp.env", &json!({"crs": "EPSG:32616"})).unwrap();
     assert_eq!(s.project.gp_env.cell_in(Crs::Epsg(32616)), Some(250.0));
     let before = s.project.gp_env.clone();
-    assert!(s.run("gp.env", &json!({"crs": "EPSG:3857", "cellSize": -1})).is_err());
-    assert_eq!(s.project.gp_env, before);
+    assert!(s.run("gp.env", &json!({"extent": [0, 0, 1, 1], "crs": "EPSG:3857", "cellSize": -1})).is_err());
+    assert_eq!(s.project.gp_env, before, "the extent set before the refusal is rolled back too");
     assert!(s.run("gp.env", &json!({"crs": "EPSG:4326", "cellSize": 100})).is_err());
     assert_eq!(s.project.gp_env, before);
 
@@ -39338,6 +39341,11 @@ fn interpolation_in_a_projected_coordinate_system() {
     // So does a geocentric system, and a cell size that isn't above 0 (the system kept).
     let mut text = serde_json::to_value(&s.project).unwrap();
     text["gp_env"]["projected"] = json!({"crs": {"Epsg": 4978}, "cell_size": 250.0});
+    let mut opened = Project::from_json(&text.to_string()).unwrap();
+    assert_eq!(opened.gp_env.projected, None);
+    assert!(format!("{:?}", opened.take_read_notices(&[crate::project::ReadPart::Items])).contains("isn't a projected one"));
+    // And a code this version has no definition for.
+    text["gp_env"]["projected"] = json!({"crs": {"Epsg": 1}, "cell_size": 250.0});
     let mut opened = Project::from_json(&text.to_string()).unwrap();
     assert_eq!(opened.gp_env.projected, None);
     assert!(format!("{:?}", opened.take_read_notices(&[crate::project::ReadPart::Items])).contains("isn't a projected one"));
