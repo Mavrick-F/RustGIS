@@ -18231,7 +18231,7 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
     };
     let out = |name: &str| dir.join(name).display().to_string();
     let n = said(&mut s, "share.exportLayer", json!({"layer": "Areas", "path": out("areas.csv")}));
-    assert!(n.len() == 1 && n[0].contains("the geometry of 1 polygon wasn't written"), "{n:?}");
+    assert!(n.len() == 1 && n[0].contains("the geometry of 1 feature wasn't written"), "{n:?}");
     let n = said(&mut s, "share.exportLayer", json!({"layer": "Sites", "path": out("sites.csv")}));
     assert!(n.len() == 1 && n[0].contains("1 feature has more than one point"), "{n:?}");
     let n = said(&mut s, "share.exportLayer", json!({"layer": "Areas", "path": out("areas.gpx")}));

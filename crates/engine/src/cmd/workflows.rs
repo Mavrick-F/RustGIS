@@ -1423,13 +1423,14 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let mut notes = rustgis_data::export_notes([(ds, ds.extent())], target, rustgis_data::raster::Crs::LonLat);
     // CSV holds a point a row, GPX a name for each feature and no areas.
     match ps(p, "format") {
-        Some("csv") => notes.extend(rustgis_data::io::CsvLosses::of(&ds.features, ds.geometry_type).notes(ds.geometry_type, target)),
+        Some("csv") => notes.extend(rustgis_data::io::CsvLosses::of(&ds.features, ds.geometry_type).notes(target)),
         Some("gpx") => notes.extend(rustgis_data::io::gpx_notes(ds, name_field, target)),
         _ => {}
     }
     // KML and GPX hold features with geometry only.
     if let Some(ext @ ("kml" | "gpx")) = ps(p, "format") {
-        let without = ds.features.iter().filter(|f| f.geometry.is_none()).count();
+        let without =
+            if ext == "gpx" { rustgis_data::io::gpx_left_out(ds) } else { ds.features.iter().filter(|f| f.geometry.is_none()).count() };
         notes.extend(rustgis_data::io::left_out_note(target, ext, without));
     }
     let out = match ps(p, "path") {

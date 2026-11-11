@@ -516,7 +516,7 @@ fn projected_bytes(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usize)
             let kml = crate::interop::to_kml(ds, name_field(ds))?.into_bytes();
             (crate::zip::write(&[("doc.kml".to_string(), kml)]).map_err(DataError::Format)?, without_geometry(ds))
         }
-        "gpx" => (crate::interop::to_gpx(ds, name_field(ds))?.into_bytes(), without_geometry(ds)),
+        "gpx" => (crate::interop::to_gpx(ds, name_field(ds))?.into_bytes(), gpx_left_out(ds)),
         "shp" | "zip" => {
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
             let base: String = ds.name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') { c } else { '_' }).collect();
@@ -2695,8 +2695,9 @@ impl CsvLosses {
         out
     }
 
-    /// One notice for each loss of a layer of type `gt` written to `target`; none without loss.
-    pub fn notes(self, gt: GeometryType, target: &str) -> Vec<String> {
+    /// One notice for each loss of a layer written to `target`; none without loss. Geometry
+    /// not written is counted by feature, whatever its kind: a layer of one type can hold others.
+    pub fn notes(self, target: &str) -> Vec<String> {
         let mut notes = Vec::new();
         if self.as_one_point > 0 {
             let what = if self.as_one_point == 1 { "1 feature has".to_string() } else { format!("{} features have", self.as_one_point) };
@@ -2705,15 +2706,8 @@ impl CsvLosses {
             ));
         }
         if self.unwritten > 0 {
-            let kind = match gt {
-                GeometryType::Polygon => "polygon",
-                GeometryType::Polyline => "line",
-                _ => "feature",
-            };
-            let what = if self.unwritten == 1 { format!("1 {kind}") } else { format!("{} {kind}s", self.unwritten) };
-            notes.push(format!(
-                "{target}: CSV holds points, so the geometry of {what} wasn't written, only the attributes; CSV with WKT (Data Interop, data.convert \"format\": \"wkt\") keeps it"
-            ));
+            let what = if self.unwritten == 1 { "1 feature".to_string() } else { format!("{} features", self.unwritten) };
+            notes.push(format!("{target}: CSV holds points, so the geometry of {what} wasn't written, only the attributes"));
         }
         notes
     }
@@ -2725,6 +2719,17 @@ impl std::ops::AddAssign for CsvLosses {
         self.as_one_point += other.as_one_point;
         self.unwritten += other.unwritten;
     }
+}
+
+/// Features a GPX file of `ds` leaves out: those without geometry, and multipoints without a
+/// point, which give no waypoint.
+pub fn gpx_left_out(ds: &Dataset) -> usize {
+    let empty = |g: &Option<Geometry>| match g {
+        None => true,
+        Some(Geometry::MultiPoint(v)) => v.is_empty(),
+        Some(_) => false,
+    };
+    ds.features.iter().filter(|f| empty(&f.geometry)).count()
 }
 
 /// What a GPX file of `ds` can't hold, each feature named from field `name_field`: other
@@ -4056,10 +4061,22 @@ mod tests {
         ds.push(None, vec![]);
         let losses = CsvLosses::of(&ds.features, ds.geometry_type);
         assert_eq!(losses, CsvLosses { as_one_point: 0, unwritten: 1 });
-        assert!(losses.notes(ds.geometry_type, "t.csv")[0].contains("the geometry of 1 feature wasn't written"));
+        assert!(losses.notes("t.csv")[0].contains("the geometry of 1 feature wasn't written"));
         assert!(!to_csv(&ds).unwrap().contains("longitude"));
         let points = [crate::Feature { id: 0, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![] }];
         assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses::default());
+    }
+
+    /// GPX leaves out a feature without geometry and a multipoint without a point (no waypoint
+    /// for it), and counts both; a point is written.
+    #[test]
+    fn gpx_counts_a_multipoint_without_points_as_left_out() {
+        let mut ds = Dataset::new("t", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![]);
+        ds.push(Some(Geometry::MultiPoint(vec![])), vec![]);
+        ds.push(None, vec![]);
+        assert_eq!(gpx_left_out(&ds), 2);
+        assert_eq!(write_bytes(&ds, "gpx").unwrap().1, 2);
     }
 
     #[test]
