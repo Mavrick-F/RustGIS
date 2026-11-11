@@ -39342,7 +39342,8 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
     // A project from elsewhere names the path: a network share or a file no record is made for
     // is refused without being opened.
     let shares = [r"\\host\share\towns.shp", "//host/share/towns.shp", r"/\host\share\towns.shp", r"\/host/share/towns.shp"];
-    for path in shares.into_iter().chain([r"file:///\\host\share\towns.shp", "towns.json"]) {
+    let more = [r"file:///\\host\share\towns.shp", r"\\?\UNC\host\share\towns.shp", "towns.json"];
+    for path in shares.into_iter().chain(more) {
         let id = s.map().layer_by_name("towns.shp").unwrap().id;
         s.map_mut().layer_mut(id).unwrap().dataset.source = Some(path.into());
         let e = s.run("source.syncState", &json!({"layer": id})).unwrap_err();
@@ -39353,6 +39354,11 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
         let read = ahead.run(&rustgis_analysis::control::Control::stoppable()).unwrap();
         assert!(crate::cmd::reads::read_land(&mut s, read).is_err(), "{path}");
     }
+    // Windows' long form of a path on a drive is a file on this computer: checked (and missing here).
+    let id = s.map().layer_by_name("towns.shp").unwrap().id;
+    s.map_mut().layer_mut(id).unwrap().dataset.source = Some(r"\\?\C:\data\towns.shp".into());
+    let v = s.run("source.syncState", &json!({"layer": id})).unwrap();
+    assert!(v["changed"].as_array().unwrap().iter().any(|c| c.as_str().is_some_and(|c| c.ends_with("towns.shp"))), "{v}");
     // A part that can't be read to record it (a folder where the .prj would be): the layer is
     // added without a record, and says so; one read cleanly says nothing of it.
     let said = |s: &Session, mark: u64| s.notices_since(mark).iter().filter(|n| n.text.contains("couldn't be read to record it")).count();

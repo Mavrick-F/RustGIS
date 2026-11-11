@@ -1613,6 +1613,11 @@ fn read_shapefile_with(path: &str, name: &str, crs: rustgis_data::raster::Crs) -
 /// compared with its file later.
 #[cfg(not(target_arch = "wasm32"))]
 fn read_synced(path: &str, read: impl FnOnce() -> WholeRead) -> WholeRead {
+    // A file past what the readers take (its `.dbf` too) is refused by the read: not hashed first.
+    let over = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.len() > rustgis_data::io::MAX_BYTES);
+    if over(Path::new(path)) || over(&Path::new(path).with_extension("dbf")) {
+        return read();
+    }
     let (read, files) = rustgis_data::sync::FileSync::around(Path::new(path), read).map_err(|e| format!("{path}: {e}"))?;
     let (mut ds, mut report) = read?;
     // Kept whole, as the record checks it later: a relative path would be taken from wherever

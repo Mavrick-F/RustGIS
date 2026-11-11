@@ -34,13 +34,14 @@ pub struct Synced {
     pub rows: u64,
 }
 
-/// A hash of what a dataset holds, as a project saves it: its fields, coordinate system, and
-/// each row's geometry and attributes in order (FNV-1a over their JSON, written to the hash as
-/// it is made). Not its name or where it came from, which are no edit to the file. A number that
-/// isn't finite hashes as the null a project saves it as, so a layer is the same before and
-/// after its project is saved and opened again. Its work grows with the rows: each is counted
-/// as progress ([`crate::progress`]), and it stops once the run is cancelled; the desktop app
-/// runs it off the UI thread.
+/// A hash of what a dataset holds: its fields, coordinate system, and each row's geometry and
+/// attributes in order (FNV-1a over their JSON, written to the hash as it is made). Not its name
+/// or where it came from, which are no edit to the file. A number that isn't finite, which JSON
+/// writes as null, is told from an empty cell by its position and bits, as the GeoPackage edit
+/// rows are: clearing one is an edit. A project saves one as null (and says so), so a layer that
+/// held one reads as edited once its project is opened again: it no longer holds what its file
+/// does. Its work grows with the rows: each is counted as progress ([`crate::progress`]), and it
+/// stops once the run is cancelled; the desktop app runs it off the UI thread.
 pub fn rows_digest(ds: &crate::Dataset) -> crate::Result<u64> {
     /// FNV-1a over the bytes written to it.
     struct Fnv(u64);
@@ -64,6 +65,13 @@ pub fn rows_digest(ds: &crate::Dataset) -> crate::Result<u64> {
     crate::progress::begin(ds.features.len());
     for f in ds.features.iter() {
         put(&mut h, &(&f.geometry, &f.attrs));
+        for (index, value) in f.attrs.iter().enumerate() {
+            if let crate::Value::Float(number) = value
+                && !number.is_finite()
+            {
+                put(&mut h, &("non-finite", index, number.to_bits()));
+            }
+        }
         crate::progress::step(1)?;
     }
     Ok(h.0)
@@ -291,15 +299,22 @@ mod tests {
     }
 
     #[test]
-    fn a_rows_digest_is_the_same_after_a_project_round_trip() {
+    fn a_rows_digest_tells_a_non_finite_number_from_an_empty_cell() {
         use crate::{Dataset, Feature, Field, FieldType, GeometryType, Value};
+        let row = |v: Value| vec![Feature { id: 1, geometry: None, attrs: vec![v] }].into();
         let mut ds = Dataset::new("a".to_string(), GeometryType::None, vec![Field::new("v", FieldType::Double)]);
-        ds.features = vec![Feature { id: 1, geometry: None, attrs: vec![Value::Float(f64::NAN)] }].into();
+        ds.features = row(Value::Float(f64::NAN));
+        let digest = |v: Value| {
+            let mut d = ds.clone();
+            d.features = row(v);
+            rows_digest(&d).unwrap()
+        };
+        // Clearing it is an edit, and so is a project's saving it as null.
         let reopened: Dataset = serde_json::from_value(serde_json::to_value(&ds).unwrap()).unwrap();
-        assert_eq!(rows_digest(&reopened).unwrap(), rows_digest(&ds).unwrap());
-        let mut edited = ds.clone();
-        edited.features = vec![Feature { id: 1, geometry: None, attrs: vec![Value::Float(1.0)] }].into();
-        assert_ne!(rows_digest(&edited).unwrap(), rows_digest(&ds).unwrap());
+        assert_ne!(rows_digest(&reopened).unwrap(), rows_digest(&ds).unwrap());
+        assert_eq!(rows_digest(&reopened).unwrap(), digest(Value::Null));
+        assert_ne!(digest(Value::Float(f64::INFINITY)), digest(Value::Float(f64::NAN)));
+        assert_eq!(digest(Value::Float(f64::NAN)), rows_digest(&ds).unwrap());
     }
 
     /// The digest is saved in projects with no version: a change in how fields, coordinate
