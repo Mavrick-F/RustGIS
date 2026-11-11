@@ -78,7 +78,7 @@ pub fn run_then(app: &mut RustGisApp, command: &'static str, mut p: Value, then:
         let r = app.run(command, p);
         return answered(app, then, r);
     }
-    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "labels.convert")
+    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "labels.convert" | "source.syncState")
         .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
         .flatten();
     let notice_mark = app.session.notice_mark();

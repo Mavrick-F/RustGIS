@@ -39274,11 +39274,25 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
         assert_eq!(state(&mut s)["state"], "edited", "{file}");
         s.run("edit.undo", &Value::Null).unwrap();
         assert_eq!(state(&mut s)["state"], "inSync", "{file}");
-        // Saved and opened again, it still knows the file as read.
-        let l = s.map().layer(id as u32).unwrap();
-        let reopened: rustgis_map::Layer = serde_json::from_value(serde_json::to_value(l).unwrap()).unwrap();
-        assert_eq!(reopened.synced, l.synced);
-        assert!(l.synced.is_some());
+        assert!(s.map().layer(id as u32).unwrap().synced.is_some());
+    }
+    // Saved and opened again, both still know their files as read.
+    let project = dir.join("towns.rgis");
+    s.run("project.saveAs", &json!({"path": project.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": project.display().to_string()})).unwrap();
+    for layer in ["towns.shp", "towns.geojson"] {
+        assert_eq!(t.run("source.syncState", &json!({"layer": layer})).unwrap()["state"], "inSync", "{layer}");
+    }
+    // The desktop app hashes the file on a thread of its own; the command takes that check.
+    {
+        use crate::cmd::reads::{read_ahead, read_land};
+        let here = t.run("source.syncState", &json!({"layer": "towns.shp"})).unwrap();
+        let ahead = read_ahead(&mut t, "source.syncState", &json!({"layer": "towns.shp"})).unwrap();
+        assert!(ahead.reads());
+        let read = ahead.run(&rustgis_analysis::control::Control::stoppable()).unwrap();
+        assert_eq!(read_land(&mut t, read).unwrap(), here);
+        assert!(t.read_ahead.is_none(), "the check was taken");
     }
     // The same bytes written again is no change; other bytes are, named by file.
     let dbf = dir.join("towns.dbf");

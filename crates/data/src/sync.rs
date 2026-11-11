@@ -4,9 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The files of a source as they were at a moment: each one's name, size, modification time
-/// and SHA-256 hash, and the files that weren't there. A Shapefile is its `.shp`, `.shx`,
-/// `.dbf`, `.prj` and `.cpg` (the ones its reader opens); a GeoJSON file is itself.
+/// The files of a source as they were at a moment: each one's name, size and SHA-256 hash, and
+/// the files that weren't there. A Shapefile is its `.shp`, `.shx`, `.dbf`, `.prj` and `.cpg`
+/// (the ones its reader opens); a GeoJSON file is itself. Only the contents count: a file
+/// copied, touched or moved to another disk with the same bytes is the same file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSync {
     /// Each file by its name beside the source (`parcels.dbf`), with its stamp, or `None` for
@@ -18,10 +19,6 @@ pub struct FileSync {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStamp {
     pub len: u64,
-    /// When it was last written, in nanoseconds since 1970 (`None` where the system doesn't
-    /// say). Only a shortcut: the hash decides whether the file changed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub modified: Option<u64>,
     /// The SHA-256 of its bytes, in hexadecimal.
     pub sha256: String,
 }
@@ -37,6 +34,7 @@ pub fn is_syncable(path: &str) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::{FileStamp, FileSync};
+    use crate::{DataError, Result};
     use std::path::{Path, PathBuf};
 
     /// The files of the source at `path`, each as a name beside it and its path: for a
@@ -58,28 +56,19 @@ mod native {
         paths.into_iter().map(|p| (p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), p)).collect()
     }
 
-    /// How recent a modification time is too recent to trust: a file system that keeps times
-    /// to the second or two (FAT, some network shares) can give a write made just after it
-    /// the same time.
-    const FRESH: std::time::Duration = std::time::Duration::from_secs(3);
-
-    /// The file as it is now, hashed, or `None` when it isn't there. Its time is left out
-    /// when it is too recent to tell a later write by ([`FRESH`]), so that the file is always
-    /// hashed when compared.
-    fn stamp(path: &Path) -> std::io::Result<Option<FileStamp>> {
-        let m = match std::fs::metadata(path) {
-            Ok(m) if m.is_file() => m,
-            Ok(_) => return Err(std::io::Error::other(format!("{} isn't a file", path.display()))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let modified = m.modified().ok().filter(|t| t.elapsed().is_ok_and(|age| age >= FRESH));
-        let modified = modified.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).and_then(|d| u64::try_from(d.as_nanos()).ok());
-        Ok(Some(FileStamp { len: m.len(), modified, sha256: sha256(path)? }))
+    /// The file's size, or `None` when it isn't there.
+    fn len(path: &Path) -> Result<Option<u64>> {
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => Ok(Some(m.len())),
+            Ok(_) => Err(DataError::Format(format!("{} isn't a file", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
-    /// The SHA-256 of the file's bytes, read a block at a time.
-    fn sha256(path: &Path) -> std::io::Result<String> {
+    /// The SHA-256 of the file's bytes, read a block at a time, each counted as progress
+    /// ([`crate::progress`]) and stopping once the run is cancelled.
+    fn sha256(path: &Path) -> Result<String> {
         use sha2::Digest;
         use std::io::Read;
         let mut file = std::fs::File::open(path)?;
@@ -91,43 +80,60 @@ mod native {
                 break;
             }
             hasher.update(buf.get(..n).unwrap_or_default());
+            crate::progress::step(n)?;
         }
         Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
     }
 
+    /// Bytes as a progress count.
+    fn count(bytes: u64) -> usize {
+        usize::try_from(bytes).unwrap_or(usize::MAX)
+    }
+
     impl FileSync {
         /// The files of the source at `path` as they are now, each read whole to hash it.
-        pub fn read(path: &Path) -> std::io::Result<FileSync> {
-            let files = parts(path).into_iter().map(|(name, p)| Ok((name, stamp(&p)?))).collect::<std::io::Result<_>>()?;
+        pub fn read(path: &Path) -> Result<FileSync> {
+            let parts = parts(path);
+            let total = parts.iter().filter_map(|(_, p)| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+            crate::progress::begin(count(total));
+            let mut files = Vec::new();
+            for (name, p) in parts {
+                let stamp = match len(&p)? {
+                    None => None,
+                    Some(len) => Some(FileStamp { len, sha256: sha256(&p)? }),
+                };
+                files.push((name, stamp));
+            }
             Ok(FileSync { files })
         }
 
         /// Runs `read`, which reads the source at `path`, and returns with its result the files
-        /// as it read them: hashed before and after, so a write while it ran is caught whatever
-        /// the file times say. `None` when they can't be read or were written to: what was read
-        /// may then be a mix, and there is nothing to compare with later.
+        /// as it read them: hashed before and after, so a write while it ran is caught. `None`
+        /// when they can't be read or were written to: what was read may then be a mix, and
+        /// there is nothing to compare with later.
         pub fn around<R>(path: &Path, read: impl FnOnce() -> R) -> (R, Option<FileSync>) {
             let before = FileSync::read(path).ok();
             let out = read();
-            let content =
-                |s: &FileSync| s.files.iter().map(|(n, s)| (n.clone(), s.as_ref().map(|s| (s.len, s.sha256.clone())))).collect::<Vec<_>>();
-            let sync = before.and_then(|before| FileSync::read(path).ok().filter(|after| content(after) == content(&before)));
+            let sync = before.and_then(|before| FileSync::read(path).ok().filter(|after| *after == before));
             (out, sync)
         }
 
         /// The names of the files that differ now from this record: changed, added, removed or
-        /// unreadable. Empty when the source is as it was. A file whose size and recorded
-        /// modification time are both unchanged is taken as unchanged without reading it; any
-        /// other of the same size is hashed, so a touch or a copy isn't counted as a change.
-        pub fn changed(&self, path: &Path) -> Vec<String> {
+        /// unreadable. Empty when the source is as it was. A file of the size recorded is read
+        /// whole and hashed, so its work grows with the file: a caller on the desktop's UI
+        /// thread does it on a thread of its own. Errs only when the run is cancelled.
+        pub fn changed(&self, path: &Path) -> Result<Vec<String>> {
             let now = parts(path);
             let mut changed = Vec::new();
-            // Files the set has now that the record lacks (a `.cpg` in another case).
-            for (name, _) in &now {
-                if !self.files.iter().any(|(n, _)| n == name) {
+            // Files there now that the record lacks (a `.cpg` added in another case); not the
+            // `.cpg` name `parts` falls back to when there is none.
+            for (name, p) in &now {
+                if !self.files.iter().any(|(n, _)| n == name) && p.exists() {
                     changed.push(name.clone());
                 }
             }
+            let total = self.files.iter().filter_map(|(_, s)| s.as_ref()).map(|s| s.len).sum();
+            crate::progress::begin(count(total));
             for (name, was) in &self.files {
                 let Some((_, p)) = now.iter().find(|(n, _)| n == name) else {
                     // Out of the set now: changed if it held anything.
@@ -136,23 +142,20 @@ mod native {
                     }
                     continue;
                 };
-                let same = match (was, std::fs::metadata(p)) {
-                    (None, Err(e)) => e.kind() == std::io::ErrorKind::NotFound,
-                    (Some(was), Ok(m)) if m.is_file() && m.len() == was.len => {
-                        let modified = m
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .and_then(|d| u64::try_from(d.as_nanos()).ok());
-                        (was.modified.is_some() && modified == was.modified) || sha256(p).is_ok_and(|h| h == was.sha256)
-                    }
+                let same = match (was, len(p)) {
+                    (None, Ok(None)) => true,
+                    (Some(was), Ok(Some(len))) if len == was.len => match sha256(p) {
+                        Ok(hash) => hash == was.sha256,
+                        Err(DataError::Cancelled) => return Err(DataError::Cancelled),
+                        Err(_) => false,
+                    },
                     _ => false,
                 };
                 if !same {
                     changed.push(name.clone());
                 }
             }
-            changed
+            Ok(changed)
         }
     }
 }
@@ -173,7 +176,7 @@ mod tests {
         let sync = FileSync::read(&path).unwrap();
         let names: Vec<(&str, bool)> = sync.files.iter().map(|(n, s)| (n.as_str(), s.is_some())).collect();
         assert_eq!(names, [("a.shp", true), ("a.shx", true), ("a.dbf", true), ("a.prj", false), ("a.cpg", true)]);
-        assert!(sync.changed(&path).is_empty());
+        assert!(sync.changed(&path).unwrap().is_empty());
     }
 
     #[test]
@@ -185,15 +188,44 @@ mod tests {
             std::fs::write(d.join(format!("a.{ext}")), ext).unwrap();
         }
         let sync = FileSync::read(&path).unwrap();
-        // The same bytes written again (a new time): read and hashed, not a change.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The same bytes written again: not a change.
         std::fs::write(d.join("a.dbf"), "dbf").unwrap();
-        assert!(sync.changed(&path).is_empty());
+        assert!(sync.changed(&path).unwrap().is_empty());
         // Other bytes of the same length, a file added and one removed.
         std::fs::write(d.join("a.dbf"), "DBF").unwrap();
         std::fs::write(d.join("a.prj"), "GEOGCS").unwrap();
         std::fs::remove_file(d.join("a.shx")).unwrap();
-        assert_eq!(sync.changed(&path), ["a.shx", "a.dbf", "a.prj"]);
+        assert_eq!(sync.changed(&path).unwrap(), ["a.shx", "a.dbf", "a.prj"]);
+    }
+
+    /// A copy that keeps times (`cp -p`, `rsync -t`) can put back the size and time a file had
+    /// with other bytes: the hash still tells.
+    #[test]
+    fn a_rewrite_that_puts_the_time_back_is_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.geojson");
+        std::fs::write(&path, "{}").unwrap();
+        let sync = FileSync::read(&path).unwrap();
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "[]").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(time).unwrap();
+        assert_eq!(sync.changed(&path).unwrap(), ["a.geojson"]);
+    }
+
+    #[test]
+    fn a_removed_cpg_is_named_as_it_was_spelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for ext in ["shp", "shx", "dbf"] {
+            std::fs::write(d.join(format!("a.{ext}")), ext).unwrap();
+        }
+        // Recorded under a spelling no file has now: as `a.CPG` is once removed on a
+        // case-sensitive file system (one that ignores case would find `a.cpg` there).
+        let path = d.join("a.shp");
+        let mut sync = FileSync::read(&path).unwrap();
+        let cpg = sync.files.iter_mut().find(|(n, _)| n == "a.cpg").unwrap();
+        *cpg = ("a.CPG".into(), Some(FileStamp { len: 5, sha256: "00".into() }));
+        assert_eq!(sync.changed(&path).unwrap(), ["a.CPG"]);
     }
 
     #[test]
@@ -209,10 +241,10 @@ mod tests {
     }
 
     #[test]
-    fn a_record_round_trips_without_an_unknown_time() {
-        let sync = FileSync { files: vec![("a.geojson".into(), Some(FileStamp { len: 2, modified: None, sha256: "ab".into() }))] };
+    fn a_record_round_trips() {
+        let sync = FileSync { files: vec![("a.geojson".into(), Some(FileStamp { len: 2, sha256: "ab".into() })), ("a.prj".into(), None)] };
         let text = serde_json::to_string(&sync).unwrap();
-        assert_eq!(text, r#"{"files":[["a.geojson",{"len":2,"sha256":"ab"}]]}"#);
+        assert_eq!(text, r#"{"files":[["a.geojson",{"len":2,"sha256":"ab"}],["a.prj",null]]}"#);
         assert_eq!(serde_json::from_str::<FileSync>(&text).unwrap(), sync);
     }
 }

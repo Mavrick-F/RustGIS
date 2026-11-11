@@ -12,10 +12,45 @@ pub fn commands() -> Vec<C> {
     ]
 }
 
-/// Compares the layer with the files it was read from. Runs on the UI thread: it reads the
-/// files' sizes and times, hashing only a file of the same size whose time changed or was too
-/// recent to record (a copy, a touch, a file just written), and finds edits by hashing the
-/// layer's rows, as `gpkg.pendingEdits` does, for no more rows than a layer read whole holds.
+/// The key a check of layer `id`'s files made ahead is taken by (see [`super::reads`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn ahead_key(id: u32) -> String {
+    format!("syncState:{id}")
+}
+
+/// A check of a layer's files made ahead: the record and path checked, and what changed.
+#[cfg(not(target_arch = "wasm32"))]
+struct Checked {
+    files: rustgis_data::sync::FileSync,
+    path: String,
+    changed: Result<Vec<String>, String>,
+}
+
+/// The check `source.syncState` makes before it runs in the desktop app: every part of the
+/// file read and hashed on a thread of its own, with progress and Cancel.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn sync_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
+    let id = s.layer_id(p).ok()?;
+    let l = s.map().layer(id)?;
+    let (files, path) = (l.synced.as_ref()?.files.clone(), l.dataset.source.clone()?);
+    Some(super::reads::ahead("Source File State", ahead_key(id), move || {
+        let changed = files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string());
+        Checked { files, path, changed }
+    }))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn sync_ahead(_: &Session, _: &Value) -> Option<super::reads::ReadWork> {
+    None
+}
+
+/// Compares the layer with the files it was read from: each part of the size recorded is read
+/// and hashed, so the work grows with the file. The desktop app checks them on a thread of its
+/// own first ([`sync_ahead`]), with progress and **Cancel**, and the command takes that check as
+/// it lands; when the layer's record changed meanwhile it says so rather than check again here,
+/// which would hold the window. The assistant, scripts and the command line check where they
+/// ask. Edits are found by hashing the layer's rows here, as `gpkg.pendingEdits` does: no more
+/// rows than a layer read whole from a file of at most [`rustgis_data::io::MAX_BYTES`] holds.
 fn sync_state(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("the layer no longer exists")?;
@@ -36,7 +71,13 @@ fn sync_state(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let changed = synced.files.changed(std::path::Path::new(path));
+        let (files, path) = (synced.files.clone(), path.clone());
+        let changed = match super::reads::take::<Checked>(s, &ahead_key(id)) {
+            Some(checked) if checked.files == files && checked.path == path => checked.changed?,
+            // Checking again here would hold the window: the check made on its thread is dropped.
+            Some(_) => return Err("the layer's file or its record changed while it was checked: check again".into()),
+            None => files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string())?,
+        };
         let state = match (edited, !changed.is_empty()) {
             (false, false) => "inSync",
             (true, false) => "edited",

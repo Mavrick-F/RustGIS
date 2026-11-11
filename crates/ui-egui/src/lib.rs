@@ -2261,6 +2261,10 @@ impl RustGisApp {
                 let params = if params.is_null() { json!({}) } else { params };
                 return readjob::run(self, "topology.validate", params);
             }
+            // Comparing a layer with its file hashes the file: on a thread of its own.
+            if id == "source.syncState" {
+                return readjob::run(self, "source.syncState", params);
+            }
             // Converting the labels of a layer read in place reads all of its source first, on a
             // thread of its own, whoever asks (a click, the assistant).
             if id == "labels.convert"
