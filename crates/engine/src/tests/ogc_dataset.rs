@@ -50,6 +50,28 @@ fn ogc_dataset_rejected_landing_links_never_guess_a_template() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn ogc_dataset_prepared_add_keeps_error_path_losses() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    for query in [false, true] {
+        let url = if query { "https://maps.example.org/landing?token=synthetic-query" } else { "https://maps.example.org/landing" };
+        let text = json!({"links":[{"rel":"data","type":"application/json","href":"https://other.example.org/collections"}]}).to_string();
+        let mut params = json!({"url":url,"type":"ogcapi","layer":"map","text":text});
+        let listing = Session::new(Project::default()).run("service.layers", &params).unwrap();
+        params["documents"] = json!([{"url":listing["next"],"text":"not JSON"}]);
+        let mut direct = Session::new(Project::default());
+        assert!(direct.run("service.add", &params).is_err());
+        let notes = |s: &Session| s.notices.iter().filter(|n| !n.error).map(|n| n.text.clone()).collect::<Vec<_>>();
+        let expected = notes(&direct);
+        assert_eq!(expected.len(), usize::from(query), "{expected:?}");
+        let mut prepared = Session::new(Project::default());
+        let read = read_ahead(&mut prepared, "service.add", &params).unwrap().run(&crate::analysis::control::Control::new()).unwrap();
+        assert!(read_land(&mut prepared, read).is_err());
+        assert_eq!(notes(&prepared), expected, "prepared errors must retain counted losses after rollback");
+    }
+}
+
 /// A dataset offering two projections and styles whose ids deliberately misname their grid.
 fn documents() -> Vec<(&'static str, Value)> {
     vec![
@@ -103,6 +125,16 @@ fn ogc_dataset_styles_use_advertised_projection_and_native_web_parity() {
     assert!(native["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().starts_with("1 styles were left out")));
     let requests = server.requests().len();
     assert_eq!(requests, docs.len());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::cmd::reads::{read_ahead, read_land};
+        let read = read_ahead(&mut session, "service.layers", &json!({"url":url,"type":"ogcapi"})).unwrap();
+        assert!(read.reads(), "URL-only discovery must fetch on the worker too");
+        let read = read.run(&crate::analysis::control::Control::new()).unwrap();
+        assert_eq!(read_land(&mut session, read).unwrap(), native);
+        assert_eq!(server.requests().len(), requests + docs.len());
+    }
+    let requests = server.requests().len();
     let mut params = json!({"url":url,"type":"ogcapi","text":docs[0].1.to_string(),"documents":[]});
     loop {
         let listing = session.run("service.layers", &params).unwrap();

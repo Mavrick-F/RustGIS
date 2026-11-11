@@ -98,7 +98,7 @@ fn run_presented(
         let r = app.run(command, p);
         return answered(app, then, r);
     }
-    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "labels.convert")
+    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "labels.convert" | "source.syncState")
         .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
         .flatten();
     let notice_mark = app.session.notice_mark();
@@ -236,7 +236,12 @@ fn not_run_asked(app: &mut RustGisApp, asked: &Asked, why: String) {
 /// Updates only this service add's pending dialog line; generic failures already have notices.
 fn service_result(app: &mut RustGisApp, asked: &Asked, result: Result<(), String>) {
     let pending = crate::serviceui::adding(&asked.what);
-    if asked.command == "service.add" && app.dialogs.open == Some("addService") && app.dialogs.info.as_deref() == Some(pending.as_str()) {
+    if asked.command == "service.add"
+        && asked.opened == app.session.opened
+        && asked.map == app.session.map().instance_id()
+        && app.dialogs.open == Some("addService")
+        && app.dialogs.info.as_deref() == Some(pending.as_str())
+    {
         app.report_step(true, Some(&pending), result.map(|()| crate::serviceui::added(&asked.what)));
     }
 }
@@ -373,7 +378,7 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
         *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(read);
     });
     if let Err(e) = spawned {
-        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles" | "service.add") {
+        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers") {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
             app.session.notify(why.clone(), true);
             not_run_asked(app, &asked, why.clone());
@@ -822,6 +827,16 @@ mod tests {
                 assert!(app.session.map().tiles.is_empty());
             }
         }
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.reads_off_frame = true;
+        crate::connectiontree::run_named(&mut app, "service.add", p.clone(), None).unwrap();
+        app.run("project.new", json!({})).unwrap();
+        crate::connectiontree::run_named(&mut app, "service.add", p, None).unwrap();
+        app.dialogs.open = Some("addService");
+        app.dialogs.info = Some(crate::serviceui::adding("good"));
+        landed(&mut app, 30);
+        assert_eq!(app.session.map().tiles.len(), 1);
+        assert_eq!(app.dialogs.info, Some(crate::serviceui::added("good")), "an old project must not replace the new add's progress line");
     }
 
     #[test]
@@ -1184,6 +1199,55 @@ mod tests {
         assert_eq!(annotation.dataset.features.len(), 2);
         let l = app.session.map().layer(id).unwrap();
         assert!(l.is_streamed() && !l.labels.enabled);
+    }
+
+    /// Source File State hashes the file on a thread of its own and says what it found once
+    /// it lands: Command Search shows no answer.
+    #[test]
+    fn a_source_file_state_check_runs_on_a_thread_and_says_what_it_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("places.geojson");
+        publish_point(&path, 1.0);
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let id = app.run("layer.addData", json!({"path": path})).unwrap()["layer"].as_u64().unwrap();
+        app.reads_off_frame = true;
+        let mark = app.session.notice_mark();
+        assert_eq!(app.run_by_user("source.syncState", json!({"layer": id})).unwrap()["started"], "Source File State");
+        landed(&mut app, 60);
+        let said: Vec<String> = app.session.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|t| t == "places is in step with places.geojson"), "{said:?}");
+    }
+
+    /// The desktop's Add Data reads a Shapefile (in a coordinate system given, as Import
+    /// Shapefile asks) and a GeoJSON with `"stream": false` on a thread of its own, recording the
+    /// file with the read.
+    #[test]
+    fn whole_files_are_read_and_recorded_on_a_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let geojson = dir.path().join("places.geojson");
+        publish_point(&geojson, 1.0);
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addData", json!({"path": geojson, "name": "seed"})).unwrap();
+        let shp = dir.path().join("towns.shp");
+        app.run("share.exportLayer", json!({"layer": "seed", "path": shp})).unwrap();
+        app.reads_off_frame = true;
+        for (p, name) in [
+            (json!({"path": shp, "crs": "EPSG:4326", "name": "towns"}), "towns"),
+            // Another system than the file's: the rows recorded are the rows as read in it.
+            (json!({"path": shp, "crs": "EPSG:3857", "name": "projected"}), "projected"),
+            (json!({"path": geojson, "stream": false, "name": "whole"}), "whole"),
+        ] {
+            assert_eq!(run(&mut app, "layer.addData", p).unwrap()["started"], "Add Data", "{name}");
+            landed(&mut app, 60);
+            let id = app.session.map().layer_by_name(name).unwrap().id;
+            assert!(app.session.map().layer(id).unwrap().synced.is_some(), "{name}");
+            if name == "projected" {
+                assert_eq!(app.session.map().layer(id).unwrap().dataset.crs, rustgis_engine::data::raster::Crs::parse("EPSG:3857").ok());
+            }
+            app.reads_off_frame = false;
+            assert_eq!(app.run("source.syncState", json!({"layer": id})).unwrap()["state"], "inSync", "{name}");
+            app.reads_off_frame = true;
+        }
     }
 
     fn reload_fixture() -> (tempfile::TempDir, RustGisApp, u32, std::path::PathBuf) {

@@ -623,7 +623,8 @@ feature of the clip, erase, overlay, update or split layer with no polygon, and 
 without geometry, a point or line in the polygon layer (as Minimum Bounding Geometry's flat hulls
 are), or an empty polygon. Clip also leaves out a mask whose polygons, unioned, have no area, and
 the others a feature of several parts that, unioned, come to nothing (Update writes it as it is),
-saying how many. When none of the features of that layer is left, Clip, Intersect and Split, whose
+saying how many. Clip also says how many input features it leaves out for having no geometry, or
+an empty one. When none of the features of that layer is left, Clip, Intersect and Split, whose
 result would be empty, stop with an error. In all of them, a feature selected twice in that layer is
 used once.
 
@@ -1438,7 +1439,8 @@ save and run models without the canvas:
 
 ## Imagery
 
-The Analyze tab's imagery groups open their tools in the Workflows pane:
+The Imagery tab's groups open their tools in the Workflows pane. The tab belongs to the Imagery
+[extension](index.md#extensions): turn it on in Plugins › Extensions to show the tab:
 
 - **Ortho Mapping** and **Reality Mapping** workspaces mosaic georeferenced images into an
   orthomosaic, or elevation rasters into a surface model that exports as a 3D mesh (OBJ).
@@ -1755,11 +1757,11 @@ the wrong field.
 
 ## Deep learning and hosted imagery
 
-**Analyze › Deep Learning Tools** trains a neural network (a multilayer perceptron) on the pixels
+**Imagery › Deep Learning Tools** trains a neural network (a multilayer perceptron) on the pixels
 under training polygons and classifies every pixel, adding a class raster with a confidence band
 and reporting the accuracy on held-back pixels. Run from its pane in the desktop app, it trains
 on every sampled pixel for all the epochs asked, however long that takes, and can be cancelled;
 elsewhere it keeps to a few seconds of work (see the limits above). Trained models stay in the project; **Publish ›
-Share As › Deep Learning** saves one as a package to apply in other projects. **Analyze › Create
+Share As › Deep Learning** saves one as a package to apply in other projects. **Imagery › Create
 Hosted Imagery** cuts a raster into XYZ web map tiles (PNG, transparent outside the raster) with
 a TileJSON file and a viewer page.

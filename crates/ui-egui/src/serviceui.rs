@@ -100,6 +100,7 @@ pub(crate) fn reading_tileset(name: &str) -> String {
 }
 
 /// The line a queued add owns until it succeeds, fails or is cancelled.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn adding(name: &str) -> String {
     i18n::fmt("Adding {name}…", &[("name", name)])
 }

@@ -788,25 +788,35 @@ pub fn service_json(svc: &Service) -> Value {
     json!({"kind": svc.kind, "title": svc.title, "count": layers.len(), "layers": layers, "notes": notes})
 }
 
-/// A prepared supplied-document discovery and any loss notice emitted before an error.
+/// A prepared discovery, ordinary notices and counted losses that must survive rollback.
 #[cfg(not(target_arch = "wasm32"))]
-type DiscoveryRead = (Result<Discovery, String>, Vec<crate::Notice>);
+type DiscoveryRead = (Result<Discovery, String>, Vec<crate::Notice>, Vec<crate::LossNotice>);
 
-/// Prepares only supplied-document parsing. Login binding happens on the initiating session;
-/// the worker replays those exact documents without another login lookup or network fetch.
+/// Holds the worker's counted losses in their structured channel until the admitted command
+/// lands. Replaying them as ordinary notices would withdraw them on a mutating error.
+#[cfg(not(target_arch = "wasm32"))]
+fn discovery_read(read: impl FnOnce(&mut Session) -> Result<Discovery, String>) -> DiscoveryRead {
+    let mut copy = Session::new(crate::Project::default());
+    let mut result = Err("service discovery did not run".into());
+    let mut losses = Vec::new();
+    let guard = copy.guarded("Discover Service", false, |s| {
+        result = read(s);
+        losses = std::mem::take(&mut s.loss_notices);
+        Ok(Value::Null)
+    });
+    (guard.and(result), copy.notices, losses)
+}
+
+/// Binds the initiating login before bounded discovery runs on the worker. Supplied documents
+/// keep their incremental replay; URL-only listings fetch their documents on that worker.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn listing_ahead(s: &mut Session, p: &Value) -> Result<Option<super::reads::ReadWork>, String> {
-    if ps(p, "text").is_none() {
-        return Ok(None);
-    }
     let owned = without_token(p)?;
     let p = owned.as_ref().unwrap_or(p);
     let p = crate::service_logins::request_params(s, p)?.into_owned();
     let words = filter_words(&p)?;
     Ok(Some(super::reads::ahead("List Service Layers", "service.layers".into(), move || {
-        let mut copy = Session::new(crate::Project::default());
-        let result = discover_matching(&mut copy, &p, false, &words, None);
-        (result, copy.notices)
+        discovery_read(|s| discover_matching(s, &p, false, &words, None))
     })))
 }
 
@@ -821,17 +831,18 @@ pub(crate) fn adding_ahead(s: &mut Session, p: &Value) -> Result<Option<super::r
     let p = owned.as_ref().unwrap_or(p);
     let p = crate::service_logins::request_params(s, p)?.into_owned();
     Ok(Some(super::reads::ahead("Add Service Layer", "service.add".into(), move || {
-        let mut copy = Session::new(crate::Project::default());
         let explicit_map = ps(&p, "tiles").filter(|_| ps(&p, "layer").map(str::trim) == Some("map")).map(|t| (t, ps(&p, "source_url")));
-        let result = discover(&mut copy, &p, false, explicit_map);
-        (result, copy.notices)
+        discovery_read(|s| discover(s, &p, false, explicit_map))
     })))
 }
 
 /// Takes only this command's admitted discovery and forwards its error-path notices.
 #[cfg(not(target_arch = "wasm32"))]
 fn prepared_discovery(s: &mut Session, command: &str) -> Option<Result<Discovery, String>> {
-    super::reads::take::<DiscoveryRead>(s, command).map(|(result, notices)| {
+    super::reads::take::<DiscoveryRead>(s, command).map(|(result, notices, losses)| {
+        for loss in losses {
+            s.notify_loss(loss.template, loss.count);
+        }
         for notice in notices {
             s.notify(notice.text, notice.error);
         }

@@ -6,6 +6,7 @@
 //! the labels too, for export and the command line.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod cancel;
 mod canvas;
 mod diagrams;
 mod effects;
@@ -593,7 +594,8 @@ pub fn viewing_distance(ground_res: f64, view_height: f64) -> f64 {
 }
 
 /// The built-in world outline used by every basemap (Natural Earth 1:110m, public domain), in the
-/// current worldview.
+/// current worldview (the renderer reads the worldview once a frame and calls `world_of`).
+#[cfg(test)]
 fn world() -> &'static Vec<Geometry> {
     world_of(sample_data::view())
 }
@@ -616,10 +618,120 @@ fn world_of(wv: sample_data::View) -> &'static Vec<Geometry> {
 /// time (the desktop app does it on the download's thread), so none of it is done on the UI
 /// thread when the view is shown. A map in another projection still projects the outline once,
 /// on the first frame drawn in it.
+///
+/// A detailed outline's levels of detail are built here too, eagerly: a flat map shown at any zoom
+/// then finds its level ready, never building one on the UI thread. They are independent, so they
+/// are built on several threads (the user's thread setting, [`rustgis_data::threads::max`]; one in
+/// the browser), about 280 ms and 15 MB on one thread for a 1:10m worldview.
 pub fn prepare_world(v: sample_data::View) {
     let _ = sample_data::dataset(v);
     let _ = world_of(v);
     let _ = world_lonlat_of(v);
+    // An outline small enough to draw whole has no levels: no threads for it.
+    if outline_level(v, 0).is_none() {
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let level = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if level > OUTLINE_LEVELS {
+                break;
+            }
+            let _ = outline_level(v, level);
+        }
+    };
+    let threads = if cfg!(target_arch = "wasm32") { 1 } else { rustgis_data::threads::max().min(OUTLINE_LEVELS + 1) };
+    std::thread::scope(|scope| {
+        // A thread the system refuses costs speed: the others, and this one, build its levels.
+        for _ in 1..threads {
+            let _ = std::thread::Builder::new().name("rustgis-outline-levels".into()).spawn_scoped(scope, work);
+        }
+        work();
+    });
+}
+
+/// How many simplified levels a detailed world outline has, after its full-detail one (level 0):
+/// level `k` is simplified to `2^(OUTLINE_FINEST + k - 1)` metres.
+const OUTLINE_LEVELS: usize = 7;
+
+/// The tolerance (log2 metres) of the finest simplified outline level: 512 m, a device pixel at
+/// regional zoom. Finer levels would keep most of a 1:10m outline's vertices for their memory;
+/// zoomed in further the outline is drawn at full detail, only its parts in view.
+const OUTLINE_FINEST: i32 = 9;
+
+/// A world outline with more vertices than this is drawn from levels of detail, part by part
+/// (#1750); a smaller one (the built-in 1:110m countries, every simplified worldview) is drawn
+/// whole, as it is.
+const OUTLINE_LEVELS_ABOVE: usize = rustgis_map::lod::THIN_ABOVE;
+
+/// One country of a world outline level: its extent, each part's, and its parts simplified
+/// (`None` at full detail, drawn from the outline itself).
+struct OutlineCountry {
+    index: usize,
+    extent: Extent,
+    parts: Vec<Extent>,
+    simplified: Option<Vec<Vec<Vec<Coord>>>>,
+}
+
+/// A detailed world outline at one level of detail: level 0 is full detail, level `k` is
+/// simplified with Douglas–Peucker to `2^(OUTLINE_FINEST + k - 1)` metres. `None` for an outline
+/// small enough to draw whole (or not at hand). Each level is built once per view, on first use;
+/// the desktop app builds them all on the download's thread ([`prepare_world`]).
+fn outline_level(wv: sample_data::View, level: usize) -> Option<&'static [OutlineCountry]> {
+    type Levels = [OnceLock<Vec<OutlineCountry>>; OUTLINE_LEVELS + 1];
+    static L: [Levels; sample_data::VIEW_COUNT] = [const { [const { OnceLock::new() }; OUTLINE_LEVELS + 1] }; sample_data::VIEW_COUNT];
+    static BIG: [OnceLock<bool>; sample_data::VIEW_COUNT] = [const { OnceLock::new() }; sample_data::VIEW_COUNT];
+    let world = world_of(wv);
+    if world.is_empty() {
+        return None;
+    }
+    let big = BIG.get(wv.index())?;
+    if !*big.get_or_init(|| world.iter().map(rustgis_map::lod::vertices).sum::<usize>() > OUTLINE_LEVELS_ABOVE) {
+        return None;
+    }
+    let cell = L.get(wv.index())?.get(level)?;
+    let tol = (level > 0).then(|| 2f64.powi(OUTLINE_FINEST + level as i32 - 1));
+    Some(cell.get_or_init(|| {
+        world
+            .iter()
+            .enumerate()
+            .filter_map(|(index, g)| {
+                let simplified = match tol {
+                    Some(t) => match rustgis_map::lod::simplify(g, t) {
+                        Geometry::Polygon(p) => Some(p),
+                        _ => return None,
+                    },
+                    None => None,
+                };
+                let polys = match (&simplified, g) {
+                    (Some(p), _) => p,
+                    (None, Geometry::Polygon(p)) => p,
+                    _ => return None,
+                };
+                // A part's outer ring bounds it.
+                let parts: Vec<Extent> = polys
+                    .iter()
+                    .map(|rings| {
+                        let mut e = Extent::EMPTY;
+                        rings.first().into_iter().flatten().filter(|c| c.is_finite()).for_each(|c| e.expand(*c));
+                        e
+                    })
+                    .collect();
+                let extent = parts.iter().fold(Extent::EMPTY, |e, p| e.union(p));
+                Some(OutlineCountry { index, extent, parts, simplified })
+            })
+            .collect()
+    }))
+}
+
+/// The level of a detailed world outline to draw at `map_per_px` metres a device pixel: the most
+/// simplified one whose tolerance is within [`rustgis_map::lod::THIN_PX`] device pixels.
+fn outline_level_for(map_per_px: f64) -> usize {
+    match rustgis_map::lod::level(map_per_px * rustgis_map::lod::THIN_PX) {
+        Some(l) if l >= OUTLINE_FINEST => ((l - OUTLINE_FINEST + 1) as usize).min(OUTLINE_LEVELS),
+        _ => 0,
+    }
 }
 
 /// The built-in world outline in longitude/latitude, for the globe.
@@ -1979,6 +2091,10 @@ fn render_with_backend(map: &mut Map, view: &View, full_res_rasters: bool, backe
 fn render_any(map: &mut Map, view: &View, full_res_rasters: bool, backend: Backend, record: bool) -> Option<RenderOutput> {
     let revisions = archive_revisions([&*map]);
     let output = render_pass(map, view, full_res_rasters, backend, record);
+    // A frame stopped part-way (see `cancel`) is no frame.
+    if cancel::requested() {
+        return None;
+    }
     revisions.current([&*map]).then_some(output).flatten()
 }
 
@@ -2351,6 +2467,11 @@ fn render_tilted(map: &mut Map, view: &View, full_res_rasters: bool, sources_rea
     let (mut attribution, mut tiles_pending, mut tile_errors) = (Vec::<String>::new(), false, Vec::<String>::new());
     let (mut partial, mut pending_in_place) = (Vec::<u32>::new(), Vec::<u32>::new());
     for (i, b) in bands_of.into_iter().enumerate() {
+        // A stopped frame (see `cancel`) draws no further band, nor its drape or warp.
+        if cancel::requested() {
+            map.label_lock = lock;
+            return None;
+        }
         let v = band_view(view, &b);
         let Some(RenderOutput::Cpu(r)) =
             render_frame(map, &v, full_res_rasters, Backend::Cpu, Labels::Tilted(view, &mut candidates), false)
@@ -2406,6 +2527,10 @@ fn render_tilted(map: &mut Map, view: &View, full_res_rasters: bool, sources_rea
         }
     }
     map.label_lock = lock;
+    // A frame stopped during its last band goes no further (see `cancel`).
+    if cancel::requested() {
+        return None;
+    }
     match &ground {
         Some(g) => {
             drape_terrain(pm.pixels(), view, map, &kept, g);
@@ -2630,10 +2755,19 @@ fn gpu_turned(map: &mut Map, view: &View, full_res_rasters: bool, sources_ready:
     let mut plain = true;
     let last = bands.len().saturating_sub(1);
     for (i, b) in bands.iter().enumerate() {
+        // A stopped frame (see `cancel`) draws no further band, nor falls back to the CPU.
+        if cancel::requested() {
+            map.label_lock = lock;
+            return None;
+        }
         let v = band_view(view, b);
         let Some(RenderOutput::Gpu(scene)) =
             render_frame(map, &v, full_res_rasters, Backend::Gpu, Labels::Tilted(view, &mut candidates), false)
         else {
+            if cancel::requested() {
+                map.label_lock = lock;
+                return None;
+            }
             plain = false;
             break;
         };
@@ -2689,6 +2823,10 @@ fn gpu_turned(map: &mut Map, view: &View, full_res_rasters: bool, sources_ready:
         cmds.extend(scene.cmds);
     }
     map.label_lock = lock;
+    // A frame stopped during its last band goes no further (see `cancel`).
+    if cancel::requested() {
+        return None;
+    }
     if !plain {
         return None;
     }
@@ -3598,12 +3736,51 @@ fn render_frame(
     if map.draws_world_outline() {
         let fill = paint(land, 1.0);
         let stroke = (outline.a() > 0).then(|| (paint(outline, 1.0), 0.6));
+        // The worldview read once: the outline and its level must be of the same one, though
+        // another thread may switch it mid-frame.
+        let worldview = sample_data::view();
         let custom_world = custom.then(|| world_in(&flat, &key));
         let outlines: &Vec<Geometry> = match (&globe, &custom_world) {
             (Some(_), _) => world_lonlat(),
             (None, Some(w)) => w,
-            (None, None) => world(),
+            (None, None) => world_of(worldview),
         };
+        // A detailed outline on the flat map is drawn at the level of detail for the zoom, and
+        // only its parts in view (#1750).
+        // An outline not at hand yet (`world_of` said so) isn't looked up again.
+        let levelled =
+            (globe.is_none() && !custom && !outlines.is_empty()).then(|| outline_level(worldview, outline_level_for(map_per_px))).flatten();
+        for c in levelled.unwrap_or_default() {
+            if !visible(&c.extent) {
+                continue;
+            }
+            let polys: &[Vec<Vec<Coord>>] = match (&c.simplified, outlines.get(c.index)) {
+                (Some(p), _) => p,
+                (None, Some(Geometry::Polygon(p))) => p,
+                _ => continue,
+            };
+            // The GPU backend tessellates a country in view whole (its mesh moves with the camera,
+            // `GPU_CULL_MARGIN`): the level's fewer vertices help it, the per-part culling doesn't.
+            if gpu {
+                flush_acc(pm.pixels(), &mut cmds, &mut cpu_dirty)?;
+                if mesh::collect_basemap(&mut cmds, polys, &c.extent, land, outline, ctx.ppp, map_per_px).is_ok() {
+                    continue;
+                }
+                // Lyon refused, or it's too large for f32 this far in: tiny-skia still draws it.
+                cpu_dirty = true;
+            }
+            // A country whose parts are all in view is one path; otherwise only those in view are drawn.
+            if c.parts.iter().all(&visible) {
+                ctx.polygon(&mut pm, polys, Some(fill.clone()), stroke.clone());
+                continue;
+            }
+            for (part, e) in polys.iter().zip(&c.parts) {
+                if visible(e) {
+                    ctx.polygon(&mut pm, std::slice::from_ref(part), Some(fill.clone()), stroke.clone());
+                }
+            }
+        }
+        let outlines: &[Geometry] = if levelled.is_some() { &[] } else { outlines };
         for g in outlines {
             if let Geometry::Polygon(polys) = g
                 && visible(&g.extent())
@@ -3776,6 +3953,10 @@ fn render_frame(
     // The layer drawn last, whose tile layers go over it before the next.
     let mut below: Option<u32> = None;
     for li in order {
+        // A frame no longer wanted stops between layers (see `cancel`).
+        if cancel::requested() {
+            break;
+        }
         if let Some(id) = below.take() {
             draw_tiles!(Some(id));
         }
@@ -3951,6 +4132,10 @@ fn render_frame(
         // polygons.
         let mut extruded_charts: Option<Canvas> = None;
         let mut draw_chunk = |layer: &mut rustgis_map::Layer| -> rustgis_data::Result<()> {
+            // A stopped frame draws no more of a layer or a streamed chunk (see `cancel`).
+            if cancel::requested() {
+                return Ok(());
+            }
             // The definition query and the display filters that apply at this scale (a feature draws
             // only if it matches all of them).
             let mut rows = layer.drawn_rows(scale);
@@ -4166,8 +4351,20 @@ fn render_frame(
                     // Polygons with stacked fills (patterns) draw them in place of their single fill.
                     let has_fills = layer.has_fills();
                     let mut stacked: Vec<(&[Vec<Coord>], Symbol, &[LineStroke])> = Vec::new();
+                    // Vertices drawn since the stop was last looked at (see `cancel`).
+                    let mut since_look = 0usize;
                     for (row, g) in drawn.iter().enumerate() {
+                        // And every few thousand features, or vertices, of a large layer.
+                        if (row % cancel::EVERY == 0 && row > 0 || since_look >= cancel::EVERY_VERTICES) && cancel::requested() {
+                            break;
+                        }
+                        if since_look >= cancel::EVERY_VERTICES {
+                            since_look = 0;
+                        }
+                        #[cfg(test)]
+                        cancel::DRAWN.set(cancel::DRAWN.get() + 1);
                         let Some(g) = g else { continue };
+                        since_look += rustgis_map::lod::vertices(g);
                         let e = extents.get(row).copied().unwrap_or_else(|| g.extent());
                         // A point's marks, shifted from it, may show while the point is off the view.
                         let marked_in = || {
@@ -4364,6 +4561,10 @@ fn render_frame(
             } else {
                 Vec::new()
             };
+            // A stopped frame places no labels for the rest of the layer (see `cancel`).
+            if cancel::requested() {
+                return Ok(());
+            }
             if label_fields.iter().any(Option::is_some) {
                 let label_factor = layer.size_factor(label_scale);
                 // Each class's font, where it is installed. An export (`full_res_rasters`: see
@@ -4537,6 +4738,9 @@ fn render_frame(
                                 (line.clone(), None)
                             };
                             let overrun = size;
+                            // Off the line by its class's distance (#1187): above it as the text
+                            // reads, or below; its anchors stay on the line.
+                            let off = line_labels::off_line(class.line_offset * 1.33 * label_factor, text::block_height(&text, size));
                             let positions = |width| match locked_at {
                                 Some(at) => {
                                     let won = lock.as_ref().and_then(|keys| keys.get(&key)).map_or(0, |won| won.place);
@@ -4575,6 +4779,13 @@ fn render_frame(
                                     line_places = Some(LinePlaces { anchors: anchors(&positions), ..Default::default() });
                                     let Some((cx, cy)) = line.anchor(locked_at.unwrap_or(line.length() / 2.0)) else { continue };
                                     let angle = line.parallel(width, overrun, locked_at).map(|(_, _, a)| a);
+                                    // Off the line as its curves will be (by the line's direction
+                                    // where the text can't fit, as a tilted view's preview is).
+                                    let (cx, cy) =
+                                        angle.or_else(|| line.direction(locked_at.unwrap_or(line.length() / 2.0))).map_or((cx, cy), |a| {
+                                            let (x, y, _) = line_labels::parallel_off((cx, cy, a), off);
+                                            (x, y)
+                                        });
                                     // The preview is also View Unplaced's middle when every curve fails.
                                     places.push((0, cx, cy, angle, Vec::new()));
                                     let locked = lock.as_ref().and_then(|k| k.get(&key)).map(|won| usize::from(won.place));
@@ -4585,13 +4796,17 @@ fn render_frame(
                                             advances,
                                             gap: spacing * 1.33,
                                             overrun,
+                                            off,
                                         }),
                                         positions,
                                         locked,
                                     ));
                                 } else {
                                     for (i, at) in line_labels::repeats(line.length(), repeat) {
-                                        let Some(((cx, cy), turns)) = line.curved(&advances, spacing * 1.33, overrun, Some(at)) else {
+                                        let Some(((cx, cy), turns)) = line
+                                            .curved(&advances, spacing * 1.33, overrun, Some(at))
+                                            .and_then(|c| line_labels::curved_off(c, off))
+                                        else {
                                             continue;
                                         };
                                         let glyphs = chars
@@ -4616,7 +4831,9 @@ fn render_frame(
                                 // range: if the middle cannot fit, none can. Keep it as place 0
                                 // so a lock's alternative indices do not change.
                                 for (i, at) in along {
-                                    if let Some((x, y, angle)) = line.parallel(width, overrun, Some(at)) {
+                                    if let Some((x, y, angle)) =
+                                        line.parallel(width, overrun, Some(at)).map(|p| line_labels::parallel_off(p, off))
+                                    {
                                         if try_others && i > 0 {
                                             line_alternatives.push(LabelPlace { x, y, angle: Some(angle), glyphs: Vec::new() });
                                         } else {
@@ -4751,6 +4968,10 @@ fn render_frame(
             // All coordinates are read here: filtering only to the viewport can change labels,
             // shadows and screen-space effects whose geometry lies beyond its boundary.
             let result = visit_complete(source.as_ref(), &mut |features| {
+                // A frame no longer wanted reads no further (see `cancel`).
+                if cancel::requested() {
+                    return Err(rustgis_data::DataError::Cancelled);
+                }
                 chunk.clear_cache();
                 chunk.selection =
                     features.iter().enumerate().filter_map(|(r, f)| selected_order.contains_key(&f.id).then_some(r)).collect();
@@ -4762,6 +4983,10 @@ fn render_frame(
                 Ok(())
             });
             if let Err(e) = result {
+                // Stopped, not failed: the source is fine.
+                if cancel::requested() {
+                    return None;
+                }
                 if let Some(s) = &mut layer.source {
                     s.error = Some(e.to_string());
                 }
@@ -4803,6 +5028,11 @@ fn render_frame(
             ctx.highlight(&mut pm, &geometry, &symbol, &strokes, turn);
             cpu_dirty = true;
         }
+    }
+    // A frame stopped part-way (see `cancel`) is no frame: its tiles, labels and effects aren't
+    // worth working out.
+    if cancel::requested() {
+        return None;
     }
     if let Some(id) = below {
         draw_tiles!(Some(id));
@@ -6954,6 +7184,82 @@ mod tests {
         let default_original = View::new(Worldview::DEFAULT, Detail::Original);
         install(default_original, sample_data::COUNTRIES.to_string()).unwrap();
         assert_eq!(sample_data::view(), View::DEFAULT);
+    }
+
+    /// A detailed world outline is drawn from Douglas–Peucker levels, part by part (#1750); the
+    /// built-in one, small enough to draw whole, isn't.
+    #[test]
+    fn a_detailed_world_outline_has_levels_of_detail() {
+        use sample_data::{Detail, View, Worldview, install};
+        assert!(outline_level(View::DEFAULT, 0).is_none());
+        // The built-in countries with 24 vertices along each edge: the same borders, over the
+        // vertex count that calls for levels. Vietnam's view, which no other test uses.
+        let mut dense: serde_json::Value = serde_json::from_str(sample_data::COUNTRIES).unwrap();
+        let densify = |ring: &mut serde_json::Value| {
+            let pts: Vec<(f64, f64)> = ring.as_array().unwrap().iter().map(|p| (p[0].as_f64().unwrap(), p[1].as_f64().unwrap())).collect();
+            let mut out = Vec::new();
+            for w in pts.windows(2) {
+                for k in 0..24 {
+                    let t = k as f64 / 24.0;
+                    out.push(serde_json::json!([w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t]));
+                }
+            }
+            out.push(serde_json::json!([pts.last().unwrap().0, pts.last().unwrap().1]));
+            *ring = serde_json::Value::Array(out);
+        };
+        for f in dense["features"].as_array_mut().unwrap() {
+            let g = &mut f["geometry"];
+            let polys = if g["type"] == "Polygon" {
+                vec![&mut g["coordinates"]]
+            } else {
+                g["coordinates"].as_array_mut().unwrap().iter_mut().collect()
+            };
+            for rings in polys {
+                rings.as_array_mut().unwrap().iter_mut().for_each(densify);
+            }
+        }
+        let v = View::new(Worldview::from_code("vnm").unwrap(), Detail::Original);
+        install(v, dense.to_string()).unwrap();
+        let full: usize = world_of(v).iter().map(rustgis_map::lod::vertices).sum();
+        assert!(full > OUTLINE_LEVELS_ABOVE, "{full}");
+        let built_in: usize = world_of(View::DEFAULT).iter().map(rustgis_map::lod::vertices).sum();
+        let count = |l: &[OutlineCountry]| l.iter().flat_map(|c| c.simplified.iter().flatten().flatten()).map(Vec::len).sum::<usize>();
+        // Full detail keeps the outline's own geometry, with an extent for each part.
+        let level0 = outline_level(v, 0).unwrap();
+        assert!(level0.iter().all(|c| c.simplified.is_none() && !c.parts.is_empty() && !c.extent.is_empty()));
+        assert_eq!(
+            level0.iter().map(|c| c.parts.len()).sum::<usize>(),
+            world_of(v)
+                .iter()
+                .map(|g| match g {
+                    Geometry::Polygon(p) => p.len(),
+                    _ => 0,
+                })
+                .sum::<usize>()
+        );
+        // The straight runs (in degrees; a little curved in Mercator) go at the finest level, and
+        // each level keeps at most the one finer.
+        let mut last = full;
+        for level in 1..=OUTLINE_LEVELS {
+            let n = count(outline_level(v, level).unwrap());
+            assert!(n <= built_in * 11 / 10 && n <= last, "level {level}: {n} vertices of {full}");
+            last = n;
+        }
+        assert!(last * 30 < full && last < built_in, "{last} of {full}");
+        // Each part's extent is still its own: a simplified ring keeps its extreme vertices.
+        for level in 1..=OUTLINE_LEVELS {
+            for (c, f) in outline_level(v, level).unwrap().iter().zip(level0) {
+                assert_eq!(c.index, f.index);
+                assert_eq!(c.parts, f.parts, "level {level}");
+            }
+        }
+        // The level for a zoom: within a device pixel, full detail zoomed in, the coarsest out.
+        assert_eq!(outline_level_for(100.0), 0);
+        assert_eq!(outline_level_for(f64::NAN), 0);
+        assert_eq!(outline_level_for(512.0), 1);
+        assert_eq!(outline_level_for(1000.0), 1);
+        assert_eq!(outline_level_for(1024.0), 2);
+        assert_eq!(outline_level_for(1e9), OUTLINE_LEVELS);
     }
 
     #[test]
@@ -10522,6 +10828,59 @@ mod tests {
         m.layer_mut(line).unwrap().labels.default.placement = rustgis_map::LabelPlacement::Curved;
         let r = render(&mut m, &view).unwrap();
         assert!(r.labels.iter().any(|l| l.text == "Obere Töss" && !l.glyphs.is_empty()), "curved in one line");
+    }
+
+    /// A distance from the line sets a line's label above it or below it, to the text's nearest
+    /// edge, straight or curved; 0 leaves it on the line and a point's label isn't moved (#1187).
+    #[test]
+    fn a_distance_sets_a_line_label_above_or_below_its_line() {
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("towns", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        d.push(Some(Geometry::Point(Coord::new(0.0, -0.5))), vec![Value::Text("Winterthur".into())]);
+        let id = m.add_dataset(d);
+        let mut d = Dataset::new("rivers", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        d.push(Some(Geometry::Line(vec![vec![Coord::new(-1.0, 0.5), Coord::new(1.0, 0.5)]])), vec![Value::Text("Töss".into())]);
+        let line = m.add_dataset(d);
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        m.camera = camera;
+        let view = View { width: 400.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+        for (layer, placement) in [(id, rustgis_map::LabelPlacement::Right), (line, rustgis_map::LabelPlacement::Parallel)] {
+            let l = m.layer_mut(layer).unwrap();
+            l.labels.enabled = true;
+            l.labels.default.field = "name".into();
+            l.labels.default.placement = placement;
+        }
+        let at = |m: &mut Map| {
+            let r = render(m, &view).unwrap();
+            let find = |t: &str| r.labels.iter().find(|l| l.text == t).map(|l| (l.x, l.y, l.size)).unwrap();
+            (find("Winterthur"), find("Töss"))
+        };
+        let (town, on) = at(&mut m);
+        for layer in [id, line] {
+            m.layer_mut(layer).unwrap().labels.default.line_offset = 4.0;
+        }
+        let (town2, above) = at(&mut m);
+        assert_eq!(town, town2, "a point's label isn't moved");
+        // Points × 1.33, as the text's size, to the text's nearest edge: half its height more.
+        let gap = 4.0 * 1.33 + text::block_height("Töss", on.2) / 2.0;
+        assert!((above.0 - on.0).abs() < 0.01 && (on.1 - above.1 - gap).abs() < 0.01, "{on:?} → {above:?}");
+        m.layer_mut(line).unwrap().labels.default.line_offset = -4.0;
+        let (_, below) = at(&mut m);
+        assert!((below.1 - on.1 - gap).abs() < 0.01, "{on:?} → {below:?}");
+        m.layer_mut(line).unwrap().labels.default.line_offset = 0.0;
+        assert_eq!(at(&mut m).1, on, "0 is on the line, as before");
+        // Curved, its characters go with it.
+        m.layer_mut(line).unwrap().labels.default.placement = rustgis_map::LabelPlacement::Curved;
+        let curved = |m: &mut Map| {
+            let r = render(m, &view).unwrap();
+            let l = r.labels.iter().find(|l| l.text == "Töss").unwrap();
+            assert!(!l.glyphs.is_empty(), "curved");
+            l.glyphs.iter().map(|g| l.y + g.dy).sum::<f32>() / l.glyphs.len() as f32
+        };
+        let on = curved(&mut m);
+        m.layer_mut(line).unwrap().labels.default.line_offset = 4.0;
+        assert!((on - curved(&mut m) - gap).abs() < 0.05, "above, curved");
     }
 
     #[test]

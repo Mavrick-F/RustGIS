@@ -779,6 +779,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.stac.usgsLidar", "USGS LiDAR…", "Home › Add › Web Data › United States"),
     ("ui.pane.sources", "Data Sources", "Home › Add"),
     ("ui.plugins", "Plugin Manager…", "Plugins"),
+    ("ui.extensions", "Extensions…", "Plugins › Extensions"),
     ("ui.mcpRelay", "MCP Relay", "Help › Help"),
     ("ui.pane.geoprocessing", "Tools Pane", "View › Windows"),
     ("ui.pane.symbology", "Symbology Pane", "Style › Drawing"),
@@ -1046,7 +1047,8 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
         // Workflow titles are searchable even when they differ from the engine command's label.
         // A command with the same title that routes to the workflow is listed instead, if it matches.
         if !ql.is_empty() {
-            for &(section, label) in crate::analysispane::SECTIONS {
+            for &(section, label) in crate::analysispane::SECTIONS.iter().filter(|s| crate::analysispane::section_shown(&app.session, s.0))
+            {
                 if (label.to_lowercase().contains(&ql) || section.to_lowercase().contains(&ql) || tl!(label).to_lowercase().contains(&ql))
                     && !app.session.registry.commands.iter().any(|c| {
                         c.label == label
@@ -1059,7 +1061,11 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         for c in &app.session.registry.commands {
-            if command_available(c.id, cfg!(target_arch = "wasm32")) && command_matches(c, &ql) {
+            // A command of an extension that is off isn't offered (#1752).
+            if command_available(c.id, cfg!(target_arch = "wasm32"))
+                && app.session.extensions().blocks(c.id).is_none()
+                && command_matches(c, &ql)
+            {
                 hits.push((c.id.to_string(), tl!(c.label).to_string(), crate::i18n::location(c.location)));
             }
         }
@@ -1325,19 +1331,23 @@ fn notice_hover(notice: &rustgis_engine::Notice) -> String {
     crate::i18n::fmt("{message}\n{open}", &[("message", &message), ("open", tl_raw!("Open Messages"))])
 }
 
+/// Makes a toast for each notice the session still holds that was given since the last call.
+/// Counted by the session's notice mark, not by its list, which keeps only the last 200 notices
+/// and so stops growing (#1755); more than 200 between two frames toast only the 200 kept.
+fn toast_new_notices(app: &mut RustGisApp, now: f64) {
+    for n in app.session.notices_since(app.map.notices_seen) {
+        app.map.toasts_made += 1;
+        app.map.toasts.push(Toast { text: notice_text(n), error: n.error, at: now, id: app.map.toasts_made });
+    }
+    app.map.notices_seen = app.session.notice_mark();
+}
+
 /// Toasts for recent notices (errors stay longer, and any stays while the pointer is on it, so
 /// its text can be selected and copied).
 pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
     let t = Tokens::get(ctx);
     let now = ctx.input(|i| i.time);
-    let total = app.session.notices.len();
-    if total > app.map.notices_seen {
-        for n in app.session.notices.iter().skip(app.map.notices_seen) {
-            app.map.toasts_made += 1;
-            app.map.toasts.push(Toast { text: notice_text(n), error: n.error, at: now, id: app.map.toasts_made });
-        }
-        app.map.notices_seen = total;
-    }
+    toast_new_notices(app, now);
     app.map.toasts.retain(|toast| now - toast.at < if toast.error { 6.0 } else { 3.0 });
     if app.map.toasts.is_empty() {
         return;
@@ -1377,6 +1387,30 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Past the 200 notices the session keeps, each new notice it holds still makes one toast (#1755).
+    #[test]
+    fn each_kept_notice_makes_one_toast_past_the_200th() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        toast_new_notices(&mut app, 0.0);
+        app.map.toasts.clear();
+        for i in 0..205 {
+            app.session.notify(format!("notice {i}"), false);
+            toast_new_notices(&mut app, 0.0);
+            toast_new_notices(&mut app, 0.0);
+            let texts: Vec<&str> = app.map.toasts.iter().map(|t| t.text.as_str()).collect();
+            assert_eq!(texts, [format!("notice {i}")], "notice {i} is toasted once");
+            app.map.toasts.clear();
+        }
+        // Several notices between two frames each make their toast, in order.
+        for i in 0..3 {
+            app.session.notify(format!("batch {i}"), true);
+        }
+        toast_new_notices(&mut app, 0.0);
+        let texts: Vec<&str> = app.map.toasts.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, ["batch 0", "batch 1", "batch 2"]);
+        assert!(app.map.toasts.iter().all(|t| t.error));
+    }
 
     #[test]
     fn desktop_only_search_actions_are_disabled_only_on_the_web() {
