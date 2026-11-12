@@ -541,7 +541,7 @@ they use the projected system the layer was read in, as Kernel Density does, and
 it; a layer read in longitude and latitude gives a raster in degrees, with all three in degrees.
 `crs: "EPSG:4326"` makes it in degrees whatever the layer was read in, as these tools always did
 before `crs` was there; so does a layer read in a system that can't hold a raster's cells (a
-geocentric one), with a notice. Another geographic `crs` is refused, and points the system can't
+geocentric one) or that this version can't project to, with a notice saying which. Another geographic `crs` is refused, and points the system can't
 hold are left out and counted.
 
 **Ordinary Kriging** (`kriging`) estimates both a value and its uncertainty. Set `input` and a
