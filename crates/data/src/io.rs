@@ -2567,13 +2567,16 @@ pub fn utc_dates_note(fields: &[Field], counts: &[usize], target: &str) -> Optio
     ))
 }
 
-/// Counts, for each date field, the text values in it that aren't dates, which a GeoPackage
-/// export writes as they are and a read gives back as null.
+/// Counts, for each date field, the values in it that a GeoPackage export writes in a form a read
+/// gives back as null: text that isn't a date, and a date-time with a time or zone in a date
+/// field.
 pub fn text_in_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, fields: &[Field]) -> Vec<usize> {
     let mut counts = vec![0usize; fields.len()];
     for f in features {
         for ((n, field), v) in counts.iter_mut().zip(fields).zip(&f.attrs) {
-            if field.ty.is_temporal() && matches!(v, Value::Text(t) if !v.asks_null() && Value::parse_stored(t, field.ty).is_null()) {
+            let text = matches!(v, Value::Text(t) if !v.asks_null() && Value::parse_stored(t, field.ty).is_null());
+            let moment = field.ty == FieldType::Date && matches!(v, Value::DateTime(t) if !t.is_date());
+            if field.ty.is_temporal() && (text || moment) {
                 *n += 1;
             }
         }

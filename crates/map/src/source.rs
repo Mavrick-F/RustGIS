@@ -686,9 +686,10 @@ impl SourceLayer {
     /// What view reads found of values in date fields that weren't dates
     /// ([`rustgis_data::source::unread_dates_note`]), once for the source.
     pub fn take_unread_dates(&mut self) -> Option<String> {
+        let fields = self.info()?.fields.clone();
         let counts = self.unread_dates.take()?;
         self.unread_dates_said = true;
-        rustgis_data::source::unread_dates_note(&self.info()?.fields, &counts)
+        rustgis_data::source::unread_dates_note(&fields, &counts)
     }
 
     /// Whether another installed window needs its retained display expressions checked.
