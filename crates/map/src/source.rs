@@ -1239,6 +1239,9 @@ impl SourceLayer {
         self.pending = None;
         self.error = None;
         self.login = false;
+        // A new opening may hold other values: what was said of the last one doesn't hold.
+        self.unread_dates = None;
+        self.unread_dates_said = false;
         self.reset();
         self.open()
     }

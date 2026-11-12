@@ -448,10 +448,15 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     if designed {
         return Err(format!("'{name}' has a domain, subtypes or contingent values, which hold text: remove them first"));
     }
-    // Saving to the GeoPackage writes values, not column types: its column would stay text.
+    // Saving edits writes values, not column types: the table's column would stay text.
     if l.gpkg.is_some() {
         return Err(format!(
             "'{name}' is a text column of the GeoPackage table being edited, and saving can't change a column's type: export the layer, or convert it in the file"
+        ));
+    }
+    if l.postgis.is_some() {
+        return Err(format!(
+            "'{name}' is a text column of the PostGIS table being edited, and saving can't change a column's type: change it in the database"
         ));
     }
     // A filter that compares the text with a number stops reading once it's a date.
@@ -471,8 +476,13 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     if l.renderer.expression().is_some_and(|e| !reads(e)) {
         return Err(format!("the symbology's expression wouldn't read '{name}' as dates: change it first"));
     }
-    if l.labels.default.by.text.as_deref().is_some_and(|t| !reads(t)) {
-        return Err(format!("the labels' text expression wouldn't read '{name}' as dates: change it first"));
+    for c in std::iter::once(&l.labels.default).chain(&l.labels.classes) {
+        if c.by.text.as_deref().is_some_and(|t| !reads(t)) {
+            return Err(format!("the labels' text expression wouldn't read '{name}' as dates: change it first"));
+        }
+        if c.where_.as_deref().is_some_and(|w| !reads(w)) {
+            return Err(format!("label class '{}' wouldn't read '{name}' as dates: change its clause first", c.name));
+        }
     }
     // An attribute rule that stops reading would stop checking or calculating, without a word.
     let rule_reads = |r: &rustgis_map::design::AttributeRule, ds: &rustgis_data::Dataset| match r.kind {

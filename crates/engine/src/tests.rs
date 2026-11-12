@@ -748,6 +748,14 @@ fn text_fields_convert_to_dates() {
     s.map_mut().layers.iter_mut().find(|l| l.name == "Cities").unwrap().labels.default.by.text = Some("code + 1".into());
     let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "code", "type": "date"})).unwrap_err();
     assert!(err.starts_with("the labels' text expression wouldn't read 'code' as dates"), "{err}");
+    // So is one a label class's clause would stop reading.
+    let cities = s.map_mut().layers.iter_mut().find(|l| l.name == "Cities").unwrap();
+    cities.labels.default.by.text = None;
+    let mut class = cities.labels.default.clone();
+    (class.name, class.where_) = ("Coded".into(), Some("code > 5".into()));
+    cities.labels.classes.push(class);
+    let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "code", "type": "date"})).unwrap_err();
+    assert!(err.starts_with("label class 'Coded' wouldn't read 'code' as dates"), "{err}");
 }
 
 /// A Shapefile read in place a view at a time says, once, the dates its view reads found weren't

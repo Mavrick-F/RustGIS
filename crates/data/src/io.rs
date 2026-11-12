@@ -2760,7 +2760,10 @@ fn dbf_date(v: &Value) -> Option<crate::date::Date> {
     match v {
         Value::Date(d) => Some(*d),
         Value::DateTime(t) if t.is_date() => Some(t.date()),
-        Value::Text(t) => crate::date::Date::parse(t),
+        Value::Text(t) => match Value::parse_stored(t, FieldType::Date) {
+            Value::Date(d) => Some(d),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -4712,6 +4715,12 @@ mod tests {
     fn shapefile_dates_are_written_and_read_as_dates() {
         let fields = vec![Field::new("issued", FieldType::Date), Field::new("ts", FieldType::DateTime)];
         let mut ds = Dataset::new("permits", GeometryType::Point, fields);
+        // A midnight without a zone held as text in a date field is written as its day.
+        let mut midnight = Dataset::new("m", GeometryType::Point, ds.fields.clone());
+        midnight.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("2026-01-01T00:00:00".into()), Value::Null]);
+        let (bytes, _) = write_bytes(&midnight, "zip").unwrap();
+        assert_eq!(read_bytes("m.zip", &bytes).unwrap().0.features[0].attrs[0], Value::parse("2026-01-01", FieldType::Date));
+        assert!(shapefile_values_notes(&midnight, "m.shp").is_empty());
         for (i, day) in ["2026-03-05", "1999-12-31", "2000-01-01", "0001-01-01", ""].into_iter().enumerate() {
             let at = Value::parse("2026-03-05T14:30:00+02:00", FieldType::DateTime);
             ds.push(Some(Geometry::Point(Coord::new(i as f64, 1.0))), vec![Value::parse(day, FieldType::Date), at]);

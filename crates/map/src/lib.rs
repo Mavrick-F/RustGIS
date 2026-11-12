@@ -702,8 +702,8 @@ impl Layer {
     /// Gives `fields` (the layer's, as a project saved before RustGIS read a source's date columns
     /// as dates lists them: text) the source's date types, so the live layer and its whole reads
     /// and exports say what the source now gives. A field stays text when the layer's definition
-    /// query, a display filter or an attribute rule reads it as text (comparing it with a number)
-    /// and wouldn't read it as dates, so the filter or rule keeps working.
+    /// query, a display filter, an attribute rule or a label class reads it as text (comparing it
+    /// with a number) and wouldn't read it as dates, so it keeps working.
     fn date_fields_from_source(&self, fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) {
         let filters: Vec<&str> = self
             .definition_query
@@ -711,6 +711,11 @@ impl Layer {
             .map(String::as_str)
             .chain(self.display_filters.iter().map(|f| f.where_.as_str()))
             .chain(self.design.rules.iter().map(|r| r.expression.as_str()))
+            .chain(
+                std::iter::once(&self.labels.default)
+                    .chain(&self.labels.classes)
+                    .flat_map(|c| c.where_.as_deref().into_iter().chain(c.by.text.as_deref())),
+            )
             .collect();
         for k in 0..fields.len() {
             let Some(f) = fields.get(k) else { continue };
@@ -3180,6 +3185,14 @@ mod tests {
             layer.date_fields_from_source(&mut got, &source);
             assert_eq!(got[0].ty, FieldType::Text, "{expression}");
         }
+        // And a label class's clause.
+        layer.design.rules.clear();
+        let mut class = layer.labels.default.clone();
+        class.where_ = Some("issued >= 2026".into());
+        layer.labels.classes.push(class);
+        let mut got = fields.clone();
+        layer.date_fields_from_source(&mut got, &source);
+        assert_eq!(got[0].ty, FieldType::Text);
     }
 
     fn points() -> Dataset {
