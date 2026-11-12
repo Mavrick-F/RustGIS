@@ -57,7 +57,7 @@ struct Candidate {
 }
 
 /// A short or registered OGC link relation, without accepting unrelated suffixes.
-fn relation(link: &Value, name: &str) -> bool {
+pub(super) fn relation(link: &Value, name: &str) -> bool {
     link.get("rel").and_then(Value::as_str).is_some_and(|r| r == name || r == format!("http://www.opengis.net/def/rel/ogc/1.0/{name}"))
 }
 
@@ -114,6 +114,17 @@ impl DatasetDiscovery {
         self.omissions.iter().map(|(reason, count)| format!("{count} {reason}")).collect()
     }
 
+    /// Counts dataset catalogues that the existing collections traversal does not visit.
+    /// Map metadata keeps its legacy resolver; vector tiles and styles need the dataset plan.
+    pub(super) fn collections_notes(mut self) -> Vec<String> {
+        let skipped = self.pending.iter().filter(|doc| !matches!(&doc.kind, Kind::Tiles(t) if !t.vector)).count();
+        if skipped > 0 {
+            *self.omissions.entry("dataset tileset and style catalogues were left out: the landing also lists collections").or_default() +=
+                skipped;
+        }
+        self.notes()
+    }
+
     /// Starts only from advertised dataset tileset links. Styles alone do not establish a
     /// projection, and a collection id is never used as a dataset's vector layer name.
     pub(super) fn landing(from: &str, links: &[Value], withheld: &mut u32) -> Option<Self> {
@@ -160,6 +171,8 @@ impl DatasetDiscovery {
             } else {
                 out.omissions.insert("style catalogues were left out: addresses exceed 8192 bytes", 1);
             }
+        } else if links.iter().any(|link| relation(link, "styles")) {
+            out.omissions.insert("style catalogues were left out: no usable JSON link", 1);
         }
         Some(out)
     }

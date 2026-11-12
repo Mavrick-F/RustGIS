@@ -2625,7 +2625,12 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
 
 /// Reads collections or starts dataset discovery only from advertised links.
 fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
-    let collections = v.get("collections").and_then(|c| c.as_array());
+    let collections = v.get("collections").and_then(|c| c.as_array()).filter(|collections| {
+        !collections.is_empty()
+            || !v.get("links").and_then(serde_json::Value::as_array).is_some_and(|links| {
+                links.iter().any(|link| dataset::relation(link, "tilesets-map") || dataset::relation(link, "tilesets-vector"))
+            })
+    });
     let Some(collections) = collections else {
         // A landing page can offer both dataset tiles and a collections document to discover.
         let title = v.get("title").and_then(|t| t.as_str()).unwrap_or_default().to_string();
@@ -2640,7 +2645,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         if service.collections_url.is_none() {
             service.dataset = dataset;
         } else if let Some(dataset) = dataset {
-            let notes = dataset.notes();
+            let notes = dataset.collections_notes();
             service.incomplete |= !notes.is_empty();
             service.notes.extend(notes);
         }
@@ -2951,11 +2956,13 @@ pub fn resolve_tiles(list: &str, doc: &str, body: &[u8], vector: bool) -> Option
 /// Keeps an absent declaration compatible with older services, but never treats coverage or
 /// an unknown declared type as a map. OGC API Tiles 1.0 distinguishes map, vector and coverage.
 fn tile_data_type(t: &serde_json::Value, vector: bool) -> bool {
-    match t.get("dataType").and_then(serde_json::Value::as_str) {
+    match t.get("dataType") {
         None => true,
-        Some("map") => !vector,
-        Some("vector") => vector,
-        Some(_) => false,
+        Some(declared) => match declared.as_str() {
+            Some("map") => !vector,
+            Some("vector") => vector,
+            _ => false,
+        },
     }
 }
 
@@ -3012,7 +3019,7 @@ fn item_template(from: &str, links: &[serde_json::Value], vector: bool) -> Optio
     } else {
         items.iter().find(|l| ty(l) == "image/png").or_else(|| items.iter().find(|l| ty(l).starts_with("image/")))
     }
-    .or_else(|| items.first())?;
+    .or_else(|| items.iter().find(|link| link.get("type").is_none()))?;
     let href = pick.get("href")?.as_str()?;
     if href.len() > 2000 {
         return None;

@@ -66,6 +66,134 @@ fn ogc_dataset_rejected_landing_links_never_guess_a_template() {
     }
 }
 
+#[test]
+fn ogc_dataset_empty_collections_still_discover_advertised_tiles() {
+    for collections in [None, Some(json!([])), Some(json!([{"id":"roads"}]))] {
+        let mut landing = json!({"links":[{"rel":"tilesets-map","href":"/tiles"}]});
+        if let Some(collections) = &collections {
+            landing["collections"] = collections.clone();
+        }
+        let tiles = json!({"tileMatrixSetId":"WebMercatorQuad","links":[
+            {"rel":"item","type":"image/png","href":"/map/{tileMatrix}/{tileRow}/{tileCol}.png"}]});
+        let listing = Session::new(Project::default())
+            .run(
+                "service.layers",
+                &json!({
+                    "url":"https://maps.example.org/dataset","type":"ogcapi","text":landing.to_string(),
+                    "documents":[{"url":"https://maps.example.org/tiles?f=json","text":tiles.to_string()}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(listing["count"], 1, "{listing}");
+        let features = collections.as_ref().is_some_and(|c| !c.as_array().unwrap().is_empty());
+        assert_eq!(listing["layers"][0]["offer"]["type"], if features { "features" } else { "tiles" }, "{listing}");
+        assert!(listing["next"].is_null(), "{listing}");
+    }
+    let empty = Session::new(Project::default())
+        .run(
+            "service.layers",
+            &json!({
+                "url":"https://maps.example.org/dataset","type":"ogcapi","text":"{\"collections\":[]}"
+            }),
+        )
+        .unwrap();
+    assert_eq!(empty["count"], 0, "an ordinary empty collections document remains valid: {empty}");
+}
+
+#[test]
+fn ogc_dataset_shared_tilesets_do_not_use_an_item_typed_for_the_other_kind() {
+    for (media, expected) in [(Some("application/vnd.mapbox-vector-tile"), "vectorTiles"), (Some("image/png"), "tiles"), (None, "both")] {
+        let landing = json!({"links":[{"rel":"tilesets-map","href":"/tiles"},{"rel":"tilesets-vector","href":"/tiles"}]});
+        let mut item = json!({"rel":"item","href":"/tile/{tileMatrix}/{tileRow}/{tileCol}"});
+        if let Some(media) = media {
+            item["type"] = json!(media);
+        }
+        let list = json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad","vector_layers":[{"id":"roads"}],"links":[item]}]});
+        let listing = Session::new(Project::default())
+            .run(
+                "service.layers",
+                &json!({
+                    "url":"https://maps.example.org/dataset","type":"ogcapi","text":landing.to_string(),
+                    "documents":[{"url":"https://maps.example.org/tiles?f=json","text":list.to_string()}]
+                }),
+            )
+            .unwrap();
+        let both = expected == "both";
+        assert_eq!(listing["count"], if both { 2 } else { 1 }, "{listing}");
+        assert!(listing["layers"].as_array().unwrap().iter().all(|l| both || l["offer"]["type"] == expected), "{listing}");
+        assert_eq!(listing["notes"].as_array().unwrap().len(), usize::from(!both), "the rejected kind is counted: {listing}");
+        assert!(listing["next"].is_null(), "{listing}");
+    }
+}
+
+#[test]
+fn ogc_dataset_mixed_landings_report_catalogues_left_out_of_collections_discovery() {
+    for dataset in [false, true] {
+        let mut landing = json!({"links":[{"rel":"data","type":"application/json","href":"/collections"}]});
+        if dataset {
+            landing["links"]
+                .as_array_mut()
+                .unwrap()
+                .extend([json!({"rel":"tilesets-vector","href":"/tiles"}), json!({"rel":"styles","href":"/styles"})]);
+        }
+        let listing = Session::new(Project::default())
+            .run(
+                "service.layers",
+                &json!({
+                    "url":"https://maps.example.org/dataset","type":"ogcapi","text":landing.to_string(),
+                    "documents":[{"url":"https://maps.example.org/collections","text":"{\"collections\":[{\"id\":\"roads\"}]}"}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(listing["count"], 1, "{listing}");
+        assert_eq!(listing["layers"][0]["offer"]["type"], "features");
+        assert!(listing["next"].is_null(), "{listing}");
+        let notices = listing["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|note| note.contains("the landing also lists collections"))
+            .collect::<Vec<_>>();
+        if dataset {
+            assert_eq!(notices, ["2 dataset tileset and style catalogues were left out: the landing also lists collections"]);
+        } else {
+            assert!(notices.is_empty(), "{listing}");
+        }
+    }
+}
+
+#[test]
+fn ogc_dataset_unusable_style_catalogues_are_counted() {
+    for styles in
+        [None, Some(json!({"rel":"styles","type":"text/html","href":"/styles"})), Some(json!({"rel":"styles","type":"application/json"}))]
+    {
+        let mut landing = json!({"links":[{"rel":"tilesets-map","href":"/tiles"}]});
+        if let Some(style) = &styles {
+            landing["links"].as_array_mut().unwrap().push(style.clone());
+        }
+        let metadata = json!({"tileMatrixSetId":"WebMercatorQuad","links":[
+            {"rel":"item","type":"image/png","href":"/map/{tileMatrix}/{tileRow}/{tileCol}.png"}]});
+        let listing = Session::new(Project::default())
+            .run(
+                "service.layers",
+                &json!({
+                    "url":"https://maps.example.org/dataset","type":"ogcapi","text":landing.to_string(),
+                    "documents":[{"url":"https://maps.example.org/tiles?f=json","text":metadata.to_string()}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(listing["count"], 1, "{listing}");
+        assert!(listing["next"].is_null(), "{listing}");
+        let notes = listing["notes"].as_array().unwrap();
+        if styles.is_some() {
+            assert_eq!(notes, &[json!("1 style catalogues were left out: no usable JSON link")], "{listing}");
+        } else {
+            assert!(notes.is_empty(), "{listing}");
+        }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn ogc_dataset_prepared_add_keeps_error_path_losses() {
@@ -699,12 +827,20 @@ fn ogc_dataset_failed_discovery_keeps_prior_omission_counts() {
 #[test]
 fn ogc_dataset_map_tiles_reject_declared_coverage_and_unknown_types() {
     for listed in [false, true] {
-        for kind in [None, Some("map"), Some("vector"), Some("coverage"), Some("unknown")] {
+        for kind in [
+            None,
+            Some(json!("map")),
+            Some(json!("vector")),
+            Some(json!("coverage")),
+            Some(json!("unknown")),
+            Some(json!(5)),
+            Some(Value::Null),
+        ] {
             let mut tileset = json!({"tileMatrixSetId":"WebMercatorQuad","links":[
                 {"rel":"item","type":"image/png","href":"/tiles/{tileMatrix}/{tileRow}/{tileCol}.png"}
             ]});
-            if let Some(kind) = kind {
-                tileset["dataType"] = json!(kind);
+            if let Some(kind) = &kind {
+                tileset["dataType"] = kind.clone();
             }
             let document = if listed { json!({"tilesets":[tileset]}) } else { tileset };
             let listing = Session::new(Project::default())
@@ -717,7 +853,7 @@ fn ogc_dataset_map_tiles_reject_declared_coverage_and_unknown_types() {
                     }),
                 )
                 .unwrap();
-            let supported = kind.is_none_or(|k| k == "map");
+            let supported = kind.as_ref().is_none_or(|k| k == "map");
             assert_eq!(listing["count"], usize::from(supported), "{kind:?}: {listing}");
             let notes = listing["notes"].as_array().unwrap();
             if supported {
