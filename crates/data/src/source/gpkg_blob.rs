@@ -54,9 +54,12 @@ pub(crate) fn split_blob(b: &[u8]) -> Option<(Option<Extent>, &[u8])> {
 /// The field type of a declared column type; `None` for a BLOB (not an attribute).
 pub(crate) fn field_type(decl: &str) -> Option<FieldType> {
     let d = decl.to_ascii_uppercase();
-    Some(if d.contains("DATETIME") || d.contains("TIMESTAMP") {
+    // Dates by the type's own name (`DATE`, `DATETIME`, `TIMESTAMP(3)`), not a part of another
+    // (`UPDATED_INT` is an integer).
+    let named = |n: &str| d.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|w| w == n);
+    Some(if named("DATETIME") || named("TIMESTAMP") {
         FieldType::DateTime
-    } else if d.contains("DATE") {
+    } else if named("DATE") {
         FieldType::Date
     } else if d.contains("BOOL") {
         FieldType::Boolean
@@ -72,10 +75,10 @@ pub(crate) fn field_type(decl: &str) -> Option<FieldType> {
 }
 
 /// A DATE or DATETIME column's value, from its text (`None` for a number or a blob): ISO 8601, as
-/// GeoPackage stores them. `None` when it isn't a date of the field's type, which a read gives as
+/// GeoPackage stores them ([`crate::Value::parse_stored`]). `None` when it isn't a date of the field's type, which a read gives as
 /// null and counts ([`super::Batch::unread_dates`]); empty text is null without being counted.
 pub(crate) fn temporal(text: Option<&str>, ty: FieldType) -> Option<crate::Value> {
     let text = text?;
-    let v = crate::Value::parse(text, ty);
+    let v = crate::Value::parse_stored(text, ty);
     (!v.is_null() || crate::Value::Text(text.to_string()).asks_null()).then_some(v)
 }

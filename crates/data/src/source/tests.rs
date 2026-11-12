@@ -3235,6 +3235,8 @@ fn geopackage_dates_are_written_and_read_as_dates() {
         // What another program may leave: text that isn't a date, a number, and empty text (no loss).
         [Value::Text("2026-02-30".into()), Value::Int(1_772_700_000)],
         [Value::Text(String::new()), Value::Null],
+        // A midnight without a zone says a day: a date.
+        [Value::Text("2026-01-01T00:00:00".into()), Value::Null],
     ];
     for row in &rows {
         permits.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), row.to_vec());
@@ -3276,12 +3278,31 @@ fn geopackage_dates_are_written_and_read_as_dates() {
         let null = vec![Value::Null; 2];
         // The moment is kept, at UTC.
         let utc = vec![day("2026-03-05"), at("2026-03-05T12:30:00Z")];
-        assert_eq!(read, [utc, rows[1].to_vec(), null.clone(), null.clone(), null]);
+        assert_eq!(read, [utc, rows[1].to_vec(), null.clone(), null.clone(), null.clone(), vec![day("2026-01-01"), Value::Null]]);
         assert!(
             report.messages.contains(&"permits: 2 values aren't dates and were read as empty, in 'issued', 'seen'".to_string()),
             "{report:?}"
         );
     }
+    // The export says the text it wrote in a date field that isn't a date.
+    let text = crate::io::text_in_dates(permits.features.iter(), &permits.fields);
+    assert_eq!(
+        crate::io::text_in_dates_note(&permits.fields, &text, "permits.gpkg").as_deref(),
+        Some("permits.gpkg: 1 value isn't a date and was written as text, which reads back empty, in 'issued'")
+    );
+    // Dates by a declared type's own name, not a part of another.
+    let ty = |d: &str| super::gpkg_blob::field_type(d);
+    assert_eq!(
+        ["DATE", "datetime", "TIMESTAMP(3)", "UPDATED_INT", "DATEish TEXT", "TEXT"].map(ty),
+        [
+            Some(FieldType::Date),
+            Some(FieldType::DateTime),
+            Some(FieldType::DateTime),
+            Some(FieldType::Integer),
+            Some(FieldType::Text),
+            Some(FieldType::Text)
+        ]
+    );
     // A clean table says nothing.
     let clean = workspace.path().join("clean.gpkg");
     permits.features = permits.features.iter().take(3).cloned().collect::<Vec<_>>().into();

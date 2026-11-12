@@ -2028,7 +2028,10 @@ impl Session {
             for layer in &mut map.layers {
                 // Values in date fields that weren't dates, once for a layer read in place.
                 if let Some(note) = layer.source.as_mut().and_then(|source| source.take_unread_dates()) {
-                    dates.push(format!("{}: in the features read so far, {note}", layer.name));
+                    dates.push(format!(
+                        "{}: in the features read for the view, {note} (Load All Features counts the whole layer)",
+                        layer.name
+                    ));
                 }
                 if layer.source.as_mut().is_some_and(|source| source.take_display_window()) {
                     landed.push(&*layer);

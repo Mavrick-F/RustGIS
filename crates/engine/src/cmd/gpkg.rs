@@ -309,6 +309,9 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         if !saved.skipped_fields.is_empty() {
             s.notify(format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")), false);
         }
+        // A field without a column isn't saved, so nothing of it was written in UTC.
+        let utc_dates: Vec<usize> =
+            fields.iter().zip(&utc_dates).map(|(f, n)| if saved.skipped_fields.contains(&f.name) { 0 } else { *n }).collect();
         if let Some(note) = rustgis_data::io::utc_dates_note(&fields, &utc_dates, &format!("{name}: {table}")) {
             s.notify(note, false);
         }

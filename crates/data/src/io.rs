@@ -2564,6 +2564,32 @@ pub fn utc_dates_note(fields: &[Field], counts: &[usize], target: &str) -> Optio
     ))
 }
 
+/// Counts, for each date field, the text values in it that aren't dates, which a GeoPackage
+/// export writes as they are and a read gives back as null.
+pub fn text_in_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, fields: &[Field]) -> Vec<usize> {
+    let mut counts = vec![0usize; fields.len()];
+    for f in features {
+        for ((n, field), v) in counts.iter_mut().zip(fields).zip(&f.attrs) {
+            if field.ty.is_temporal() && matches!(v, Value::Text(t) if !v.asks_null() && Value::parse_stored(t, field.ty).is_null()) {
+                *n += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// What a GeoPackage export to `target` says of the text it wrote in date fields
+/// ([`text_in_dates`]). `None` when there was none.
+pub fn text_in_dates_note(fields: &[Field], counts: &[usize], target: &str) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let what = if total == 1 { "1 value isn't a date and was".to_string() } else { format!("{total} values aren't dates and were") };
+    Some(format!("{target}: {what} written as text, which reads back empty, in {}", named_fields(fields, counts)))
+}
+
 /// The fields with a count, quoted, the first five named: `'a', 'b' and 3 more`.
 pub(crate) fn named_fields(fields: &[Field], counts: &[usize]) -> String {
     let named: Vec<String> =

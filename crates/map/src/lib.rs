@@ -143,6 +143,19 @@ pub struct HiddenFills {
     pub partial: bool,
 }
 
+/// A project saved before RustGIS read a source's date columns as dates lists them as text; the
+/// source now gives dates, so the fields say so too (the live layer, and its whole reads and
+/// exports, alike).
+fn date_fields_from_source(fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) {
+    for f in fields {
+        if f.ty == rustgis_data::FieldType::Text
+            && let Some(s) = source.iter().find(|s| s.name == f.name && s.ty.is_temporal())
+        {
+            f.ty = s.ty;
+        }
+    }
+}
+
 /// What a whole read of a layer's source ([`Layer::load_all_counted`]) couldn't read.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Unreadable {
@@ -588,16 +601,8 @@ impl Layer {
         {
             self.dataset.fields = info.fields.clone();
         }
-        // A project saved before RustGIS read a source's date columns as dates lists them as
-        // text; the source now gives dates, so the field says so too.
         if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
-            for f in &mut self.dataset.fields {
-                if f.ty == rustgis_data::FieldType::Text
-                    && let Some(s) = info.fields.iter().find(|s| s.name == f.name && s.ty.is_temporal())
-                {
-                    f.ty = s.ty;
-                }
-            }
+            date_fields_from_source(&mut self.dataset.fields, &info.fields);
         }
         // An opened source's dropped Z or M values, for a project saved without the mark. Added to,
         // not replaced: a source that couldn't tell (a check that timed out) mustn't clear a mark the
@@ -721,6 +726,9 @@ impl Layer {
         // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
+            if let Some(info) = copy.info() {
+                date_fields_from_source(&mut ds.fields, &info.fields);
+            }
         }
         ds.source = self.dataset.source.clone();
         Ok((ds, Unreadable { rows: report.skipped, dates: report.unread_dates }))
@@ -747,6 +755,7 @@ impl Layer {
         ds.zm_dropped = info.zm_dropped || self.dataset.zm_dropped;
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
+            date_fields_from_source(&mut ds.fields, &info.fields);
         }
         // (A source declaring no geometry type takes its first geometry's when exported, as a
         // whole read does.)

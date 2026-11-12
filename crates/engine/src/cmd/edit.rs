@@ -424,8 +424,9 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
 /// also takes a date-time at midnight without a zone. Values that aren't dates become null, said
 /// with their count and the first few, and undo brings them back. Refused while a data design
 /// (domain, subtype, contingent values) names the field or a definition query or display filter
-/// would stop reading with it. It runs on the UI thread, as Add Field and Delete Field do: one
-/// parse of the layer's text in memory, a fraction of a second for a million rows.
+/// would stop reading with it. It runs on the UI thread: it is one parse of the text of a layer
+/// held in memory (a layer read in place is refused, as every `edit.*` command is), measured at
+/// about 60 ms for a million values, with nothing to read or wait for that progress could show.
 fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let fi = field_index(s, id, ps(p, "field").ok_or("field is required")?)?;
@@ -447,6 +448,12 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     if designed {
         return Err(format!("'{name}' has a domain, subtypes or contingent values, which hold text: remove them first"));
     }
+    // Saving to the GeoPackage writes values, not column types: its column would stay text.
+    if l.gpkg.is_some() {
+        return Err(format!(
+            "'{name}' is a text column of the GeoPackage table being edited, and saving can't change a column's type: export the layer, or convert it in the file"
+        ));
+    }
     // A filter that compares the text with a number stops reading once it's a date.
     let mut schema = rustgis_data::Dataset::new(l.dataset.name.clone(), l.dataset.geometry_type, l.dataset.fields.clone());
     if let Some(f) = schema.fields.get_mut(fi) {
@@ -460,17 +467,20 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(f) = l.display_filters.iter().find(|f| !reads(&f.where_)) {
         return Err(format!("display filter '{}' wouldn't read '{name}' as dates: change or remove it first", f.name));
     }
+    // An attribute rule that stops reading would stop checking or calculating, without a word.
+    let rule_reads = |r: &rustgis_map::design::AttributeRule, ds: &rustgis_data::Dataset| match r.kind {
+        rustgis_map::design::RuleKind::Calculation => Calculation::parse(&r.expression, ds).is_ok(),
+        rustgis_map::design::RuleKind::Constraint => rustgis_data::query::parse_fields(&r.expression, ds).is_ok(),
+    };
+    if let Some(r) = l.design.rules.iter().find(|r| rule_reads(r, &l.dataset) && !rule_reads(r, &schema)) {
+        return Err(format!("attribute rule '{}' wouldn't read '{name}' as dates: change or remove it first", r.name));
+    }
     let (mut converted, mut nulled, mut examples) = (0usize, 0usize, Vec::new());
     for f in &mut l.dataset.features {
         let Some(v) = f.attrs.get_mut(fi) else { continue };
         let date = match &*v {
             v if v.asks_null() => Value::Null,
-            Value::Text(t) => match (ty, Value::parse(t, ty)) {
-                (FieldType::Date, Value::Null) => {
-                    rustgis_data::date::DateTime::parse(t).filter(|t| t.is_date()).map_or(Value::Null, |t| Value::Date(t.date()))
-                }
-                (_, d) => d,
-            },
+            Value::Text(t) => Value::parse_stored(t, ty),
             other => Value::parse(&other.to_string(), ty),
         };
         if date.is_null() && !v.asks_null() {

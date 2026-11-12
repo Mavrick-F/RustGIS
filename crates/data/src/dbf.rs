@@ -194,7 +194,7 @@ pub(crate) fn dates_as_text(dbf: &mut [u8]) -> Vec<usize> {
 /// a date empty, and `Err(())` when it isn't a date (`20260230`, `2026-3-5`).
 pub(crate) fn date(field: &[u8]) -> std::result::Result<Option<crate::date::Date>, ()> {
     let t = field.trim_ascii();
-    if t.iter().all(|b| *b == b'0' || *b == 0) {
+    if t.is_empty() || t == b"00000000" || field.iter().all(|b| *b == 0) {
         return Ok(None);
     }
     let [y0, y1, y2, y3, m0, m1, d0, d1] = *t else { return Err(()) };
@@ -248,7 +248,7 @@ mod tests {
         for empty in [&b""[..], b"        ", b"00000000", b"\0\0\0\0\0\0\0\0"] {
             assert_eq!(date(empty), Ok(None), "{empty:?}");
         }
-        for bad in [&b"20260230"[..], b"20261301", b"2026-3-5", b"2026030", b"202603050", b"abcdefgh", b"00000101"] {
+        for bad in [&b"20260230"[..], b"20261301", b"2026-3-5", b"2026030", b"202603050", b"abcdefgh", b"00000101", b"0000    "] {
             assert_eq!(date(bad), Err(()), "{bad:?}");
         }
     }

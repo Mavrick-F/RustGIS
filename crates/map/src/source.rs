@@ -673,15 +673,17 @@ impl SourceLayer {
     pub fn unavailable_areas(&self, features: &rustgis_data::Features) -> Option<AmbiguousAreas> {
         self.area_features.as_ref().filter(|key| Weak::ptr_eq(key, &features.allocation_key())).map(|_| self.area_counts)
     }
-    /// Keeps what a view read found of values in date fields that weren't dates, the first time
-    /// one finds any, for [`SourceLayer::take_unread_dates`] to say.
+    /// Keeps what view reads found of values in date fields that weren't dates, until
+    /// [`SourceLayer::take_unread_dates`] says it. Once said, later reads aren't counted: they
+    /// read the same features again, and the notice says Load All Features counts them all.
     pub fn saw_unread_dates(&mut self, counts: &[usize]) {
-        if !self.unread_dates_said && self.unread_dates.is_none() && counts.iter().any(|n| *n > 0) {
-            self.unread_dates = Some(counts.to_vec());
+        if self.unread_dates_said || !counts.iter().any(|n| *n > 0) {
+            return;
         }
+        rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), counts);
     }
 
-    /// What a view read found of values in date fields that weren't dates
+    /// What view reads found of values in date fields that weren't dates
     /// ([`rustgis_data::source::unread_dates_note`]), once for the source.
     pub fn take_unread_dates(&mut self) -> Option<String> {
         let counts = self.unread_dates.take()?;

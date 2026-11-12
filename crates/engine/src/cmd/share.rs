@@ -649,13 +649,15 @@ pub(crate) fn layer_work(s: &Session, p: &Value) -> Result<Work, String> {
     }))
 }
 
-/// What a GeoPackage export of `ds` says of the date-times it wrote in UTC; `None` for another
-/// format, or when there were none.
-fn gpkg_dates_note(ds: &rustgis_data::Dataset, ext: &str, path: &str) -> Option<String> {
+/// What a GeoPackage export of `ds` says of its dates: date-times written in UTC, and text in
+/// date fields that isn't a date. Nothing for another format, or when there was none.
+pub fn gpkg_dates_note(ds: &rustgis_data::Dataset, ext: &str, path: &str) -> Vec<String> {
+    use rustgis_data::io::{offset_dates, text_in_dates, text_in_dates_note, utc_dates_note};
     if ext != "gpkg" {
-        return None;
+        return Vec::new();
     }
-    rustgis_data::io::utc_dates_note(&ds.fields, &rustgis_data::io::offset_dates(ds.features.iter(), &ds.fields), path)
+    let utc = utc_dates_note(&ds.fields, &offset_dates(ds.features.iter(), &ds.fields), path);
+    utc.into_iter().chain(text_in_dates_note(&ds.fields, &text_in_dates(ds.features.iter(), &ds.fields), path)).collect()
 }
 
 /// Writes layer `l` to `path`, in `asked` or the system the format defaults to; a GeoPackage's

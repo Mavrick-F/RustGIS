@@ -737,6 +737,12 @@ fn text_fields_convert_to_dates() {
     s.run("layer.definitionQuery", &json!({"layer": "Cities", "where": "code > 5 OR code IS NULL"})).unwrap();
     let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "code", "type": "date"})).unwrap_err();
     assert!(err.starts_with("the definition query (code > 5 OR code IS NULL) wouldn't read 'code' as dates"), "{err}");
+    s.run("layer.definitionQuery", &json!({"layer": "Cities", "where": ""})).unwrap();
+    // So is one an attribute rule would stop reading: it would stop checking without a word.
+    let rule = json!({"layer": "Cities", "name": "Small", "kind": "constraint", "expression": "code > 5 OR code IS NULL"});
+    s.run("data.attributeRule", &rule).unwrap();
+    let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "code", "type": "date"})).unwrap_err();
+    assert!(err.starts_with("attribute rule 'Small' wouldn't read 'code' as dates"), "{err}");
 }
 
 /// A Shapefile read in place a view at a time says, once, the dates its view reads found weren't
@@ -772,7 +778,16 @@ fn a_streamed_shapefile_says_dates_it_could_not_read_once() {
         s.notice_landed_rasters();
     }
     let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("date")).collect();
-    assert_eq!(said, ["permits: in the features read so far, 1 value isn't a date and was read as empty, in 'issued'"]);
+    assert_eq!(
+        said,
+        [
+            "permits: in the features read for the view, 1 value isn't a date and was read as empty, in 'issued' (Load All Features counts the whole layer)"
+        ]
+    );
+    // Converting a field is refused while the layer is read in place, as every edit is.
+    s.run("edit.addField", &json!({"layer": "permits", "name": "note", "type": "text"})).unwrap_err();
+    let err = s.run("edit.convertField", &json!({"layer": "permits", "field": "issued", "type": "datetime"})).unwrap_err();
+    assert!(err.contains("Load All Features"), "{err}");
 }
 
 /// A polygon layer stacks fills (a colour, hatch lines, markers on a grid), for the layer or a
@@ -33840,6 +33855,9 @@ fn geopackage_edits_save_back() {
     // A stored date that isn't one loads as null, said; saving leaves it unless it's edited.
     let said = "R: 1 value isn't a date and was read as empty, in 'seen'; saving leaves them as they are unless they're edited";
     assert!(s.notices_since(mark).iter().any(|n| n.text == said), "{:?}", s.notices_since(mark));
+    // Saving can't change a column's type, so a text column isn't converted to dates here.
+    let err = s.run("edit.convertField", &json!({"layer": "R", "field": "name", "type": "date"})).unwrap_err();
+    assert!(err.contains("saving can't change a column's type"), "{err}");
     let id = loaded["layer"].as_u64().unwrap() as u32;
     let row_of = |s: &Session, key: u64| s.map().layer(id).unwrap().dataset.features.iter().position(|f| f.id == key).unwrap();
     let ids: Vec<_> = s.map().layer(id).unwrap().dataset.features.iter().map(|f| f.id).collect();
