@@ -28,11 +28,15 @@ pub fn current_tab(name: &str) -> &str {
         "Map" => "Home",
         "Insert" | "Raster Data" => "Data",
         "Feature Layer" | "Raster Layer" => "Style",
-        "Analysis" | "Imagery" => "Analyze",
+        "Analysis" => "Analyze",
         "Share" | "Layout" => "Publish",
         _ => name,
     };
-    if TABS.contains(&tab) || tab.starts_with("plugin:") { tab } else { "Home" }
+    // The imagery groups were on Analyze, then moved to the Imagery extension's tab (#1752).
+    if tab == "Imagery" {
+        return "extension:imagery";
+    }
+    if TABS.contains(&tab) || tab.starts_with("plugin:") || tab.starts_with("extension:") { tab } else { "Home" }
 }
 
 /// Saved hidden tabs under the current names: renamed tabs carry over, and names of tabs whose
@@ -47,7 +51,10 @@ pub fn current_hidden_tabs(saved: Vec<String>) -> Vec<String> {
             "Share" => "Publish",
             n => n,
         };
-        if (TABS.contains(&tab) || tab.starts_with("plugin:")) && !FIXED_TABS.contains(&tab) && !out.iter().any(|t| t == tab) {
+        if (TABS.contains(&tab) || tab.starts_with("plugin:") || tab.starts_with("extension:"))
+            && !FIXED_TABS.contains(&tab)
+            && !out.iter().any(|t| t == tab)
+        {
             out.push(tab.to_string());
         }
     }
@@ -69,10 +76,40 @@ fn plugin_tabs(app: &RustGisApp) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The extensions that are on with a tab of their own (#1752): (tab id, caption in the interface
+/// language).
+fn extension_tabs(app: &RustGisApp) -> Vec<(String, String)> {
+    rustgis_engine::extensions::ALL
+        .iter()
+        .filter(|e| app.session.extensions().is_on(e.id))
+        .filter_map(|e| e.tab.map(|caption| (rustgis_engine::extensions::tab_id(e.id), tl_raw!(caption).to_string())))
+        .collect()
+}
+
+/// RustGIS's tabs, then the tabs of extensions that are on (after Help), then plugins' own tabs:
+/// (tab id, caption in the interface language).
+pub(crate) fn all_tabs(app: &RustGisApp) -> Vec<(String, String)> {
+    let mut tabs: Vec<(String, String)> = TABS.iter().map(|t| (t.to_string(), tl!(*t).to_string())).collect();
+    tabs.extend(extension_tabs(app));
+    tabs.extend(plugin_tabs(app));
+    tabs
+}
+
+/// Whether tab `tab` (one of RustGIS's, an extension's or a plugin's) is there to show.
+pub fn tab_exists(app: &RustGisApp, tab: &str) -> bool {
+    if tab.starts_with("plugin:") {
+        plugin_tabs(app).iter().any(|(id, _)| id == tab)
+    } else if tab.starts_with("extension:") {
+        extension_tabs(app).iter().any(|(id, _)| id == tab)
+    } else {
+        TABS.contains(&tab)
+    }
+}
+
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
-    // A plugin's tab whose plugin was turned off or removed.
-    if app.ui.tab.starts_with("plugin:") && !plugin_tabs(app).iter().any(|(id, _)| *id == app.ui.tab) {
+    // A tab whose plugin or extension was turned off or removed.
+    if !tab_exists(app, &app.ui.tab) {
         app.ui.tab = "Plugins".into();
     }
     egui::Panel::top("tabs")
@@ -102,6 +139,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     let tab = app.ui.tab.clone();
                     match tab.as_str() {
                         t if t.starts_with("plugin:") => plugin_tab(app, ui, t.trim_start_matches("plugin:")),
+                        t if t.starts_with("extension:") => extension_groups(app, ui, t.trim_start_matches("extension:")),
                         "Data" => data_tab(app, ui),
                         "Style" => style_tab(app, ui),
                         "Labeling" => labeling_tab(app, ui),
@@ -214,9 +252,8 @@ fn tab_strip(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             app.ui.backstage = true;
         }
         ui.add_space(6.0);
-        // RustGIS's tabs, then plugins' own tabs; the user can hide any of them.
-        let mut tabs: Vec<(String, String)> = TABS.iter().map(|t| (t.to_string(), tl!(*t).to_string())).collect();
-        tabs.extend(plugin_tabs(app));
+        // RustGIS's tabs, extensions' and plugins' own tabs; the user can hide any of them.
+        let mut tabs = all_tabs(app);
         tabs.retain(|(id, _)| !app.ui.hidden_tabs.iter().any(|h| h == id));
         // The tabs scroll between the Project button and the right-side controls (the collapse
         // button and the active tool indicator) when the window is too narrow for them.
@@ -1689,10 +1726,14 @@ fn analysis_groups(app: &mut RustGisApp, ui: &mut Ui) {
             "Workflows",
             "Guided analysis: suitability, visibility, networks, interpolation and more.",
             |ui, app| {
-                for (id, title) in crate::analysispane::SECTIONS
+                let shown: Vec<&(&str, &str)> = crate::analysispane::SECTIONS
                     .iter()
-                    .filter(|s| !matches!(s.0, "rasterFunctions" | "functionEditor" | "environments" | "models"))
-                {
+                    .filter(|s| {
+                        !matches!(s.0, "rasterFunctions" | "functionEditor" | "environments" | "models")
+                            && crate::analysispane::section_shown(&app.session, s.0)
+                    })
+                    .collect();
+                for (id, title) in shown {
                     menu_item(ui, app, "geoprocessing", title, "ui.pane.workflows", json!({"section": id}));
                 }
             },
@@ -2139,6 +2180,16 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 Value::Null,
                 app.ui.right == Some(RightPane::DiagnosticLog),
             );
+            small(
+                ui,
+                app,
+                "settings",
+                "Layer Properties",
+                "Show the selected layer's settings in one place.",
+                "ui.pane.layerProperties",
+                Value::Null,
+                app.ui.right == Some(RightPane::LayerProperties),
+            );
         });
     });
     group(ui, "Navigation", |ui| {
@@ -2371,11 +2422,21 @@ fn layer_hint(ui: &mut Ui, text: &str) {
     });
 }
 
-/// The Analyze tab: geoprocessing, workflows, imagery and notebooks.
+/// The Analyze tab: geoprocessing, workflows and notebooks. Its imagery groups are on the Imagery extension's tab (#1752).
 fn analyze_tab(app: &mut RustGisApp, ui: &mut Ui) {
     analysis_groups(app, ui);
     notebook_group(app, ui);
-    imagery_groups(app, ui);
+}
+
+/// An extension's groups (#1752), on its own tab or, for one without a tab, on the Plugins tab.
+/// Nothing while it is off.
+fn extension_groups(app: &mut RustGisApp, ui: &mut Ui, id: &str) {
+    if !app.session.extensions().is_on(id) {
+        return;
+    }
+    if id == rustgis_engine::extensions::IMAGERY.id {
+        imagery_groups(app, ui);
+    }
 }
 
 /// The Publish tab: the open layout's groups first, then reports, presentations, export and
@@ -2835,16 +2896,19 @@ fn share_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 Value::Null,
                 app.ui.right == Some(RightPane::Shares),
             );
-            small(
-                ui,
-                app,
-                "modelbuilder",
-                "Deep Learning",
-                "Package a trained deep learning model.",
-                "ui.saveItem",
-                json!({"kind": "dlPackage"}),
-                false,
-            );
+            // Deep learning packages are the Imagery extension's (#1752).
+            if app.session.extensions().is_on(rustgis_engine::extensions::IMAGERY.id) {
+                small(
+                    ui,
+                    app,
+                    "modelbuilder",
+                    "Deep Learning",
+                    "Package a trained deep learning model.",
+                    "ui.saveItem",
+                    json!({"kind": "dlPackage"}),
+                    false,
+                );
+            }
         });
     });
     group(ui, "Layout", |ui| {
@@ -3262,6 +3326,23 @@ fn plugins_tab(app: &mut RustGisApp, ui: &mut Ui) {
             );
         });
     });
+    group(ui, "Extensions", |ui| {
+        big(
+            ui,
+            app,
+            "extension",
+            "Extensions",
+            "Turn on or off the optional parts of RustGIS, such as Imagery.",
+            "ui.extensions",
+            Value::Null,
+            app.extensions.open,
+            false,
+        );
+    });
+    // The groups of the extensions that are on and have no tab of their own.
+    for e in rustgis_engine::extensions::ALL.iter().filter(|e| e.tab.is_none()) {
+        extension_groups(app, ui, e.id);
+    }
     // A group per enabled plugin with commands, in the interface language when it has one
     // (plugins with a tab of their own are on that tab instead).
     let lang = app.lang().code();
@@ -3474,10 +3555,9 @@ fn settings_tab(app: &mut RustGisApp, ui: &mut Ui) {
     });
     group(ui, "Customize", |ui| {
         let hidden = app.ui.hidden_tabs.clone();
-        // RustGIS's tabs and plugins' tabs.
-        let mut all: Vec<(String, String)> =
-            TABS.iter().filter(|t| !FIXED_TABS.contains(*t)).map(|t| (t.to_string(), tl!(*t).to_string())).collect();
-        all.extend(plugin_tabs(app));
+        // RustGIS's tabs, extensions' and plugins' tabs.
+        let mut all = all_tabs(app);
+        all.retain(|(id, _)| !FIXED_TABS.contains(&id.as_str()));
         big_form_menu(ui, app, "settings", "Ribbon", "Choose which tabs the ribbon shows.", move |ui, app| {
             for (tab, caption) in &all {
                 let mut on = !hidden.iter().any(|h| h == tab);
@@ -3856,16 +3936,21 @@ fn feature_style_groups(app: &mut RustGisApp, ui: &mut Ui) {
     layer_group(app, ui, &layer);
 }
 
-/// The polygon layers that could mask `layer`.
-fn mask_menu(ui: &mut Ui, app: &mut RustGisApp, layer: &rustgis_engine::map::Layer) {
-    let polys: Vec<String> = app
-        .session
+/// The names of the polygon layers that could mask `layer`: the ribbon's Masking menu and the
+/// Layer Properties pane's Display tab (#1803) offer the same ones.
+pub(crate) fn mask_choices(app: &RustGisApp, layer: &rustgis_engine::map::Layer) -> Vec<String> {
+    app.session
         .map()
         .layers
         .iter()
         .filter(|l| l.id != layer.id && l.geometry_type() == GeometryType::Polygon)
         .map(|l| l.name.clone())
-        .collect();
+        .collect()
+}
+
+/// The polygon layers that could mask `layer`.
+fn mask_menu(ui: &mut Ui, app: &mut RustGisApp, layer: &rustgis_engine::map::Layer) {
+    let polys = mask_choices(app, layer);
     let cur = layer.mask.clone();
     small_menu(ui, app, "polygon_layer", "Masking", "Show the layer only inside another layer's polygons.", move |ui, app| {
         if ui.radio(cur.is_none(), tl!("No mask")).clicked() {
@@ -4182,36 +4267,43 @@ fn imagery_groups(app: &mut RustGisApp, ui: &mut Ui) {
     });
 }
 
+/// The layer's Out Beyond and In Beyond pickers (`layer.scaleRange`), a row each: the ribbon's
+/// Visibility Range group and the Layer Properties pane's Display tab (#1803) share them. `salt`
+/// keeps the two places' pickers apart; `size` is the labels' text size.
+pub(crate) fn scale_range_rows(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map::Layer, salt: &str, size: f32) {
+    for (label, cur, key) in [("Out Beyond", layer.min_scale, "min"), ("In Beyond", layer.max_scale, "max")] {
+        ui.horizontal(|ui| {
+            let input_label = ui.label(egui::RichText::new(tl!(label)).size(size));
+            egui::ComboBox::from_id_salt(format!("{salt}_{key}"))
+                .selected_text(scale_label(cur))
+                .width(118.0)
+                .show_ui(ui, |ui| {
+                    let mut choices: Vec<Option<f64>> = vec![None];
+                    choices.extend(SCALES.iter().map(|s| Some(*s)));
+                    for c in choices {
+                        if ui.selectable_label(c == cur, scale_label(c)).clicked() {
+                            let (mut min, mut max) = (layer.min_scale, layer.max_scale);
+                            if key == "min" {
+                                min = c;
+                            } else {
+                                max = c;
+                            }
+                            let _ = app.run("layer.scaleRange", json!({"min": min, "max": max}));
+                        }
+                    }
+                })
+                .response
+                .labelled_by(input_label.id);
+        });
+    }
+}
+
 /// The Visibility Range and Effects groups shared by feature and raster layers.
 fn visibility_and_effects(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map::Layer) {
     group(ui, "Visibility Range", |ui| {
         ui.vertical(|ui| {
             ui.add_space(6.0);
-            for (label, cur, key) in [("Out Beyond", layer.min_scale, "min"), ("In Beyond", layer.max_scale, "max")] {
-                ui.horizontal(|ui| {
-                    let input_label = ui.label(egui::RichText::new(tl!(label)).size(11.5));
-                    egui::ComboBox::from_id_salt(format!("scale_{key}"))
-                        .selected_text(scale_label(cur))
-                        .width(118.0)
-                        .show_ui(ui, |ui| {
-                            let mut choices: Vec<Option<f64>> = vec![None];
-                            choices.extend(SCALES.iter().map(|s| Some(*s)));
-                            for c in choices {
-                                if ui.selectable_label(c == cur, scale_label(c)).clicked() {
-                                    let (mut min, mut max) = (layer.min_scale, layer.max_scale);
-                                    if key == "min" {
-                                        min = c;
-                                    } else {
-                                        max = c;
-                                    }
-                                    let _ = app.run("layer.scaleRange", json!({"min": min, "max": max}));
-                                }
-                            }
-                        })
-                        .response
-                        .labelled_by(input_label.id);
-                });
-            }
+            scale_range_rows(app, ui, layer, "scale", 11.5);
         });
         big(ui, app, "scale_range", "Clear\nLimits", "Draw the layer at every scale.", "layer.scaleRange", json!({}), false, false);
     });
@@ -4332,7 +4424,9 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                     crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("layer.color", json!({"color": crate::theme::rgba(c).hex8()}));
                 }
-                ui.label(egui::RichText::new(tl!("Color")).size(11.5));
+                // A line has no inside: its colour is the line's (the outline is the "Outline" width below).
+                let name = if layer.geometry_type() == GeometryType::Polyline { tl!("Color") } else { tl!("Fill") };
+                ui.label(egui::RichText::new(name).size(11.5));
             });
             let mut w = layer.renderer.base_symbol().stroke_width;
             ui.horizontal(|ui| {
@@ -5219,6 +5313,17 @@ mod tests {
         assert!(layer.no_fill.is_none());
         assert_eq!(layer.renderer, renderer);
         assert!(h.query_by_label("No Fill").is_some());
+    }
+
+    #[test]
+    fn drawing_names_the_colour_by_what_it_changes() {
+        let mut h = drawing_harness();
+        for (layer, fill) in [("Countries", true), ("Cities", true), ("Rivers", false)] {
+            h.state_mut().run("layer.select", json!({"layer": layer})).unwrap();
+            h.run();
+            // The colour well itself is also labelled "Color", so only "Fill" tells the two apart.
+            assert_eq!(h.query_by_label("Fill").is_some(), fill, "{layer}");
+        }
     }
 
     /// Drags a number of the harness from `at` by 16, 32 and 48 points, calling `each` between.

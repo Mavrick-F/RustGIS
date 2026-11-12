@@ -153,6 +153,7 @@ fn right_title(pane: RightPane) -> (&'static str, &'static str) {
         RightPane::Bookmarks => ("Bookmarks", "ui.pane.bookmarks"),
         RightPane::Format => ("Format", "ui.pane.format"),
         RightPane::Labeling => ("Labeling", "ui.pane.labeling"),
+        RightPane::LayerProperties => ("Layer Properties", "ui.pane.layerProperties"),
         // Its tab says which service it shows (see `right_name`).
         RightPane::WebData => ("Web Data", "ui.pane.webData"),
         // Its tab says whose panel it is (see `right_name`).
@@ -165,6 +166,8 @@ fn right_name(app: &RustGisApp, pane: RightPane) -> String {
     match pane {
         RightPane::Plugin => crate::pluginpanel::title(app),
         RightPane::WebData => tl!(web_data_title(app)).to_string(),
+        // Its tab names the layer it shows (#1803).
+        RightPane::LayerProperties => crate::layerprops::tab_name(app),
         _ => tl!(right_title(pane).0).to_string(),
     }
 }
@@ -214,6 +217,7 @@ fn right_pane(app: &mut RustGisApp, ui: &mut Ui, right: RightPane, t: &Tokens) {
             RightPane::Bookmarks => crate::bookmarkpane::show(app, ui, t),
             RightPane::Format => crate::graphicformat::show(app, ui, t),
             RightPane::Labeling => crate::labelpane::show(app, ui, t),
+            RightPane::LayerProperties => crate::layerprops::show(app, ui, t),
             RightPane::Plugin => crate::pluginpanel::show(app, ui, t),
             RightPane::WebData => web_data(app, ui),
         });
@@ -2388,6 +2392,14 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let _ = app.run("layer.remove", json!({"layer": l.id}));
         ui.close();
     }
+    // Last, as in other desktop GIS (#1803).
+    ui.separator();
+    if ui.button(tl!("Properties…")).clicked() {
+        if let Err(e) = app.run("ui.pane.layerProperties", json!({"layer": l.id})) {
+            app.session.notify(e, true);
+        }
+        ui.close();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4421,14 +4433,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.add_space(10.0);
     ui.separator();
     ui.label(egui::RichText::new(tl!("Layer")).size(11.5).color(t.text_dim));
-    let mut tr = l.transparency;
-    ui.horizontal(|ui| {
-        let input_label = ui.label(tl!("Transparency"));
-        ui.spacing_mut().slider_width = 150.0;
-        let r =
-            ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).update_while_editing(false).suffix(" %").integer()).labelled_by(input_label.id);
-        transparency_drag(app, ui, &r, &l, tr);
-    });
+    transparency_row(app, ui, &l);
     if !l.graphics {
         reference_scale_row(app, ui, &l);
     }
@@ -4731,9 +4736,10 @@ fn held_drag(ui: &mut Ui, id: egui::Id, v: &mut f32, range: std::ops::RangeInclu
 /// The scales the Reference scale picker offers, besides none and the map's own.
 const REFERENCE_SCALE_CHOICES: [f64; 8] = [5_000.0, 10_000.0, 25_000.0, 50_000.0, 100_000.0, 200_000.0, 500_000.0, 1_000_000.0];
 
-/// The Symbology pane's Reference scale: the scale a layer's symbol and label sizes are set
-/// for, so they grow and shrink with the map (`layer.referenceScale`).
-fn reference_scale_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+/// The Symbology pane's Reference scale, also on the Layer Properties pane's Display tab (#1803):
+/// the scale a layer's symbol and label sizes are set for, so they grow and shrink with the map
+/// (`layer.referenceScale`).
+pub(crate) fn reference_scale_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
     let current = app.session.map().scale().round();
     ui.horizontal(|ui| {
         ui.label(tl!("Reference scale")).on_hover_text(tl!(
@@ -4757,6 +4763,19 @@ fn reference_scale_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
             })
             .response
             .on_hover_text(tl!("Reference scale"));
+    });
+}
+
+/// The layer's Transparency row, as the Symbology pane and the Layer Properties pane's Display tab
+/// (#1803) show it.
+pub(crate) fn transparency_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+    let mut tr = l.transparency;
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Transparency"));
+        ui.spacing_mut().slider_width = 150.0;
+        let r =
+            ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).update_while_editing(false).suffix(" %").integer()).labelled_by(input_label.id);
+        transparency_drag(app, ui, &r, l, tr);
     });
 }
 
@@ -5209,7 +5228,8 @@ fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, 
         });
         egui::Grid::new("symbol_grid").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
             if g != GeometryType::Polyline {
-                ui.label(tl!("Color"));
+                // The same name as the ribbon's Drawing group gives this `layer.color` button.
+                ui.label(tl!("Fill"));
                 let mut c = c32(s.fill);
                 let resp = crate::widgets::color_button(ui, &mut c);
                 if resp.changed() {
@@ -5276,7 +5296,7 @@ fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, 
 }
 
 /// The dash patterns the stroke editor offers, in stroke widths (dash, gap, …).
-const DASH_PRESETS: [(&str, Option<&[f32]>); 5] = [
+pub(crate) const DASH_PRESETS: [(&str, Option<&[f32]>); 5] = [
     ("Solid", None),
     ("Dashed", Some(&[4.0, 2.0])),
     ("Dotted", Some(&[1.0, 2.0])),
@@ -6301,8 +6321,14 @@ fn details(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         ui.label(egui::RichText::new(tl!("Select a layer in the Layers pane.")).color(t.text_dim));
         return;
     };
-    let e = l.extent();
     ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
+    source_details(ui, l, t);
+}
+
+/// What the Details pane and the Layer Properties pane's Source tab (#1803) show of a layer: its
+/// geometry, counts, source, coordinate system, extent and fields, or a raster's own details.
+pub(crate) fn source_details(ui: &mut Ui, l: &Layer, t: &Tokens) {
+    let e = l.extent();
     if let Some(rl) = &l.raster {
         raster_details(ui, rl, t);
         return;
@@ -6675,21 +6701,24 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         RasterRenderer::Colormap => {
             ui.label(egui::RichText::new(tl!("Colors from the raster's own color table.")).size(11.5).color(t.text_dim));
         }
-        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor } => {
-            let (az, alt, zf, rp) = (*azimuth, *altitude, *z_factor, ramp.as_ref().map(|r| r.name().to_string()));
-            let relief = move |band: usize, az: f64, alt: f64, zf: f64| {
-                let mut p = json!({"type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf});
+        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow } => {
+            let (az, alt, zf, sh, rp) = (*azimuth, *altitude, *z_factor, *shadow, ramp.as_ref().map(|r| r.name().to_string()));
+            let relief = move |band: usize, az: f64, alt: f64, zf: f64, sh: f64| {
+                let mut p = json!({"type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh});
                 match &rp {
                     Some(r) => p["ramp"] = json!(r),
                     None => p["grey"] = json!(true),
                 }
                 p
             };
-            band_combo(app, ui, "Band", *band, &|i| ("raster.symbology".into(), relief(i, az, alt, zf)));
+            band_combo(app, ui, "Band", *band, &|i| ("raster.symbology".into(), relief(i, az, alt, zf, sh)));
             egui::Grid::new("relief").num_columns(2).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
-                for (label, v, range, speed, which) in
-                    [("Azimuth", az, 0.0..=360.0, 1.0, 0), ("Altitude", alt, 0.0..=90.0, 0.5, 1), ("Z factor", zf, 0.001..=1000.0, 0.01, 2)]
-                {
+                for (label, v, range, speed, which) in [
+                    ("Azimuth", az, 0.0..=360.0, 1.0, 0),
+                    ("Altitude", alt, 0.0..=90.0, 0.5, 1),
+                    ("Z factor", zf, 0.001..=1000.0, 0.01, 2),
+                    ("Cast shadows", sh, 0.0..=1.0, 0.01, 3),
+                ] {
                     let input_label = ui.label(tl!(label));
                     let mut x = v;
                     // Kept across a drag until it is let go (#607).
@@ -6697,20 +6726,26 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     let r = ui
                         .add(egui::DragValue::new(&mut x).update_while_editing(false).range(range).speed(speed).max_decimals(3))
                         .labelled_by(input_label.id);
+                    let r = if which == 3 {
+                        r.on_hover_text(tl!("How dark the shadows the terrain casts are, from 0 (none) to 1, for the sun set above"))
+                    } else {
+                        r
+                    };
                     if drag.settled(ui, &r, &mut x) && x != v {
-                        let (a, b, c) = match which {
-                            0 => (x, alt, zf),
-                            1 => (az, x, zf),
-                            _ => (az, alt, x),
+                        let (a, b, c, d) = match which {
+                            0 => (x, alt, zf, sh),
+                            1 => (az, x, zf, sh),
+                            2 => (az, alt, x, sh),
+                            _ => (az, alt, zf, x),
                         };
-                        let _ = app.run("raster.symbology", relief(*band, a, b, c));
+                        let _ = app.run("raster.symbology", relief(*band, a, b, c, d));
                     }
                     ui.end_row();
                 }
             });
             let mut tint = ramp.is_some();
             if ui.checkbox(&mut tint, tl!("Tint by elevation")).changed() {
-                let mut p = relief(*band, az, alt, zf);
+                let mut p = relief(*band, az, alt, zf, sh);
                 if tint {
                     p["ramp"] = json!("Terrain");
                     p["grey"] = json!(false);
@@ -6860,14 +6895,7 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
     ui.add_space(10.0);
     ui.separator();
     ui.label(egui::RichText::new(tl!("Layer")).size(11.5).color(t.text_dim));
-    let mut tr = l.transparency;
-    ui.horizontal(|ui| {
-        let input_label = ui.label(tl!("Transparency"));
-        ui.spacing_mut().slider_width = 150.0;
-        let r =
-            ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).update_while_editing(false).suffix(" %").integer()).labelled_by(input_label.id);
-        transparency_drag(app, ui, &r, l, tr);
-    });
+    transparency_row(app, ui, l);
 }
 
 /// The Masking section of a raster's symbology (#348): values drawn as no data, and a range of

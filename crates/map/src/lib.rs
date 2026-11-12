@@ -24,6 +24,7 @@ pub mod projection;
 pub mod qgis;
 pub mod raster;
 pub mod report;
+pub mod shadow;
 pub mod slots;
 pub mod source;
 pub use slots::{LayerRole, Slot, SlotAt, SlotPos, TileRole};
@@ -250,6 +251,11 @@ pub struct Layer {
     /// The GeoPackage table this layer's edits save to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpkg: Option<source::GpkgEdit>,
+    /// Set for a layer read whole from a Shapefile or GeoJSON file (its `dataset.source`): the
+    /// file and the layer as they were when last in step, to tell edits the file lacks and
+    /// changes made to the file since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced: Option<rustgis_data::sync::Synced>,
     /// The saved connection it was added from (its id, in the app's preferences): a layer whose
     /// source is read again logs in with that connection's login, and a project opened where
     /// the connection or its login is missing asks for one. Empty for a layer that came from no
@@ -484,6 +490,7 @@ impl Layer {
             source: None,
             postgis: None,
             gpkg: None,
+            synced: None,
             connection: String::new(),
             anonymous: false,
             projected: Default::default(),
@@ -2964,6 +2971,7 @@ impl Layer {
             source,
             postgis,
             gpkg,
+            synced: _,
             connection: _,
             anonymous: _,
             instance_id: _,
@@ -3368,10 +3376,11 @@ mod tests {
         assert!(!r.has_class_strokes());
     }
 
-    /// A layer of one long line along the equator with `n` vertices.
+    /// A layer of one line around the equator of `n` vertices, zigzagging about 11 m either side of it, so
+    /// display thinning keeps every vertex zoomed in and only the ends zoomed out.
     fn long_line(n: usize) -> Layer {
         let mut d = Dataset::new("line", GeometryType::Polyline, vec![]);
-        let run = (0..n).map(|i| Coord::new(-170.0 + 340.0 * i as f64 / n as f64, 0.0)).collect();
+        let run = (0..n).map(|i| Coord::new(-170.0 + 340.0 * i as f64 / n as f64, if i % 2 == 0 { 1e-4 } else { -1e-4 })).collect();
         d.push(Some(Geometry::Line(vec![run])), vec![]);
         Layer::new(1, d)
     }

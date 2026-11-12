@@ -1591,11 +1591,40 @@ pub fn post_json(url: &str, body: String, done: Done) {
     }
 }
 
+/// Like [`post_json`], to an address the user named, which may be on their own network (as
+/// [`download`] is; see [`post_json_named_blocking`]). Not for addresses a document pointed to.
+/// The browser's poster is used as for [`post_json`].
+pub fn post_json_named(url: &str, body: String, done: Done) {
+    if let Err(e) = crate::address::check(url, None) {
+        done(Err(e));
+        return;
+    }
+    let p = poster().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if p.is_some() {
+        return post_json(url, body, done);
+    }
+    IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    let key = url.to_string();
+    let done: Done = Box::new(move |r| {
+        done(crate::logins::check(&key).map_err(str::to_string).and(r));
+        finished();
+    });
+    native::post_named(url.to_string(), body, done);
+}
+
 /// Like [`post_json`], waiting for the answer (at most [`BLOCKING_TIMEOUT`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn post_json_blocking(url: &str, body: &str) -> Result<Vec<u8>, String> {
     crate::address::check(url, None)?;
     native::post_with(&native::public_agent(BLOCKING_TIMEOUT), url, body)
+}
+
+/// Like [`post_json_blocking`], to an address the user named: it may be on their own network, as
+/// a download from one is ([`download_blocking`]). Not for addresses a document pointed to.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn post_json_named_blocking(url: &str, body: &str) -> Result<Vec<u8>, String> {
+    crate::address::check(url, None)?;
+    native::post_with(&native::download_agent(BLOCKING_TIMEOUT), url, body)
 }
 
 /// What a `HEAD` request says of a file before any of it is read: the length of its TIFF header
@@ -1733,6 +1762,28 @@ pub(crate) fn fetch_local(url: String, done: Done) {
             finished();
         }),
     );
+}
+
+/// Work the map waits for that runs off the fetch workers (an MBTiles file's metadata, read on a
+/// thread of its own), counted in [`in_flight`] from [`Counted::start`] until dropped, as a fetch
+/// is: an export waiting for the map's tiles waits for it too. However it ends (answered, unwound
+/// by a panic, or its thread never started), the drop draws again and the count goes down once.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct Counted(());
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Counted {
+    pub(crate) fn start() -> Self {
+        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Counted {
+    fn drop(&mut self) {
+        finished();
+    }
 }
 
 /// Something the map draws from arrived outside the cache (a PMTiles archive's header): draw
@@ -2550,6 +2601,18 @@ mod native {
         });
     }
 
+    /// Like [`post`], to an address the user named: any address its name resolves to.
+    pub(super) fn post_named(url: String, body: String, done: Done) {
+        let capture = Capture::current();
+        let still = super::current_still();
+        std::thread::spawn(move || {
+            super::with_optional_still(still, || {
+                let _scope = capture.enter();
+                done(super::check_current().and_then(|_| post_with(&download_agent(std::time::Duration::from_secs(60)), &url, &body)));
+            });
+        });
+    }
+
     /// POSTs a JSON document and reads the answer (at most [`MAX_BYTES`]); an error status is
     /// `http status: <status>`, and a redirect isn't followed.
     pub(super) fn post_with(agent: &ureq::Agent, url: &str, body: &str) -> Result<Vec<u8>, String> {
@@ -3058,6 +3121,10 @@ mod native {
 
     pub(super) fn post(url: String, _body: String, done: Done) {
         done(Err(rustgis_data::diagnostics::message_with_address(&url, "this build has no way to send requests")));
+    }
+
+    pub(super) fn post_named(url: String, body: String, done: Done) {
+        post(url, body, done);
     }
 
     pub(super) fn head(url: String, done: super::HeadDone) {
@@ -4244,21 +4311,33 @@ mod tests {
         let _turn = crate::cache::turn();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // Sent once the test has looked at the progress mid-download. The server holds the
+        // response open until then, so the progress is read while bytes are still to come, and
+        // then sends the rest at once: no sleeps for a busy runner to stretch (macOS CI). A
+        // failed assertion drops the sender, and the server closes the response at once rather
+        // than holding a download in flight for the tests after this one.
+        let (release, released) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
+                let _ = stream.set_nodelay(true);
                 let path = read_request(&mut stream).split_whitespace().nth(1).unwrap_or("").to_string();
                 if path == "/a.shp" {
                     let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789");
                     continue;
                 }
-                // Chunked, so no length: a 1 kB chunk every 20 ms.
-                let _ = write!(stream, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
-                for _ in 0..200 {
-                    if write!(stream, "3e8\r\n{}\r\n", "x".repeat(1000)).is_err() {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                // Chunked, so no length: 10 kB, past the 5 kB the test waits for, then a pause
+                // until the test has looked.
+                let chunk = format!("3e8\r\n{}\r\n", "x".repeat(1000));
+                let head = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{}", chunk.repeat(10));
+                if stream.write_all(head.as_bytes()).is_err() {
+                    return;
+                }
+                if released.recv_timeout(std::time::Duration::from_secs(30)).is_err() {
+                    return;
+                }
+                if stream.write_all(chunk.repeat(190).as_bytes()).is_err() {
+                    return;
                 }
                 let _ = write!(stream, "0\r\n\r\n");
             }
@@ -4280,6 +4359,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(progress.fraction(), None, "{progress:?}");
+        let _ = release.send(());
         assert!(rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap().is_ok());
     }
 

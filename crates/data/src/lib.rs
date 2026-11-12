@@ -9,6 +9,7 @@ pub mod citygml;
 pub mod cityjson;
 mod citymodel;
 pub mod color;
+pub mod date;
 mod dbf;
 pub mod diagnostics;
 pub mod dirs;
@@ -44,6 +45,7 @@ pub mod sheets;
 pub mod source;
 pub mod source_layers;
 pub mod sqlite;
+pub mod sync;
 pub mod threads;
 pub mod time;
 pub mod topojson;
@@ -52,6 +54,7 @@ pub mod wkb;
 pub mod xml;
 pub mod zip;
 
+pub use date::{Date, DateTime};
 pub use geometry::{Geometry, GeometryType, Measure, VertexId, ambiguous_area_message};
 pub use rustgis_geom::{Coord, Extent};
 pub use value::{Field, FieldType, Value};
@@ -377,6 +380,10 @@ impl Serialize for Dataset {
 pub struct ReadReport {
     pub skipped: usize,
     pub messages: Vec<String>,
+    /// The files read and the rows read from them, when the read recorded them
+    /// ([`sync::FileSync::around`]): what a layer kept in the project compares with its source
+    /// before writing edits back.
+    pub synced: Option<sync::Synced>,
 }
 
 /// What a read says when it drops Z or M values (see [`Dataset::zm_dropped`]): from `features` of

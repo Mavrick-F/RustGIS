@@ -41,6 +41,8 @@ struct Asked {
     /// The exact archive and its presentation when asked, not a reusable list index.
     archive: Option<(usize, rustgis_engine::map::TileLayer)>,
     reload: Option<crate::reloaddata::Form>,
+    /// A service add keeps the connection's display name until its actual landing.
+    origin: Option<String>,
     /// Given what the command answered when it runs, or why it didn't (cancelled, or left).
     then: Option<Then>,
     /// A direct relay archive call owns its real completion, rather than a Native callback.
@@ -73,12 +75,30 @@ pub fn run(app: &mut RustGisApp, command: &'static str, p: Value) -> Result<Valu
 
 /// [`run`], then `then` with what the command answered once it ran, here or as it lands, or why
 /// it never ran.
-pub fn run_then(app: &mut RustGisApp, command: &'static str, mut p: Value, then: Option<Then>) -> Result<Value, String> {
+pub fn run_then(app: &mut RustGisApp, command: &'static str, p: Value, then: Option<Then>) -> Result<Value, String> {
+    run_presented(app, command, p, then, None)
+}
+
+/// Keeps a service layer's title and connection display name outside recorded parameters
+/// until its admitted discovery lands. The ordinary read queue owns progress and Cancel.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn run_service(app: &mut RustGisApp, p: Value, name: &str, origin: Option<&str>) -> Result<Value, String> {
+    run_presented(app, "service.add", p, None, Some((name.to_string(), origin.map(str::to_string))))
+}
+
+/// Queues the admitted read with optional presentation supplied by the service dialog/tree.
+fn run_presented(
+    app: &mut RustGisApp,
+    command: &'static str,
+    mut p: Value,
+    then: Option<Then>,
+    presentation: Option<(String, Option<String>)>,
+) -> Result<Value, String> {
     if !app.reads_off_frame {
         let r = app.run(command, p);
         return answered(app, then, r);
     }
-    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "labels.convert")
+    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "labels.convert" | "source.syncState")
         .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
         .flatten();
     let notice_mark = app.session.notice_mark();
@@ -124,8 +144,12 @@ pub fn run_then(app: &mut RustGisApp, command: &'static str, mut p: Value, then:
         None if archive.is_some() => archive.as_ref().map(|(_, tile)| tile.name.clone()).unwrap_or_default(),
         // A model by its name (one drawn but not yet named has none: see `called`).
         None if command == "model.run" => p.get("name").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string(),
+        None if command == "service.add" => {
+            p.get("name").or_else(|| p.get("layer")).and_then(Value::as_str).unwrap_or_default().to_string()
+        }
         None => p.get("path").and_then(Value::as_str).map(|path| file_name(path).to_string()).unwrap_or_default(),
     };
+    let (what, origin) = presentation.unwrap_or((what, None));
     let reload = if command == "layer.reloadData" {
         match app.session.layer_id(&p).and_then(|id| crate::reloaddata::Form::for_read(&app.session, id)) {
             Ok(form) => Some(form),
@@ -147,6 +171,7 @@ pub fn run_then(app: &mut RustGisApp, command: &'static str, mut p: Value, then:
         layer: layer.map(|(instance, _)| instance),
         archive,
         reload,
+        origin,
         then,
         relay: None,
     };
@@ -183,6 +208,7 @@ pub fn admitted(app: &mut RustGisApp, ahead: reads::ReadAhead, relay: rustgis_as
         layer: None,
         archive,
         reload: None,
+        origin: None,
         then: None,
         relay: Some(relay),
     };
@@ -199,10 +225,24 @@ pub fn admitted(app: &mut RustGisApp, ahead: reads::ReadAhead, relay: rustgis_as
 }
 
 fn not_run_asked(app: &mut RustGisApp, asked: &Asked, why: String) {
+    service_result(app, asked, Err(why.clone()));
     not_run(app, asked.then, why.clone());
     if let Some(relay) = &asked.relay {
         relay.begin_archive_landing(&app.session);
         finish_relay(app, relay, Err(why));
+    }
+}
+
+/// Updates only this service add's pending dialog line; generic failures already have notices.
+fn service_result(app: &mut RustGisApp, asked: &Asked, result: Result<(), String>) {
+    let pending = crate::serviceui::adding(&asked.what);
+    if asked.command == "service.add"
+        && asked.opened == app.session.opened
+        && asked.map == app.session.map().instance_id()
+        && app.dialogs.open == Some("addService")
+        && app.dialogs.info.as_deref() == Some(pending.as_str())
+    {
+        app.report_step(true, Some(&pending), result.map(|()| crate::serviceui::added(&asked.what)));
     }
 }
 
@@ -244,6 +284,7 @@ fn called<'a>(command: &str, what: &'a str) -> &'a str {
         (false, _) => what,
         (true, "script.run") => tl_raw!("Run Script"),
         (true, "topology.validate") => tl_raw!("Error Inspector"),
+        (true, "service.add") => tl_raw!("Add Service Layer"),
         (true, _) => tl_raw!("Run Model"),
     }
 }
@@ -337,11 +378,8 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
         *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(read);
     });
     if let Err(e) = spawned {
-        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles") {
-            let why = crate::i18n::fmt(
-                "The archive validation worker could not start ({error}). Retry the command.",
-                &[("error", &e.to_string())],
-            );
+        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers") {
+            let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
             app.session.notify(why.clone(), true);
             not_run_asked(app, &asked, why.clone());
             return Err(why);
@@ -377,7 +415,12 @@ fn complete_here(app: &mut RustGisApp, asked: Asked, p: Value, done: Result<read
     if let Some(relay) = &asked.relay {
         relay.begin_archive_landing(&app.session);
     }
+    let before = app.session.sources.generation;
     let r = app.run_read(asked.command, p, read);
+    service_result(app, &asked, r.as_ref().map(|_| ()).map_err(Clone::clone));
+    if r.is_ok() {
+        crate::connectiontree::name_recent(app, before, asked.origin.as_deref());
+    }
     if asked.command == "map.repairTiles"
         && let Ok(answer) = &r
         && let Some(index) = answer.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok())
@@ -733,6 +776,67 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ogc_dataset_add_reads_on_a_thread_and_keeps_its_origin() {
+        let base = "https://maps.example.org";
+        let docs = [
+            ("/dataset", json!({"links":[{"rel":"tilesets-vector","href":"/tiles?f=json"},{"rel":"styles","href":"/styles?f=json"}]})),
+            (
+                "/tiles?f=json",
+                json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad","dataType":"vector","links":[{"rel":"item","type":"application/vnd.mapbox-vector-tile","href":"/wm/{tileMatrix}/{tileRow}/{tileCol}"}]}]}),
+            ),
+            (
+                "/styles?f=json",
+                json!({"styles":[{"id":"good","links":[{"rel":"stylesheet","type":"application/vnd.mapbox.style+json","href":"/good?f=mapbox"}]}]}),
+            ),
+            (
+                "/good?f=mapbox",
+                json!({"version":8,"sources":{"base":{"type":"vector","tiles":["/wm/{z}/{y}/{x}"]}},"layers":[{"id":"roads","type":"line","source":"base","source-layer":"roads"}]}),
+            ),
+        ];
+        let p = json!({"url":format!("{base}/dataset"),"type":"ogcapi","layer":"good","text":docs[0].1.to_string(),"documents":docs.iter().skip(1).map(|(path,body)|json!({"url":format!("{base}{path}"),"text":body.to_string()})).collect::<Vec<_>>()});
+        for cancel in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.reads_off_frame = true;
+            let result = crate::connectiontree::run_named(&mut app, "service.add", p.clone(), Some("Fixture connection")).unwrap();
+            assert_eq!(result["started"], "Add Service Layer");
+            app.dialogs.open = Some("addService");
+            app.dialogs.info = Some(crate::serviceui::adding("good"));
+            assert!(showing(&app));
+            assert!(app.session.map().tiles.is_empty());
+            if cancel {
+                let end = std::time::Instant::now() + Duration::from_secs(5);
+                while app.reads.job.as_ref().unwrap().slot.lock().unwrap().is_none() {
+                    assert!(std::time::Instant::now() < end);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                app.reads.cancel_for_tests();
+            }
+            landed(&mut app, 5);
+            assert_eq!(app.session.map().tiles.len(), usize::from(!cancel));
+            if cancel {
+                assert!(app.dialogs.info.is_none());
+                assert!(app.dialogs.error.as_ref().is_some_and(|e| e.contains("cancelled")));
+            } else {
+                assert_eq!(app.dialogs.info, Some(crate::serviceui::added("good")));
+                assert_eq!(app.session.map().tiles[0].url, format!("{base}/good?f=mapbox"));
+                assert_eq!(app.session.sources.recent[0].name, "Fixture connection");
+                app.run("edit.undo", Value::Null).unwrap();
+                assert!(app.session.map().tiles.is_empty());
+            }
+        }
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.reads_off_frame = true;
+        crate::connectiontree::run_named(&mut app, "service.add", p.clone(), None).unwrap();
+        app.run("project.new", json!({})).unwrap();
+        crate::connectiontree::run_named(&mut app, "service.add", p, None).unwrap();
+        app.dialogs.open = Some("addService");
+        app.dialogs.info = Some(crate::serviceui::adding("good"));
+        landed(&mut app, 30);
+        assert_eq!(app.session.map().tiles.len(), 1);
+        assert_eq!(app.dialogs.info, Some(crate::serviceui::added("good")), "an old project must not replace the new add's progress line");
     }
 
     #[test]
@@ -1095,6 +1199,55 @@ mod tests {
         assert_eq!(annotation.dataset.features.len(), 2);
         let l = app.session.map().layer(id).unwrap();
         assert!(l.is_streamed() && !l.labels.enabled);
+    }
+
+    /// Source File State hashes the file on a thread of its own and says what it found once
+    /// it lands: Command Search shows no answer.
+    #[test]
+    fn a_source_file_state_check_runs_on_a_thread_and_says_what_it_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("places.geojson");
+        publish_point(&path, 1.0);
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let id = app.run("layer.addData", json!({"path": path})).unwrap()["layer"].as_u64().unwrap();
+        app.reads_off_frame = true;
+        let mark = app.session.notice_mark();
+        assert_eq!(app.run_by_user("source.syncState", json!({"layer": id})).unwrap()["started"], "Source File State");
+        landed(&mut app, 60);
+        let said: Vec<String> = app.session.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|t| t == "places is in step with places.geojson"), "{said:?}");
+    }
+
+    /// The desktop's Add Data reads a Shapefile (in a coordinate system given, as Import
+    /// Shapefile asks) and a GeoJSON with `"stream": false` on a thread of its own, recording the
+    /// file with the read.
+    #[test]
+    fn whole_files_are_read_and_recorded_on_a_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let geojson = dir.path().join("places.geojson");
+        publish_point(&geojson, 1.0);
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addData", json!({"path": geojson, "name": "seed"})).unwrap();
+        let shp = dir.path().join("towns.shp");
+        app.run("share.exportLayer", json!({"layer": "seed", "path": shp})).unwrap();
+        app.reads_off_frame = true;
+        for (p, name) in [
+            (json!({"path": shp, "crs": "EPSG:4326", "name": "towns"}), "towns"),
+            // Another system than the file's: the rows recorded are the rows as read in it.
+            (json!({"path": shp, "crs": "EPSG:3857", "name": "projected"}), "projected"),
+            (json!({"path": geojson, "stream": false, "name": "whole"}), "whole"),
+        ] {
+            assert_eq!(run(&mut app, "layer.addData", p).unwrap()["started"], "Add Data", "{name}");
+            landed(&mut app, 60);
+            let id = app.session.map().layer_by_name(name).unwrap().id;
+            assert!(app.session.map().layer(id).unwrap().synced.is_some(), "{name}");
+            if name == "projected" {
+                assert_eq!(app.session.map().layer(id).unwrap().dataset.crs, rustgis_engine::data::raster::Crs::parse("EPSG:3857").ok());
+            }
+            app.reads_off_frame = false;
+            assert_eq!(app.run("source.syncState", json!({"layer": id})).unwrap()["state"], "inSync", "{name}");
+            app.reads_off_frame = true;
+        }
     }
 
     fn reload_fixture() -> (tempfile::TempDir, RustGisApp, u32, std::path::PathBuf) {

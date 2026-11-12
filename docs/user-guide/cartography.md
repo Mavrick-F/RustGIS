@@ -532,6 +532,17 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   Lock keeps the ones placed. The distance grows with the labels at a reference scale
   (`labels.placement={"layer": "Rivers", "position": "curved", "repeat": 144}`; `null` or `0` is
   the one at the middle).
+- **Distance from the line**: a label placed along a line (Parallel or Curved) set off it, so it
+  doesn't sit over the line it names (Labeling pane › Position › **Distance**, 0 to 200 points, with
+  **Above** or **Below**). The distance runs from the line to the text's nearest edge, and above and
+  below are as the text reads, not north and south: over a level road the label is higher on the
+  screen, beside a road read downward it is to its right. Curved, each character moves off with its
+  own part of the line, so the text keeps following it; where the line bends so tightly that the
+  characters on the inside of the bend would run into one another, the place is left out, as one
+  too sharp to curve is. Repeats and other places along the line sit off it the same way, Lock keeps
+  them where they were found along the line, and the distance grows with the labels at a reference
+  scale (`labels.placement={"layer": "Rivers", "lineOffset": 4}`; negative is below, `0` or `null`
+  on the line).
 - **Show all labels** (Labeling pane › Position): labels among the view's 20,000 highest-priority
   candidates are drawn, over the others where
   they crowd, rather than some left out (`labels.placement={"layer": "Cities", "showAll": true}`).
@@ -606,6 +617,10 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
 - **Convert** (Labeling › Map Labeling, or Layers › right-click › **Convert To Annotation**) turns a
   layer's labels into an annotation layer: one point per label, carrying its
   text in a `TEXT` field, which you can then edit, move or delete like any other features.
+  A label along a line becomes an upright point at its line's middle vertex (the end of a line
+  of two), which can be some way from where the label was drawn: its angle, curve, repeats and
+  distance from the line are left out, and the conversion says how many, and how many of them
+  belong to a class that repeats along lines (each becomes one point).
 - **Label classes** label different features differently, such as large cities in larger text.
   Each class has a SQL clause choosing its features, and its own field, text symbol, placement
   and visibility range. Each class labels every feature its clause matches, the **Default**
@@ -643,6 +658,34 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   ![Europe with the Countries and Cities labelled; the city names sit above and to the right of their points](https://assets.rustgis.app/images/labels.webp)
   <figcaption>City labels placed above and to the right of their points, beside the country labels.</figcaption>
 </figure>
+
+## Layer properties
+
+The **Layer Properties pane** brings together a layer's settings that are otherwise spread over
+the ribbon, the Details pane and the layer's right-click menu. A tab per topic shows one part at a
+time:
+
+- **General**: the layer's name (renamed when you leave the box or press Enter; Escape keeps the
+  old one; up to 200 characters: a longer paste is cut to fit, and a note under the full box says
+  so),
+  **Visible**, for a feature layer **Selectable** (whether the Select tool picks its
+  features on the map), and **Show legend in Layers**. Symbology and labels keep their own panes.
+- **Source**: what the Details pane shows (geometry, feature and field counts, source, coordinate
+  system, extent and fields), with the actions on the source that the layer's menu has, where they
+  apply: **Load All Features**, **Repair Data Source…**, **Reload Data** (desktop) and **Define
+  Projection…**.
+- **Display**: the visibility range (**Out Beyond**, **In Beyond**, **Clear Limits**),
+  **Transparency**, **Masking**, a raster's **Layer Blend** or a feature layer's **Reference
+  scale**, and the **Depth priority** that View › Scene › Raise and Lower Priority change (a
+  higher one draws on top, whatever the layer order).
+
+Open it with Layers › right-click › **Properties…** or **View › Windows › Layer Properties**. It
+follows the selected layer, as the Symbology and Labeling panes do: its header shows the layer's
+type and name, and lights up for a moment when another layer is selected, and the pane's tab names
+the layer too. A name being typed is kept when you click away, even on another layer, as Enter keeps
+it; Escape drops it. It runs the same commands as the ribbon, so each change undoes on its own,
+except **Show legend in Layers**: like the arrow beside a layer in the Layers pane, it changes what
+that pane shows, not the layer, so it isn't a step to undo.
 
 ## Layer effects
 

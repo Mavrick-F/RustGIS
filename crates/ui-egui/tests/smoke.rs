@@ -889,6 +889,7 @@ fn every_tab_pane_and_dialog_renders() {
     for (id, p) in [
         ("ui.pane.symbology", json!(null)),
         ("ui.pane.labeling", json!({"layer": "Cities"})),
+        ("ui.pane.layerProperties", json!({"layer": "Cities"})),
         ("ui.pane.geoprocessing", json!(null)),
         ("ui.gp.open", json!({"tool": "buffer"})),
         ("ui.pane.history", json!(null)),
@@ -1810,7 +1811,8 @@ fn show_me_points_at_where_a_steps_command_is() {
 fn old_and_unknown_tab_names_open_a_current_tab() {
     let mut h = harness();
     for (asked, opened) in [
-        ("Imagery", "Analyze"),
+        // The imagery groups are on the Imagery extension's tab (#1752).
+        ("Imagery", "extension:imagery"),
         ("Feature Layer", "Style"),
         ("Labeling", "Labeling"),
         ("Share", "Publish"),

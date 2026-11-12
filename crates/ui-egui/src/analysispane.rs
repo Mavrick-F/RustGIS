@@ -24,6 +24,8 @@ pub struct Workflow {
     pub field: String,
     pub number: String,
     pub number2: String,
+    /// The viewshed reads the ground between cells (bilinear heights), not the nearest cell.
+    pub bilinear: bool,
     pub text: String,
     pub function: String,
     pub chain: Vec<String>,
@@ -50,6 +52,19 @@ pub struct Workflow {
     /// The Spectral Analysis section's profile: the points read and charted.
     pub spectral: crate::spectralui::Spectral,
     pub selected_only: Option<bool>,
+    /// The projected coordinate system the Geostatistical Wizard's surface is made in; empty: the
+    /// environment's, else the projected one the layer was read in, else degrees.
+    pub crs: String,
+    /// The system the Wizard's surface was last to be made in (its own, else the environment's):
+    /// when it changes, the cell size typed for it is cleared.
+    pub wizard_system: String,
+    /// The system the Wizard's layer was read in, and the one its surface is made in from it
+    /// ([`rustgis_engine::analysis::layer_raster_crs`]), kept so it is worked out once.
+    pub layer_system: Option<(rustgis_engine::data::raster::Crs, Option<rustgis_engine::data::raster::Crs>)>,
+    /// The projected coordinate system typed for the environment's Set Coordinate System.
+    pub env_crs: String,
+    /// The cell size typed for the environment, apart from the Wizard's, which is the run's own.
+    pub env_cell: String,
     pub zonal_stats: ZonalStatsForm,
     /// A workflow running on a thread of its own: its progress and Cancel show, and what it made
     /// lands through [`land_job`].
@@ -399,6 +414,25 @@ fn num(s: &str, d: f64) -> f64 {
     s.trim().parse().unwrap_or(d)
 }
 
+/// The viewshed's parameters from the pane, seen from `at`: an empty radius field leaves the
+/// radius out, so the command takes the whole DEM.
+fn viewshed_params(w: &Workflow, at: rustgis_engine::geom::Coord) -> Value {
+    let mut params = json!({"layer": w.layer, "lon": at.x, "lat": at.y});
+    // A number is the height or radius; other text goes as it is, for the command to refuse,
+    // naming it (`inf`, `NaN` and `1e400` parse, but aren't numbers JSON holds: they'd be null).
+    // Empty: the command's own (1.7 m up; the whole raster).
+    for (key, text) in [("height", &w.number), ("radius", &w.number2)] {
+        match text.trim() {
+            "" => {}
+            t => params[key] = t.parse::<f64>().ok().filter(|v| v.is_finite()).map_or_else(|| json!(t), |v| json!(v)),
+        }
+    }
+    if w.bilinear {
+        params["heights"] = json!("bilinear");
+    }
+    params
+}
+
 /// The sections of the Workflows pane: (id, title).
 pub const SECTIONS: &[(&str, &str)] = &[
     ("rasterFunctions", "Raster Functions"),
@@ -433,6 +467,32 @@ pub const SECTIONS: &[(&str, &str)] = &[
     ("reality", "Reality Mapping"),
 ];
 
+/// The extension (#1752) that owns Workflows section `section`: it is hidden while that
+/// extension is off.
+pub fn section_extension(section: &str) -> Option<&'static str> {
+    match section {
+        "georeference" | "change" | "spectral" | "classify" | "supervised" | "deepLearning" | "hosted" | "indices" | "process"
+        | "pixels" | "mensuration" | "ortho" | "reality" => Some(rustgis_engine::extensions::IMAGERY.id),
+        _ => None,
+    }
+}
+
+/// Whether Workflows section `section` shows: its extension, if it has one, is on.
+pub fn section_shown(session: &rustgis_engine::Session, section: &str) -> bool {
+    section_extension(section).is_none_or(|e| session.extensions().is_on(e))
+}
+
+/// Why Workflows section `section` can't open: its extension is off. `None` when it can.
+pub fn section_blocked(session: &rustgis_engine::Session, section: &str) -> Option<String> {
+    let e = section_extension(section).and_then(rustgis_engine::extensions::get)?;
+    (!session.extensions().is_on(e.id)).then(|| {
+        crate::i18n::fmt(
+            "{section} is part of the {name} extension, which is off; turn it on in Plugins › Extensions",
+            &[("section", tl_raw!(SECTIONS.iter().find(|s| s.0 == section).map_or(section, |s| s.1))), ("name", tl_raw!(e.name))],
+        )
+    })
+}
+
 /// Starts picking `needed` map points for a workflow.
 fn pick_button(app: &mut RustGisApp, ui: &mut Ui, purpose: &'static str, needed: usize, label: &str) {
     let active = app.workflow.pick.as_ref().is_some_and(|p| p.purpose == purpose);
@@ -448,14 +508,19 @@ fn picked(app: &mut RustGisApp, purpose: &str) -> Option<Vec<rustgis_engine::geo
 }
 
 pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
-    if app.workflow.section.is_empty() {
+    // A section whose extension was turned off while it was open: back to the first.
+    if app.workflow.section.is_empty() || !section_shown(&app.session, app.workflow.section) {
+        // Its map pick ends with it (a pick started elsewhere, with no section open, stays).
+        if !app.workflow.section.is_empty() {
+            app.workflow.pick = None;
+        }
         app.workflow.section = "rasterFunctions";
     }
     egui::ComboBox::from_id_salt("wf_section")
         .selected_text(tl!(SECTIONS.iter().find(|s| s.0 == app.workflow.section).map_or("", |s| s.1)))
         .width(ui.available_width() - 8.0)
         .show_ui(ui, |ui| {
-            for (id, title) in SECTIONS {
+            for (id, title) in SECTIONS.iter().filter(|s| section_shown(&app.session, s.0)) {
                 if ui.selectable_label(app.workflow.section == *id, tl!(*title)).clicked() {
                     app.workflow.section = id;
                     app.workflow.result = None;
@@ -658,12 +723,25 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("observer height m")).desired_width(110.0));
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number2).hint_text(tl!("radius m")).desired_width(80.0));
             });
+            // How the ground along each ray is read.
+            ui.horizontal(|ui| {
+                ui.label(tl!("Ground heights"));
+                let (nearest, between) = (tl!("Nearest cell"), tl!("Between cells (bilinear)"));
+                egui::ComboBox::from_id_salt("wf_v_heights")
+                    .selected_text(if app.workflow.bilinear { between } else { nearest })
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut app.workflow.bilinear, false, nearest);
+                        ui.selectable_value(&mut app.workflow.bilinear, true, between);
+                    })
+                    .response
+                    .on_hover_text(tl!(
+                        "How the ground between the observer and a cell is read: the cell each point falls in, or between the cells' centres. Between cells is an estimate too, but closer on ground that bulges, a hill seen from its top, where the nearest cell can hide cells just inside the horizon."
+                    ));
+            });
             pick_button(app, ui, "viewshed", 1, "Click the observer on the map");
             if let Some(p) = picked(app, "viewshed").and_then(|v| v.first().copied()) {
-                let mut params = json!({"layer": app.workflow.layer, "lon": p.x, "lat": p.y, "height": num(&app.workflow.number, 1.7)});
-                if let Ok(r) = app.workflow.number2.trim().parse::<f64>() {
-                    params["radius"] = json!(r);
-                }
+                let params = viewshed_params(&app.workflow, p);
                 run(app, "analysis.viewshed", params);
             }
         }
@@ -681,14 +759,51 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             heading(ui, "Interpolate a surface from points (IDW)");
             combo(ui, "wf_i", "Layer", &mut app.workflow.layer, &points);
             combo(ui, "wf_if", "Field", &mut app.workflow.field, &numeric);
+            // Empty: the environment's system, else the projected one the layer was read in, else
+            // degrees; the hint shows which.
+            let read_in = app.session.map().layer_by_name(&app.workflow.layer).and_then(|l| l.dataset.crs);
+            // The run's choice; kept for the layer's system, so a projection isn't built every frame.
+            let layer_crs = match (read_in, app.workflow.layer_system) {
+                (Some(c), Some((seen, chosen))) if seen == c => chosen,
+                (Some(c), _) => {
+                    let chosen = rustgis_engine::analysis::layer_raster_crs(Some(c)).and_then(Result::ok);
+                    app.workflow.layer_system = Some((c, chosen));
+                    chosen
+                }
+                (None, _) => None,
+            };
+            let empty_crs = app.session.project.gp_env.projected.map(|g| g.crs).or(layer_crs);
+            let degrees = app.workflow.crs.trim().is_empty() && empty_crs.is_none();
+            ui.add(
+                egui::TextEdit::singleline(&mut app.workflow.crs)
+                    .hint_text(match empty_crs {
+                        Some(c) => c.label(),
+                        None => tl!("projected system (EPSG:32616), or degrees").to_string(),
+                    })
+                    .desired_width(f32::INFINITY),
+            );
+            // A cell size typed for one system means nothing in another: when the system the surface
+            // will be made in changes (typed here, or the environment's), the size is cleared.
+            let system = match app.workflow.crs.trim() {
+                "" => empty_crs.map(|c| c.code()).unwrap_or_default(),
+                typed => typed.to_string(),
+            };
+            if system != app.workflow.wizard_system {
+                app.workflow.number.clear();
+                app.workflow.wizard_system = system;
+            }
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("cell size °")).desired_width(80.0));
+                let hint = if degrees { tl!("cell size °") } else { tl!("cell size") };
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0));
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number2).hint_text(tl!("power 2")).desired_width(60.0));
             });
             if ui.button(tl!("Run")).clicked() {
                 let mut p = json!({"layer": app.workflow.layer, "field": app.workflow.field, "power": num(&app.workflow.number2, 2.0)});
                 if let Ok(c) = app.workflow.number.trim().parse::<f64>() {
                     p["cellSize"] = json!(c);
+                }
+                if !app.workflow.crs.trim().is_empty() {
+                    p["crs"] = json!(app.workflow.crs.trim());
                 }
                 run(app, "analysis.interpolate", p);
             }
@@ -796,11 +911,50 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 }
             });
+            let system =
+                env.projected.map(|g| g.crs.label()).unwrap_or_else(|| tl!("the layer's projected system, else degrees").to_string());
+            let cells = env.cell_in(env.projected.map_or(rustgis_engine::data::raster::Crs::LonLat, |g| g.crs));
+            // A size in degrees is used only for a surface in degrees: said so, also beside a system
+            // with no size of its own.
+            let degrees = |c: f64| crate::i18n::fmt("{c}° (in degrees only)", &[("c", &c.to_string())]);
+            let cells = match (cells, env.projected) {
+                (Some(c), Some(_)) => c.to_string(),
+                (Some(c), None) => degrees(c),
+                (None, _) => match env.cell_size {
+                    Some(d) => crate::i18n::fmt("the tool's own; {d}", &[("d", &degrees(d))]),
+                    None => tl!("the tool's own").to_string(),
+                },
+            };
+            ui.label(
+                egui::RichText::new(crate::i18n::fmt("Rasters: {system}, cell size {cells}", &[("system", &system), ("cells", &cells)]))
+                    .small(),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.env_crs).hint_text("EPSG:32616").desired_width(110.0));
+                // An empty box sets nothing; clearing the system is its own button, so a click never
+                // clears it and its cell size by accident. Cleared, a run takes the layer's system.
+                let typed = app.workflow.env_crs.trim().to_string();
+                if ui.add_enabled(!typed.is_empty(), egui::Button::new(tl!("Set Coordinate System"))).clicked() {
+                    run(app, "gp.env", json!({"crs": typed}));
+                }
+                if ui.add_enabled(env.projected.is_some(), egui::Button::new(tl!("Clear Coordinate System"))).clicked() {
+                    run(app, "gp.env", json!({"crs": null}));
+                }
+            });
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("cell size °")).desired_width(80.0));
+                let hint = if env.projected.is_some() { tl!("cell size") } else { tl!("cell size °") };
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.env_cell).hint_text(hint).desired_width(80.0));
                 if ui.button(tl!("Set Cell Size")).clicked() {
-                    let v = app.workflow.number.trim().parse::<f64>().ok();
-                    run(app, "gp.env", json!({"cellSize": v}));
+                    // Empty clears the size; text that isn't a number is refused, not taken as empty.
+                    let typed = app.workflow.env_cell.trim().to_string();
+                    match typed.parse::<f64>() {
+                        // `inf` and `NaN` parse, but aren't sizes (and go out as null, which clears).
+                        Ok(v) if v.is_finite() => run(app, "gp.env", json!({"cellSize": v})),
+                        Err(_) if typed.is_empty() => run(app, "gp.env", json!({"cellSize": null})),
+                        _ => {
+                            app.workflow.error = Some(crate::i18n::fmt("'{size}' isn't a cell size: give a number", &[("size", &typed)]));
+                        }
+                    }
                 }
             });
         }
@@ -2010,6 +2164,71 @@ pub fn script_details(app: &mut RustGisApp, ctx: &egui::Context) {
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable;
+
+    /// An empty radius field (or one of spaces) runs the viewshed over the whole DEM, about
+    /// 630 km long: one whose radius square, the DEM's diagonal each way, holds far more cells
+    /// than the DEM.
+    #[test]
+    fn a_viewshed_with_an_empty_radius_field_sees_the_whole_dem() {
+        use base64::Engine;
+        use rustgis_engine::geom::Coord;
+        let mut app = RustGisApp::with_sample();
+        use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+        // A strip 4,000 cells long and 2 high, 0.002° (about 160 m) a cell: about 630 km. The
+        // DEM's diagonal each way spans 8,001 × 8,001 cells, 64 million, of which 8,000 are the
+        // DEM's.
+        let (w, h) = (4_000u32, 2u32);
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 45.004, pixel_width: 0.002, pixel_height: -0.002 };
+        let dem =
+            Raster::new("strip", w, h, vec![vec![200.0; (w * h) as usize]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(geotiff::write(&dem, 0).unwrap());
+        app.session.run("layer.addDataBytes", &json!({"fileName": "strip.tif", "data": data})).unwrap();
+        let layer = app.session.map().layers.iter().rev().find(|l| l.is_raster()).unwrap().name.clone();
+        // Cells of a viewshed worked out (not left no-data), and whether the strip's far end is.
+        let worked = |app: &RustGisApp, name: &str| {
+            let r = app.session.map().layer_by_name(name).and_then(|l| l.raster.as_ref()?.data.clone()).unwrap();
+            let n = (0..h as i64)
+                .flat_map(|row| (0..w as i64).map(move |col| (col, row)))
+                .filter(|&(c, rr)| r.value(0, c, rr).is_some())
+                .count();
+            (n, r.value(0, i64::from(w) - 1, 0).is_some())
+        };
+        let at = Coord::new(10.001, 45.001);
+        // A radius given short of the far end leaves it out; one past the DEM's diagonal works
+        // out every cell, as an empty field does.
+        app.session
+            .run("analysis.viewshed", &json!({"layer": layer, "lon": at.x, "lat": at.y, "height": 2.0, "radius": 100_000, "name": "short"}))
+            .unwrap();
+        assert!(!worked(&app, "short").1);
+        app.session
+            .run("analysis.viewshed", &json!({"layer": layer, "lon": at.x, "lat": at.y, "height": 2.0, "radius": 1e9, "name": "given"}))
+            .unwrap();
+        assert_eq!(worked(&app, "given"), ((w * h) as usize, true));
+        for (i, radius) in ["", "   "].into_iter().enumerate() {
+            let workflow = Workflow { layer: layer.clone(), number: "2".into(), number2: radius.into(), ..Default::default() };
+            let mut p = viewshed_params(&workflow, at);
+            assert!(p.get("radius").is_none(), "radius {radius:?}: {p}");
+            let name = format!("empty{i}");
+            p["name"] = json!(name);
+            app.session.run("analysis.viewshed", &p).unwrap_or_else(|e| panic!("radius {radius:?}: {e}"));
+            assert_eq!(worked(&app, &name), ((w * h) as usize, true), "radius {radius:?}: every cell worked out");
+        }
+        // A number in the field is the radius; other text is refused, not taken as no radius.
+        let workflow = Workflow { layer: layer.clone(), number2: " 5000 ".into(), ..Default::default() };
+        assert_eq!(viewshed_params(&workflow, Coord::new(10.0005, 45.0005))["radius"], json!(5000.0));
+        // So is the height, and an empty one is the command's 1.7 m.
+        for (text, e) in [("abc", r#"not "abc""#), ("1,7", r#"not "1,7""#), ("-3", "not -3.0")] {
+            let workflow = Workflow { layer: layer.clone(), number: text.into(), ..Default::default() };
+            let got = app.session.run("analysis.viewshed", &viewshed_params(&workflow, at)).unwrap_err();
+            assert!(got.starts_with("height must be a number of metres from 0 to 10,000") && got.ends_with(e), "{got}");
+        }
+        assert!(viewshed_params(&Workflow { layer: layer.clone(), ..Default::default() }, at).get("height").is_none());
+        for text in ["500km", "inf", "NaN", "1e400", "-infinity"] {
+            let workflow = Workflow { layer: layer.clone(), number2: text.into(), ..Default::default() };
+            let e = app.session.run("analysis.viewshed", &viewshed_params(&workflow, at)).unwrap_err();
+            assert_eq!(e, format!(r#"radius must be a number of metres above 0, not "{text}""#));
+        }
+    }
 
     /// A Script pane run works its tools out on a thread of its own: the results say Running…
     /// until it lands, runs land in the order asked, and one cancelled or left says so.

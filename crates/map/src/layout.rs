@@ -10,6 +10,7 @@ use rustgis_geom::Coord;
 use serde::{Deserialize, Serialize};
 
 use crate::raster::{Colorizer, Normalizer, RasterLayer, RasterMask, RasterRenderer, RasterStyle};
+use crate::symbology::Dash;
 use crate::{Camera, Layer, Map, Rgba};
 
 /// Logical points per millimetre (96 points per inch).
@@ -945,7 +946,8 @@ pub enum ElementKind {
     /// for classes, a block per value for unique values and colour tables (#326).
     Colorbar {
         frame: u32,
-        /// The raster layer (by name); `None` is the top visible raster of the frame's map.
+        /// The raster layer (by name); `None` is the frame map's top shown raster with a colour scale
+        /// that isn't drawn by classes ([`colorbar_layer`]).
         #[serde(default)]
         layer: Option<String>,
         /// Drawn beside the bar, e.g. the units: `Elevation (m)`.
@@ -989,6 +991,11 @@ pub enum ElementKind {
         /// (trimmed, bounded, none when not a name).
         #[serde(default, deserialize_with = "crate::symbology::de_font", skip_serializing_if = "Option::is_none")]
         font_name: Option<String>,
+        /// Turned about the centre of its box, in degrees clockwise as a frame's `bearing` is
+        /// (90 reads top to bottom, -90 bottom to top), -180 to 180 ([`rotation()`]); the element's
+        /// box stays the unturned one. Left out when 0, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        rotation: f64,
     },
     Picture {
         /// Base64 PNG or JPEG.
@@ -1019,9 +1026,21 @@ pub enum ElementKind {
         /// Its corners rounded by this much, in millimetres (0: square corners).
         #[serde(default, skip_serializing_if = "is_zero")]
         radius: f64,
+        /// Dashed: the pattern along the outline, in points, as a line layer's stroke takes it
+        /// ([`Dash`]); `None` is solid. Left out when solid, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::symbology::de_dash")]
+        dash: Option<Dash>,
     },
     /// An ellipse filling the element's box: a circle in a square one.
-    Ellipse { fill: Rgba, outline: Rgba, width: f64 },
+    Ellipse {
+        fill: Rgba,
+        outline: Rgba,
+        width: f64,
+        /// Dashed: the pattern along the outline, in points, as a line layer's stroke takes it
+        /// ([`Dash`]); `None` is solid. Left out when solid, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::symbology::de_dash")]
+        dash: Option<Dash>,
+    },
     /// A straight line across the element's box, `width` points wide.
     Line {
         color: Rgba,
@@ -1031,6 +1050,11 @@ pub enum ElementKind {
         /// Arrowheads: none makes it a plain line.
         #[serde(default)]
         head: LineHead,
+        /// Dashed: the pattern along the line, in points, as a line layer's stroke takes it
+        /// ([`Dash`]); `None` is solid. Only the shaft is dashed: arrowheads stay solid. Left out
+        /// when solid, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::symbology::de_dash")]
+        dash: Option<Dash>,
     },
 }
 
@@ -1051,6 +1075,7 @@ impl ElementKind {
             letter_spacing: 0.0,
             font: FontFamily::Sans,
             font_name: None,
+            rotation: 0.0,
         }
     }
 
@@ -1136,9 +1161,49 @@ pub struct Element {
 }
 
 impl Element {
+    /// Whether the point (mm) is on the element, its box turned as it is drawn.
     pub fn contains(&self, x: f64, y: f64) -> bool {
+        let (x, y) = self.unturned(x, y);
         x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
     }
+
+    /// How far it is turned about its centre, in degrees clockwise: a text's `rotation`, else 0.
+    pub fn rotation(&self) -> f64 {
+        match self.kind {
+            ElementKind::Text { rotation, .. } => rotation,
+            _ => 0.0,
+        }
+    }
+
+    /// The point (mm) seen in the element's unturned box: turned back about its centre.
+    pub fn unturned(&self, x: f64, y: f64) -> (f64, f64) {
+        if self.rotation() == 0.0 {
+            return (x, y);
+        }
+        let (cx, cy) = (self.x + self.w / 2.0, self.y + self.h / 2.0);
+        let (sin, cos) = (-self.rotation()).to_radians().sin_cos();
+        let (dx, dy) = (x - cx, y - cy);
+        (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+    }
+
+    /// The rectangle (x, y, w, h in mm) its turned box takes up on the page: its box when it isn't
+    /// turned.
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        let (sin, cos) = self.rotation().to_radians().sin_cos();
+        let (w, h) = (self.w * cos.abs() + self.h * sin.abs(), self.w * sin.abs() + self.h * cos.abs());
+        (self.x + (self.w - w) / 2.0, self.y + (self.h - h) / 2.0, w, h)
+    }
+}
+
+/// An angle in degrees as a text's `rotation` keeps it: within -180..=180 (450 is 90, 270 is -90),
+/// 0 when it isn't a number.
+pub fn rotation(degrees: f64) -> f64 {
+    if !degrees.is_finite() {
+        return 0.0;
+    }
+    let a = degrees.rem_euclid(360.0);
+    // `rem_euclid` of a tiny negative angle can round to 360 itself.
+    if a > 180.0 { a - 360.0 } else { a }
 }
 
 /// A map series: one page per feature of an index layer, the main frame zoomed to each.
@@ -1396,7 +1461,8 @@ impl Layout {
                         label.truncate(end);
                     }
                 }
-                ElementKind::Text { text, size, letter_spacing, .. } => {
+                ElementKind::Text { text, size, letter_spacing, rotation: turn, .. } => {
+                    *turn = rotation(*turn);
                     *size = finite_or(*size, 12.0).clamp(*crate::graphics::FONT_SIZE.start(), *crate::graphics::FONT_SIZE.end());
                     *letter_spacing = finite_or(*letter_spacing, 0.0).clamp(MIN_LETTER_SPACING, MAX_LETTER_SPACING);
                     let end = text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i);
@@ -1574,11 +1640,21 @@ pub const MAX_COLORBAR_VALUES: usize = 64;
 /// Colours sampled along a continuous colorbar.
 const RAMP_SAMPLES: usize = 256;
 
-/// The raster layer a colorbar shows: `layer` by name, or the top visible raster of the map.
+/// The raster layer a colorbar shows: `layer` by name, or the topmost raster the map shows (its
+/// groups visible too) with a colour scale ([`color_scale`]) that isn't drawn by classes: a legend lists those (#1679), and a colorbar
+/// of their codes would be the only key a land cover had. An RGB composite or a land cover over a
+/// DEM leaves it to the DEM. A raster on a ramp (Stretch, a tinted hillshade) whose pixels aren't
+/// read yet keeps its place: it is returned with no colour scale to show, rather than the one of
+/// a raster under it.
 pub fn colorbar_layer<'a>(map: &'a Map, layer: Option<&str>) -> Option<&'a Layer> {
     match layer {
         Some(n) => map.layer_by_name(n).filter(|l| l.is_raster()),
-        None => map.layers.iter().find(|l| l.visible && l.is_raster()),
+        None => map.layers.iter().filter(|l| map.shows(l)).find(|l| {
+            l.raster.as_ref().is_some_and(|r| match r.data {
+                None => matches!(r.style.renderer, RasterRenderer::Stretch { .. } | RasterRenderer::ShadedRelief { ramp: Some(_), .. }),
+                Some(_) => !r.style.renderer.draws_classes() && color_scale(r).is_some(),
+            })
+        }),
     }
 }
 
@@ -1646,11 +1722,12 @@ pub fn color_scale(rl: &RasterLayer) -> Option<ColorScale> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symbology::MAX_DASH_STEP;
 
     #[test]
     fn elements_are_arranged_in_the_drawing_order() {
         let mut l = Layout::new("L", 100.0, 100.0);
-        let rect = || ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 };
+        let rect = || ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0, dash: None };
         let ids: Vec<u32> = (0..4).map(|i| l.add(format!("E{i}"), (10.0, 10.0, 50.0, 50.0), rect())).collect();
         let order = |l: &Layout| l.elements.iter().map(|e| e.id).collect::<Vec<_>>();
         // All four overlap: the one drawn last is the one a click picks.
@@ -1774,7 +1851,7 @@ mod tests {
         let a = big.add(
             "a",
             (0.0, 0.0, 1.0, 1.0),
-            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0, radius: 0.0 },
+            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0, radius: 0.0, dash: None },
         );
         assert!(a != big.elements[0].id && a <= MAX_ID + 1);
     }
@@ -1782,7 +1859,7 @@ mod tests {
     #[test]
     fn hairline_rectangles_keep_their_height() {
         let mut l = Layout::new("Layout", 210.0, 297.0);
-        let rule = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 };
+        let rule = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0, dash: None };
         let id = l.add("Rule", (14.0, 33.0, 182.0, 0.15), rule.clone());
         assert_eq!(l.element(id).map(|e| e.h), Some(0.15));
         // A zero height becomes the thinnest element, not a 1 mm box.
@@ -1958,6 +2035,107 @@ mod tests {
         assert_eq!(grid, Grid { step: 10.0, ..Grid::default() });
         assert_eq!(grid.edges, GridEdges { top: false, bottom: true, left: true, right: false });
         assert_eq!(grid.style, GridStyle::Lines);
+    }
+
+    /// Lines and the outlines of rectangles and ellipses keep a dash pattern through a save
+    /// (#1763); solid, nothing is written, so a layout saved before is written back byte for
+    /// byte; a pattern read from a file is brought into range as a line layer's is.
+    #[test]
+    fn dashes_round_trip_and_old_layouts_keep_their_bytes() {
+        let black = Rgba::rgb(0, 0, 0);
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let line = l.add(
+            "Line",
+            (10.0, 10.0, 60.0, 6.0),
+            ElementKind::Line { color: black, width: 1.0, dir: LineDir::Horizontal, head: LineHead::End, dash: None },
+        );
+        let rect = l.add(
+            "Box",
+            (10.0, 30.0, 60.0, 30.0),
+            ElementKind::Rectangle { fill: black, outline: black, width: 1.0, radius: 0.0, dash: None },
+        );
+        let oval = l.add("Oval", (10.0, 70.0, 30.0, 20.0), ElementKind::Ellipse { fill: black, outline: black, width: 1.0, dash: None });
+        let old = serde_json::to_string(&l).unwrap();
+        assert!(!old.contains("dash"), "solid writes no pattern");
+        assert_eq!(serde_json::to_string(&serde_json::from_str::<Layout>(&old).unwrap()).unwrap(), old, "written back byte for byte");
+        let dash_of = |l: &Layout, id: u32| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Line { dash, .. } | ElementKind::Rectangle { dash, .. } | ElementKind::Ellipse { dash, .. }) => {
+                dash.map(|d| d.steps().to_vec())
+            }
+            _ => panic!("a line or a shape"),
+        };
+        let pattern = Dash::new(&[4.0, 2.0, 1.0, 2.0]);
+        for id in [line, rect, oval] {
+            if let Some(ElementKind::Line { dash, .. } | ElementKind::Rectangle { dash, .. } | ElementKind::Ellipse { dash, .. }) =
+                l.element_mut(id).map(|e| &mut e.kind)
+            {
+                *dash = pattern;
+            }
+        }
+        let saved = serde_json::to_string(&l).unwrap();
+        assert!(saved.contains(r#""dash":[4.0,2.0,1.0,2.0]"#), "{saved}");
+        let back: Layout = serde_json::from_str(&saved).unwrap();
+        for id in [line, rect, oval] {
+            assert_eq!(dash_of(&back, id), Some(vec![4.0, 2.0, 1.0, 2.0]));
+        }
+        // From a file, as a line layer's pattern: steps clamped, all-zero read as solid.
+        let file = saved.replacen("[4.0,2.0,1.0,2.0]", "[4,1e9,-2]", 1).replacen("[4.0,2.0,1.0,2.0]", "[0,0]", 1);
+        let read: Layout = serde_json::from_str(&file).unwrap();
+        assert_eq!(dash_of(&read, line), Some(vec![4.0, MAX_DASH_STEP, 0.0]));
+        assert_eq!(dash_of(&read, rect), None);
+        assert_eq!(dash_of(&read, oval), Some(vec![4.0, 2.0, 1.0, 2.0]));
+    }
+
+    /// A text turned 90° or -90° (#1763) keeps its turn through a save; one saved before reads
+    /// upright and is written back byte for byte; a turn read from a file is kept within -180 to
+    /// 180.
+    #[test]
+    fn text_rotation_round_trips_and_old_layouts_keep_their_bytes() {
+        let turn_of = |l: &Layout, id: u32| l.element(id).map(Element::rotation);
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let upright = l.add("Title", (10.0, 10.0, 60.0, 10.0), ElementKind::text("Brasil", 12.0, Rgba::rgb(0, 0, 0), false));
+        let old = serde_json::to_string(&l).unwrap();
+        assert!(!old.contains("rotation"), "an upright text writes no turn");
+        let back: Layout = serde_json::from_str(&old).unwrap();
+        assert_eq!(turn_of(&back, upright), Some(0.0));
+        assert_eq!(serde_json::to_string(&back).unwrap(), old, "written back byte for byte");
+        for turn in [90.0, -90.0] {
+            let mut l = l.clone();
+            if let Some(ElementKind::Text { rotation, .. }) = l.element_mut(upright).map(|e| &mut e.kind) {
+                *rotation = turn;
+            }
+            let back: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+            assert_eq!(turn_of(&back, upright), Some(turn));
+        }
+        // Read from a file, a turn is kept within -180..=180.
+        let file = old.replace(r#""bold":false"#, r#""bold":false,"rotation":450"#);
+        let mut read: Layout = serde_json::from_str(&file).unwrap();
+        read.clamp();
+        assert_eq!(turn_of(&read, upright), Some(90.0));
+        assert_eq!(
+            [rotation(270.0), rotation(-270.0), rotation(180.0), rotation(-180.0), rotation(f64::NAN)],
+            [-90.0, 90.0, 180.0, 180.0, 0.0]
+        );
+    }
+
+    /// A turned text is hit, and takes up the page, where it is drawn: its box turned about its
+    /// centre (#1763).
+    #[test]
+    fn a_turned_text_is_hit_on_its_turned_box() {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let id = l.add("Source", (20.0, 45.0, 60.0, 10.0), ElementKind::text("Fonte: IBGE", 8.0, Rgba::rgb(0, 0, 0), false));
+        // Upright: 60 wide, 10 high, centred on (50, 50).
+        assert_eq!((l.hit(25.0, 50.0), l.hit(50.0, 25.0)), (Some(id), None));
+        if let Some(ElementKind::Text { rotation, .. }) = l.element_mut(id).map(|e| &mut e.kind) {
+            *rotation = 90.0;
+        }
+        // Turned: 10 wide, 60 high, about the same centre.
+        assert_eq!((l.hit(25.0, 50.0), l.hit(50.0, 25.0)), (None, Some(id)));
+        let (x, y, w, h) = l.element(id).unwrap().bounds();
+        assert!((x - 45.0).abs() < 1e-9 && (y - 20.0).abs() < 1e-9 && (w - 10.0).abs() < 1e-9 && (h - 60.0).abs() < 1e-9);
+        // The element keeps its unturned box.
+        let e = l.element(id).unwrap();
+        assert_eq!((e.x, e.y, e.w, e.h), (20.0, 45.0, 60.0, 10.0));
     }
 
     #[test]

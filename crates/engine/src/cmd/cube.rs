@@ -25,10 +25,10 @@ use super::ps;
 use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
-    vec![C::new("cube.trend", "Trend Analysis", "Analyze › Image Analysis", trend_cmd).inputs(cube_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
+    vec![C::new("cube.trend", "Trend Analysis", "Analyze › Workflows", trend_cmd).inputs(cube_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
         r#"{"cube"?: an entry of cube.catalog (its STAC API, collection, band, cell size and cloud cap, or its Zarr store and variable) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer (or "path" | "url", "variable", "index", "crs" as for zarr.reduce) or a raster of several bands, a date each (default: the active layer) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "url"?: the collection's STAC API (as for stac.addCube), "asset"?: the collection's band, such as NDVI, "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default: that overview's pixels as stored) | "average" (each cell the mean of the full images' pixels in it, which reads them), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "start"?, "end"?: dates (a whole number from 1000 to 9999 is a year; an end given as a year or a month takes all of it), "months"?: [1–12] (one season across years), "test"?: "hamedRao" (default) | "yueWang" | "seasonal" | "original", "seasons"?: parts of a year for the seasonal test (default 12), "alpha"?: 0.05 (above 0, below 0.5), "minValid"?: dates a cell needs (default: half of them, at least 4; the seasonal test also needs 4 in seasons of two or more), "per"?: "year" (default) | "decade", "name"?: text, "ran"?: (internal: a trend the app has worked out)} → four raster layers: Sen's slope, the test's Z and p-value, and the slope where p < alpha"#,
     ),
-    C::new("cube.reduce", "Summarise a Data Cube over Time", "Analyze › Image Analysis", reduce_cmd).inputs(cube_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
+    C::new("cube.reduce", "Summarise a Data Cube over Time", "Analyze › Workflows", reduce_cmd).inputs(cube_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
         r#"{"cube"?: an entry of cube.catalog (as for cube.trend) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer or a raster of several bands, a date each (default: the active layer) | "path"?: a Zarr store's folder | "url"?: a Zarr store's address, or a STAC collection's API (as for stac.addCube) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "variable"?, "index"?, "crs"?: a Zarr variable's (as for zarr.reduce), "asset"?: the collection's band, such as NDVI, "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default) | "average" (as for cube.trend), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "stat": "mean"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove"|"mode" or "majority" (a categorical cube's most frequent class; the least of those tied)|"modeCount" (how many dates had the mode)|"variety" (how many classes)|"changes" (how many times the class changed from one valued date to the next)|"longestRun" (the class of the longest run of dates in one class; the least of those tied)|"longestRunLength" (how many dates that run lasted)|"frequency" (a layer for each class met: its count of dates)|"countIn" (how many dates in the classes given), "above"?: number (countAbove's threshold), "classes"?: [whole numbers 0–255, at most 256] (countIn's classes), "by"?: "all" (default: one layer) | "year" (a layer for each calendar year) | "month" (a layer for each month of the year, across years), "start"?, "end"?: dates (as for cube.trend), "months"?: [1–12] (a season across years), "minValid"?: 0–1 (a cell with a smaller share of its group's dates is left empty; default 0), "name"?: text} → raster layers of the statistic, one for each group (frequency: one for each class of each group)"#,
     )]
 }
@@ -96,6 +96,22 @@ pub trait TimeCube: Send + Sync {
     fn nothing_read(&self) -> Option<String> {
         None
     }
+    /// What reading its slices said (a shift a Zarr store's system doesn't apply, …), once each,
+    /// asked once every slice is read: the outputs are on their grid, so it is said of them too.
+    /// A stack's slices are layers, whose notices were said when they were added.
+    fn lost(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// `outputs` with what reading the cube's slices said ([`TimeCube::lost`]) on the first of them:
+/// said once for the run, not once a layer.
+fn with_lost(outputs: Result<Vec<Raster>, String>, cube: &dyn TimeCube) -> Result<Vec<Raster>, String> {
+    let mut outputs = outputs?;
+    if let Some(first) = outputs.first_mut() {
+        first.lost = cube.lost();
+    }
+    Ok(outputs)
 }
 
 /// A stack of rasters (or a raster's bands), a date each.
@@ -143,9 +159,9 @@ impl TimeCube for Stack {
     }
 }
 
-/// A Zarr variable along its time dimension.
+/// A Zarr variable along its time dimension, and what reading its slices said, once each.
 #[cfg(not(target_arch = "wasm32"))]
-struct ZarrCube(super::zarr::ZarrCube);
+struct ZarrCube(super::zarr::ZarrCube, std::sync::Mutex<Vec<String>>);
 
 #[cfg(not(target_arch = "wasm32"))]
 impl TimeCube for ZarrCube {
@@ -164,7 +180,17 @@ impl TimeCube for ZarrCube {
                 None => return Ok(None),
             },
         };
+        // A poisoned lock still holds the notices said so far.
+        let mut lost = self.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for l in &r.lost {
+            if !lost.contains(l) {
+                lost.push(l.clone());
+            }
+        }
         Ok(Some((r, 0)))
+    }
+    fn lost(&self) -> Vec<String> {
+        self.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
     fn label(&self) -> String {
         self.0.zt.variable.clone()
@@ -359,7 +385,7 @@ pub fn cube_from(s: &mut Session, p: &Value, needs: Needs) -> Result<Box<dyn Tim
                     cube.zt.variable
                 ));
             }
-            return Ok(Box::new(ZarrCube(cube)));
+            return Ok(Box::new(ZarrCube(cube, std::sync::Mutex::default())));
         }
     }
     let id = s.layer_id(p)?;
@@ -635,14 +661,15 @@ impl TrendRun {
             format!("{} p-value ({})", self.name, self.test.code()),
             format!("{} significant slope per {unit} (p < {})", self.name, self.alpha),
         ];
-        names
+        let outputs = names
             .into_iter()
             .zip(bands)
             .map(|(name, band)| {
                 Raster::new(name, grid.width, height, vec![band], grid.transform, grid.crs, None, raster::ColorHint::Gray, "Float32")
                     .map_err(|e| e.to_string())
             })
-            .collect()
+            .collect();
+        with_lost(outputs, self.cube.as_ref())
     }
 
     /// One piece's slices read into a block, cell by date: the piece's first slice (its grid), the
@@ -1683,7 +1710,8 @@ impl ReduceRun {
         }
         done.store(self.total(), Ordering::Relaxed);
         let grid = &grid;
-        self.groups
+        let outputs = self
+            .groups
             .iter()
             .zip(bands)
             .flat_map(|((name, _), columns)| {
@@ -1696,7 +1724,8 @@ impl ReduceRun {
                         .map_err(|e| e.to_string())
                 })
             })
-            .collect()
+            .collect();
+        with_lost(outputs, self.cube.as_ref())
     }
 }
 

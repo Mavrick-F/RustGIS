@@ -28,7 +28,7 @@ Formats](data-formats.md).
 | ASCII grid (`.asc`, with an optional `.prj`) | Yes | No |
 | Unreferenced TIFF and PNG scans; JPEG with `"as": "scan"` | Yes | GeoTIFF after georeferencing |
 | Through GDAL: JPEG 2000, ERDAS Imagine, SRTM HGT, DTED, NetCDF, HDF, ENVI, SAGA… | Yes (desktop, when GDAL is installed) | No |
-| Web tiles: XYZ/TMS/WMS rasters, Mapbox Vector Tiles, MapLibre styles, PMTiles and MBTiles archives | Yes | Yes (Analyze › Create Hosted Imagery) |
+| Web tiles: XYZ/TMS/WMS rasters, Mapbox Vector Tiles, MapLibre styles, PMTiles and MBTiles archives | Yes | Yes (Imagery › Create Hosted Imagery) |
 | RustGIS project (`.rgis`; older `.rgisx` files open too) | Yes | Yes |
 
 Add data with **Home › Add › Add Data**: its main button opens the file picker, and its menu offers
@@ -111,6 +111,23 @@ or other WKT:
   none of these, when the target gives a zero transformation where its datum has another (a
   writer's placeholder, as for ED50 or NAD 27), or when combining the two transformations'
   rotations could be off by a centimetre.
+- A grid transformation (NTv2 or NADCON, a `BOUNDCRS`'s, or GDAL's WKT1 `PROJ4_GRIDS` or
+  `+nadgrids` in its `PROJ4` extension), or another without Helmert translations, isn't applied:
+  the system is read without it, with a notice naming it and its grid file, as positions may be
+  off by as much as that shift. A system read by an EPSG code that has its own shift to WGS 84
+  uses that shift instead, and the notice says so. A `BOUNDCRS` without a transformation, which
+  PROJ refuses, is read as its source system, with a notice unless the source is on WGS 84. A
+  ballpark offset is no known shift (the datum's own notice says so), and a null offset is none.
+- The notices come with WKT read from a Shapefile's or ASCII grid's `.prj`, a GeoPackage's or
+  FileGDB's system, a LAS file or a Zarr store. WKT given as a command's `crs`, and a GeoPackage
+  system read by its EPSG code, say of these only the two above: a transformation that isn't
+  applied, and a `BOUNDCRS` without one (typed WKT also says its projection method's formula, as
+  below). A Zarr store's `crs` says them only when the slice uses it: a store that gives its own
+  system, or a longitude/latitude grid, doesn't. A PostGIS, MySQL or SQL Server layer's `crs` is
+  read only for a geometry with no SRID of its own, by its EPSG code, with the same two notices; a
+  geometry that has an SRID ignores it, so nothing is said of it. A DuckDB query's `crs` isn't
+  read by RustGIS: it goes to DuckDB, which transforms the geometry from it even when the
+  geometry's type gives a system, so none of these notices come with it.
 - A UTM name (`WGS_1984_UTM_Zone_31N`) gives its EPSG code only when the parameters are that
   zone's.
 - Transverse Mercator (South Orientated), the method GDAL and Esri write South Africa's Lo grids
@@ -132,7 +149,15 @@ produces a notice when no transformation is available. Swiss oblique Mercator, t
 Krovak East/North variant, the oblique Mercator in its azimuth forms (the two-point form, with
 no azimuth, is refused), and the Cassini-Soldner, polyconic and Equal Earth methods are
 supported from their parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator
-(variant A), in `.prj` files and in GeoTIFF keys. Esri's orthographic is a spherical projection:
+(variant A), in `.prj` files and in GeoTIFF keys. Natural Earth, Winkel Tripel and Eckert IV are
+read from WKT as GDAL, Esri and PROJ write it, and by their ESRI codes (Natural Earth and Eckert
+IV, on WGS 84 and on a sphere: `ESRI:54077`, `53077`, `54012`, `53012`). They're computed on a
+sphere of the datum's semi-major axis, as PROJ computes them. Winkel Tripel's standard parallel
+is the file's; a definition or WKT without one is at 0, as PROJ and GDAL take a coordinate
+system without one (PROJ's `proj` program, which runs the bare projection, takes Winkel's own
+instead). The map's Winkel Tripel is at Winkel's own, acos(2/π) (about 50.46°), and its
+definition and WKT say so. A parameter that isn't a finite number, or a scale factor other than
+1, is refused rather than left out. Esri's orthographic is a spherical projection:
 on an ellipsoid it is refused, with a notice, rather than computed as EPSG's ellipsoidal one.
 The equidistant cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
 semi-major axis, matching legacy PROJ/GDAL coordinates (verified with PROJ 9.7.1), both for data
@@ -1172,6 +1197,23 @@ With a raster layer selected in Layers, the **Style** and **Data** tabs show its
 | Style › Rendering | **Symbology**: Stretch, RGB, Classify, Unique Values, Colormap, Shaded Relief; **Stretch Type**: None, Minimum Maximum, Custom Min/Max (your own bounds, one pair per colour channel on an RGB layer), Percent Clip, Standard Deviation, Histogram Equalize; **DRA** (stretch the pixels in view); **Resampling** (nearest or bilinear); **Band Combination** (natural colour, colour infrared, or any bands) |
 | Style › Enhancement | Brightness, contrast, gamma |
 | Data | Raster information (size, bands, statistics, coordinate system) and Export Raster (GeoTIFF) |
+
+**Cast shadows**, on a Shaded Relief layer (`raster.symbology` `"shadow"`, 0 to 1), darkens the
+slopes the terrain hides from the sun as well as those facing away from it: a valley behind a ridge
+is in shadow, with a soft edge. Only the direct light is darkened: a slope in full shadow keeps the
+relief's ambient light. 0, the default, draws the relief as before. The shadows are worked out once
+for the layer's sun, band and Z factor, off the map's frame on the desktop: the map and the Layout
+view draw without them for the moment that takes (under a second for a few million cells on a
+multi-core computer, several seconds on one thread; a sun under about 5° traces much farther, some
+seconds on a multi-core computer and twenty or so on one thread), then with them. An export
+waits for them; what the window draws at once (Copy Map or Copy Layout to the clipboard, printing,
+the presentation and report previews, an agent's snapshot) doesn't, and says the layers it drew
+without them.
+The strength is drawn, not worked out, so changing it is immediate. The browser works them out for
+rasters of at most 500,000 cells, and a cloud-optimised GeoTIFF read in place has none unless its
+whole image is held: either way the layer is drawn without them, and a notice says so. Terrain
+outside the raster casts nothing on it, and a grid spanning 0 to 360° casts nothing across its
+seam.
 
 **Masking**, at the foot of the Symbology pane (`raster.mask`), hides pixel values from view without
 changing the data: values to draw as no data (a background of 0 or −9999 the file doesn't flag, QA
