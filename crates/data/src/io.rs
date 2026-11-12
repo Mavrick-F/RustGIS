@@ -2526,8 +2526,16 @@ fn names_note(fields: &[Field], names: Vec<String>, target: &str, what: &str) ->
     // notice stays one line, reads in the order it is written, and copies no more of a field name
     // than it shows.
     let target: String = target.chars().map(dbf_notice_char).collect();
-    let listed: Vec<String> =
-        renamed.iter().take(5).map(|(old, new)| format!("'{}' → '{}'", dbf_notice_name(old), dbf_notice_name(new))).collect();
+    let listed: Vec<String> = renamed
+        .iter()
+        .take(5)
+        .map(|(old, new)| {
+            let (o, n) = (dbf_notice_name(old), dbf_notice_name(new));
+            // A long name made unique keeps its start and gains an ending: show the endings.
+            let (o, n) = if o == n { (notice_name_end(old), notice_name_end(new)) } else { (o, n) };
+            format!("'{o}' → '{n}'")
+        })
+        .collect();
     let more = if renamed.len() > 5 { format!(" and {} more", renamed.len() - 5) } else { String::new() };
     let count = if renamed.len() == 1 { "1 field name was".to_string() } else { format!("{} field names were", renamed.len()) };
     Some(format!("{target}: {count} changed to fit {what}: {}{more}", listed.join(", ")))
@@ -2570,6 +2578,21 @@ pub(crate) fn dbf_notice_name(name: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// The end of `name` as a notice shows it, like [`dbf_notice_name`] but keeping the last 40 bytes.
+fn notice_name_end(name: &str) -> String {
+    let mut kept: Vec<char> = Vec::new();
+    let mut len = 0;
+    for c in name.chars().rev().map(dbf_notice_char) {
+        if len + c.len_utf8() > 40 {
+            kept.push('…');
+            break;
+        }
+        len += c.len_utf8();
+        kept.push(c);
+    }
+    kept.into_iter().rev().collect()
 }
 
 /// Value losses counted independently for each dBase field, using only rows the writer keeps.

@@ -1827,6 +1827,10 @@ fn writes_points_lines_kmz_and_zipped_shapefiles() {
     );
     let kept: Vec<Field> = ["fid", "geom", "a"].iter().map(|n| Field::new(*n, FieldType::Integer)).collect();
     assert_eq!(crate::io::geopackage_names_note(&kept, "k.gpkg"), None);
+    // A long name shows the ending that makes it unique.
+    let long: Vec<Field> = ["L".repeat(50), "l".repeat(50)].iter().map(|n| Field::new(n, FieldType::Integer)).collect();
+    let note = crate::io::geopackage_names_note(&long, "l.gpkg").unwrap();
+    assert!(note.ends_with(&format!("'…{}' → '…{}_1'", "l".repeat(40), "l".repeat(38))), "{note}");
     // An empty layer writes too.
     let empty = Dataset::new("e", GeometryType::Point, vec![]);
     assert!(crate::io::write_bytes(&empty, "parquet").is_ok());
