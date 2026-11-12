@@ -709,6 +709,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     // CSV holds a point a row, GPX a name for each feature and no areas.
     if ext == "csv" {
         said.extend(csv.notes(path));
+        said.extend(rustgis_data::io::csv_coordinates_note(&ds.fields, ds.geometry_type, path));
     }
     if ext == "gpx" {
         said.extend(rustgis_data::io::gpx_notes(ds, rustgis_data::io::name_field(ds), path));
