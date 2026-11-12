@@ -1201,19 +1201,22 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let crs_note = rustgis_analysis::in_its_units(p, crs, crs_note, &Extent::EMPTY, &[], &["cellSize"]);
     let env_extent = env.extent;
     let given_cell = f(p, "cellSize").or(env.cell_in(crs));
-    // An environment cell size in another system's units isn't used, and said: one in degrees for a
-    // surface made in the layer's system, or one in the environment's system for another given.
+    // The environment's cell sizes this run doesn't use are said: the projected one when the run is
+    // in another system, the degree one when it isn't in degrees. Run in the environment's own
+    // system with its size, the degree size kept beside it (for older versions) goes unsaid.
+    let own = env.projected.is_some_and(|g| g.crs == crs && g.cell_size.is_some());
     let unused: Vec<String> = [
-        env.projected.and_then(|g| g.cell_size.map(|c| format!("{c}, in {}'s units", g.crs.label()))),
-        env.cell_size.map(|c| format!("{c}, in degrees")),
+        env.projected.filter(|g| g.crs != crs).and_then(|g| g.cell_size.map(|c| format!("{c}, in {}'s units", g.crs.label()))),
+        env.cell_size.filter(|_| crs != Crs::LonLat && !own).map(|c| format!("{c}, in degrees")),
     ]
     .into_iter()
     .flatten()
     .collect();
-    let cell_note = (given_cell.is_none() && !unused.is_empty()).then(|| {
+    let cell_note = (f(p, "cellSize").is_none() && !unused.is_empty()).then(|| {
         let (what, verb) = if unused.len() > 1 { ("sizes", "weren't") } else { ("size", "wasn't") };
+        let from_extent = if given_cell.is_none() { "; the cell size was set from the extent" } else { "" };
         format!(
-            "Geostatistical Wizard: the environment's cell {what} ({}) {verb} used for a surface made in {}; the cell size was set from the extent. Give cellSize, or set the environment's cell size in {}",
+            "Geostatistical Wizard: the environment's cell {what} ({}) {verb} used for a surface made in {}{from_extent}. Give cellSize, or set the environment's cell size in {}",
             unused.join("; "),
             crs.label(),
             if crs == Crs::LonLat { "degrees".to_string() } else { format!("{}'s units", crs.label()) }

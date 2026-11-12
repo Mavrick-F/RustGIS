@@ -39563,6 +39563,14 @@ fn interpolation_in_a_projected_coordinate_system() {
     let (_, _, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:3857"}));
     let both = format!("cell sizes (250, in {}'s units; 0.02, in degrees) weren't used", Crs::Epsg(32616).label());
     assert!(notices.iter().any(|n| n.contains(&both)), "{notices:?}");
+    // Run in degrees, the degree size is used and the projected one said; run in the environment's
+    // own system, nothing is said of the degree size kept beside it.
+    let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326"}));
+    assert_eq!((crs, cell), (Crs::LonLat, 0.02));
+    assert!(notices.iter().any(|n| n.contains("cell size (250, in ") && !n.contains("set from the extent")), "{notices:?}");
+    let (_, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
+    assert_eq!(cell, 250.0);
+    assert!(!notices.iter().any(|n| n.contains("wasn't used")), "{notices:?}");
     s.run("gp.env", &json!({"crs": null})).unwrap();
     s.run("gp.env", &json!({"cellSize": null})).unwrap();
 
