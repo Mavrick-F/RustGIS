@@ -4368,7 +4368,8 @@ pub fn in_its_units(
         .copied()
         .filter(|k| p.get(*k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty())))
         .collect();
-    if given.contains(&"extent") && !pts.iter().any(|(c, _)| extent.contains(*c)) {
+    // With no points left (the system holds none), the run's own error says why.
+    if given.contains(&"extent") && !pts.is_empty() && !pts.iter().any(|(c, _)| extent.contains(*c)) {
         return Err(format!("the extent holds none of the points in {}'s units ({note})", crs.label()));
     }
     Ok(Some(if given.is_empty() { note } else { format!("{note} ({} as given, in its units)", given.join(", ")) }))

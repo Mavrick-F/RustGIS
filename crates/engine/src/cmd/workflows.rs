@@ -1213,9 +1213,10 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let cell_note = (given_cell.is_none() && !unused.is_empty()).then(|| {
         let (what, verb) = if unused.len() > 1 { ("sizes", "weren't") } else { ("size", "wasn't") };
         format!(
-            "Geostatistical Wizard: the environment's cell {what} ({}) {verb} used for a surface made in {}; the cell size was set from the extent. Give cellSize, or set the environment's coordinate system",
+            "Geostatistical Wizard: the environment's cell {what} ({}) {verb} used for a surface made in {}; the cell size was set from the extent. Give cellSize, or set the environment's cell size in {}",
             unused.join("; "),
-            crs.label()
+            crs.label(),
+            if crs == Crs::LonLat { "degrees".to_string() } else { format!("{}'s units", crs.label()) }
         )
     });
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
