@@ -781,7 +781,7 @@ fn a_streamed_shapefile_says_dates_it_could_not_read_once() {
     assert_eq!(
         said,
         [
-            "permits: in the features read for the view, 1 value isn't a date and was read as empty, in 'issued' (Load All Features counts the whole layer)"
+            "permits: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, 1 value isn't a date and was read as empty, in 'issued'"
         ]
     );
     // Converting a field is refused while the layer is read in place, as every edit is.

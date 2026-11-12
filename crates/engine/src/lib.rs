@@ -2029,7 +2029,7 @@ impl Session {
                 // Values in date fields that weren't dates, once for a layer read in place.
                 if let Some(note) = layer.source.as_mut().and_then(|source| source.take_unread_dates()) {
                     dates.push(format!(
-                        "{}: in the features read for the view, {note} (Load All Features counts the whole layer)",
+                        "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
                         layer.name
                     ));
                 }

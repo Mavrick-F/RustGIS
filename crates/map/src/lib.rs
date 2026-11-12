@@ -725,7 +725,15 @@ impl Layer {
             }
             let reads =
                 |q: &str| rustgis_data::query::parse_fields(q, &before).is_err() || rustgis_data::query::parse_fields(q, &after).is_ok();
-            if filters.iter().all(|q| reads(q)) {
+            // A calculation rule the expression language doesn't read is the earlier calculator's
+            // (`issued + 1`), which only the engine parses: one that names the field keeps it text.
+            let name = f.name.to_lowercase();
+            let calculates = self.design.rules.iter().any(|r| {
+                r.kind == design::RuleKind::Calculation
+                    && rustgis_data::query::parse_fields(&r.expression, &before).is_err()
+                    && r.expression.to_lowercase().split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == name)
+            });
+            if !calculates && filters.iter().all(|q| reads(q)) {
                 fields.clone_from_slice(&after.fields);
             }
         }
@@ -3163,15 +3171,13 @@ mod tests {
         assert_eq!(rows([day("2026-03-05"), day("2025-12-31")]), rows([text("2026-03-05"), text("2025-12-31")]));
         // An attribute rule is kept reading too.
         layer.definition_query = None;
-        layer.design.rules.push(design::AttributeRule {
-            name: "Recent".into(),
-            kind: design::RuleKind::Constraint,
-            field: String::new(),
-            expression: "issued >= 2026".into(),
-        });
-        let mut got = fields.clone();
-        layer.date_fields_from_source(&mut got, &source);
-        assert_eq!(got[0].ty, FieldType::Text);
+        for (kind, expression) in [(design::RuleKind::Constraint, "issued >= 2026"), (design::RuleKind::Calculation, "Issued + 1 days")] {
+            layer.design.rules =
+                vec![design::AttributeRule { name: "Recent".into(), kind, field: String::new(), expression: expression.into() }];
+            let mut got = fields.clone();
+            layer.date_fields_from_source(&mut got, &source);
+            assert_eq!(got[0].ty, FieldType::Text, "{expression}");
+        }
     }
 
     fn points() -> Dataset {

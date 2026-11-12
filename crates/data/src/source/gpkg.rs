@@ -388,6 +388,7 @@ impl GpkgSource {
                         super::unread_date(unread_dates, k);
                         Value::Null
                     }
+                    // The select list holds a column for every field, so there is no column to miss.
                     Err(_) => Value::Null,
                 });
             }
