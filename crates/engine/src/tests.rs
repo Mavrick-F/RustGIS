@@ -39541,7 +39541,7 @@ fn interpolation_in_a_projected_coordinate_system() {
     assert!(!assumed(&notices), "{notices:?}");
     // An environment cell size in degrees isn't used for the layer's system, and said; in degrees
     // it is, with nothing to say.
-    let unused = |notices: &[String]| notices.iter().any(|n| n.contains("the environment's cell size (0.02 degrees) wasn't used"));
+    let unused = |notices: &[String]| notices.iter().any(|n| n.contains("the environment's cell size (0.02, in degrees) wasn't used"));
     s.run("gp.env", &json!({"cellSize": 0.02})).unwrap();
     let (crs, _, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
     assert_eq!(crs, Crs::Epsg(32616));
@@ -39549,6 +39549,12 @@ fn interpolation_in_a_projected_coordinate_system() {
     let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326"}));
     assert_eq!((crs, cell), (Crs::LonLat, 0.02));
     assert!(!unused(&notices), "{notices:?}");
+    // So with an environment system that has no cell size of its own.
+    s.run("gp.env", &json!({"crs": "EPSG:3857"})).unwrap();
+    let (crs, _, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
+    assert_eq!(crs, Crs::WebMercator);
+    assert!(unused(&notices), "{notices:?}");
+    s.run("gp.env", &json!({"crs": null})).unwrap();
     s.run("gp.env", &json!({"cellSize": null})).unwrap();
 
     // The environment's system, with its cell size in metres; its degree cell size stays apart.
