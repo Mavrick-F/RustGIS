@@ -39558,6 +39558,11 @@ fn interpolation_in_a_projected_coordinate_system() {
     let (crs, _, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
     assert_eq!(crs, Crs::WebMercator);
     assert!(unused(&notices), "{notices:?}");
+    // Both sizes the environment holds are named when a run's system uses neither.
+    s.run("gp.env", &json!({"crs": "EPSG:32616", "cellSize": 250})).unwrap();
+    let (_, _, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:3857"}));
+    let both = format!("cell sizes (250, in {}'s units; 0.02, in degrees) weren't used", Crs::Epsg(32616).label());
+    assert!(notices.iter().any(|n| n.contains(&both)), "{notices:?}");
     s.run("gp.env", &json!({"crs": null})).unwrap();
     s.run("gp.env", &json!({"cellSize": null})).unwrap();
 

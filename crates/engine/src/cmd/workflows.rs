@@ -1203,14 +1203,18 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let given_cell = f(p, "cellSize").or(env.cell_in(crs));
     // An environment cell size in another system's units isn't used, and said: one in degrees for a
     // surface made in the layer's system, or one in the environment's system for another given.
-    let cell_note = env
-        .projected
-        .and_then(|g| g.cell_size.map(|c| (c, format!("{}'s units", g.crs.label()))))
-        .or_else(|| env.cell_size.map(|c| (c, "degrees".to_string())))
-        .filter(|_| given_cell.is_none())
-    .map(|(c, units)| {
+    let unused: Vec<String> = [
+        env.projected.and_then(|g| g.cell_size.map(|c| format!("{c}, in {}'s units", g.crs.label()))),
+        env.cell_size.map(|c| format!("{c}, in degrees")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let cell_note = (given_cell.is_none() && !unused.is_empty()).then(|| {
+        let (what, verb) = if unused.len() > 1 { ("sizes", "weren't") } else { ("size", "wasn't") };
         format!(
-            "Geostatistical Wizard: the environment's cell size ({c}, in {units}) wasn't used for a surface made in {}; the cell size was set from the extent. Give cellSize, or set the environment's coordinate system",
+            "Geostatistical Wizard: the environment's cell {what} ({}) {verb} used for a surface made in {}; the cell size was set from the extent. Give cellSize, or set the environment's coordinate system",
+            unused.join("; "),
             crs.label()
         )
     });
