@@ -1255,9 +1255,8 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
             // The hints say the grid the workspace gets: without a system, a cell size is in
             // degrees and keeps the mosaic in degrees, as in older projects.
-            let typed = app.workflow.workspace_crs.trim();
-            let degrees = typed.is_empty()
-                || rustgis_engine::data::raster::Crs::parse(typed).is_ok_and(|c| c == rustgis_engine::data::raster::Crs::LonLat);
+            // Read once as it's typed (below), not each frame.
+            let degrees = app.workflow.workspace_system.is_none();
             let crs_hint = if app.workflow.number.trim().is_empty() {
                 tl!("the images' projected system, else degrees")
             } else {

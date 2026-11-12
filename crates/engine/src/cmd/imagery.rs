@@ -1971,7 +1971,12 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         (e, finest, w.projected_cell_size)
     };
     // A size from a project file is checked here: the options refuse others.
-    let cell = cell.filter(|c| c.is_finite() && *c > 0.0).unwrap_or(finest).max(1e-7);
+    let cell = match cell {
+        Some(c) if c.is_finite() && c > 0.0 => c,
+        Some(c) => return Err(format!("the workspace's cell size, {c}, isn't a size above 0: set it in the workspace options")),
+        None => finest,
+    }
+    .max(1e-7);
     let (cols, rows) = ((e.width() / cell).ceil().max(1.0) as usize, (e.height() / cell).ceil().max(1.0) as usize);
     if cols.saturating_mul(rows) > rasterops::max_pixels() / 2 {
         let made_in = crs_note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();
@@ -2067,7 +2072,16 @@ fn mosaic_crs(w: &Workspace, imgs: &[Arc<Raster>]) -> Result<(Crs, Option<String
         // Set through the options, which refuse others; a project file can hold anything.
         Some(c) => {
             return match rustgis_analysis::layer_raster_crs(Some(c)) {
-                Some(Ok(c)) => Ok((c, None)),
+                // A size kept from degrees isn't one in this system's units.
+                Some(Ok(c)) => Ok((
+                    c,
+                    w.cell_size.filter(|_| w.projected_cell_size.is_none()).map(|d| {
+                        format!(
+                            "its cell size ({d}) is in degrees, so the finest image's pixel was taken for a mosaic in {0}; set cellSize in {0}'s units",
+                            c.label()
+                        )
+                    }),
+                )),
                 Some(Err(why)) => Err(format!("the workspace's coordinate system is {why}: set another crs in the workspace options")),
                 None => Err(format!(
                     "the workspace's coordinate system, {}, is in degrees: set crs to EPSG:4326 for degrees, or to a projected system",

@@ -39952,6 +39952,10 @@ fn ortho_mosaic_is_made_in_its_images_projected_system() {
     s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": 3857})).unwrap();
     let w = s.project.workspaces.iter().find(|w| w.name == "Fields").unwrap();
     assert_eq!((w.crs, w.projected_cell_size, w.cell_size), (Some(Crs::WebMercator), None, Some(0.0005)));
+    // The degree size it keeps isn't used in that system, and that is said.
+    let (r, v, _) = build(&mut s, "Fields");
+    assert_eq!(r.crs, Crs::WebMercator);
+    assert!(v["messages"][0].as_str().unwrap().contains("its cell size (0.0005) is in degrees"), "{v}");
     let e = s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": "EPSG:4269"})).unwrap_err();
     assert!(e.contains("EPSG:4326 makes it in degrees"), "{e}");
     assert_eq!(s.project.workspaces.iter().find(|w| w.name == "Fields").unwrap().crs, Some(Crs::WebMercator));
@@ -39989,6 +39993,11 @@ fn ortho_mosaic_is_made_in_its_images_projected_system() {
     let (r, v, notices) = build(&mut s, "Plain");
     assert_eq!(r.crs, Crs::LonLat);
     assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    // A cell size a damaged project holds is refused, not replaced.
+    let at = s.project.workspaces.iter().position(|w| w.name == "Over").unwrap();
+    s.project.workspaces[at].projected_cell_size = Some(-5.0);
+    let e = s.run("imagery.mosaic", &json!({"name": "Over"})).unwrap_err();
+    assert!(e.contains("cell size, -5, isn't a size above 0"), "{e}");
     // The system and its cell size save with the project.
     s.run("imagery.workspaceOptions", &json!({"name": "Fields", "cellSize": 30})).unwrap();
     let p = crate::Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
