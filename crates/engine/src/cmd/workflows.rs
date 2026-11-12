@@ -1198,7 +1198,7 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
         Some(g) if !given => (g.crs, None),
         _ => rustgis_analysis::raster_crs(ds, p, "Geostatistical Wizard")?,
     };
-    let crs_note = rustgis_analysis::in_its_units(p, crs, crs_note, &Extent::EMPTY, &[], &["cellSize"])?;
+    let crs_note = rustgis_analysis::in_its_units(p, crs, crs_note, &Extent::EMPTY, &[], &["cellSize"]);
     let env_extent = env.extent;
     let given_cell = f(p, "cellSize").or(env.cell_in(crs));
     // An environment cell size in another system's units isn't used, and said: one in degrees for a

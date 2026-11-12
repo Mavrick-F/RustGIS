@@ -4077,7 +4077,7 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     };
     // Defaults only when a value is not given: a bad one is refused, not replaced.
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
-    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize"])?;
+    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize"]);
     let cell = match num(p, "pixelSize") {
         Some(c) if c > 0.0 => c,
         _ if given("pixelSize") => return Err("the pixel size must be more than zero".into()),
@@ -4191,7 +4191,7 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         }
     };
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
-    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize", "range"])?;
+    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize", "range"]);
     let neighbours = match num(p, "neighbours") {
         Some(n) if n >= 2.0 => (n as usize).min(32),
         Some(_) => return Err("neighbours must be at least 2".into()),
@@ -4350,33 +4350,25 @@ fn in_projected(crs: Crs, to: &Transformer, c: Coord) -> Option<Coord> {
 /// The note on a system an interpolation took from the layer (`p`'s `crs` empty), naming the values
 /// among `keys` that `p` gives, read in its units: a script written when these tools worked in
 /// degrees is told, not answered in metres without a word (#1743). An `extent` that holds none of
-/// `pts` in those units is refused, as degrees read as metres would be.
-pub fn in_its_units(
-    p: &Json,
-    crs: Crs,
-    note: Option<String>,
-    extent: &Extent,
-    pts: &[(Coord, f64)],
-    keys: &[&str],
-) -> Result<Option<String>, String> {
-    let Some(note) = note else { return Ok(None) };
+/// `pts` is said too, with how to ask for degrees; it isn't refused, as one in the system's units
+/// may lie away from the points and still be interpolated.
+pub fn in_its_units(p: &Json, crs: Crs, note: Option<String>, extent: &Extent, pts: &[(Coord, f64)], keys: &[&str]) -> Option<String> {
+    let note = note?;
     if crs == Crs::LonLat || !s(p, "crs").trim().is_empty() {
-        return Ok(Some(note));
+        return Some(note);
     }
     let given: Vec<&str> = keys
         .iter()
         .copied()
         .filter(|k| p.get(*k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty())))
         .collect();
-    // Only an extent that looks like degrees, around points that don't, is refused: one in the
-    // system's units may lie away from the points and still be interpolated. With no points left
-    // (the system holds none), the run's own error says why.
-    let in_degrees = extent.min_x >= -180.0 && extent.max_x <= 180.0 && extent.min_y >= -90.0 && extent.max_y <= 90.0;
-    let beyond_degrees = pts.iter().any(|(c, _)| c.x.abs() > 360.0 || c.y.abs() > 360.0);
-    if given.contains(&"extent") && in_degrees && beyond_degrees && !pts.iter().any(|(c, _)| extent.contains(*c)) {
-        return Err(format!("the extent looks like degrees and holds none of the points in {}'s units ({note})", crs.label()));
+    if given.is_empty() {
+        return Some(note);
     }
-    Ok(Some(if given.is_empty() { note } else { format!("{note} ({} as given, in its units)", given.join(", ")) }))
+    // With no points left (the system holds none), the run's own error says why.
+    let outside = given.contains(&"extent") && !pts.is_empty() && !pts.iter().any(|(c, _)| extent.contains(*c));
+    let outside = if outside { "; the extent holds none of the points: if it is in degrees, set crs to EPSG:4326" } else { "" };
+    Some(format!("{note} ({} as given, in its units{outside})", given.join(", ")))
 }
 
 /// `e` with `note` after it, when there is one: what was left out can be why a run failed.
@@ -10031,12 +10023,22 @@ mod tests {
             // Values a script gave in degrees, read in the layer's metres, are said, not taken quietly:
             // an extent holding no points is refused, and too many cells say the units.
             let run = |p: serde_json::Value| crate::run(tool, &m, &p);
-            let e = run(serde_json::json!({"input": "wells", "field": "v", "extent": "-90.1,35.05,-89.9,35.25"})).err().unwrap_or_default();
-            assert!(e.contains("holds none of the points") && e.contains("EPSG:4326"), "{tool}: {e}");
-            // An extent in metres away from the wells is made, and said.
+            let r = run(serde_json::json!({"input": "wells", "field": "v", "extent": "-90.1,35.05,-89.9,35.25"}))
+                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(
+                r.messages.iter().any(|m| m.contains("the extent holds none of the points: if it is in degrees, set crs to EPSG:4326")),
+                "{tool}: {:?}",
+                r.messages
+            );
+            // An extent in metres away from the wells is made too, with the same word: its numbers
+            // can't say which units they were meant in.
             let r = run(serde_json::json!({"input": "wells", "field": "v", "extent": "0,0,10000,10000"}))
                 .unwrap_or_else(|e| panic!("{tool}: {e}"));
-            assert!(r.messages.iter().any(|m| m.contains("(extent as given, in its units)")), "{tool}: {:?}", r.messages);
+            assert!(
+                r.messages.iter().any(|m| m.contains("(extent as given, in its units; the extent holds none of the points")),
+                "{tool}: {:?}",
+                r.messages
+            );
             let e = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 0.01})).err().unwrap_or_default();
             assert!(e.contains(&format!("made in {label}")), "{tool}: {e}");
             let r = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 500})).unwrap_or_else(|e| panic!("{tool}: {e}"));
