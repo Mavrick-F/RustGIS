@@ -33831,6 +33831,7 @@ fn geopackage_edits_save_back() {
          UPDATE roads SET photo = x'00ff' WHERE fid = 1;
          ALTER TABLE roads ADD COLUMN seen DATETIME;
          UPDATE roads SET seen = 'soon' WHERE fid = 2;
+         UPDATE roads SET seen = '2026-01-01T00:00:00+02:00' WHERE fid = 1;
          CREATE TABLE other (id INTEGER PRIMARY KEY, v TEXT);
          INSERT INTO other VALUES (1, 'keep');
          CREATE TRIGGER no_bad BEFORE INSERT ON roads WHEN NEW.name = 'bad'
@@ -33869,7 +33870,6 @@ fn geopackage_edits_save_back() {
 
     let r1 = row_of(&s, 1);
     s.run("edit.setValue", &json!({"layer": "R", "row": r1, "field": "name", "value": "renamed"})).unwrap();
-    s.run("edit.setValue", &json!({"layer": "R", "row": r1, "field": "seen", "value": "2026-03-05T14:30:00+02:00"})).unwrap();
     let moved = vec![Coord::new(15.0, 25.0), Coord::new(15.2, 25.3)];
     {
         let r2 = row_of(&s, 2);
@@ -33885,7 +33885,8 @@ fn geopackage_edits_save_back() {
         json!({"layer": "R", "geometry": {"type": "LineString", "coordinates": [[13, 22], [13.1, 22.1]]},
             "attributes": {"name": name, "lanes": 4}})
     };
-    s.run("edit.addFeature", &new_line("new")).unwrap();
+    let added = s.run("edit.addFeature", &new_line("new")).unwrap()["row"].as_u64().unwrap() as usize;
+    s.run("edit.setValue", &json!({"layer": "R", "row": added, "field": "seen", "value": "2026-03-05T14:30:00+02:00"})).unwrap();
     // Deleting the highest loaded key must not make the new feature reuse its baseline id.
     let l = s.map().layer(id).unwrap();
     assert_eq!(l.dataset.features.len(), 3);
@@ -33913,11 +33914,15 @@ fn geopackage_edits_save_back() {
     let mark = s.notice_mark();
     let r = s.run("gpkg.saveEdits", &p).unwrap();
     assert_eq!((r["inserted"].as_u64(), r["updated"].as_u64(), r["deleted"].as_u64()), (Some(1), Some(2), Some(1)), "{r}");
-    // The edited date-time is saved in UTC, and said; the one that wasn't a date is kept.
+    // The new date-time is saved in UTC, and said. Row 1's stored offset is left as it is (only its
+    // name was edited), and isn't counted; the value that wasn't a date is kept.
     let said = "R: roads: 1 date-time was written in UTC, as GeoPackage stores them, without their own offsets, in 'seen'";
     assert!(s.notices_since(mark).iter().any(|n| n.text == said), "{:?}", s.notices_since(mark));
     let seen = |key: i64| -> Option<String> { db.query_row("SELECT seen FROM roads WHERE fid = ?1", [key], |r| r.get(0)).unwrap() };
-    assert_eq!((seen(1).as_deref(), seen(2).as_deref()), (Some("2026-03-05T12:30:00.000Z"), Some("soon")));
+    assert_eq!(
+        (seen(1).as_deref(), seen(2).as_deref(), seen(4).as_deref()),
+        (Some("2026-01-01T00:00:00+02:00"), Some("soon"), Some("2026-03-05T12:30:00.000Z"))
+    );
     assert_eq!(r["keys"], json!([4]));
     assert!(s.map().layer(id).unwrap().dataset.features.iter().any(|f| f.id == 4));
     assert_eq!(counts(&mut s), (0, 0, 0));

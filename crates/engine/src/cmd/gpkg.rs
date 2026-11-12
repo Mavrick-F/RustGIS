@@ -229,8 +229,6 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         }
         let rows = changes.insert_rows;
         let edits = rustgis_data::source::edits::Edits { updates: changes.updates, deletes: changes.deletes, inserts: changes.inserts };
-        // Values read from the table are in UTC already, so these are the edited ones.
-        let utc_dates = rustgis_data::io::offset_dates(edits.updates.iter().map(|(f, _)| f).chain(&edits.inserts), &fields);
         let saved_rows = match src.save(&edits, &fields, edit.versions.iter().map(|(key, _)| key), &edit.revision).map_err(err)? {
             Ok(saved) => saved,
             Err(conflicts) => {
@@ -247,6 +245,7 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
             }
         };
         let saved = saved_rows.changes;
+        let utc_dates = saved_rows.utc_dates;
         let mut stored: std::collections::HashMap<_, _> = saved_rows.features.into_iter().map(|f| (f.id, f)).collect();
         let versions = saved.versions.iter().copied().collect();
         if let Some(l) = s.map_mut().layer_mut(id) {
@@ -309,9 +308,6 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         if !saved.skipped_fields.is_empty() {
             s.notify(format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")), false);
         }
-        // A field without a column isn't saved, so nothing of it was written in UTC.
-        let utc_dates: Vec<usize> =
-            fields.iter().zip(&utc_dates).map(|(f, n)| if saved.skipped_fields.contains(&f.name) { 0 } else { *n }).collect();
         if let Some(note) = rustgis_data::io::utc_dates_note(&fields, &utc_dates, &format!("{name}: {table}")) {
             s.notify(note, false);
         }

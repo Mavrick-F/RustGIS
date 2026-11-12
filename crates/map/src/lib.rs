@@ -143,19 +143,6 @@ pub struct HiddenFills {
     pub partial: bool,
 }
 
-/// A project saved before RustGIS read a source's date columns as dates lists them as text; the
-/// source now gives dates, so the fields say so too (the live layer, and its whole reads and
-/// exports, alike).
-fn date_fields_from_source(fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) {
-    for f in fields {
-        if f.ty == rustgis_data::FieldType::Text
-            && let Some(s) = source.iter().find(|s| s.name == f.name && s.ty.is_temporal())
-        {
-            f.ty = s.ty;
-        }
-    }
-}
-
 /// What a whole read of a layer's source ([`Layer::load_all_counted`]) couldn't read.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Unreadable {
@@ -602,7 +589,9 @@ impl Layer {
             self.dataset.fields = info.fields.clone();
         }
         if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
-            date_fields_from_source(&mut self.dataset.fields, &info.fields);
+            let mut fields = self.dataset.fields.clone();
+            self.date_fields_from_source(&mut fields, &info.fields);
+            self.dataset.fields = fields;
         }
         // An opened source's dropped Z or M values, for a project saved without the mark. Added to,
         // not replaced: a source that couldn't tell (a check that timed out) mustn't clear a mark the
@@ -710,6 +699,33 @@ impl Layer {
         self.load_all_counted().map(|(ds, _)| ds)
     }
 
+    /// Gives `fields` (the layer's, as a project saved before RustGIS read a source's date columns
+    /// as dates lists them: text) the source's date types, so the live layer and its whole reads
+    /// and exports say what the source now gives. A field stays text when the layer's definition
+    /// query or a display filter reads it as text (comparing it with a number) and wouldn't read
+    /// it as dates, so the filter keeps working.
+    fn date_fields_from_source(&self, fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) {
+        let filters: Vec<&str> =
+            self.definition_query.iter().map(String::as_str).chain(self.display_filters.iter().map(|f| f.where_.as_str())).collect();
+        for k in 0..fields.len() {
+            let Some(f) = fields.get(k) else { continue };
+            let Some(ty) = source.iter().find(|s| s.name == f.name && s.ty.is_temporal()).map(|s| s.ty) else { continue };
+            if f.ty != rustgis_data::FieldType::Text {
+                continue;
+            }
+            let before = rustgis_data::Dataset::new("", self.dataset.geometry_type, fields.to_vec());
+            let mut after = before.clone();
+            if let Some(f) = after.fields.get_mut(k) {
+                f.ty = ty;
+            }
+            let reads =
+                |q: &str| rustgis_data::query::parse_fields(q, &before).is_err() || rustgis_data::query::parse_fields(q, &after).is_ok();
+            if filters.iter().all(|q| reads(q)) {
+                fields.clone_from_slice(&after.fields);
+            }
+        }
+    }
+
     /// [`Layer::load_all`], with what of the source couldn't be read.
     pub fn load_all_counted(&self) -> Result<(Dataset, Unreadable), String> {
         let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), Unreadable::default())) };
@@ -727,7 +743,7 @@ impl Layer {
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
             if let Some(info) = copy.info() {
-                date_fields_from_source(&mut ds.fields, &info.fields);
+                self.date_fields_from_source(&mut ds.fields, &info.fields);
             }
         }
         ds.source = self.dataset.source.clone();
@@ -755,7 +771,7 @@ impl Layer {
         ds.zm_dropped = info.zm_dropped || self.dataset.zm_dropped;
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
-            date_fields_from_source(&mut ds.fields, &info.fields);
+            self.date_fields_from_source(&mut ds.fields, &info.fields);
         }
         // (A source declaring no geometry type takes its first geometry's when exported, as a
         // whole read does.)
@@ -3111,6 +3127,23 @@ mod tests {
     use super::*;
     use rustgis_data::{Field, FieldType, Value};
     use rustgis_geom::lonlat_to_merc;
+
+    /// A text field an old project lists for a source's date column becomes a date field, unless
+    /// a filter reads it as text and wouldn't as dates: then it stays text and the filter works.
+    #[test]
+    fn source_dates_upgrade_text_fields_a_filter_still_reads() {
+        let fields = vec![Field::new("issued", FieldType::Text)];
+        let source = [Field::new("issued", FieldType::Date)];
+        let mut layer = Layer::new(1, Dataset::new("permits", rustgis_data::GeometryType::Point, fields.clone()));
+        for (query, ty) in
+            [(None, FieldType::Date), (Some("issued >= '2026-01-01'"), FieldType::Date), (Some("issued >= 2026"), FieldType::Text)]
+        {
+            layer.definition_query = query.map(String::from);
+            let mut got = fields.clone();
+            layer.date_fields_from_source(&mut got, &source);
+            assert_eq!(got[0].ty, ty, "{query:?}");
+        }
+    }
 
     fn points() -> Dataset {
         let mut d = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);

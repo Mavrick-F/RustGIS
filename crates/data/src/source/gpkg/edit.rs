@@ -47,6 +47,9 @@ pub struct SavedRows {
     /// Supplied field positions that have no stored column.
     pub unstored_fields: Vec<usize>,
     pub revision: String,
+    /// Per supplied field, date-times written in UTC that had another offset
+    /// ([`crate::io::offset_dates`]): only values the save wrote.
+    pub utc_dates: Vec<usize>,
 }
 
 /// An existing feature table; its read connection is never reused for writes.
@@ -265,6 +268,7 @@ impl EditTable {
         let table = quote(self.table());
         let pk = quote(self.key());
         let mut spatial_changed = !edits.inserts.is_empty() || !edits.deletes.is_empty();
+        let mut utc_dates = vec![0usize; fields.len()];
         for (f, _) in &edits.updates {
             let row = current.get(&f.id.cast_signed()).ok_or_else(|| self.shape_error())?;
             let mut sets = Vec::new();
@@ -279,6 +283,7 @@ impl EditTable {
                 if previous != *attr && !same_nan {
                     sets.push(format!("{} = ?", quote(columns.get(c).ok_or_else(|| self.shape_error())?)));
                     args.push(sql_value(attr, field.ty));
+                    count_utc(&mut utc_dates, i, attr);
                 }
             }
             let old = ValueRef::from(row.get(geom).ok_or_else(|| self.shape_error())?);
@@ -334,6 +339,7 @@ impl EditTable {
                     let field = fields.get(i).ok_or_else(|| self.shape_error())?;
                     names.push(quote(columns.get(c).ok_or_else(|| self.shape_error())?));
                     args.push(sql_value(attr, field.ty));
+                    count_utc(&mut utc_dates, i, attr);
                 }
             }
             let sql = format!("INSERT INTO {table} ({}) VALUES ({})", names.join(", "), vec!["?"; names.len()].join(", "));
@@ -441,7 +447,7 @@ impl EditTable {
         .map_err(err)?;
         let revision = self.revision(&tx)?;
         tx.commit().map_err(err)?;
-        Ok(Ok(SavedRows { changes: saved, features, removed, unstored_fields, revision }))
+        Ok(Ok(SavedRows { changes: saved, features, removed, unstored_fields, revision, utc_dates }))
     }
 
     fn revision(&self, conn: &Connection) -> Result<String> {
@@ -590,6 +596,16 @@ impl FeatureWrites {
     fn unmarked(&self) -> Result<Vec<i64>> {
         let residents = self.residents.lock().map_err(|_| DataError::Format("GeoPackage write observer poisoned".into()))?;
         Ok(residents.iter().filter_map(|(&k, &changed)| (!changed).then_some(k)).collect())
+    }
+}
+
+/// Counts `attr` in field `i` when it is a date-time at an offset other than UTC's, which the
+/// save writes in UTC.
+fn count_utc(counts: &mut [usize], i: usize, attr: &Value) {
+    if matches!(attr, Value::DateTime(t) if t.offset().is_some_and(|o| o != 0))
+        && let Some(n) = counts.get_mut(i)
+    {
+        *n += 1;
     }
 }
 
