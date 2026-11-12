@@ -1872,30 +1872,16 @@ fn csv_cell(v: &Value) -> String {
 
 /// The names of a point layer's longitude and latitude columns in CSV: the first of the names
 /// reading takes for each that no field has, ignoring case and the spaces around a name (reading
-/// trims them), and whether there was one of each.
-/// A layer with a field of every such name gets `longitude_1` or `latitude_1`, which reading
-/// doesn't take as coordinates ([`csv_coordinates_note`]).
-fn csv_coordinate_names(fields: &[Field]) -> ([String; 2], bool) {
+/// trims them).
+/// A layer with a field of every such name gets `longitude_1` or `latitude_1`, and reading takes
+/// that field instead ([`CsvLosses::coordinates_note`]).
+fn csv_coordinate_names(fields: &[Field]) -> [String; 2] {
     let taken = |name: &str| fields.iter().any(|f| f.name.trim().eq_ignore_ascii_case(name));
     let pick = |base: &str, known: &[&str]| {
         let name = known.iter().map(|n| n.to_string()).chain((1..).map(|i| format!("{base}_{i}"))).find(|n| !taken(n));
         name.unwrap_or_default()
     };
-    let names = [pick("longitude", LON_NAMES), pick("latitude", LAT_NAMES)];
-    let read = LON_NAMES.contains(&names[0].as_str()) && LAT_NAMES.contains(&names[1].as_str());
-    (names, read)
-}
-
-/// What a CSV export of a point layer (`gt`) to `target` says when its fields take every name
-/// reading takes for a longitude or a latitude: the coordinates are in columns reading doesn't
-/// find on its own. `None` otherwise.
-pub fn csv_coordinates_note(fields: &[Field], gt: GeometryType, target: &str) -> Option<String> {
-    let ([x, y], read) = csv_coordinate_names(fields);
-    (gt == GeometryType::Point && !read).then(|| {
-        format!(
-            "{target}: the fields have every name read as a longitude or latitude, so the coordinates are in columns '{x}' and '{y}', which adding the file back doesn't take as coordinates unless they are picked"
-        )
-    })
+    [pick("longitude", LON_NAMES), pick("latitude", LAT_NAMES)]
 }
 
 /// A dataset as CSV text: its fields, and a point layer's longitude and latitude ([`CsvWriter`]).
@@ -1921,7 +1907,7 @@ impl<W: std::io::Write> CsvWriter<W> {
         if point {
             // The coordinate columns come first, so reading takes them rather than a field
             // named `lat` or `x`.
-            head.extend(csv_coordinate_names(fields).0);
+            head.extend(csv_coordinate_names(fields));
         }
         head.extend(fields.iter().map(|f| f.name.clone()));
         w.write_record(&head).map_err(|e| DataError::Format(e.to_string()))?;
@@ -2721,12 +2707,15 @@ pub struct CsvLosses {
     /// Features whose geometry isn't written: in a line or polygon layer (or one that declares
     /// no type), and in a point layer those with no point to write (an empty multipoint).
     pub unwritten: usize,
+    /// Written with coordinate columns, as a point layer: a streamed export knows this from its
+    /// chunks when the layer declares no type ([`CsvLosses::coordinates_note`]).
+    pub points: bool,
 }
 
 impl CsvLosses {
     /// The losses of `features` in a layer of type `gt`; a streamed export adds up its chunks'.
     pub fn of(features: &[crate::Feature], gt: GeometryType) -> Self {
-        let mut out = Self::default();
+        let mut out = Self { points: gt == GeometryType::Point, ..Self::default() };
         for g in features.iter().filter_map(|f| f.geometry.as_ref()) {
             match (gt, g) {
                 (GeometryType::Point, Geometry::Point(_)) => {}
@@ -2757,6 +2746,31 @@ impl CsvLosses {
         }
         notes
     }
+
+    /// What a CSV export with these losses says when reading the file back wouldn't take its
+    /// coordinate columns: its `fields` have every name reading takes for a longitude or a
+    /// latitude, and reading takes those fields instead. `None` otherwise.
+    pub fn coordinates_note(self, fields: &[Field], target: &str) -> Option<String> {
+        if !self.points {
+            return None;
+        }
+        let header: Vec<String> = csv_coordinate_names(fields).into_iter().chain(fields.iter().map(|f| f.name.clone())).collect();
+        let found = found_xy(&header);
+        if found == Some((0, 1)) {
+            return None;
+        }
+        let name = |i: usize| dbf_notice_name(header.get(i).map_or("", String::as_str));
+        let read = match found {
+            Some((x, y)) => format!("reads columns '{}' and '{}' as the coordinates, which moves the points", name(x), name(y)),
+            None => "reads no coordinates".to_string(),
+        };
+        let target: String = target.chars().map(dbf_notice_char).collect();
+        Some(format!(
+            "{target}: the fields have every name read as a longitude or latitude, so the coordinates are in columns '{}' and '{}'; adding the file back {read} unless those columns are picked",
+            name(0),
+            name(1)
+        ))
+    }
 }
 
 impl std::ops::AddAssign for CsvLosses {
@@ -2764,17 +2778,19 @@ impl std::ops::AddAssign for CsvLosses {
     fn add_assign(&mut self, other: Self) {
         self.as_one_point += other.as_one_point;
         self.unwritten += other.unwritten;
+        self.points |= other.points;
     }
 }
 
 /// What a CSV or GPX file (extension `ext`) of the whole dataset `ds` can't hold, written to
-/// `target`: [`CsvLosses`]' notices and [`csv_coordinates_note`], or [`gpx_notes`] with each feature named from `name_field`;
+/// `target`: [`CsvLosses`]' notices, or [`gpx_notes`] with each feature named from `name_field`;
 /// none for another format. A streamed export counts CSV's a chunk at a time instead.
 pub fn export_losses_notes(ds: &Dataset, ext: &str, name_field: Option<usize>, target: &str) -> Vec<String> {
     match ext {
         "csv" => {
-            let mut notes = CsvLosses::of(&ds.features, ds.geometry_type).notes(target);
-            notes.extend(csv_coordinates_note(&ds.fields, ds.geometry_type, target));
+            let losses = CsvLosses::of(&ds.features, ds.geometry_type);
+            let mut notes = losses.notes(target);
+            notes.extend(losses.coordinates_note(&ds.fields, target));
             notes
         }
         "gpx" => gpx_notes(ds, name_field, target),
@@ -4136,14 +4152,14 @@ mod tests {
         ds.push(Some(square), vec![]);
         ds.push(None, vec![]);
         let losses = CsvLosses::of(&ds.features, ds.geometry_type);
-        assert_eq!(losses, CsvLosses { as_one_point: 0, unwritten: 1 });
+        assert_eq!(losses, CsvLosses { as_one_point: 0, unwritten: 1, points: false });
         assert!(losses.notes("t.csv")[0].contains("the geometry of 1 feature wasn't written"));
         assert!(!to_csv(&ds).unwrap().contains("longitude"));
         let points = [crate::Feature { id: 0, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![] }];
-        assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses::default());
+        assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses { points: true, ..CsvLosses::default() });
         // A multipoint without a point in a point layer gets empty coordinate cells.
         let empty = [crate::Feature { id: 1, geometry: Some(Geometry::MultiPoint(vec![])), attrs: vec![] }];
-        assert_eq!(CsvLosses::of(&empty, GeometryType::Point), CsvLosses { as_one_point: 0, unwritten: 1 });
+        assert_eq!(CsvLosses::of(&empty, GeometryType::Point), CsvLosses { as_one_point: 0, unwritten: 1, points: true });
     }
 
     /// GPX leaves out a feature without geometry and a multipoint without a point (no waypoint
@@ -4200,13 +4216,16 @@ mod tests {
         assert!(out.starts_with("longitude_1,latitude,"), "{out}");
         let notes = export_losses_notes(&every, "csv", None, "t.csv");
         assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("columns 'longitude_1' and 'latitude'"), "{notes:?}");
-        // As said: reading takes a field for the longitude.
+        assert_eq!(
+            notes[0],
+            "t.csv: the fields have every name read as a longitude or latitude, so the coordinates are in columns 'longitude_1' and 'latitude'; adding the file back reads columns 'longitude' and 'latitude' as the coordinates, which moves the points unless those columns are picked"
+        );
+        // As said: reading takes the field `longitude` (1) for the longitude.
         let (back, _) = read_csv(&out, "t").unwrap();
-        assert_ne!(back.features[0].geometry, Some(Geometry::Point(Coord::new(20.0, 10.0))));
+        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Coord::new(1.0, 10.0))));
         // A name left, or a layer that isn't of points: nothing to say.
         assert!(export_losses_notes(&layer(&LON_NAMES[1..]), "csv", None, "t.csv").is_empty());
-        assert_eq!(csv_coordinates_note(&every.fields, GeometryType::Polyline, "t.csv"), None);
+        assert_eq!(CsvLosses::of(&[], GeometryType::Polyline).coordinates_note(&every.fields, "t.csv"), None);
     }
 
     #[test]
