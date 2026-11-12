@@ -108,7 +108,8 @@ down, or delete it. Bookmark edits run `bookmark.*` commands and undo with ++ctr
 **Home › Navigate › Locate › By Place or Address…** (`map.findPlace`) looks up a place or an
 address by name with OpenStreetMap's [Nominatim](https://nominatim.org) (or a
 [Photon](https://photon.komoot.io) server, PDOK's
-[Locatieserver](data.md#geocoding-addresses) for Dutch addresses and places, or a geocoder of your
+[Locatieserver](data.md#geocoding-addresses) for Dutch addresses and places, the U.S. Census
+Bureau for U.S. street addresses (desktop/CLI, or a CORS-enabled proxy on the web), or a geocoder of your
 own given by its address) and zooms to the one picked. The search goes to that server over the network; see
 [Geocoding addresses](data.md#geocoding-addresses) for whole tables.
 
@@ -636,4 +637,9 @@ GPU Rendering is off by default and remembered across sessions (`ui.map.gpu` is 
 simulation stay on the CPU, and exports are unaffected. A rotated or tilted map uses the GPU
 only when every visible layer can be drawn there: tiles, rasters, terrain, transparency,
 masking, swipe, blending, aggregation, graphics, stacked strokes, fills or labels with icons keep it
-on the CPU. Extrusions use the GPU only on a tilted map.
+on the CPU. Extrusions use the GPU only on a tilted map. In the desktop app, if the graphics
+card runs out of memory (a card with 2 GB at a large window size, with other programs using it
+too), the map switches to the CPU, with a notice, instead of the app closing; clicking **CPU**
+in the status bar tries the GPU again, as does the next start (the setting stays on). Any other
+error the graphics card reports is said once, as the map (or, with the map on the CPU, the
+window) may then be drawn wrongly.
