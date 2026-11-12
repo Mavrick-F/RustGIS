@@ -29,6 +29,9 @@ pub struct Editable {
     pub revision: String,
     pub matched: u64,
     pub skipped: u64,
+    /// Values in date fields that weren't dates and are read as null, by field
+    /// ([`crate::source::Batch::unread_dates`]).
+    pub unread_dates: Vec<usize>,
     pub writable: bool,
 }
 
@@ -110,6 +113,8 @@ impl EditTable {
         (&self.geometry_type, self.z, self.m)
     }
 
+    /// Reads up to `limit` rows for editing, with their versions, in one snapshot; rows with a
+    /// geometry that can't be read are counted, and dates that aren't ones read as null and counted.
     pub fn read_editable(&self, limit: usize) -> Result<Editable> {
         let guard = self.src.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
         let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
@@ -130,6 +135,7 @@ impl EditTable {
             revision: self.revision(&tx)?,
             matched,
             skipped: 0,
+            unread_dates: Vec::new(),
             writable: std::fs::metadata(&self.path).is_ok_and(|m| !m.permissions().readonly()),
         };
         {
@@ -152,14 +158,14 @@ impl EditTable {
                 for i in 0..self.columns.len() {
                     hash_value(&mut hash, row.get_ref(i).map_err(err)?);
                 }
-                let attrs = self
-                    .info()
-                    .fields
-                    .iter()
-                    .zip(&attrs)
-                    .map(|(f, &i)| row.get_ref(i).map(|v| value(v, f.ty)))
-                    .collect::<rusqlite::Result<_>>()
-                    .map_err(err)?;
+                let mut values = Vec::with_capacity(attrs.len());
+                for (k, (f, &i)) in self.info().fields.iter().zip(&attrs).enumerate() {
+                    values.push(value(row.get_ref(i).map_err(err)?, f.ty).unwrap_or_else(|| {
+                        crate::source::unread_date(&mut out.unread_dates, k);
+                        Value::Null
+                    }));
+                }
+                let attrs = values;
                 out.versions.push((id, hash.cast_signed()));
                 out.features.push(Feature { id, geometry, attrs });
             }
@@ -267,7 +273,8 @@ impl EditTable {
                 let field = fields.get(i).ok_or_else(|| self.shape_error())?;
                 let old = row.get(c).ok_or_else(|| self.shape_error())?;
                 let attr = f.attrs.get(i).unwrap_or(&Value::Null);
-                let previous = value(ValueRef::from(old), field.ty);
+                // A stored date that isn't one reads as null and is kept unless edited.
+                let previous = value(ValueRef::from(old), field.ty).unwrap_or(Value::Null);
                 let same_nan = matches!((&previous, attr), (Value::Float(a), Value::Float(b)) if a.is_nan() && b.is_nan());
                 if previous != *attr && !same_nan {
                     sets.push(format!("{} = ?", quote(columns.get(c).ok_or_else(|| self.shape_error())?)));
@@ -385,7 +392,7 @@ impl EditTable {
             for &(i, c) in &snapshot_columns {
                 let field = fields.get(i).ok_or_else(|| self.shape_error())?;
                 let attr = feature.attrs.get_mut(i).ok_or_else(|| self.shape_error())?;
-                *attr = value(ValueRef::from(row.get(c).ok_or_else(|| self.shape_error())?), field.ty);
+                *attr = value(ValueRef::from(row.get(c).ok_or_else(|| self.shape_error())?), field.ty).unwrap_or(Value::Null);
             }
             saved.versions.push((k.cast_unsigned(), fingerprint(row.iter().map(ValueRef::from))));
             features.push(feature);

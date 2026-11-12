@@ -142,6 +142,16 @@ pub struct HiddenFills {
     pub partial: bool,
 }
 
+/// What a whole read of a layer's source ([`Layer::load_all_counted`]) couldn't read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Unreadable {
+    /// Rows left out.
+    pub rows: usize,
+    /// What it says of values in date fields that weren't dates, read as null
+    /// ([`rustgis_data::source::unread_dates_note`]).
+    pub dates: Option<String>,
+}
+
 /// A layer: a dataset drawn with a renderer and labels.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layer {
@@ -577,6 +587,17 @@ impl Layer {
         {
             self.dataset.fields = info.fields.clone();
         }
+        // A project saved before RustGIS read a source's date columns as dates lists them as
+        // text; the source now gives dates, so the field says so too.
+        if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
+            for f in &mut self.dataset.fields {
+                if f.ty == rustgis_data::FieldType::Text
+                    && let Some(s) = info.fields.iter().find(|s| s.name == f.name && s.ty.is_temporal())
+                {
+                    f.ty = s.ty;
+                }
+            }
+        }
         // An opened source's dropped Z or M values, for a project saved without the mark. Added to,
         // not replaced: a source that couldn't tell (a check that timed out) mustn't clear a mark the
         // project kept, and a stale one gives one notice too many rather than one too few.
@@ -590,7 +611,10 @@ impl Layer {
         // A failed read leaves nothing drawn for it (its error shows in Layers), not the
         // previous view's features.
         match src.poll(block) {
-            source::Polled::Done(_, batch) => self.install(batch.features),
+            source::Polled::Done(_, batch) => {
+                src.saw_unread_dates(&batch.unread_dates);
+                self.install(batch.features)
+            }
             source::Polled::Failed(_) => self.install(Vec::new()),
             source::Polled::Idle | source::Polled::Waiting => {}
         }
@@ -598,7 +622,10 @@ impl Layer {
         if let Some(e) = src.wanted(view) {
             src.start(e, block);
             match src.poll(block) {
-                source::Polled::Done(_, batch) => self.install(batch.features),
+                source::Polled::Done(_, batch) => {
+                    src.saw_unread_dates(&batch.unread_dates);
+                    self.install(batch.features)
+                }
                 source::Polled::Failed(_) => self.install(Vec::new()),
                 // A thread that couldn't start leaves an error and no read.
                 source::Polled::Idle if src.error.is_some() => self.install(Vec::new()),
@@ -677,9 +704,9 @@ impl Layer {
         self.load_all_counted().map(|(ds, _)| ds)
     }
 
-    /// [`Layer::load_all`], with the number of rows of the source that couldn't be read.
-    pub fn load_all_counted(&self) -> Result<(Dataset, usize), String> {
-        let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), 0)) };
+    /// [`Layer::load_all`], with what of the source couldn't be read.
+    pub fn load_all_counted(&self) -> Result<(Dataset, Unreadable), String> {
+        let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), Unreadable::default())) };
         let (mut ds, report) = copy.read_all()?;
         ds.name = self.dataset.name.clone();
         ds.zm_dropped |= self.dataset.zm_dropped;
@@ -695,7 +722,7 @@ impl Layer {
             ds.fields = self.dataset.fields.clone();
         }
         ds.source = self.dataset.source.clone();
-        Ok((ds, report.skipped))
+        Ok((ds, Unreadable { rows: report.skipped, dates: report.unread_dates }))
     }
 
     /// A streamed layer's source, to export whole a chunk at a time, with a dataset of no

@@ -24,6 +24,9 @@ pub fn commands() -> Vec<C> {
         C::new("edit.deleteField", "Delete Field", "Data › Data Design › Fields", delete_field).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_layer)
             .params(r#"{"layer"?, "field": string}"#),
+        C::new("edit.convertField", "Convert Field to Dates", "Attribute Table", convert_field).roles(&[]).effects(crate::policy::Effects::NONE)
+            .when(need_layer)
+            .params(r#"{"layer"?, "field": string, "type": "date"|"datetime"}"#),
         C::new("edit.calculateField", "Calculate Field", "Attribute Table", calculate_field).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "field": string, "expression": "an expression: fields, 'text', numbers, + - * / % ^ ||, functions (see the Expressions page)"}"#),
@@ -414,6 +417,85 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
     }
     l.dataset.ensure_field(name, ty);
     Ok(Json::Null)
+}
+
+/// `edit.convertField`: makes a text field a date or date-time field, reading each value as ISO
+/// 8601 (`2026-03-05`; `2026-03-05T14:30:00+02:00`, or with a space for the `T`). A date field
+/// also takes a date-time at midnight without a zone. Values that aren't dates become null, said
+/// with their count and the first few, and undo brings them back. Refused while a data design
+/// (domain, subtype, contingent values) names the field or a definition query or display filter
+/// would stop reading with it. It runs on the UI thread, as Add Field and Delete Field do: one
+/// parse of the layer's text in memory, a fraction of a second for a million rows.
+fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
+    let id = s.layer_id(p)?;
+    let fi = field_index(s, id, ps(p, "field").ok_or("field is required")?)?;
+    let ty = match ps(p, "type").ok_or("type is required")?.to_ascii_lowercase().as_str() {
+        "date" => FieldType::Date,
+        "datetime" | "date-time" | "timestamp" => FieldType::DateTime,
+        other => return Err(format!("'{other}' isn't a type a field converts to: date or datetime")),
+    };
+    let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
+    let field = l.dataset.fields.get(fi).ok_or("no such field")?;
+    let name = field.name.clone();
+    if field.ty != FieldType::Text {
+        return Err(format!("'{name}' is a {} field: only a text field converts to dates", field.ty.label()));
+    }
+    let d = &l.design;
+    let designed = d.domains.iter().any(|x| x.field.eq_ignore_ascii_case(&name))
+        || d.subtypes.as_ref().is_some_and(|st| st.field.eq_ignore_ascii_case(&name))
+        || d.contingent.iter().any(|c| c.fields.iter().any(|f| f.eq_ignore_ascii_case(&name)));
+    if designed {
+        return Err(format!("'{name}' has a domain, subtypes or contingent values, which hold text: remove them first"));
+    }
+    // A filter that compares the text with a number stops reading once it's a date.
+    let mut schema = rustgis_data::Dataset::new(l.dataset.name.clone(), l.dataset.geometry_type, l.dataset.fields.clone());
+    if let Some(f) = schema.fields.get_mut(fi) {
+        f.ty = ty;
+    }
+    let reads =
+        |q: &str| rustgis_data::query::parse_fields(q, &l.dataset).is_err() || rustgis_data::query::parse_fields(q, &schema).is_ok();
+    if let Some(q) = l.definition_query.as_deref().filter(|q| !reads(q)) {
+        return Err(format!("the definition query ({q}) wouldn't read '{name}' as dates: change or clear it first"));
+    }
+    if let Some(f) = l.display_filters.iter().find(|f| !reads(&f.where_)) {
+        return Err(format!("display filter '{}' wouldn't read '{name}' as dates: change or remove it first", f.name));
+    }
+    let (mut converted, mut nulled, mut examples) = (0usize, 0usize, Vec::new());
+    for f in &mut l.dataset.features {
+        let Some(v) = f.attrs.get_mut(fi) else { continue };
+        let date = match &*v {
+            v if v.asks_null() => Value::Null,
+            Value::Text(t) => match (ty, Value::parse(t, ty)) {
+                (FieldType::Date, Value::Null) => {
+                    rustgis_data::date::DateTime::parse(t).filter(|t| t.is_date()).map_or(Value::Null, |t| Value::Date(t.date()))
+                }
+                (_, d) => d,
+            },
+            other => Value::parse(&other.to_string(), ty),
+        };
+        if date.is_null() && !v.asks_null() {
+            nulled += 1;
+            if examples.len() < 3 {
+                let text: String = v.to_string().chars().map(rustgis_data::io::dbf_notice_char).collect();
+                let short: String = text.chars().take(40).collect();
+                examples.push(if short.len() < text.len() { format!("'{short}…'") } else { format!("'{short}'") });
+            }
+        }
+        converted += usize::from(!date.is_null());
+        *v = date;
+    }
+    if let Some(f) = l.dataset.fields.get_mut(fi) {
+        f.ty = ty;
+    }
+    let (kind, one) = if ty == FieldType::Date { ("dates", "a date") } else { ("date-times", "a date-time") };
+    if nulled > 0 {
+        let rows = if nulled == 1 { "1 row".to_string() } else { format!("{nulled} rows") };
+        s.notify(
+            format!("Convert Field: '{name}' holds {kind} now, and is null in {rows} whose text isn't {one}: {}", examples.join(", ")),
+            false,
+        );
+    }
+    Ok(json!({"converted": converted, "null": nulled}))
 }
 
 /// `edit.deleteField`: removes a field and every reference to it (symbology, labels, the data

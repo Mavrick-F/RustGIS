@@ -92,6 +92,12 @@ pub struct SourceLayer {
     /// Losses from a conversion actually performed while opening, consumed once by its caller.
     #[serde(skip)]
     conversion_notes_unsaid: Vec<String>,
+    /// Values in date fields a view read found weren't dates ([`Batch::unread_dates`]), until
+    /// said by [`SourceLayer::take_unread_dates`]; once said, later reads aren't counted again.
+    #[serde(skip)]
+    unread_dates: Option<Vec<usize>>,
+    #[serde(skip)]
+    unread_dates_said: bool,
     #[serde(skip)]
     window: Option<Window>,
     /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
@@ -667,6 +673,22 @@ impl SourceLayer {
     pub fn unavailable_areas(&self, features: &rustgis_data::Features) -> Option<AmbiguousAreas> {
         self.area_features.as_ref().filter(|key| Weak::ptr_eq(key, &features.allocation_key())).map(|_| self.area_counts)
     }
+    /// Keeps what a view read found of values in date fields that weren't dates, the first time
+    /// one finds any, for [`SourceLayer::take_unread_dates`] to say.
+    pub fn saw_unread_dates(&mut self, counts: &[usize]) {
+        if !self.unread_dates_said && self.unread_dates.is_none() && counts.iter().any(|n| *n > 0) {
+            self.unread_dates = Some(counts.to_vec());
+        }
+    }
+
+    /// What a view read found of values in date fields that weren't dates
+    /// ([`rustgis_data::source::unread_dates_note`]), once for the source.
+    pub fn take_unread_dates(&mut self) -> Option<String> {
+        let counts = self.unread_dates.take()?;
+        self.unread_dates_said = true;
+        rustgis_data::source::unread_dates_note(&self.info()?.fields, &counts)
+    }
+
     /// Whether another installed window needs its retained display expressions checked.
     pub fn take_display_window(&mut self) -> bool {
         if self.reads == self.display_read_said {
@@ -1529,6 +1551,8 @@ impl SourceLayer {
             conversion_info: _,
             conversion_fallback: _,
             conversion_notes_unsaid: _,
+            unread_dates: _,
+            unread_dates_said: _,
             gdal,
             duckdb,
             postgis,

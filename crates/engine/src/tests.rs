@@ -685,6 +685,96 @@ fn date_fields_work_from_adding_to_saving() {
     );
 }
 
+/// A text field converts to dates: ISO text becomes dates, text that isn't one becomes null and is
+/// said with examples, and undo brings the text back. A field that isn't text, a filter that
+/// would stop reading, and a type that isn't a date are refused.
+#[test]
+fn text_fields_convert_to_dates() {
+    use rustgis_data::{FieldType, Value as V};
+    let mut s = world();
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "founded", "type": "text"})).unwrap();
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "seen", "type": "text"})).unwrap();
+    let rows = [("2026-03-05", "2026-03-05 14:30"), ("1999-12-31T00:00:00", "2026-03-05T14:30:00+02:00"), ("n/a", "soon"), ("", "<null>")];
+    for (row, (day, at)) in rows.iter().enumerate() {
+        s.run("edit.setValue", &json!({"layer": "Cities", "row": row, "field": "founded", "value": day})).unwrap();
+        s.run("edit.setValue", &json!({"layer": "Cities", "row": row, "field": "seen", "value": at})).unwrap();
+    }
+    let column = |s: &Session, field: &str| {
+        let ds = &s.map().layer_by_name("Cities").unwrap().dataset;
+        let k = ds.field_index(field).unwrap();
+        (ds.fields[k].ty, (0..4).map(|r| ds.value(r, k).clone()).collect::<Vec<_>>())
+    };
+    let before = column(&s, "founded");
+    let mark = s.notice_mark();
+    let out = s.run("edit.convertField", &json!({"layer": "Cities", "field": "founded", "type": "date"})).unwrap();
+    assert_eq!((out["converted"].as_u64(), out["null"].as_u64()), (Some(2), Some(1)));
+    let day = |d| V::parse(d, FieldType::Date);
+    assert_eq!(column(&s, "founded"), (FieldType::Date, vec![day("2026-03-05"), day("1999-12-31"), V::Null, V::Null]));
+    let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(notices, ["Convert Field: 'founded' holds dates now, and is null in 1 row whose text isn't a date: 'n/a'"]);
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(column(&s, "founded"), before);
+
+    let mark = s.notice_mark();
+    s.run("edit.convertField", &json!({"layer": "Cities", "field": "seen", "type": "datetime"})).unwrap();
+    let at = |t| V::parse(t, FieldType::DateTime);
+    assert_eq!(
+        column(&s, "seen"),
+        (FieldType::DateTime, vec![at("2026-03-05T14:30:00"), at("2026-03-05T14:30:00+02:00"), V::Null, V::Null])
+    );
+    assert_eq!(s.notices_since(mark).len(), 1);
+    // Clean text converts without a word.
+    s.run("edit.setValue", &json!({"layer": "Cities", "row": 2, "field": "founded", "value": "2026-01-01"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("edit.convertField", &json!({"layer": "Cities", "field": "founded", "type": "date"})).unwrap();
+    assert!(s.notices_since(mark).is_empty());
+
+    let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "founded", "type": "date"})).unwrap_err();
+    assert_eq!(err, "'founded' is a Date field: only a text field converts to dates");
+    let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "name", "type": "long"})).unwrap_err();
+    assert!(err.contains("date or datetime"), "{err}");
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "code", "type": "text"})).unwrap();
+    s.run("layer.definitionQuery", &json!({"layer": "Cities", "where": "code > 5 OR code IS NULL"})).unwrap();
+    let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "code", "type": "date"})).unwrap_err();
+    assert!(err.starts_with("the definition query (code > 5 OR code IS NULL) wouldn't read 'code' as dates"), "{err}");
+}
+
+/// A Shapefile read in place a view at a time says, once, the dates its view reads found weren't
+/// dates (a whole read says them as it reads).
+#[test]
+fn a_streamed_shapefile_says_dates_it_could_not_read_once() {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-streamed-dates-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let mut ds = Dataset::new("permits", GeometryType::Point, vec![Field::new("issued", FieldType::Date)]);
+    for (i, day) in ["2026-03-05", "1999-12-31"].into_iter().enumerate() {
+        ds.push(Some(Geometry::Point(rustgis_geom::Coord::new(i as f64, 1.0))), vec![V::parse(day, FieldType::Date)]);
+    }
+    let shp = dir.0.join("permits.shp");
+    rustgis_data::io::write_path(&ds, &shp).unwrap();
+    let dbf = shp.with_extension("dbf");
+    let mut table = std::fs::read(&dbf).unwrap();
+    let at = table.windows(8).position(|w| w == b"19991231").unwrap();
+    table[at..at + 8].copy_from_slice(b"20260230");
+    std::fs::write(&dbf, table).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": shp.display().to_string(), "stream": true})).unwrap();
+    let mark = s.notice_mark();
+    for _ in 0..2 {
+        s.map_mut().sync_sources(&rustgis_geom::Extent::new(-180.0, -90.0, 180.0, 90.0), 1000.0, true);
+        s.notice_landed_rasters();
+    }
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("date")).collect();
+    assert_eq!(said, ["permits: in the features read so far, 1 value isn't a date and was read as empty, in 'issued'"]);
+}
+
 /// A polygon layer stacks fills (a colour, hatch lines, markers on a grid), for the layer or a
 /// class of its own; junk is refused and numbers held within range; each change undoes, and the
 /// project keeps them (a layer without them saves as before).
@@ -33564,6 +33654,8 @@ fn geopackage_edits_save_back() {
     db.execute_batch(
         "ALTER TABLE roads ADD COLUMN photo BLOB;
          UPDATE roads SET photo = x'00ff' WHERE fid = 1;
+         ALTER TABLE roads ADD COLUMN seen DATETIME;
+         UPDATE roads SET seen = 'soon' WHERE fid = 2;
          CREATE TABLE other (id INTEGER PRIMARY KEY, v TEXT);
          INSERT INTO other VALUES (1, 'keep');
          CREATE TRIGGER no_bad BEFORE INSERT ON roads WHEN NEW.name = 'bad'
@@ -33581,9 +33673,13 @@ fn geopackage_edits_save_back() {
     };
     let p = json!({"layer": "R"});
     let mut s = Session::new(Project::default());
+    let mark = s.notice_mark();
     let loaded = s.run("gpkg.addLayer", &json!({"path": path, "table": "roads", "name": "R"})).unwrap();
     assert_eq!((loaded["features"].as_u64(), loaded["matched"].as_u64(), loaded["skipped"].as_u64()), (Some(3), Some(3), Some(0)));
     assert_eq!(loaded["writable"], true);
+    // A stored date that isn't one loads as null, said; saving leaves it unless it's edited.
+    let said = "R: 1 value isn't a date and was read as empty, in 'seen'; saving leaves them as they are unless they're edited";
+    assert!(s.notices_since(mark).iter().any(|n| n.text == said), "{:?}", s.notices_since(mark));
     let id = loaded["layer"].as_u64().unwrap() as u32;
     let row_of = |s: &Session, key: u64| s.map().layer(id).unwrap().dataset.features.iter().position(|f| f.id == key).unwrap();
     let ids: Vec<_> = s.map().layer(id).unwrap().dataset.features.iter().map(|f| f.id).collect();
@@ -33595,6 +33691,7 @@ fn geopackage_edits_save_back() {
 
     let r1 = row_of(&s, 1);
     s.run("edit.setValue", &json!({"layer": "R", "row": r1, "field": "name", "value": "renamed"})).unwrap();
+    s.run("edit.setValue", &json!({"layer": "R", "row": r1, "field": "seen", "value": "2026-03-05T14:30:00+02:00"})).unwrap();
     let moved = vec![Coord::new(15.0, 25.0), Coord::new(15.2, 25.3)];
     {
         let r2 = row_of(&s, 2);
@@ -33635,8 +33732,14 @@ fn geopackage_edits_save_back() {
     }
 
     let before = changed_at();
+    let mark = s.notice_mark();
     let r = s.run("gpkg.saveEdits", &p).unwrap();
     assert_eq!((r["inserted"].as_u64(), r["updated"].as_u64(), r["deleted"].as_u64()), (Some(1), Some(2), Some(1)), "{r}");
+    // The edited date-time is saved in UTC, and said; the one that wasn't a date is kept.
+    let said = "R: roads: 1 date-time was written in UTC, as GeoPackage stores them, without their own offsets, in 'seen'";
+    assert!(s.notices_since(mark).iter().any(|n| n.text == said), "{:?}", s.notices_since(mark));
+    let seen = |key: i64| -> Option<String> { db.query_row("SELECT seen FROM roads WHERE fid = ?1", [key], |r| r.get(0)).unwrap() };
+    assert_eq!((seen(1).as_deref(), seen(2).as_deref()), (Some("2026-03-05T12:30:00.000Z"), Some("soon")));
     assert_eq!(r["keys"], json!([4]));
     assert!(s.map().layer(id).unwrap().dataset.features.iter().any(|f| f.id == 4));
     assert_eq!(counts(&mut s), (0, 0, 0));
