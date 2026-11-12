@@ -2483,8 +2483,39 @@ pub(crate) fn cut(s: &str, max: usize) -> &str {
 /// marks, embeddings, overrides and isolates) in a name or in `target` show as spaces, and a
 /// long name only its first 40 bytes.
 pub fn shapefile_names_note(fields: &[Field], target: &str) -> Option<String> {
-    let renamed: Vec<(&str, String)> =
-        fields.iter().zip(dbf_names(fields)).filter(|(f, n)| f.name != *n).map(|(f, n)| (f.name.as_str(), n)).collect();
+    names_note(fields, dbf_names(fields), target, "a Shapefile (10 bytes at most, unique ignoring case)")
+}
+
+/// The column each field gets in a GeoPackage: its name, unless an earlier field's column or the
+/// id or geometry column has it without regard to case, as SQLite compares column names; then
+/// the name with `_1`, `_2`… added (a later `a` beside `A` becomes `a_1`).
+pub fn geopackage_columns(fields: &[Field]) -> Vec<String> {
+    let free = |base: &str| {
+        let taken = |n: &str| fields.iter().any(|f| f.name.eq_ignore_ascii_case(n));
+        (0..).map(|i| if i == 0 { base.to_string() } else { format!("{base}_{i}") }).find(|n| !taken(n)).unwrap_or_default()
+    };
+    let (fid, geom) = (free("fid"), free("geom"));
+    let mut columns: Vec<String> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let taken =
+            |n: &str| columns.iter().any(|c| c.eq_ignore_ascii_case(n)) || n.eq_ignore_ascii_case(&fid) || n.eq_ignore_ascii_case(&geom);
+        let name = (0..).map(|i| if i == 0 { f.name.clone() } else { format!("{}_{i}", f.name) }).find(|n| !taken(n));
+        columns.push(name.unwrap_or_else(|| f.name.clone()));
+    }
+    columns
+}
+
+/// What an export to a GeoPackage says when field names differ only in case, which SQLite's
+/// columns can't ([`geopackage_columns`]), or `None` when every name is kept; written as
+/// [`shapefile_names_note`] is.
+pub fn geopackage_names_note(fields: &[Field], target: &str) -> Option<String> {
+    names_note(fields, geopackage_columns(fields), target, "a GeoPackage (unique ignoring case)")
+}
+
+/// One notice of the fields whose names became `names` in `target`, a file of the kind `what`
+/// describes, or `None` when every name is kept.
+fn names_note(fields: &[Field], names: Vec<String>, target: &str, what: &str) -> Option<String> {
+    let renamed: Vec<(&str, String)> = fields.iter().zip(names).filter(|(f, n)| f.name != *n).map(|(f, n)| (f.name.as_str(), n)).collect();
     if renamed.is_empty() {
         return None;
     }
@@ -2496,7 +2527,7 @@ pub fn shapefile_names_note(fields: &[Field], target: &str) -> Option<String> {
         renamed.iter().take(5).map(|(old, new)| format!("'{}' → '{}'", dbf_notice_name(old), dbf_notice_name(new))).collect();
     let more = if renamed.len() > 5 { format!(" and {} more", renamed.len() - 5) } else { String::new() };
     let count = if renamed.len() == 1 { "1 field name was".to_string() } else { format!("{} field names were", renamed.len()) };
-    Some(format!("{target}: {count} changed to fit a Shapefile (10 bytes at most, unique ignoring case): {}{more}", listed.join(", ")))
+    Some(format!("{target}: {count} changed to fit {what}: {}{more}", listed.join(", ")))
 }
 
 /// What an export to `target` says of its date fields: Shapefile, GeoPackage, GeoParquet and

@@ -1819,6 +1819,14 @@ fn writes_points_lines_kmz_and_zipped_shapefiles() {
     let (back, _) = crate::io::read_path(&d.join("c.gpkg")).unwrap();
     assert_eq!(back.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["A", "a_1"]);
     assert_eq!(back.features[0].attrs, [Value::Int(1), Value::Text("x".into())]);
+    // And the export says so, as the file has it; names kept (an id or geometry column moves
+    // aside for a field) say nothing.
+    assert_eq!(
+        crate::io::geopackage_names_note(&cased.fields, "c.gpkg").as_deref(),
+        Some("c.gpkg: 1 field name was changed to fit a GeoPackage (unique ignoring case): 'a' → 'a_1'")
+    );
+    let kept: Vec<Field> = ["fid", "geom", "a"].iter().map(|n| Field::new(*n, FieldType::Integer)).collect();
+    assert_eq!(crate::io::geopackage_names_note(&kept, "k.gpkg"), None);
     // An empty layer writes too.
     let empty = Dataset::new("e", GeometryType::Point, vec![]);
     assert!(crate::io::write_bytes(&empty, "parquet").is_ok());
