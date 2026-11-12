@@ -1200,6 +1200,19 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     };
     let env_extent = env.extent;
     let given_cell = f(p, "cellSize").or(env.cell_in(crs));
+    // An environment cell size in another system's units isn't used, and said: one in degrees for a
+    // surface made in the layer's system, or one in the environment's system for another given.
+    let cell_note = match env.projected {
+        Some(g) => g.cell_size.map(|c| (c, format!("{}'s units", g.crs.label()))),
+        None => env.cell_size.map(|c| (c, "degrees".to_string())),
+    }
+    .filter(|_| given_cell.is_none())
+    .map(|(c, units)| {
+        format!(
+            "Geostatistical Wizard: the environment's cell size ({c} {units}) wasn't used for a surface made in {}; the cell size was set from the extent. Give cellSize, or set the environment's coordinate system",
+            crs.label()
+        )
+    });
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
     let power = f(p, "power").unwrap_or(2.0).clamp(0.5, 10.0);
     let neighbors = p.get("neighbors").and_then(Value::as_u64).unwrap_or(12).max(1) as usize;
@@ -1236,7 +1249,7 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
             }
         };
         let m = made(rasterops::idw(&pts, &e, cell, power, neighbors, &name, crs).map_err(left_out)?, None)?;
-        if no_point == 0 && no_value == 0 && beyond_note.is_none() && crs_note.is_none() {
+        if no_point == 0 && no_value == 0 && beyond_note.is_none() && crs_note.is_none() && cell_note.is_none() {
             return Ok(m);
         }
         let then: Then = Box::new(move |s: &mut Session, v: &mut Value| {
@@ -1258,6 +1271,9 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
             }
             // It names the layer itself.
             if let Some(note) = crs_note {
+                s.notify(note, false);
+            }
+            if let Some(note) = cell_note {
                 s.notify(note, false);
             }
         });

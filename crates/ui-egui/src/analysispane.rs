@@ -875,7 +875,12 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             });
             let system = env.projected.map(|g| g.crs.label()).unwrap_or_else(|| tl!("the layer's if projected, else degrees").to_string());
             let cells = env.cell_in(env.projected.map_or(rustgis_engine::data::raster::Crs::LonLat, |g| g.crs));
-            let cells = cells.map(|c| c.to_string()).unwrap_or_else(|| tl!("the tool's own").to_string());
+            // With no system, the size is in degrees, and a layer read in a projected system doesn't use it.
+            let cells = match cells {
+                Some(c) if env.projected.is_none() => crate::i18n::fmt("{c}° (in degrees only)", &[("c", &c.to_string())]),
+                Some(c) => c.to_string(),
+                None => tl!("the tool's own").to_string(),
+            };
             ui.label(
                 egui::RichText::new(crate::i18n::fmt("Rasters: {system}, cell size {cells}", &[("system", &system), ("cells", &cells)]))
                     .small(),

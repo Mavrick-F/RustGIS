@@ -1254,7 +1254,9 @@ its cell size as `projected` (`crs` there is the text to give it back), and `cel
 in degrees. The Geostatistical Wizard
 uses the environment's extent, coordinate system and cell size; its own `crs` and `cellSize` win
 over them (`EPSG:4326` asks for degrees, with the degree cell size), and without either system it
-uses the layer's, as IDW Interpolation and Ordinary Kriging do. IDW Interpolation and Ordinary
+uses the layer's, as IDW Interpolation and Ordinary Kriging do. A cell size the environment holds in
+another system's units (degrees, for a surface made in the layer's system) isn't used, and the
+run says so. IDW Interpolation and Ordinary
 Kriging instead use their own `extent`, `pixelSize` and `crs` parameters; the environment does not
 set their output grids.
 
