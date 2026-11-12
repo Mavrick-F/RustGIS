@@ -2490,11 +2490,7 @@ pub fn shapefile_names_note(fields: &[Field], target: &str) -> Option<String> {
 /// id or geometry column has it without regard to case, as SQLite compares column names; then
 /// the name with `_1`, `_2`… added (a later `a` beside `A` becomes `a_1`).
 pub fn geopackage_columns(fields: &[Field]) -> Vec<String> {
-    let free = |base: &str| {
-        let taken = |n: &str| fields.iter().any(|f| f.name.eq_ignore_ascii_case(n));
-        (0..).map(|i| if i == 0 { base.to_string() } else { format!("{base}_{i}") }).find(|n| !taken(n)).unwrap_or_default()
-    };
-    let (fid, geom) = (free("fid"), free("geom"));
+    let (fid, geom) = (free_column_name(fields, "fid"), free_column_name(fields, "geom"));
     let mut columns: Vec<String> = Vec::with_capacity(fields.len());
     for f in fields {
         let taken =
@@ -2503,6 +2499,13 @@ pub fn geopackage_columns(fields: &[Field]) -> Vec<String> {
         columns.push(name.unwrap_or_else(|| f.name.clone()));
     }
     columns
+}
+
+/// A name no field has, ignoring case (`base`, else `base_1`, `base_2`, …): a GeoPackage's id and
+/// geometry columns.
+pub(crate) fn free_column_name(fields: &[Field], base: &str) -> String {
+    let taken = |n: &str| fields.iter().any(|f| f.name.eq_ignore_ascii_case(n));
+    (0..).map(|i| if i == 0 { base.to_string() } else { format!("{base}_{i}") }).find(|n| !taken(n)).unwrap_or_else(|| base.to_string())
 }
 
 /// What an export to a GeoPackage says when field names differ only in case, which SQLite's
