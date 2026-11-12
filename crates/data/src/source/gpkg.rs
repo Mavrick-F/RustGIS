@@ -1179,8 +1179,12 @@ fn sql_value(v: &Value, ty: FieldType) -> rusqlite::types::Value {
         (Value::Date(d), _) => Sql::Text(d.to_string()),
         (Value::DateTime(t), FieldType::Date) if t.is_date() => Sql::Text(t.date().to_string()),
         (Value::DateTime(t), _) => Sql::Text(gpkg_datetime(*t)),
-        // Kept as it is, though a read finds it isn't a date and gives null.
-        (Value::Text(s), FieldType::Date | FieldType::DateTime) => Sql::Text(s.clone()),
+        // Text that reads as a date is written as that date; other text is kept as it is, though
+        // a read finds it isn't a date and gives null.
+        (Value::Text(s), FieldType::Date | FieldType::DateTime) => match Value::parse_stored(s, ty) {
+            Value::Null => Sql::Text(s.clone()),
+            date => sql_value(&date, ty),
+        },
         (v, ty) => match Value::parse_source(&v.to_string(), ty) {
             Value::Int(x) => Sql::Integer(x),
             Value::Float(x) if x.is_finite() => Sql::Real(x),

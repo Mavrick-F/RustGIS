@@ -702,11 +702,16 @@ impl Layer {
     /// Gives `fields` (the layer's, as a project saved before RustGIS read a source's date columns
     /// as dates lists them: text) the source's date types, so the live layer and its whole reads
     /// and exports say what the source now gives. A field stays text when the layer's definition
-    /// query or a display filter reads it as text (comparing it with a number) and wouldn't read
-    /// it as dates, so the filter keeps working.
+    /// query, a display filter or an attribute rule reads it as text (comparing it with a number)
+    /// and wouldn't read it as dates, so the filter or rule keeps working.
     fn date_fields_from_source(&self, fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) {
-        let filters: Vec<&str> =
-            self.definition_query.iter().map(String::as_str).chain(self.display_filters.iter().map(|f| f.where_.as_str())).collect();
+        let filters: Vec<&str> = self
+            .definition_query
+            .iter()
+            .map(String::as_str)
+            .chain(self.display_filters.iter().map(|f| f.where_.as_str()))
+            .chain(self.design.rules.iter().map(|r| r.expression.as_str()))
+            .collect();
         for k in 0..fields.len() {
             let Some(f) = fields.get(k) else { continue };
             let Some(ty) = source.iter().find(|s| s.name == f.name && s.ty.is_temporal()).map(|s| s.ty) else { continue };
@@ -3143,6 +3148,30 @@ mod tests {
             layer.date_fields_from_source(&mut got, &source);
             assert_eq!(got[0].ty, ty, "{query:?}");
         }
+        // Kept as text, the field holds the dates the source reads, and the filter keeps the rows
+        // it kept when they were text.
+        let rows = |values: [Value; 2]| {
+            let mut ds = Dataset::new("permits", GeometryType::None, fields.clone());
+            for v in values {
+                ds.push(None, vec![v]);
+            }
+            let q = rustgis_data::query::parse("issued >= 2026", &ds).unwrap();
+            (0..2).map(|r| rustgis_data::query::eval(&q, &ds, r)).collect::<Vec<bool>>()
+        };
+        let day = |d: &str| Value::parse(d, FieldType::Date);
+        let text = |d: &str| Value::Text(d.into());
+        assert_eq!(rows([day("2026-03-05"), day("2025-12-31")]), rows([text("2026-03-05"), text("2025-12-31")]));
+        // An attribute rule is kept reading too.
+        layer.definition_query = None;
+        layer.design.rules.push(design::AttributeRule {
+            name: "Recent".into(),
+            kind: design::RuleKind::Constraint,
+            field: String::new(),
+            expression: "issued >= 2026".into(),
+        });
+        let mut got = fields.clone();
+        layer.date_fields_from_source(&mut got, &source);
+        assert_eq!(got[0].ty, FieldType::Text);
     }
 
     fn points() -> Dataset {

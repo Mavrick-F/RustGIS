@@ -283,7 +283,7 @@ impl EditTable {
                 if previous != *attr && !same_nan {
                     sets.push(format!("{} = ?", quote(columns.get(c).ok_or_else(|| self.shape_error())?)));
                     args.push(sql_value(attr, field.ty));
-                    count_utc(&mut utc_dates, i, attr);
+                    count_utc(&mut utc_dates, i, attr, field.ty);
                 }
             }
             let old = ValueRef::from(row.get(geom).ok_or_else(|| self.shape_error())?);
@@ -339,7 +339,7 @@ impl EditTable {
                     let field = fields.get(i).ok_or_else(|| self.shape_error())?;
                     names.push(quote(columns.get(c).ok_or_else(|| self.shape_error())?));
                     args.push(sql_value(attr, field.ty));
-                    count_utc(&mut utc_dates, i, attr);
+                    count_utc(&mut utc_dates, i, attr, field.ty);
                 }
             }
             let sql = format!("INSERT INTO {table} ({}) VALUES ({})", names.join(", "), vec!["?"; names.len()].join(", "));
@@ -601,8 +601,11 @@ impl FeatureWrites {
 
 /// Counts `attr` in field `i` when it is a date-time at an offset other than UTC's, which the
 /// save writes in UTC.
-fn count_utc(counts: &mut [usize], i: usize, attr: &Value) {
-    if matches!(attr, Value::DateTime(t) if t.offset().is_some_and(|o| o != 0))
+fn count_utc(counts: &mut [usize], i: usize, attr: &Value, ty: crate::FieldType) {
+    let offset = |v: &Value| matches!(v, Value::DateTime(t) if t.offset().is_some_and(|o| o != 0));
+    // Text in a date field that reads as a date is written as that date.
+    let text = matches!(attr, Value::Text(t) if ty.is_temporal() && offset(&Value::parse_stored(t, ty)));
+    if (offset(attr) || text)
         && let Some(n) = counts.get_mut(i)
     {
         *n += 1;

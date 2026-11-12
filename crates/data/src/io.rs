@@ -2391,7 +2391,7 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
     }
     ds.drop_zm(&mut report, zm_shapes);
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
-    report.messages.extend(report.unread_dates.clone());
+    report.messages.extend(report.unread_dates.iter().map(|n| format!("{name}: {n}")));
     ds.geometry_type = dominant_type(&ds);
     // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
     // conversion warning. Its shapes can be recovered by importing with an override.
@@ -2538,10 +2538,13 @@ pub fn dates_as_text_note(fields: &[Field], target: &str) -> Option<String> {
 /// Counts, for each field, the date-times at an offset other than UTC's (`+02:00`), which a
 /// GeoPackage holds in UTC: the moment is kept, the offset it was shown at isn't.
 pub fn offset_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, fields: &[Field]) -> Vec<usize> {
+    let offset = |v: &Value| matches!(v, Value::DateTime(t) if t.offset().is_some_and(|o| o != 0));
     let mut counts = vec![0usize; fields.len()];
     for f in features {
-        for (n, v) in counts.iter_mut().zip(&f.attrs) {
-            if matches!(v, Value::DateTime(t) if t.offset().is_some_and(|o| o != 0)) {
+        for ((n, field), v) in counts.iter_mut().zip(fields).zip(&f.attrs) {
+            // Text in a date field that reads as a date is written as that date.
+            let text = matches!(v, Value::Text(t) if field.ty.is_temporal() && offset(&Value::parse_stored(t, field.ty)));
+            if offset(v) || text {
                 *n += 1;
             }
         }
@@ -4734,7 +4737,7 @@ mod tests {
             assert_eq!(days, [at("2026-03-05"), Value::Null, Value::Null, at("0001-01-01"), Value::Null], "{read}");
             assert!(back.features.iter().all(|f| f.geometry.is_some()), "{read}");
             let note = report.messages.iter().find(|m| m.contains("date")).unwrap_or_else(|| panic!("{read}: {report:?}"));
-            assert!(note.ends_with("1 value isn't a date and was read as empty, in 'issued'"), "{read}: {note}");
+            assert_eq!(note, "permits: 1 value isn't a date and was read as empty, in 'issued'", "{read}");
         }
     }
 
