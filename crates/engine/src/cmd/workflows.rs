@@ -1248,11 +1248,10 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
                 why.push(format!("{no_value} whose value isn't a number"));
             }
             let e = if why.is_empty() { e } else { format!("{e} ({} left out)", why.join(", ")) };
-            // A size read in the layer's system's units can be why there are too many cells.
-            let e = match &crs_note {
-                Some(note) => format!("{e} ({note})"),
-                None => e,
-            };
+            // A size read in the layer's system's units, or one the environment holds that wasn't
+            // used, can be why it failed.
+            let notes: Vec<&str> = [crs_note.as_deref(), cell_note.as_deref()].into_iter().flatten().collect();
+            let e = if notes.is_empty() { e } else { format!("{e} ({})", notes.join("; ")) };
             // Points the system can't hold can be why there are too few.
             match &beyond_note {
                 Some(note) => format!("{e}; {note}"),

@@ -39618,6 +39618,17 @@ fn interpolation_in_a_projected_coordinate_system() {
     let label = Crs::WebMercator.label();
     let beyond = format!("polar: 1 point(s) beyond what {label} can hold (past 85.05° of latitude) were left out");
     assert!(notices.contains(&beyond), "{notices:?}");
+    // A run that fails still names an environment cell size it didn't use.
+    let mut arctic = Dataset::new("arctic", GeometryType::Point, vec![Field::new("depth", FieldType::Double)]);
+    for (x, y, depth) in [(0.0, 88.0, 1.0), (10.0, 89.0, 2.0)] {
+        arctic.push(Some(Geometry::Point(Coord::new(x, y))), vec![V::Float(depth)]);
+    }
+    crate::cmd::layer::add_dataset(&mut s, arctic);
+    let before = s.run("gp.env", &json!({})).unwrap()["projected"]["cellSize"].clone();
+    s.run("gp.env", &json!({"cellSize": 0.02})).unwrap();
+    let e = s.run("analysis.interpolate", &json!({"layer": "arctic", "field": "depth", "crs": "EPSG:3857"})).unwrap_err();
+    assert!(e.contains("cell size (0.02, in ") && e.contains("wasn't used"), "{e}");
+    s.run("gp.env", &json!({"cellSize": before})).unwrap();
 
     // A geographic system other than EPSG:4326 is refused, and the environment takes none;
     // clearing the environment's goes back to the layer's.
