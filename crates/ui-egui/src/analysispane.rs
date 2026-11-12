@@ -56,6 +56,9 @@ pub struct Workflow {
     /// The system the Wizard's surface was last to be made in (its own, else the environment's):
     /// when it changes, the cell size typed for it is cleared.
     pub wizard_system: String,
+    /// The system the Wizard's layer was read in, and the one its surface is made in from it
+    /// ([`rustgis_engine::analysis::layer_raster_crs`]), kept so it is worked out once.
+    pub layer_system: Option<(rustgis_engine::data::raster::Crs, Option<rustgis_engine::data::raster::Crs>)>,
     /// The projected coordinate system typed for the environment's Set Coordinate System.
     pub env_crs: String,
     /// The cell size typed for the environment, apart from the Wizard's, which is the run's own.
@@ -720,12 +723,17 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             combo(ui, "wf_if", "Field", &mut app.workflow.field, &numeric);
             // Empty: the environment's system, else the projected one the layer was read in, else
             // degrees; the hint shows which.
-            let layer_crs = app
-                .session
-                .map()
-                .layer_by_name(&app.workflow.layer)
-                .and_then(|l| l.dataset.crs)
-                .filter(|c| !c.is_geographic() && !c.is_geocentric());
+            let read_in = app.session.map().layer_by_name(&app.workflow.layer).and_then(|l| l.dataset.crs);
+            // The run's choice; kept for the layer's system, so a projection isn't built every frame.
+            let layer_crs = match (read_in, app.workflow.layer_system) {
+                (Some(c), Some((seen, chosen))) if seen == c => chosen,
+                (Some(c), _) => {
+                    let chosen = rustgis_engine::analysis::layer_raster_crs(Some(c)).and_then(Result::ok);
+                    app.workflow.layer_system = Some((c, chosen));
+                    chosen
+                }
+                (None, _) => None,
+            };
             let empty_crs = app.session.project.gp_env.projected.map(|g| g.crs).or(layer_crs);
             let degrees = app.workflow.crs.trim().is_empty() && empty_crs.is_none();
             ui.add(
@@ -865,7 +873,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 }
             });
-            let system = env.projected.map(|g| g.crs.label()).unwrap_or_else(|| tl!("Degrees").to_string());
+            let system = env.projected.map(|g| g.crs.label()).unwrap_or_else(|| tl!("the layer's if projected, else degrees").to_string());
             let cells = env.cell_in(env.projected.map_or(rustgis_engine::data::raster::Crs::LonLat, |g| g.crs));
             let cells = cells.map(|c| c.to_string()).unwrap_or_else(|| tl!("the tool's own").to_string());
             ui.label(
@@ -874,13 +882,13 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             );
             ui.horizontal_wrapped(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.env_crs).hint_text("EPSG:32616").desired_width(110.0));
-                // An empty box sets nothing; going back to degrees is its own button, so a click
-                // never clears the system and its cell size by accident.
+                // An empty box sets nothing; clearing the system is its own button, so a click never
+                // clears it and its cell size by accident. Cleared, a run takes the layer's system.
                 let typed = app.workflow.env_crs.trim().to_string();
                 if ui.add_enabled(!typed.is_empty(), egui::Button::new(tl!("Set Coordinate System"))).clicked() {
                     run(app, "gp.env", json!({"crs": typed}));
                 }
-                if ui.add_enabled(env.projected.is_some(), egui::Button::new(tl!("Degrees"))).clicked() {
+                if ui.add_enabled(env.projected.is_some(), egui::Button::new(tl!("Clear Coordinate System"))).clicked() {
                     run(app, "gp.env", json!({"crs": null}));
                 }
             });
