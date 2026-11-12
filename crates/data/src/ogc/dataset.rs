@@ -46,6 +46,7 @@ struct Tileset {
     metadata: bool,
     names: Vec<String>,
     title: String,
+    schemes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,10 +61,18 @@ fn relation(link: &Value, name: &str) -> bool {
     link.get("rel").and_then(Value::as_str).is_some_and(|r| r == name || r == format!("http://www.opengis.net/def/rel/ogc/1.0/{name}"))
 }
 
-/// Whether a linked metadata document declares a grid of its own. Otherwise the validated
-/// list entry supplies it; a contradictory declaration must not override that selection.
-fn declares_grid(value: &Value) -> bool {
-    ["tileMatrixSetURI", "tileMatrixSetId", "tileMatrixSet"].iter().any(|k| value.get(*k).is_some())
+/// Linked metadata may repeat the validated list entry's definition link, whose server
+/// path need not name the grid. A new scheme link must establish its own supported grid.
+fn inherits_grid(from: &str, value: &Value, context: &Tileset) -> bool {
+    context.metadata
+        && !["tileMatrixSetURI", "tileMatrixSetId", "tileMatrixSet"].iter().any(|k| value.get(*k).is_some())
+        && value.get("links").and_then(Value::as_array).into_iter().flatten().filter(|link| relation(link, "tiling-scheme")).all(|link| {
+            link.get("href")
+                .and_then(Value::as_str)
+                .filter(|href| href.len() <= MAX_ADDRESS)
+                .and_then(|href| resolve(from, href))
+                .is_some_and(|url| context.schemes.contains(&url))
+        })
 }
 
 /// Keeps an advertised destination authoritative and counts settings omitted on this hop.
@@ -124,7 +133,7 @@ impl DatasetDiscovery {
                 out.pending.push_back(Document {
                     parent: from.into(),
                     url,
-                    kind: Kind::Tiles(Tileset { vector, metadata: false, names: Vec::new(), title: String::new() }),
+                    kind: Kind::Tiles(Tileset { vector, metadata: false, names: Vec::new(), title: String::new(), schemes: Vec::new() }),
                 });
             } else {
                 let reason = if links
@@ -160,13 +169,19 @@ impl DatasetDiscovery {
         self.pending.front().map(|d| (d.parent.as_str(), d.url.as_str()))
     }
 
+    /// The map metadata address after representation and length checks. The collections
+    /// discovery path keeps its existing resolver, but must not guess from a rejected link.
+    pub(super) fn map_url(&self) -> Option<&str> {
+        self.pending.iter().find(|d| matches!(&d.kind, Kind::Tiles(t) if !t.vector && !t.metadata)).map(|d| d.url.as_str())
+    }
+
     /// Keeps the existing `service.add` shortcut for a caller that has already resolved a map
     /// template. The engine still checks that explicit template against the service address.
     pub fn explicit_map(&self, title: &str, template: &str) -> Option<ServiceLayer> {
-        let document = self.pending.iter().find(|d| matches!(&d.kind, Kind::Tiles(t) if !t.vector && !t.metadata))?;
+        let document = self.map_url()?;
         let title = if title.is_empty() { "tiles" } else { title };
         let mut offer = layer("map".into(), format!("{title} (map tiles)"), Offer::Tiles { template: template.into() });
-        offer.tilesets = Some(document.url.clone());
+        offer.tilesets = Some(document.to_string());
         Some(offer)
     }
 
@@ -179,19 +194,17 @@ impl DatasetDiscovery {
         let mut contexts = Vec::new();
         if let Kind::Tiles(context) = &doc.kind {
             contexts.push(context.clone());
-            // A mixed list may be advertised by both relations. Consume both root contexts
-            // together, so the caller fetches the document once and keeps both kinds of offer.
-            if !context.metadata {
-                let shared = self.pending.iter().position(|next| {
-                    next.url == doc.url
-                        && next.parent == doc.parent
-                        && matches!(&next.kind, Kind::Tiles(other) if !other.metadata && other.vector != context.vector)
-                });
-                if let Some(at) = shared
-                    && let Some(Document { kind: Kind::Tiles(other), .. }) = self.pending.remove(at)
-                {
-                    contexts.push(other);
-                }
+            // Map and vector offers may share a list or metadata document. Retain both
+            // contexts in one read without crossing the parent's address-policy boundary.
+            let shared = self.pending.iter().position(|next| {
+                next.url == doc.url
+                    && next.parent == doc.parent
+                    && matches!(&next.kind, Kind::Tiles(other) if other.metadata == context.metadata && other.vector != context.vector)
+            });
+            if let Some(at) = shared
+                && let Some(Document { kind: Kind::Tiles(other), .. }) = self.pending.remove(at)
+            {
+                contexts.push(other);
             }
         }
         match serde_json::from_slice::<Value>(body) {
@@ -288,7 +301,7 @@ impl DatasetDiscovery {
         } else {
             let mut accepted = false;
             for context in contexts {
-                if (context.metadata && !declares_grid(value) || web_mercator_tileset(value)) && tile_data_type(value, context.vector) {
+                if (inherits_grid(&doc.url, value, context) || web_mercator_tileset(value)) && tile_data_type(value, context.vector) {
                     accepted = true;
                     self.tile(doc, value, context, false, allowed, service);
                 }
@@ -355,9 +368,20 @@ impl DatasetDiscovery {
             TilesStep::Next(url) if !metadata && url.len() <= MAX_ADDRESS => {
                 // Keep advertised order, with every tileset ahead of the style catalogue.
                 let at = self.pending.iter().position(|d| !matches!(d.kind, Kind::Tiles(_))).unwrap_or(self.pending.len());
+                let schemes = value
+                    .get("links")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(MAX_PARTS)
+                    .filter(|link| relation(link, "tiling-scheme"))
+                    .filter_map(|link| link.get("href").and_then(Value::as_str))
+                    .filter(|href| href.len() <= MAX_ADDRESS)
+                    .filter_map(|href| resolve(&doc.url, href))
+                    .collect();
                 self.pending.insert(
                     at,
-                    Document { parent: doc.url.clone(), url, kind: Kind::Tiles(Tileset { vector, metadata: true, names, title }) },
+                    Document { parent: doc.url.clone(), url, kind: Kind::Tiles(Tileset { vector, metadata: true, names, title, schemes }) },
                 );
             }
             TilesStep::Next(_) => self.omitted(

@@ -359,8 +359,18 @@ fn read_documents(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(
         // Distinct offers may share a name (including generated tile names and collection ids).
         let shared: std::sync::Arc<str> = address.as_str().into();
         for layer in service.layers {
+            // TileJSON completion can emit a stylesheet read earlier. Keep that document's
+            // address and sticky origin history so its saved login is neither lost nor restored.
+            let source = if dataset_document
+                && let Offer::Style { url } = &layer.offer
+                && let Some(&style_crossed) = histories.get(url)
+            {
+                CapabilitySource { address: url.as_str().into(), crossed_origin: style_crossed }
+            } else {
+                CapabilitySource { address: shared.clone(), crossed_origin }
+            };
             result.service.layers.push(layer);
-            result.sources.push(CapabilitySource { address: shared.clone(), crossed_origin });
+            result.sources.push(source);
         }
         result.service.withheld_addresses = result.service.withheld_addresses.saturating_add(service.withheld_addresses);
         result.service.past_read_limit = result.service.past_read_limit.take().or(service.past_read_limit);

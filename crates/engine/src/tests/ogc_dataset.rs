@@ -37,16 +37,32 @@ fn ogc_dataset_rejected_landing_links_never_guess_a_template() {
     let mut session = Session::new(Project::default());
     for (kind, href, reason) in [
         ("text/html", "/tiles".to_string(), "no usable JSON link"),
-        ("application/json", format!("https://maps.example.org/{}", "a".repeat(8200)), "addresses exceed 8192 bytes"),
+        ("application/json", format!("https://maps.example.org/tiles?setting={}", "a".repeat(8200)), "addresses exceed 8192 bytes"),
     ] {
-        let text = json!({"links":[{"rel":"tilesets-map","type":kind,"href":href}]}).to_string();
-        let listing =
-            session.run("service.layers", &json!({"url":"https://maps.example.org/dataset","type":"ogcapi","text":text})).unwrap();
-        assert_eq!(listing["count"], 0, "a rejected link cannot enable a guessed template");
-        assert!(listing["next"].is_null());
-        assert_eq!(listing["notes"].as_array().unwrap().len(), 1, "{listing}");
-        assert!(listing["notes"][0].as_str().unwrap().starts_with("1 tileset documents were left out"));
-        assert!(listing["notes"][0].as_str().unwrap().contains(reason), "{listing}");
+        for collections in [false, true] {
+            let mut landing = json!({"links":[{"rel":"tilesets-map","type":kind,"href":href}]});
+            if collections {
+                landing["links"].as_array_mut().unwrap().push(json!({"rel":"data","type":"application/json","href":"/collections"}));
+            }
+            let listing = session.run("service.layers", &json!({"url":"https://maps.example.org/dataset","type":"ogcapi",
+                "text":landing.to_string(),"documents":[{"url":"https://maps.example.org/collections","text":"{\"collections\":[{\"id\":\"roads\"}]}"}]})).unwrap();
+            assert_eq!(listing["count"], usize::from(collections), "{listing}");
+            assert!(
+                listing["layers"].as_array().unwrap().iter().all(|l| l["offer"]["type"] == "features"),
+                "a rejected link cannot enable a guessed template: {listing}"
+            );
+            assert!(listing["next"].is_null());
+            let omitted = listing["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|n| n.contains("tileset documents were left out"))
+                .collect::<Vec<_>>();
+            assert_eq!(omitted.len(), 1, "{listing}");
+            assert!(omitted[0].starts_with("1 tileset documents were left out"));
+            assert!(omitted[0].contains(reason), "{listing}");
+        }
     }
 }
 
@@ -211,31 +227,52 @@ fn ogc_dataset_styles_require_templates_allowed_from_the_tileset_document() {
 }
 
 #[test]
-fn ogc_dataset_shared_map_vector_list_is_read_once_for_both_offers() {
-    let root = json!({"links":[
-        {"rel":"tilesets-vector","href":"/tiles?f=json"},
-        {"rel":"tilesets-map","href":"/tiles?f=json"}
-    ]});
-    let tiles = json!({"tilesets":[
-        {"dataType":"vector","tileMatrixSetId":"WebMercatorQuad","vector_layers":[{"id":"roads"}],"links":[
-            {"rel":"item","type":"application/vnd.mapbox-vector-tile","href":"/vector/{tileMatrix}/{tileRow}/{tileCol}.pbf"}]},
-        {"dataType":"map","tileMatrixSetId":"WebMercatorQuad","links":[
-            {"rel":"item","type":"image/png","href":"/map/{tileMatrix}/{tileRow}/{tileCol}.png"}]}
-    ]});
-    let server = Server::new(vec![Route::new("/dataset", &root.to_string()), Route::new("/tiles", &tiles.to_string())]);
-    let mut session = Session::new(Project::default());
-    let mut params = json!({"url":format!("{}/dataset", server.base),"type":"ogcapi"});
-    let native = session.run("service.layers", &params).unwrap();
-    assert_eq!(native["count"], 2, "{native}");
-    let layers = native["layers"].as_array().unwrap();
-    assert!(layers.iter().any(|l| l["offer"]["type"] == "vectorTiles"), "{native}");
-    assert!(layers.iter().any(|l| l["offer"]["type"] == "tiles"), "{native}");
-    assert!(native["notes"].as_array().unwrap().is_empty(), "{native}");
-    assert_eq!(server.requests().len(), 2, "the shared list must be fetched only once");
-    params["text"] = json!(root.to_string());
-    params["documents"] = json!([{"url":format!("{}/tiles?f=json",server.base),"text":tiles.to_string()}]);
-    assert_eq!(session.run("service.layers", &params).unwrap(), native);
-    assert_eq!(server.requests().len(), 2, "supplied replay must not fetch anything");
+fn ogc_dataset_shared_map_vector_documents_are_read_once_for_both_offers() {
+    for linked in [false, true] {
+        let root = json!({"links":[
+            {"rel":"tilesets-vector","href":"/tiles?f=json"},
+            {"rel":"tilesets-map","href":"/tiles?f=json"}
+        ]});
+        let metadata = json!({"vector_layers":[{"id":"roads"}],"links":[
+            {"rel":"item","type":"application/vnd.mapbox-vector-tile","href":"/vector/{tileMatrix}/{tileRow}/{tileCol}.pbf"},
+            {"rel":"item","type":"image/png","href":"/map/{tileMatrix}/{tileRow}/{tileCol}.png"}]});
+        let tiles = if linked {
+            json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad","links":[
+                {"rel":"self","type":"application/json","href":"/metadata?f=json"}]}]})
+        } else {
+            json!({"tilesets":[
+                {"dataType":"vector","tileMatrixSetId":"WebMercatorQuad","vector_layers":[{"id":"roads"}],"links":[
+                    {"rel":"item","type":"application/vnd.mapbox-vector-tile","href":"/vector/{tileMatrix}/{tileRow}/{tileCol}.pbf"}]},
+                {"dataType":"map","tileMatrixSetId":"WebMercatorQuad","links":[
+                    {"rel":"item","type":"image/png","href":"/map/{tileMatrix}/{tileRow}/{tileCol}.png"}]}
+            ]})
+        };
+        let server = Server::new(vec![
+            Route::new("/dataset", &root.to_string()),
+            Route::new("/tiles", &tiles.to_string()),
+            Route::new("/metadata", &metadata.to_string()),
+        ]);
+        let mut session = Session::new(Project::default());
+        let mut params = json!({"url":format!("{}/dataset", server.base),"type":"ogcapi"});
+        let native = session.run("service.layers", &params).unwrap();
+        assert_eq!(native["count"], 2, "{native}");
+        let layers = native["layers"].as_array().unwrap();
+        assert!(layers.iter().any(|l| l["offer"]["type"] == "vectorTiles"), "{native}");
+        assert!(layers.iter().any(|l| l["offer"]["type"] == "tiles"), "{native}");
+        assert!(native["notes"].as_array().unwrap().is_empty(), "{native}");
+        let requests = 2 + usize::from(linked);
+        assert_eq!(server.requests().len(), requests, "each shared document must be fetched only once");
+        params["text"] = json!(root.to_string());
+        params["documents"] = json!([{"url":format!("{}/tiles?f=json",server.base),"text":tiles.to_string()}]);
+        if linked {
+            params["documents"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"url":format!("{}/metadata?f=json",server.base),"text":metadata.to_string()}));
+        }
+        assert_eq!(session.run("service.layers", &params).unwrap(), native);
+        assert_eq!(server.requests().len(), requests, "supplied replay must not fetch anything");
+    }
 }
 
 #[test]
@@ -337,6 +374,50 @@ fn ogc_dataset_metadata_and_tilejson_are_read_before_listing() {
     let listing = session.run("service.layers", &params).unwrap();
     assert_eq!(listing["count"], 2, "{listing}");
     assert!(listing["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("didn't get its keys")));
+}
+
+#[test]
+fn ogc_dataset_tilejson_completion_keeps_the_stylesheets_login_provenance() {
+    for foreign_catalog in [false, true] {
+        let mut docs = documents();
+        docs[1].1["tilesets"].as_array_mut().unwrap().remove(0);
+        docs[2].1["styles"].as_array_mut().unwrap().truncate(1);
+        let catalog = if foreign_catalog { "https://catalog.example.org" } else { "https://maps.example.org" };
+        docs[0].1["links"][1]["href"] = json!(format!("{catalog}/styles?f=json"));
+        docs[2].1["styles"][0]["links"][0]["href"] = json!("https://maps.example.org/good?f=mapbox");
+        docs[3].1["sources"]["basemap"] = json!({"type":"vector","url":"https://sources.example.org/tilejson"});
+        let mut session = Session::new(Project::default());
+        let connection = session
+            .run(
+                "connection.new",
+                &json!({"kind":"ogcapi","address":"https://maps.example.org",
+            "auth":"header","keyName":"X-Key"}),
+            )
+            .unwrap();
+        session.run("connection.login", &json!({"id":connection["id"],"apiKey":"RGSYNTH_dataset_provenance"})).unwrap();
+        let mut params = json!({"url":"https://maps.example.org/dataset","type":"ogcapi","connection":connection["id"],
+        "text":docs[0].1.to_string(),"documents":[
+            {"url":"https://maps.example.org/tiles?f=json","text":docs[1].1.to_string()},
+            {"url":format!("{catalog}/styles?f=json"),"text":docs[2].1.to_string()},
+            {"url":"https://maps.example.org/good?f=mapbox","text":docs[3].1.to_string()},
+            {"url":"https://sources.example.org/tilejson","text":json!({"tiles":["https://maps.example.org/wm/{z}/{y}/{x}?f=mvt"]}).to_string()}
+        ]});
+        let listing = session.run("service.layers", &params).unwrap();
+        assert!(listing["next"].is_null(), "{listing}");
+        assert_eq!(listing["count"], 1, "{listing}");
+        assert!(listing["notes"].as_array().unwrap().is_empty(), "{listing}");
+        let style = &listing["layers"][0];
+        params["layer"] = style["name"].clone();
+        params["source_url"] = style["source_url"].clone();
+        session.run("service.add", &params).unwrap();
+        assert_eq!(session.map().tiles.len(), 1);
+        assert_eq!(session.map().tiles[0].connection.is_empty(), foreign_catalog);
+        let source = style["source_url"].as_str().unwrap();
+        assert_eq!(crate::data::login_address::inner(source), "https://maps.example.org/good?f=mapbox", "{listing}");
+        assert_eq!(style["anonymous"].as_bool().unwrap_or(false), foreign_catalog, "{listing}");
+        let bound = crate::data::login_address::parse(style["offer"]["url"].as_str().unwrap()).unwrap().is_some();
+        assert_eq!(bound, !foreign_catalog, "the stylesheet retains only its own login history: {listing}");
+    }
 }
 
 #[test]
@@ -446,6 +527,40 @@ fn ogc_dataset_rejects_direct_and_contradictory_tileset_projections() {
             let listing = session.run("service.layers", &params).unwrap();
             assert_eq!(listing["count"], 0, "{listing}");
             assert!(listing["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("tile matrix set")));
+        }
+    }
+}
+
+#[test]
+fn ogc_dataset_linked_scheme_declarations_are_checked() {
+    for (grid, count) in [("WebMercatorQuad", 1), ("EuropeanETRS89_LAEAQuad", 0)] {
+        let landing = json!({"links":[{"rel":"tilesets-map","type":"application/json","href":"/tiles"}]}).to_string();
+        let list = json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad","links":[
+            {"rel":"self","type":"application/json","href":"/metadata"}]}]})
+        .to_string();
+        let metadata = json!({"links":[{"rel":"tiling-scheme","href":format!("https://definitions.example.org/{grid}")},
+            {"rel":"item","type":"image/png","href":"/map/{tileMatrix}/{tileRow}/{tileCol}.png"}]})
+        .to_string();
+        let listing = Session::new(Project::default())
+            .run(
+                "service.layers",
+                &json!({
+            "url":"https://maps.example.org/dataset","type":"ogcapi","text":landing,"documents":[
+                {"url":"https://maps.example.org/tiles","text":list},
+                {"url":"https://maps.example.org/metadata?f=json","text":metadata}]}),
+            )
+            .unwrap();
+        assert!(listing["next"].is_null(), "{listing}");
+        assert_eq!(listing["count"], count, "{listing}");
+        let notes = listing["notes"].as_array().unwrap();
+        if count == 1 {
+            assert!(notes.is_empty(), "{listing}");
+        } else {
+            assert_eq!(notes.len(), 1, "{listing}");
+            assert!(
+                notes[0].as_str().unwrap().starts_with("1 tilesets were left out: unsupported or undeclared tile matrix set"),
+                "{listing}"
+            );
         }
     }
 }

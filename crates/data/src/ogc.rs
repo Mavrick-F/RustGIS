@@ -2635,13 +2635,21 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             service.collections_url = Some(next);
             service.withheld_addresses = u32::from(withheld);
         }
+        let dataset = DatasetDiscovery::landing(url, &links, &mut service.withheld_addresses);
+        let map_url = dataset.as_ref().and_then(DatasetDiscovery::map_url).map(str::to_string);
         if service.collections_url.is_none() {
-            service.dataset = DatasetDiscovery::landing(url, &links, &mut service.withheld_addresses);
+            service.dataset = dataset;
+        } else if let Some(dataset) = dataset {
+            let notes = dataset.notes();
+            service.incomplete |= !notes.is_empty();
+            service.notes.extend(notes);
         }
         let name = if title.is_empty() { "tiles".to_string() } else { title };
-        // The dataset's layers aren't listed here, so its vector tiles can't be styled: map tiles only.
+        // Collections discovery keeps its existing map resolver, enabled only by a usable
+        // JSON metadata link. Dataset-only landings use the validated plan instead.
         if service.dataset.is_none()
-            && let Some((t, list, withheld)) = tileset(url, &links, TileRel::Map)
+            && let Some(map_url) = map_url
+            && let Some((t, list, withheld)) = tileset(url, &[serde_json::json!({"rel":"tilesets-map","href":map_url})], TileRel::Map)
         {
             service.withheld_addresses = service.withheld_addresses.saturating_add(u32::from(withheld));
             service.layers.push(ServiceLayer {
