@@ -2531,8 +2531,8 @@ fn names_note(fields: &[Field], names: Vec<String>, target: &str, what: &str) ->
         .take(5)
         .map(|(old, new)| {
             let (o, n) = (dbf_notice_name(old), dbf_notice_name(new));
-            // A long name made unique keeps its start and gains an ending: show the endings.
-            let (o, n) = if o == n { (notice_name_end(old), notice_name_end(new)) } else { (o, n) };
+            // A long name made unique keeps its start and gains an ending: show both.
+            let (o, n) = if o == n { (notice_name_ends(old), notice_name_ends(new)) } else { (o, n) };
             format!("'{o}' → '{n}'")
         })
         .collect();
@@ -2580,19 +2580,25 @@ pub(crate) fn dbf_notice_name(name: &str) -> String {
     out
 }
 
-/// The end of `name` as a notice shows it, like [`dbf_notice_name`] but keeping the last 40 bytes.
-fn notice_name_end(name: &str) -> String {
-    let mut kept: Vec<char> = Vec::new();
-    let mut len = 0;
-    for c in name.chars().rev().map(dbf_notice_char) {
-        if len + c.len_utf8() > 40 {
-            kept.push('…');
-            break;
-        }
-        len += c.len_utf8();
-        kept.push(c);
+/// `name` as a notice shows it, like [`dbf_notice_name`] but keeping its first and last 20 bytes
+/// around the cut, for names whose first 40 bytes match.
+fn notice_name_ends(name: &str) -> String {
+    let chars: Vec<char> = name.chars().map(dbf_notice_char).collect();
+    if chars.iter().map(|c| c.len_utf8()).sum::<usize>() <= 40 {
+        return chars.into_iter().collect();
     }
-    kept.into_iter().rev().collect()
+    let fit = |cs: &mut dyn Iterator<Item = &char>| {
+        let mut len = 0;
+        cs.take_while(|c| {
+            len += c.len_utf8();
+            len <= 20
+        })
+        .count()
+    };
+    let (head, tail) = (fit(&mut chars.iter()), fit(&mut chars.iter().rev()));
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{start}…{end}")
 }
 
 /// Value losses counted independently for each dBase field, using only rows the writer keeps.
