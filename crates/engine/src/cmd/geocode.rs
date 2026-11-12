@@ -197,6 +197,12 @@ fn geocode(s: &mut Session, p: &Value) -> CmdResult {
             if l.skipped > 0 {
                 s.warn(skipped_notice(l.skipped));
             }
+            if l.limited > 0 {
+                s.notify(
+                    format!("{} additional geocoding candidates were not used; the first match was kept for each address.", l.limited),
+                    false,
+                );
+            }
             if l.failed > 0 {
                 s.notify(
                     format!(
@@ -253,6 +259,8 @@ struct Lookup {
     error: Option<String>,
     /// Places the answers gave without a usable position.
     skipped: usize,
+    /// Additional candidates omitted when keeping one match per address.
+    limited: usize,
 }
 
 /// Geocodes each address, waiting between requests as the server asks.
@@ -278,6 +286,7 @@ fn lookup(g: &Geocoder, distinct: &[String]) -> Result<Lookup, String> {
                 succeeded += 1;
                 in_a_row = 0;
                 out.skipped += found.skipped;
+                out.limited += found.limited;
                 out.found.insert(a.clone(), found.places.into_iter().next());
             }
             // A failed request isn't "not found": it is counted apart, and a server that refuses

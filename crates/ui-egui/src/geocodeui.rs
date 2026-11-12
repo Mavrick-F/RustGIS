@@ -43,6 +43,8 @@ struct Job {
     error: Option<String>,
     /// Places the answers gave without a usable position.
     skipped: usize,
+    /// Additional candidates omitted when keeping one match per address.
+    limited: usize,
 }
 
 fn fetch(url: &str) -> Answer {
@@ -103,6 +105,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         match r.and_then(|b| job.g.read(&b)) {
             Ok(found) => {
                 job.skipped += found.skipped;
+                job.limited += found.limited + found.places.len().saturating_sub(1);
                 let place = found.places.into_iter().next();
                 job.found.insert(q.clone(), place.map(|p| json!({"lon": p.lon, "lat": p.lat, "name": p.name})).unwrap_or(Value::Null));
                 job.in_a_row = 0;
@@ -144,6 +147,15 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     let Some(job) = app.ui.geocode.job.take() else { return };
     if job.skipped > 0 {
         app.session.warn(skipped(job.skipped));
+    }
+    if job.limited > 0 {
+        app.session.notify(
+            i18n::fmt(
+                "{n} additional geocoding candidates were not used; the first match was kept for each address.",
+                &[("n", &job.limited.to_string())],
+            ),
+            false,
+        );
     }
     if job.failed > 0 {
         let why = job.error.unwrap_or_default();
@@ -392,6 +404,7 @@ pub fn geocode(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             in_a_row: 0,
             error: None,
             skipped: 0,
+            limited: 0,
         });
         Ok(())
     })
@@ -421,6 +434,7 @@ mod tests {
             in_a_row: 0,
             error: None,
             skipped: 0,
+            limited: 0,
         });
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1480.0, 900.0)).build_ui_state(
             |ui, app: &mut RustGisApp| {
@@ -461,6 +475,47 @@ mod tests {
             } else {
                 assert_eq!(app.session.notices.len(), 1);
                 assert_eq!(app.session.notices[0].text, "Search candidates not shown: 17 (limit 8).");
+            }
+        }
+    }
+
+    /// Batch runs report all alternatives omitted, including the parser cap, and keep the
+    /// first candidate. A single match produces no omission notice.
+    #[test]
+    fn census_batch_geocoding_reports_unused_candidates() {
+        for count in [1, 3, 25] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.run("layer.addDataText", json!({"fileName":"addresses.csv", "text":"address\nA\n"})).unwrap();
+            let p = json!({"matchedAddress":"A", "coordinates":{"x":-77.0,"y":38.0}});
+            let slot = Answer::default();
+            *slot.lock().unwrap() = Some(Ok(serde_json::to_vec(&json!({"result":{"addressMatches":vec![p;count]}})).unwrap()));
+            app.ui.geocode.job = Some(Job {
+                g: Geocoder::new(Some("census"), None).unwrap(),
+                params: json!({"provider":"census", "table":"addresses", "address":"address"}),
+                queue: vec!["A".into()],
+                next: 1,
+                found: Map::new(),
+                waiting: Some(("A".into(), slot)),
+                sent: None,
+                failed: 0,
+                in_a_row: 0,
+                error: None,
+                skipped: 0,
+                limited: 0,
+            });
+            let mark = app.session.notice_mark();
+            poll(&mut app, &egui::Context::default());
+            assert!(app.ui.geocode.job.is_none());
+            assert_eq!(app.session.map().layers.len(), 1);
+            let notices = app.session.notices_since(mark);
+            if count == 1 {
+                assert!(notices.is_empty(), "{notices:?}");
+            } else {
+                assert_eq!(notices.len(), 1);
+                assert_eq!(
+                    notices[0].text,
+                    format!("{} additional geocoding candidates were not used; the first match was kept for each address.", count - 1)
+                );
             }
         }
     }

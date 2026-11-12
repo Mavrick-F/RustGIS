@@ -20969,6 +20969,32 @@ fn geocoding_with_census() {
     assert_eq!(asked.lock().unwrap().len(), 3);
 }
 
+/// The command reports alternatives omitted by batch geocoding, including the parser cap;
+/// an unambiguous match produces no notice.
+#[test]
+fn geocoding_census_batch_reports_unused_candidates() {
+    for count in [1, 3, 25] {
+        let p = json!({"matchedAddress":"A", "coordinates":{"x":-77.0,"y":38.0}});
+        let response = serde_json::to_vec(&json!({"result":{"addressMatches":vec![p;count]}})).unwrap();
+        let (base, _) = serve_files(vec![("/locations/onelineaddress?address=A&benchmark=Public_AR_Current&format=json".into(), response)]);
+        let mut s = Session::new(Project::default());
+        s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"address\nA\n"})).unwrap();
+        let mark = s.notice_mark();
+        let result = s.run("layer.geocode", &json!({"provider":"census", "url":base, "table":"addresses", "address":"address"})).unwrap();
+        assert_eq!(result["matched"], 1);
+        let notices = s.notices_since(mark);
+        if count == 1 {
+            assert!(notices.is_empty(), "{notices:?}");
+        } else {
+            assert_eq!(notices.len(), 1);
+            assert_eq!(
+                notices[0].text,
+                format!("{} additional geocoding candidates were not used; the first match was kept for each address.", count - 1)
+            );
+        }
+    }
+}
+
 /// PDOK's Locatieserver as the geocoder (a local server answering as it does): places found by
 /// name, a table's Dutch addresses turned into points, and the answers' entries without a usable
 /// point counted in a notice (and no notice when every entry has one).
