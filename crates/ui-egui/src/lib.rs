@@ -708,6 +708,9 @@ pub struct UiState {
     /// The Web Data service the Web Data pane shows (a `ui.dialog` name, see
     /// `panes::web_data_name`).
     pub web_data: &'static str,
+    /// The Layer Properties pane's tab: the one last chosen, or asked for with
+    /// `ui.pane.layerProperties {"tab"}`.
+    pub layer_properties_tab: layerprops::Topic,
     pub dark: bool,
     /// The theme file in use, by name. Empty follows `dark` and the system.
     pub theme_name: String,
@@ -745,6 +748,8 @@ pub struct UiState {
     pub start_projection: String,
     /// The EPSG or ESRI code typed in Settings › Start-up › Projection.
     pub start_projection_input: String,
+    /// The coordinate system typed in View › Graticule's menu for the measured grid.
+    pub graticule_crs_input: String,
     /// Start-up preference: the extent the map opens on, `[minLon, minLat, maxLon, maxLat]`;
     /// `None` for the full extent.
     pub start_extent: Option<[f64; 4]>,
@@ -964,6 +969,7 @@ impl Default for UiState {
             diagnostic_filter: rustgis_engine::data::diagnostics::Filter::All,
             diagnostic_snapshot: None,
             web_data: "opendata",
+            layer_properties_tab: layerprops::Topic::General,
             dark: false,
             theme_name: String::new(),
             interface_scale: 1.0,
@@ -980,6 +986,7 @@ impl Default for UiState {
             last_project: None,
             start_projection: String::new(),
             start_projection_input: String::new(),
+            graticule_crs_input: String::new(),
             start_extent: None,
             start_view: None,
             ribbon_minimized: false,
@@ -2928,22 +2935,36 @@ impl RustGisApp {
                 if given.is_some() { self.ui.open_right(RightPane::Labeling) } else { toggle_right(&mut self.ui, RightPane::Labeling) }
             }
             // The Layer Properties pane (#1803), on `{"layer": id}` when given (a layer's
-            // right-click menu), as the Labeling pane is; feature and raster layers alike.
+            // right-click menu), as the Labeling pane is; feature and raster layers alike. With
+            // `{"tab": "general"|"source"|"display"|"query"}` it shows that tab (Data › Definition
+            // Query asks for "query", a feature layer's only).
             "ui.pane.layerProperties" => {
                 let given = match p.get("layer").filter(|l| !l.is_null()) {
                     Some(_) => Some(self.session.layer_id(p)?),
                     None => None,
                 };
+                let tab = match p.get("tab").filter(|t| !t.is_null()) {
+                    Some(t) => {
+                        Some(t.as_str().and_then(layerprops::Topic::parse).ok_or("unknown tab: give general, source, display or query")?)
+                    }
+                    None => None,
+                };
+                let layer = given.or(self.session.active_layer).and_then(|id| self.session.map().layer(id));
                 // Showing its tab already open needs no layer.
-                if (given.is_some() || !self.ui.right_open.contains(&RightPane::LayerProperties))
-                    && given.or(self.session.active_layer).and_then(|id| self.session.map().layer(id)).is_none()
-                {
+                if (given.is_some() || tab.is_some() || !self.ui.right_open.contains(&RightPane::LayerProperties)) && layer.is_none() {
                     return Err("select a layer in the Layers pane first".into());
+                }
+                if tab == Some(layerprops::Topic::Query) && layer.is_some_and(|l| l.is_raster()) {
+                    return Err("a raster layer has no definition query: the Query tab is a feature layer's".into());
                 }
                 if let Some(id) = given {
                     self.session.run("layer.select", &json!({"layer": id}))?;
                 }
-                if given.is_some() {
+                if let Some(tab) = tab {
+                    self.ui.layer_properties_tab = tab;
+                }
+                // Asked for a layer or a tab, it is shown, even when already in view.
+                if given.is_some() || tab.is_some() {
                     self.ui.open_right(RightPane::LayerProperties)
                 } else {
                     toggle_right(&mut self.ui, RightPane::LayerProperties)

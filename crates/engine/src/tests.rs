@@ -1700,6 +1700,70 @@ fn qgis_annotation_texts_under_layers_above_are_noted() {
     assert!(!texts.iter().any(|t| t.contains("layers above draw over in QGIS")), "{texts:?}");
 }
 
+/// A project's layer tree comes in as nested layer groups: each layer in its group with its own
+/// box, the groups' boxes, open state and a group layer's opacity on the groups, the drawing
+/// order kept (a group's own layers above and below a subgroup stay there). A web tile layer in a
+/// group comes in outside it, noted.
+#[test]
+fn qgis_layer_tree_groups_import_as_layer_groups() {
+    let dir = std::env::temp_dir().join(format!("rustgis-qgis-groups-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let point = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[8.7,47.5]}}]}"#;
+    let layer = |id: &str| {
+        std::fs::write(dir.join(format!("{id}.geojson")), point).unwrap();
+        format!(
+            r#"<maplayer type="vector"><id>{id}</id><datasource>./{id}.geojson</datasource><layername>{id}</layername><provider>ogr</provider></maplayer>"#
+        )
+    };
+    let layers: String = ["e", "a", "b", "c", "d"].iter().map(|id| layer(id)).collect();
+    let qgs = format!(
+        r#"<qgis version="4.2.3"><layer-tree-group>
+      <layer-tree-group checked="Qt::Checked" expanded="0" name="Outer">
+        <layer-tree-layer checked="Qt::Checked" id="e"/>
+        <layer-tree-group checked="Qt::Unchecked" expanded="1" name="Inner"><layer-tree-layer checked="Qt::Checked" id="a"/></layer-tree-group>
+        <layer-tree-layer checked="Qt::Unchecked" id="b"/>
+        <layer-tree-layer checked="Qt::Checked" id="t"/>
+      </layer-tree-group>
+      <layer-tree-layer checked="Qt::Checked" id="c"/>
+      <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="gl" name="Drawn as one"><layer-tree-layer checked="Qt::Checked" id="d"/><layer-tree-layer checked="Qt::Checked" id="t2"/></layer-tree-group>
+      <layer-tree-group checked="Qt::Checked" expanded="1" name="Empty"/>
+    </layer-tree-group><projectlayers>{layers}
+      <maplayer type="group" hasScaleBasedVisibilityFlag="1" minScale="50000" maxScale="1000"><id>gl</id><layername>Drawn as one</layername><layerOpacity>0.25</layerOpacity><blendMode>0</blendMode></maplayer>
+      <maplayer type="raster"><id>t2</id><datasource>type=xyz&amp;url=https://tiles2.example/%7Bz%7D/%7Bx%7D/%7By%7D.png</datasource><layername>Tiles 2</layername><provider>wms</provider></maplayer>
+      <maplayer type="raster"><id>t</id><datasource>type=xyz&amp;url=https://tiles.example/%7Bz%7D/%7Bx%7D/%7By%7D.png</datasource><layername>Tiles</layername><provider>wms</provider></maplayer>
+    </projectlayers></qgis>"#
+    );
+    let mut s = world();
+    let out = s.run("project.importQgis", &json!({"text": qgs, "dir": dir.display().to_string()})).unwrap();
+    let m = s.map();
+    let names: Vec<&str> = m.layers.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["e", "a", "b", "c", "d"], "the tree's order, top first: {out}");
+    let group = |name: &str| m.groups.iter().find(|g| g.name == name).unwrap_or_else(|| panic!("{name}: {out}"));
+    let (outer, inner, one, empty) = (group("Outer"), group("Inner"), group("Drawn as one"), group("Empty"));
+    assert_eq!((outer.visible, outer.expanded, outer.parent), (true, false, None));
+    assert_eq!((inner.visible, inner.parent), (false, Some(outer.id)));
+    assert_eq!((one.transparency, one.parent), (75.0, None));
+    // Its visibility range, in RustGIS's scales.
+    let q = rustgis_map::qgis::QGIS_SCALE;
+    assert_eq!((one.min_scale, one.max_scale), (Some(50_000.0 * q), Some(1000.0 * q)));
+    assert!(empty.children.is_empty(), "kept, as QGIS keeps it");
+    let id = |name: &str| m.layer_by_name(name).unwrap().id;
+    let visible = |name: &str| m.layer_by_name(name).unwrap().visible;
+    assert_eq!(m.group_of(id("a")).map(|g| g.id), Some(inner.id));
+    assert_eq!(m.group_of(id("b")).map(|g| g.id), Some(outer.id));
+    assert_eq!(m.group_of(id("e")).map(|g| g.id), Some(outer.id));
+    assert_eq!(m.group_of(id("c")).map(|g| g.id), None);
+    assert_eq!(m.group_of(id("d")).map(|g| g.id), Some(one.id));
+    // Its own box: a is checked in its unchecked group (the group hides it), b is unchecked.
+    assert_eq!([visible("a"), visible("b"), visible("c"), visible("d")], [true, false, true, true]);
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    assert!(notes.contains("its place in the group Outer: a web tile layer, added outside the group"), "{notes}");
+    assert!(notes.contains("its place in the group Drawn as one and the opacity of a group drawn as one holding it"), "{notes}");
+    assert!(notes.contains("opacity of groups drawn as one (1: Drawn as one)"), "{notes}");
+    assert!(!notes.contains("RustGIS doesn't read QGIS's group layers"), "{notes}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A picture whose aspect is locked keeps it on the map, as QGIS fits it on its canvas: in a
 /// project in degrees (drawn as plate carrée) its box in degrees, in a Web Mercator one its box in
 /// Mercator metres, has the picture's 2:1 aspect, the layer being in degrees either way.
@@ -2655,7 +2719,7 @@ fn a_qgis_project_opens_as_a_map_and_a_qgis_style_styles_a_layer() {
     let qgs = r#"<qgis version="3.42.0"><title>Web</title>
   <layer-tree-group><layer-tree-layer id="x" checked="Qt::Unchecked"/></layer-tree-group>
   <projectlayers><maplayer type="raster" hasScaleBasedVisibilityFlag="1" minScale="100000" maxScale="1000"><id>x</id><datasource>type=xyz&amp;url=https://tiles.example/%7Bz%7D/%7Bx%7D/%7By%7D.png&amp;zmax=19&amp;zmin=0</datasource><layername>Tiles</layername><provider>wms</provider>
-    <pipe><rasterrenderer opacity="0.25" type="singlebandcolordata"/></pipe><blendMode>13</blendMode></maplayer></projectlayers></qgis>"#;
+    <pipe><rasterrenderer opacity="0.25" type="singlebandcolordata"/></pipe><blendMode>6</blendMode></maplayer></projectlayers></qgis>"#;
     let out = s.run("project.importQgis", &json!({"text": qgs})).unwrap();
     let t = s.map().tiles.iter().find(|t| t.name == "Tiles").expect("the web layer is added");
     assert!(!t.visible, "unchecked in the layer tree");
@@ -2693,7 +2757,7 @@ fn a_qgis_project_opens_as_a_map_and_a_qgis_style_styles_a_layer() {
     // the QGIS layer's visibility, opacity, blending and scale range.
     let web = r#"<qgis version="3.42.0"><layer-tree-group><layer-tree-layer id="w" checked="Qt::Unchecked"/></layer-tree-group><projectlayers>
         <maplayer type="raster" hasScaleBasedVisibilityFlag="1" minScale="100000" maxScale="1000"><id>w</id><datasource>url=https://wms.example/wms&amp;layers=a</datasource><layername>Web</layername><provider>wms</provider>
-        <pipe><rasterrenderer opacity="0.5" type="singlebandcolordata"/></pipe><blendMode>13</blendMode></maplayer></projectlayers></qgis>"#;
+        <pipe><rasterrenderer opacity="0.5" type="singlebandcolordata"/></pipe><blendMode>6</blendMode></maplayer></projectlayers></qgis>"#;
     let mut report = rustgis_map::qgis::Report::default();
     let project = rustgis_map::qgis::read_project(web, "", &mut report).unwrap();
     let mut w = world();
@@ -10331,6 +10395,78 @@ fn a_viewshed_says_what_it_did_with_its_radius_and_the_seam() {
         let e = s.run("analysis.viewshed", &json!({"layer": dem, "lon": 0.0, "lat": 0.0, "radius": bad})).unwrap_err();
         assert_eq!(e, format!("radius must be a number of metres above 0, not {bad}"));
     }
+}
+
+/// The graticule's type and the measured grid's coordinate system (#1042): a type or system given
+/// shows it; no parameters toggle it as before; a system that isn't projected, can't be read, or
+/// is given for another type is refused, naming it; a project keeps them, and one without them
+/// reads as latitudes and longitudes.
+#[test]
+fn the_graticule_takes_a_type_and_a_measured_grids_system() {
+    use rustgis_map::graticule::GraticuleType;
+    let mut s = world();
+    assert_eq!(s.map().graticule_type, GraticuleType::Degrees);
+    s.run("map.graticule", &json!({"on": false})).unwrap();
+    let r = s.run("map.graticule", &json!({"type": "UTM"})).unwrap();
+    assert_eq!(r, json!({"on": true, "type": "utm", "crs": null}));
+    // No parameters: toggled, the type kept.
+    s.run("map.graticule", &json!({})).unwrap();
+    assert!(!s.map().graticule && s.map().graticule_type == GraticuleType::Utm);
+    let r = s.run("map.graticule", &json!({"type": "measured", "crs": " EPSG:2056 "})).unwrap();
+    assert_eq!(r, json!({"on": true, "type": "measured", "crs": "EPSG:2056"}));
+    for (p, e) in [
+        (json!({"type": "mgrs"}), "type must be one of degrees, measured, utm, not \"mgrs\""),
+        (json!({"type": 3}), "type must be one of \"degrees\", \"measured\", \"utm\", not 3"),
+        (json!({"crs": "EPSG:4326"}), "crs: EPSG:4326 is geographic"),
+        (json!({"crs": "EPSG:4978"}), "crs: EPSG:4978 is geocentric"),
+        (json!({"type": "utm", "crs": "EPSG:2056"}), "crs is the measured grid's; the graticule is \"utm\""),
+        (json!({"crs": 2056}), "crs must be a coordinate system"),
+    ] {
+        let got = s.run("map.graticule", &p).unwrap_err();
+        assert!(got.starts_with(e), "{p}: {got}");
+    }
+    assert!(s.run("map.graticule", &json!({"crs": "EPSG:999999999"})).unwrap_err().starts_with("crs: "));
+    assert!(s.run("map.graticule", &json!({"crs": "x".repeat(5000)})).unwrap_err().starts_with("crs: at most"));
+    // Unchanged by the refusals.
+    assert_eq!((s.map().graticule_type, s.map().graticule_crs.as_deref()), (GraticuleType::Measured, Some("EPSG:2056")));
+    // Saved with the project, and back.
+    let text = serde_json::to_string(&s.project).unwrap();
+    let back = crate::Project::from_json(&text).unwrap();
+    assert_eq!((back.map().graticule_type, back.map().graticule_crs.as_deref()), (GraticuleType::Measured, Some("EPSG:2056")));
+    // From a file: a system the command would refuse is left out as the project opens, and said;
+    // one it takes stays.
+    let mut v: Value = serde_json::from_str(&text).unwrap();
+    for (crs, kept) in
+        [("EPSG:4326", false), ("EPSG:4978", false), ("not a system", false), ("x".repeat(5000).as_str(), false), ("EPSG:2056", true)]
+    {
+        v["maps"][0]["graticule_crs"] = json!(crs);
+        let mut back = crate::Project::from_json(&v.to_string()).unwrap();
+        assert_eq!(back.map().graticule_crs.as_deref(), kept.then_some(crs), "{}", &crs[..crs.len().min(20)]);
+        let said = format!("{:?}", back.take_read_notices(&[crate::project::ReadPart::Maps]));
+        assert_eq!(said.contains("the measured graticule's coordinate system"), !kept, "{said}");
+    }
+    // Several maps with one each: one notice, with how many and which.
+    let mut many = v.clone();
+    many["maps"][0]["graticule_crs"] = json!("EPSG:4326");
+    let mut second = many["maps"][0].clone();
+    second["name"] = json!("Second");
+    many["maps"].as_array_mut().unwrap().push(second);
+    let mut back = crate::Project::from_json(&many.to_string()).unwrap();
+    let said: Vec<String> = back
+        .take_read_notices(&[crate::project::ReadPart::Maps])
+        .iter()
+        .map(|n| n.english())
+        .filter(|n| n.contains("measured graticule"))
+        .collect();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].contains("2 map(s)") && said[0].contains("Second (EPSG:4326)"), "{said:?}");
+    // An empty system: the map's own again.
+    s.run("map.graticule", &json!({"crs": ""})).unwrap();
+    assert_eq!(s.map().graticule_crs, None);
+    // Latitudes and longitudes aren't written, so a project saved with them is as before.
+    s.run("map.graticule", &json!({"type": "degrees"})).unwrap();
+    let text = serde_json::to_string(&s.project).unwrap();
+    assert!(!text.contains("graticule_type") && !text.contains("graticule_crs"));
 }
 
 #[test]
@@ -20620,19 +20756,43 @@ fn zipped_shapefiles_add_as_layers() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A request read whole: its head and as much body as its `Content-Length` says. A server that
+/// answers and closes with part of the request unread has its connection reset on Windows and
+/// macOS, and the client sees the reset in place of the answer.
+fn read_request(s: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut req = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut want = None;
+    while want.is_none_or(|n| req.len() < n) && req.len() < 1 << 20 {
+        let Ok(read) = s.read(&mut buf) else { break };
+        if read == 0 {
+            break;
+        }
+        req.extend_from_slice(&buf[..read]);
+        if want.is_none()
+            && let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+            let body = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|n| n.trim().parse::<usize>().ok());
+            want = Some(end + 4 + body.unwrap_or(0));
+        }
+    }
+    String::from_utf8_lossy(&req).into_owned()
+}
+
 /// Serves each request by the first route its path starts with (`{base}` in a body becomes the
 /// server's address; other paths are 404); returns the base address.
 fn serve_routes(routes: Vec<(&'static str, String)>, n: usize) -> String {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let b = base.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().take(n) {
             let Ok(mut s) = stream else { continue };
-            let mut buf = [0u8; 4096];
-            let read = s.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..read]);
+            let req = read_request(&mut s);
             let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
             match routes.iter().find(|(p, _)| path.starts_with(p)) {
                 Some((_, body)) => {
@@ -42749,7 +42909,6 @@ fn stac_search_by_shape_says_what_it_leaves_out() {
     let item = r#"{"type": "Feature", "id": "S2_1", "collection": "s2", "bbox": [7, 46, 8, 47],
         "geometry": {"type": "Polygon", "coordinates": [[[7, 46], [8, 46], [8, 47], [7, 47], [7, 46]]]},
         "properties": {"datetime": "2024-06-02T10:30:00Z", "eo:cloud_cover": 3.5}, "assets": {}}"#;
-    // A POST answered before its body is read is asked again as a GET, so each search may take two.
     let base = serve_routes(vec![("/v1/search", format!(r#"{{"type": "FeatureCollection", "features": [{item}]}}"#))], 40);
     let api = format!("{base}/v1");
     let said = |s: &Session, text: &str| s.notices.iter().filter(|n| n.text.contains(text)).count();
@@ -42981,5 +43140,60 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
     assert_eq!(said(&s, mark), 0);
     // A layer that wasn't read from such a file has nothing to compare with.
     assert!(s.run("source.syncState", &json!({"layer": "Cities"})).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `"coverage"` (#1379) writes the grid the placement searched as a PNG, three pixels a cell: dark
+/// where the map draws, white where it is free, tinted in the graticule's label strips, the placed
+/// surrounds outlined in red; the answer names it, and asking for it reaches files. A path that
+/// isn't a .png is refused with nothing changed; one that can't be written is said, the layout
+/// made all the same.
+#[test]
+fn publication_writes_its_coverage_grid() {
+    use crate::policy::{Effect, command_effects};
+    let dir = std::env::temp_dir().join(format!("rustgis-coverage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = world();
+    let piaui = json!([-46.8, -11.6, -38.5, -2.2]);
+    let path = dir.join("coverage.png").display().to_string();
+    let asked = json!({"extent": piaui, "coverage": path});
+    let spec = s.registry.get("layout.publication").unwrap();
+    assert!(command_effects(spec, &asked).contains(Effect::Files));
+    assert!(!command_effects(spec, &json!({"extent": piaui})).contains(Effect::Files));
+    let r = s.run("layout.publication", &asked).unwrap();
+    assert_eq!(r["coverage"], json!(path), "{r}");
+    let img = image::open(&path).unwrap().to_rgba8();
+    assert_eq!(img.width().max(img.height()), 384 * 3);
+    let count = |keep: &dyn Fn([u8; 3]) -> bool| img.pixels().filter(|p| keep([p.0[0], p.0[1], p.0[2]])).count();
+    let (dark, white) = (count(&|c| c == [0x33; 3] || c == [0x2E, 0x4A, 0x7A]), count(&|c| c == [0xFF; 3] || c == [0xC9, 0xDD, 0xF2]));
+    let strips = count(&|c| c == [0xC9, 0xDD, 0xF2] || c == [0x2E, 0x4A, 0x7A]);
+    let red = count(&|[r, g, b]| r > 180 && g < 90 && b < 90);
+    assert!(dark > 0 && white > 0 && strips > 0 && red > 0, "dark {dark}, white {white}, strips {strips}, outlines {red}");
+    // Refused before anything changes.
+    let layouts = s.project.layouts.len();
+    for bad in [json!("coverage.jpg"), json!(3)] {
+        let e = s.run("layout.publication", &json!({"extent": piaui, "coverage": bad})).unwrap_err();
+        assert!(e.contains("coverage is the path of a .png file"), "{e}");
+    }
+    assert_eq!(s.project.layouts.len(), layouts);
+    // A folder that isn't there: said, the layout made, no path in the answer.
+    let nowhere = dir.join("missing").join("coverage.png").display().to_string();
+    let r = s.run("layout.publication", &json!({"extent": piaui, "coverage": nowhere})).unwrap();
+    assert!(r["coverage"].is_null(), "{r}");
+    assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("the coverage image isn't written")), "{r}");
+    assert_eq!(s.project.layouts.len(), layouts + 1);
+    // A project holding all the layouts it can is refused before the file is written.
+    let full = dir.join("full.png");
+    // One a run before left behind would pass for not written.
+    let _ = std::fs::remove_file(&full);
+    let blank = s.project.layouts[0].clone();
+    s.project.layouts.resize(crate::project::MAX_LAYOUTS, blank);
+    let e = s.run("layout.publication", &json!({"extent": piaui, "coverage": full.display().to_string()})).unwrap_err();
+    assert!(e.contains("at most"), "{e}");
+    assert!(!full.exists());
+    s.project.layouts.truncate(layouts + 1);
+    // Without it, no file and no warning about one.
+    let r = s.run("layout.publication", &json!({"extent": piaui})).unwrap();
+    assert!(r["coverage"].is_null() && !r["warnings"].to_string().contains("coverage"), "{r}");
     std::fs::remove_dir_all(dir).unwrap();
 }
