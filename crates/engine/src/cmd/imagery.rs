@@ -1857,14 +1857,21 @@ fn set_grid(p: &Value, w: &mut Workspace) -> Result<Option<String>, String> {
         Some(Value::String(t)) if t.trim().is_empty() => None,
         Some(v @ (Value::String(_) | Value::Number(_))) => {
             let text = match v {
-                Value::Number(n) => format!("EPSG:{n}"),
+                // A form's number comes as a float: 32616.0 is EPSG:32616.
+                Value::Number(n) => match n.as_f64().filter(|c| c.fract() == 0.0) {
+                    Some(c) => format!("EPSG:{c}"),
+                    None => format!("EPSG:{n}"),
+                },
                 _ => v.as_str().unwrap_or_default().trim().to_string(),
             };
             if Crs::parse(&text).is_ok_and(|c| c == Crs::LonLat) {
                 Some(Crs::LonLat)
             } else {
-                let (crs, compatibility) =
-                    rustgis_analysis::projected_crs(&text).map_err(|e| format!("{e}; EPSG:4326 makes it in degrees"))?;
+                let (crs, compatibility) = rustgis_analysis::projected_crs(&text).map_err(|e| match Crs::parse(&text) {
+                    // Degrees are asked for with EPSG:4326; that can't help any other refusal.
+                    Ok(c) if c.is_geographic() => format!("{e}; EPSG:4326 makes it in degrees"),
+                    _ => e,
+                })?;
                 note = compatibility;
                 Some(crs)
             }
@@ -1977,6 +1984,21 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         None => finest,
     }
     .max(1e-7);
+    // A projected grid's cell corners fall on those of the finest image already in its system, so
+    // that image's pixels line up with the cells it is copied to.
+    let anchor = imgs
+        .iter()
+        .filter(|r| crs != Crs::LonLat && r.crs == crs)
+        .min_by(|a, b| a.transform.pixel_width.abs().total_cmp(&b.transform.pixel_width.abs()));
+    let e = match anchor {
+        Some(r) => {
+            let (ox, oy) = (r.transform.origin_x, r.transform.origin_y);
+            let west = ox + ((e.min_x - ox) / cell).floor() * cell;
+            let north = oy + ((e.max_y - oy) / cell).ceil() * cell;
+            Extent::new(west, e.min_y, e.max_x, north)
+        }
+        None => e,
+    };
     let (cols, rows) = ((e.width() / cell).ceil().max(1.0) as usize, (e.height() / cell).ceil().max(1.0) as usize);
     if cols.saturating_mul(rows) > rasterops::max_pixels() / 2 {
         let made_in = crs_note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();

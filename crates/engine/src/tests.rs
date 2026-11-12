@@ -39993,6 +39993,21 @@ fn ortho_mosaic_is_made_in_its_images_projected_system() {
     let (r, v, notices) = build(&mut s, "Plain");
     assert_eq!(r.crs, Crs::LonLat);
     assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    // A grid's corners fall on the finest image's in its system, however far off the others are,
+    // and a whole number sent as a float is an EPSG code.
+    let off = GeoTransform { origin_x: 499_993.7, origin_y: 3_900_103.0, pixel_width: 20.0, pixel_height: -20.0 };
+    add(&mut s, "off", off, utm, 5.0);
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Snapped", "images": ["off", "west"], "crs": 32616.0})).unwrap();
+    let (r, v, _) = build(&mut s, "Snapped");
+    assert_eq!((r.crs, r.transform.pixel_width), (utm, 10.0), "{v}");
+    let corner = (r.transform.origin_x - 500_000.0) / 10.0;
+    assert!((corner - corner.round()).abs() < 1e-9 && r.transform.origin_x <= 499_993.7, "{:?}", r.transform);
+    assert_eq!(
+        r.value(0, ((500_005.0 - r.transform.origin_x) / 10.0) as i64, ((r.transform.origin_y - 3_900_095.0) / 10.0) as i64),
+        Some(5.0)
+    );
+    let e = s.run("imagery.workspaceOptions", &json!({"name": "Snapped", "crs": "EPSG:4978"})).unwrap_err();
+    assert!(!e.contains("EPSG:4326"), "{e}");
     // A cell size a damaged project holds is refused, not replaced.
     let at = s.project.workspaces.iter().position(|w| w.name == "Over").unwrap();
     s.project.workspaces[at].projected_cell_size = Some(-5.0);
