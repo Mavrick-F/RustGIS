@@ -4368,9 +4368,13 @@ pub fn in_its_units(
         .copied()
         .filter(|k| p.get(*k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty())))
         .collect();
-    // With no points left (the system holds none), the run's own error says why.
-    if given.contains(&"extent") && !pts.is_empty() && !pts.iter().any(|(c, _)| extent.contains(*c)) {
-        return Err(format!("the extent holds none of the points in {}'s units ({note})", crs.label()));
+    // Only an extent that looks like degrees, around points that don't, is refused: one in the
+    // system's units may lie away from the points and still be interpolated. With no points left
+    // (the system holds none), the run's own error says why.
+    let in_degrees = extent.min_x >= -180.0 && extent.max_x <= 180.0 && extent.min_y >= -90.0 && extent.max_y <= 90.0;
+    let beyond_degrees = pts.iter().any(|(c, _)| c.x.abs() > 360.0 || c.y.abs() > 360.0);
+    if given.contains(&"extent") && in_degrees && beyond_degrees && !pts.iter().any(|(c, _)| extent.contains(*c)) {
+        return Err(format!("the extent looks like degrees and holds none of the points in {}'s units ({note})", crs.label()));
     }
     Ok(Some(if given.is_empty() { note } else { format!("{note} ({} as given, in its units)", given.join(", ")) }))
 }
@@ -10029,6 +10033,10 @@ mod tests {
             let run = |p: serde_json::Value| crate::run(tool, &m, &p);
             let e = run(serde_json::json!({"input": "wells", "field": "v", "extent": "-90.1,35.05,-89.9,35.25"})).err().unwrap_or_default();
             assert!(e.contains("holds none of the points") && e.contains("EPSG:4326"), "{tool}: {e}");
+            // An extent in metres away from the wells is made, and said.
+            let r = run(serde_json::json!({"input": "wells", "field": "v", "extent": "0,0,10000,10000"}))
+                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(r.messages.iter().any(|m| m.contains("(extent as given, in its units)")), "{tool}: {:?}", r.messages);
             let e = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 0.01})).err().unwrap_or_default();
             assert!(e.contains(&format!("made in {label}")), "{tool}: {e}");
             let r = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 500})).unwrap_or_else(|e| panic!("{tool}: {e}"));
