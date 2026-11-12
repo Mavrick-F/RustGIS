@@ -39961,6 +39961,24 @@ fn ortho_mosaic_is_made_in_its_images_projected_system() {
     assert_eq!(r.crs, Crs::LonLat);
     let m = v["messages"][0].as_str().unwrap();
     assert!(m.contains("different coordinate systems") && m.contains(&utm.label()), "{m}");
+    // A projected system set over them: the degree image is found through longitude/latitude,
+    // over the west square it overlaps but for its eastern strip.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Over", "images": ["nearby", "west"], "crs": "EPSG:32616"})).unwrap();
+    let (r, v, notices) = build(&mut s, "Over");
+    assert_eq!(r.crs, utm, "{v}");
+    assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    let values: Vec<f32> = r.bands[0].data.iter().copied().filter(|v| *v != rustgis_analysis::rasterops::NODATA).collect();
+    assert!(values.contains(&3.0) && values.contains(&1.0), "{values:?}");
+    // Images in another geographic system: WGS 84 degrees, and that is said.
+    add(&mut s, "nad83", degrees, Crs::Epsg(4269), 4.0);
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Datum", "images": ["nad83"]})).unwrap();
+    let (r, v, _) = build(&mut s, "Datum");
+    assert_eq!(r.crs, Crs::LonLat);
+    let m = v["messages"][0].as_str().unwrap();
+    assert!(m.contains("made in WGS 84 degrees (EPSG:4326), though its images are in EPSG:4269"), "{m}");
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Datums", "images": ["nad83", "nearby"]})).unwrap();
+    let (_, v, _) = build(&mut s, "Datums");
+    assert!(v["messages"][0].as_str().unwrap().contains("different geographic systems (some in EPSG:4269)"), "{v}");
     // Images in degrees: degrees, nothing said.
     s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Plain", "images": ["nearby"]})).unwrap();
     let (r, v, notices) = build(&mut s, "Plain");

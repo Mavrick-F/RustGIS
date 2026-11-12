@@ -1480,9 +1480,11 @@ The Imagery tab's groups open their tools in the Workflows pane. The tab belongs
   A workspace's mosaic is made in the projected coordinate system all its images are in, on cells
   the size of the finest image's pixel, and the run says so. Set `crs` (`imagery.workspace`,
   `imagery.workspaceOptions`) to make it in another projected system, or `"EPSG:4326"` for
-  degrees; its `cellSize` is then in that system's units. A workspace stays in degrees, saying
-  why, when its images are in different coordinate systems or when it has a cell size in degrees
-  and no `crs` (as older projects do). A geographic `crs` other than EPSG:4326 is refused.
+  degrees; its `cellSize` is then in that system's units. Without a `crs`, a workspace stays in
+  degrees, saying why, when its images are in different coordinate systems or when it has a cell
+  size in degrees (as older projects do). Images in a geographic system other than WGS 84 (NAD83,
+  say) make a mosaic in WGS 84 degrees, and the run says so. A geographic `crs` other than
+  EPSG:4326 is refused.
 - **Georeference** places a raster from control points (column, row, longitude, latitude) or
   stretches it over the map view. Those only shift and scale a north-up grid, as RustGIS's
   geotransform has no rotation. With `transform` (`raster.georeference`) the points are fitted by any

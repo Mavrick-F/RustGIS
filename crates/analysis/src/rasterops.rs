@@ -1083,14 +1083,10 @@ pub fn mosaic(
     // A cell of a projected grid is found in an image in the same system by its coordinates, and
     // in any other through longitude/latitude.
     let to = if crs == Crs::LonLat { None } else { Some(crs.transformer()?) };
-    let others = images.iter().any(|r| r.crs != crs);
-    let place = |r: &Raster, c: Coord, lonlat: Option<Coord>| match &to {
-        Some(_) if r.crs == crs => {
-            let (cc, rr) = r.transform.to_pixel(c);
-            let (cc, rr) = (cc.floor(), rr.floor());
-            (cc >= 0.0 && rr >= 0.0 && cc < f64::from(r.width) && rr < f64::from(r.height)).then_some((cc as i64, rr as i64))
-        }
-        _ => lonlat.and_then(|ll| r.pixel_at(ll)),
+    let own = |r: &Raster, c: Coord| {
+        let (cc, rr) = r.transform.to_pixel(c);
+        let (cc, rr) = (cc.floor(), rr.floor());
+        (cc >= 0.0 && rr >= 0.0 && cc < f64::from(r.width) && rr < f64::from(r.height)).then_some((cc as i64, rr as i64))
     };
     // Each row as a slice of every band, for one thread to fill.
     let mut by_band: Vec<_> = out.iter_mut().map(|b| b.chunks_mut(cols)).collect();
@@ -1106,14 +1102,17 @@ pub fn mosaic(
         |at: &mut Vec<Option<(i64, i64)>>, row, mut line: Vec<&mut [f32]>| {
             for col in 0..cols {
                 let c = Coord::new(extent.min_x + (col as f64 + 0.5) * cell, extent.max_y - (row as f64 + 0.5) * cell);
-                let lonlat = match &to {
-                    None => Some(c),
-                    Some(t) if others => t.to_lonlat(c),
-                    Some(_) => None,
-                };
+                // The cell's longitude/latitude, worked out only for an image in another system.
+                let mut lonlat: Option<Option<Coord>> = None;
                 // Where the cell falls in each image, once for all bands.
                 at.clear();
-                at.extend(images.iter().map(|r| place(r, c, lonlat)));
+                for r in images {
+                    at.push(match &to {
+                        Some(_) if r.crs == crs => own(r, c),
+                        Some(t) => (*lonlat.get_or_insert_with(|| t.to_lonlat(c))).and_then(|ll| r.pixel_at(ll)),
+                        None => r.pixel_at(c),
+                    });
+                }
                 for (bi, band) in line.iter_mut().enumerate() {
                     let vals = images.iter().zip(at.iter()).filter_map(|(r, a)| a.and_then(|(cc, rr)| r.value(bi, cc, rr)));
                     let v = if mean {

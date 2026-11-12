@@ -1250,16 +1250,26 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 });
             }
+            // The hints say the grid the workspace gets: without a system, a cell size is in
+            // degrees and keeps the mosaic in degrees, as in older projects.
+            let typed = app.workflow.workspace_crs.trim();
+            let degrees = typed.is_empty()
+                || rustgis_engine::data::raster::Crs::parse(typed).is_ok_and(|c| c == rustgis_engine::data::raster::Crs::LonLat);
+            let crs_hint = if app.workflow.number.trim().is_empty() {
+                tl!("the images' projected system, else degrees")
+            } else {
+                tl!("degrees, as the cell size is in degrees")
+            };
             ui.label(tl!("Coordinate system"));
-            ui.add(
-                egui::TextEdit::singleline(&mut app.workflow.workspace_crs)
-                    .hint_text(tl!("the images' projected system, else degrees"))
-                    .desired_width(f32::INFINITY),
-            )
-            .on_hover_text(tl!("A projected system such as EPSG:32616, or EPSG:4326 for degrees"));
+            let system = ui
+                .add(egui::TextEdit::singleline(&mut app.workflow.workspace_crs).hint_text(crs_hint).desired_width(f32::INFINITY))
+                .on_hover_text(tl!("A projected system such as EPSG:32616, or EPSG:4326 for degrees"));
+            // A cell size typed for another system isn't sent in this one's units.
+            if system.changed() {
+                app.workflow.number.clear();
+            }
             ui.horizontal(|ui| {
-                // Without a system, a cell size is in degrees, as in older projects.
-                let hint = if app.workflow.workspace_crs.trim().is_empty() { tl!("cell size °") } else { tl!("cell size") };
+                let hint = if degrees { tl!("cell size °") } else { tl!("cell size") };
                 ui.label(tl!("Cell size"));
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0))
                     .on_hover_text(tl!("In the coordinate system's units, or degrees without one"));

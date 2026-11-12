@@ -2093,24 +2093,35 @@ fn mosaic_crs(w: &Workspace, imgs: &[Arc<Raster>]) -> Result<(Crs, Option<String
         Some(Some(Err(why))) => {
             format!("made in degrees, though its images are in {why}; set a projected crs to make it in metres or feet")
         }
-        // One geographic system: degrees, as asked.
-        Some(None) => return Ok((Crs::LonLat, None)),
+        // Images in WGS 84 degrees: degrees, nothing assumed.
+        Some(None) if shared == Some(Crs::LonLat) => return Ok((Crs::LonLat, None)),
+        // In another geographic system (NAD83, say): WGS 84 degrees, said.
+        Some(None) => format!(
+            "made in WGS 84 degrees (EPSG:4326), though its images are in {}; set a projected crs to make it in metres or feet",
+            shared.map(Crs::label).unwrap_or_default()
+        ),
         None => {
-            let mut systems: Vec<String> = Vec::new();
-            for c in imgs.iter().map(|r| r.crs).filter(|c| !c.is_geographic()) {
-                if !systems.contains(&c.label()) {
-                    systems.push(c.label());
+            // Named: the projected systems, else the geographic ones other than WGS 84.
+            let distinct = |keep: &dyn Fn(Crs) -> bool| {
+                let mut systems: Vec<String> = Vec::new();
+                for c in imgs.iter().map(|r| r.crs).filter(|c| keep(*c)) {
+                    if !systems.contains(&c.label()) {
+                        systems.push(c.label());
+                    }
                 }
+                let more = if systems.len() > 5 { ", …" } else { "" };
+                systems.truncate(5);
+                (!systems.is_empty()).then(|| format!("{}{more}", systems.join(", ")))
+            };
+            match (distinct(&|c| !c.is_geographic()), distinct(&|c| c.is_geographic() && c != Crs::LonLat)) {
+                (Some(projected), _) => format!(
+                    "made in degrees, as its images are in different coordinate systems (some in {projected}); set crs to make it in a projected one"
+                ),
+                (None, Some(geographic)) => format!(
+                    "made in WGS 84 degrees (EPSG:4326), though its images are in different geographic systems (some in {geographic}); set a projected crs to make it in metres or feet"
+                ),
+                (None, None) => return Ok((Crs::LonLat, None)),
             }
-            if systems.is_empty() {
-                return Ok((Crs::LonLat, None));
-            }
-            let more = if systems.len() > 5 { ", …" } else { "" };
-            systems.truncate(5);
-            format!(
-                "made in degrees, as its images are in different coordinate systems (some in {}{more}); set crs to make it in a projected one",
-                systems.join(", ")
-            )
         }
     };
     Ok((Crs::LonLat, Some(note)))
