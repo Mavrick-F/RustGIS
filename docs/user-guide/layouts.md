@@ -17,8 +17,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   - **Sheets** (A4, A3 or A2, portrait or landscape): a frame and margin, the title and subtitle,
     the map, and a footer of two boxed columns (sources, and the cartographic reference; one
     with nothing in it is left out, the other taking the width) with a note and the authorship
-    under them. Text sizes follow the sheet: an A3's are 1.41 times an
-    A4's. Given its size alone (`"a4"`, the default, `"a3"` or `"a2"`), a sheet is turned to
+    under them. When the legend sits at the right of the map (its right edge in the frame's
+    right tenth), starting between 45 % and 70 % of the frame's width, the right column starts
+    where the legend does, unless its texts would then need a taller box. Text sizes follow the
+    sheet: an A3's are 1.41 times an A4's. Given its size alone (`"a4"`, the default, `"a3"`
+    or `"a2"`), a sheet is turned to
     portrait or landscape, whichever the map comes out larger on: the area's extent east to west
     against north to south, on the map's projection, with the room the style leaves the map. The
     result names the profile chosen (`"profile": "a4-landscape"`); give it with its orientation
@@ -32,8 +35,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     take inside the frame. A graticule's step follows the extent (2° for a state, 15′ for a city),
     with labels on every edge of a sheet.
     The north arrow, the legend (sized to what it lists), the scale bar with the numeric scale
-    under it and the locator sit in the frame's corners, clear of the graticule's
-    labels. The **arrangement** says which corner is each one's. `classic` (the default favourite) puts the
+    under it (in a box the size of the bar) and the locator sit in the frame's corners, clear of
+    the graticule's labels. The **arrangement** says which corner is each one's. `classic` (the default favourite) puts the
     locator at the top left, the arrow at the top right, the legend at the bottom left and the
     scale at the bottom right. `mirrored` swaps left and right, `legendRight` swaps the legend and
     the scale, and `legendTop` swaps the legend and the locator. `"arrangement"` also takes a
@@ -45,8 +48,12 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     with another surround. The largest is placed first (the legend, as a rule), so it takes the
     freest place, and a smaller one whose corner it took moves out of its way.
     Your favourite arrangement, set with **`layout.arrangement {"favourite": …}`** and kept with
-    the app's preferences, is the one tried first. `"arrangement": "best"`, the default, lays out
-    the favourite and every arrangement by name, and keeps the one that moves the least
+    the app's preferences, is the one tried first. Arrangements of your own are saved by name with
+    **`layout.arrangement {"save": "Atlas", "arrangement": {…}}`** (up to 20, kept with the
+    preferences too) and removed with `{"remove": "Atlas"}`; `"arrangement": "Atlas"` then takes
+    one as it takes a built-in one, and a favourite can name one. `"arrangement": "best"`, the
+    default, lays out the favourite, every arrangement by name and every saved one, and keeps the
+    one that moves the least
     (by area, so moving the north arrow costs less than moving the legend), then the one leaving
     the least over the data; the favourite wins a tie. `"favourite"` always takes the favourite.
     The answer names the arrangement taken (`"arrangement"`) and the surrounds
@@ -180,6 +187,24 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   projected (a latitude/longitude one) is refused: that is a graticule's job. From a command:
   `layout.update={"element":1,"grid":{"type":"measured","crs":"EPSG:25832","step":1000,"short":true}}`;
   a change of type without a step picks one, as degrees and metres don't carry over.
+- **MGRS labels**: a measured grid's **MGRS labels** name each 100 km square that shows with
+  its grid zone designation and square letters (`32T MT`), in the middle of what shows of it, and
+  label the lines by their kilometres' last two digits (`05`; whole, at an interval of 100 km or
+  more), as military and rescue maps print them; **Auto** picks an interval of at most 100 km, so
+  the squares' edges are drawn (on a frame over 10,000 km across, where a 100 km grid would be a
+  blur, it is widened as for any measured grid). The grid is then in a WGS 84 UTM zone: the one typed as
+  its EPSG code (`EPSG:32632`, or 32601–32660 north and 32701–32760 south), else the map's own
+  when the map is in one, else MGRS's zone at the frame's centre (southern Norway's 32V and
+  Svalbard's wider zones included). Another system is refused while MGRS labels are on, and a UTM
+  zone typed as WKT or a PROJ string isn't read as one; a switch to a graticule turns them off. A
+  square is named where all of its label fits in it, clear of the edge labels: a frame too small
+  for one names none, and nor does a frame north of 84° N or south of 80° S, where MGRS leaves
+  UTM for the polar grids (UPS), though its lines are drawn. Across the Equator, the squares on the other side are named as MGRS names
+  them there. On a frame across a zone's edge, only the zone the grid is in has its squares named,
+  as the lines past its edge are that zone's eastings and northings carried on, not the next
+  zone's. From a command: `layout.update={"element":1,"grid":{"type":"measured","mgrs":true}}`. A
+  project with MGRS labels on a graticule or naming another system (a hand-edited file) opens with
+  them off, and says so.
 - **Map surrounds**: north arrow, scale bar, legend, colorbar, table frame (a layer's attribute table) and
   chart frame (a bar chart of a numeric field), plus a neatline or backdrop. A north arrow's
   properties pick its **Style** (classic arrow, compass rose, triangle or star) and its **Fill**
@@ -375,6 +400,12 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   are pictures cut to their shape. The `dpi` also sets how fine the vectors' detail is kept, as a
   PNG at that resolution would show it. A frame or page whose vectors would pass 256 MB (64 MB
   in the browser) is drawn as a picture instead, and the export says which.
+  Its page has layers (PDF optional content groups), which a vector editor that reads them opens
+  as layers (VectorCraft, where it was checked), and PDF readers list in their layers panel:
+  one for each element, named after it, and inside a map frame's, one for each map layer and one
+  for each layer's labels (`Labels: <layer>`), and one for the frame's grid. A map series' pages
+  share them. `"pdf": {"layers": false}` on `layout.export` leaves them out. The map view's PDF
+  (Publish › Print Map) has its map layers and labels as layers too.
   A PDF is also a GeoPDF: each map frame is georeferenced (an ISO 32000 geospatial viewport, the
   form GDAL, QGIS, Acrobat and Avenza read), with its map's coordinate system as WKT and its EPSG
   code when it has one, so a reader shows coordinates and measures in it, and GDAL or QGIS open the

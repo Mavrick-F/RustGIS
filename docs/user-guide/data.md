@@ -116,8 +116,8 @@ or other WKT:
 - A grid transformation (NTv2 or NADCON, a `BOUNDCRS`'s, or GDAL's WKT1 `PROJ4_GRIDS` or
   `+nadgrids` in its `PROJ4` extension), or another without Helmert translations, isn't applied:
   the system is read without it, with a notice naming it and its grid file, as positions may be
-  off by as much as that shift. A system read by an EPSG code that has its own shift to WGS 84
-  uses that shift instead, and the notice says so. A `BOUNDCRS` without a transformation, which
+  off by as much as that shift. A system read by an EPSG or Esri code that has its own shift to
+  WGS 84 uses that shift instead, and the notice says so. A `BOUNDCRS` without a transformation, which
   PROJ refuses, is read as its source system, with a notice unless the source is on WGS 84. A
   ballpark offset is no known shift (the datum's own notice says so), and a null offset is none.
 - The notices come with WKT read from a Shapefile's or ASCII grid's `.prj`, a GeoPackage's or
@@ -1163,8 +1163,9 @@ and the MCP server see it too. A GeoTIFF read in place that is added before its 
 (the desktop app, the browser) answers `"reading": true`, sized by its header when that is in, and
 with `null` for its size and bands until then.
 `share.exportRaster` writes an untiled GeoTIFF; with `"cog": true` it writes a cloud-optimised one:
-512-pixel tiles compressed with Deflate, overviews (each half the size of the last, down to one
-tile), and every directory ahead of the tiles, so a reader fetches the header once and then only the
+512-pixel tiles compressed with Deflate after a predictor (the floating-point one for decimal
+values, differences along the row for whole numbers, none for classes), overviews (each half the
+size of the last, down to one tile), and every directory ahead of the tiles, so a reader fetches the header once and then only the
 tiles it needs. Overviews are averaged, except for a palette raster or one with a few whole-number
 classes, whose overviews take a pixel so that no class is invented; a palette keeps its colour
 table, though not the table's transparency, which a TIFF colour table can't hold (GDAL drops it
