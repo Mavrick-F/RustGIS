@@ -20920,6 +20920,38 @@ fn geocoding_places_and_addresses() {
     assert!(crate::cmd::geocode::check_batch(&g, 101).unwrap_err().contains("100"));
 }
 
+/// Census's address response through both public commands, served locally so the test needs
+/// no network. A malformed candidate is reported; unmatched rows retain their attributes.
+#[test]
+fn geocoding_with_census() {
+    let clean = br#"{"result":{"addressMatches":[{"matchedAddress":"4600 SILVER HILL RD, WASHINGTON, DC, 20233","coordinates":{"x":-76.92748724230096,"y":38.84601622386617}}, {"matchedAddress":"SECOND CANDIDATE","coordinates":{"x":-77,"y":38}}]}}"#;
+    let lossy = br#"{"result":{"addressMatches":[{}, {"matchedAddress":"SECOND ADDRESS","coordinates":{"x":-77.0,"y":38.9}}]}}"#;
+    let path = |q: &str| format!("/locations/onelineaddress?address={q}&benchmark=Public_AR_Current&format=json");
+    let (base, asked) = serve_files(vec![
+        (path("4600%20Silver%20Hill%20Rd%2C%20Washington%2C%20DC%2020233"), clean.to_vec()),
+        (path("second"), lossy.to_vec()),
+        (path("missing"), br#"{"result":{"addressMatches":[]}}"#.to_vec()),
+    ]);
+    let mut s = Session::new(Project::default());
+    let result = s
+        .run("map.findPlace", &json!({"provider":"census", "url":base, "query":"4600 Silver Hill Rd, Washington, DC 20233", "limit":1}))
+        .unwrap();
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["places"][0]["lon"], -76.92748724230096);
+    assert_eq!(result["places"][0]["lat"], 38.84601622386617);
+    assert!(s.notices.is_empty());
+    s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"id,address\n1,second\n2,missing\n"})).unwrap();
+    let result = s.run("layer.geocode", &json!({"provider":"census", "url":base, "table":"addresses", "address":"address"})).unwrap();
+    assert_eq!(result["matched"], 1);
+    assert_eq!(result["unmatched"], 1);
+    let l = s.map().layer_by_name("addresses (geocoded)").unwrap();
+    assert_eq!(l.dataset.features[0].geometry, Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(-77.0, 38.9))));
+    assert!(l.dataset.features[1].geometry.is_none());
+    assert_eq!(l.dataset.value(1, 1).to_string(), "missing");
+    assert_eq!(s.notices.iter().filter(|n| n.text.starts_with("1 of the geocoder's places")).count(), 1);
+    assert_eq!(asked.lock().unwrap().len(), 3);
+}
+
 /// PDOK's Locatieserver as the geocoder (a local server answering as it does): places found by
 /// name, a table's Dutch addresses turned into points, and the answers' entries without a usable
 /// point counted in a notice (and no notice when every entry has one).

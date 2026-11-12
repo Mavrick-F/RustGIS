@@ -1,7 +1,7 @@
 //! Geocoding: places and addresses found by name through a Nominatim or Photon server (OSM's
 //! public ones, or the user's own), or PDOK's Locatieserver (the Netherlands' official address and
-//! place registers). Requests are built and answers read here; the fetching is the caller's
-//! (blocking on the command line, off the frame in the app).
+//! place registers), or the U.S. Census Bureau's address geocoder. Requests are built and answers
+//! read here; the fetching is the caller's (blocking on the command line, off the frame in the app).
 
 use serde_json::Value;
 
@@ -14,6 +14,8 @@ pub enum Kind {
     Photon,
     /// PDOK's Locatieserver: its `/free` search (Solr's JSON, each place's point as WKT).
     Locatieserver,
+    /// U.S. Census Bureau: `/locations/onelineaddress` (current address ranges).
+    Census,
 }
 
 /// A geocoding server.
@@ -30,6 +32,9 @@ pub const NOMINATIM: &str = "https://nominatim.openstreetmap.org";
 pub const PHOTON: &str = "https://photon.komoot.io";
 /// PDOK's Locatieserver (version 3.1 of its search API).
 pub const LOCATIESERVER: &str = "https://api.pdok.nl/bzk/locatieserver/search/v3_1";
+
+/// U.S. Census Bureau's geocoder.
+pub const CENSUS: &str = "https://geocoding.geo.census.gov/geocoder";
 
 /// The kinds of place the Locatieserver is asked for: its default set (municipalities, towns,
 /// streets, postcodes, addresses) and provinces. Plots, hectometre posts, districts and water
@@ -73,14 +78,15 @@ pub struct Place {
 }
 
 impl Geocoder {
-    /// A server by `provider` (`nominatim`, the default, `photon` or `locatieserver`) and an
+    /// A server by `provider` (`nominatim`, the default, `photon`, `locatieserver` or `census`) and an
     /// optional address of one's own.
     pub fn new(provider: Option<&str>, url: Option<&str>) -> Result<Geocoder, String> {
         let kind = match provider.map(|p| p.trim().to_ascii_lowercase()).as_deref() {
             None | Some("") | Some("nominatim") => Kind::Nominatim,
             Some("photon") => Kind::Photon,
             Some("locatieserver") => Kind::Locatieserver,
-            Some(other) => return Err(format!("unknown geocoder '{other}' (nominatim, photon or locatieserver)")),
+            Some("census") => Kind::Census,
+            Some(other) => return Err(format!("unknown geocoder '{other}' (nominatim, photon, locatieserver or census)")),
         };
         let base = match url.map(str::trim).filter(|u| !u.is_empty()) {
             Some(u) => {
@@ -91,6 +97,7 @@ impl Geocoder {
                     Kind::Nominatim => "/search",
                     Kind::Photon => "/api",
                     Kind::Locatieserver => "/free",
+                    Kind::Census => "/locations/onelineaddress",
                 };
                 u.strip_suffix(path).unwrap_or(u).to_string()
             }
@@ -98,9 +105,19 @@ impl Geocoder {
                 Kind::Nominatim => NOMINATIM.to_string(),
                 Kind::Photon => PHOTON.to_string(),
                 Kind::Locatieserver => LOCATIESERVER.to_string(),
+                Kind::Census => CENSUS.to_string(),
             },
         };
-        Ok(Geocoder { kind, base })
+        let g = Geocoder { kind, base };
+        // Census documents JSONP rather than CORS for browser clients. Do not send a request
+        // that fetch cannot read; a user-supplied CORS-enabled proxy can serve the same API.
+        #[cfg(target_arch = "wasm32")]
+        if kind == Kind::Census && g.host() == "geocoding.geo.census.gov" {
+            return Err(
+                "the Census geocoder needs a CORS-enabled proxy URL in the web app; use the desktop app or CLI for direct access".into()
+            );
+        }
+        Ok(g)
     }
 
     /// The server's host, lowercased: the host itself, not a path or a look-alike host that
@@ -113,9 +130,9 @@ impl Geocoder {
     }
 
     /// Whether it is a public server shared by everyone: OSM's Nominatim, komoot's Photon or
-    /// PDOK's Locatieserver.
+    /// PDOK's Locatieserver, or Census.
     pub fn is_public(&self) -> bool {
-        self.asks_light_use() || self.host() == "api.pdok.nl"
+        self.asks_light_use() || matches!(self.host().as_str(), "api.pdok.nl" | "geocoding.geo.census.gov")
     }
 
     /// Whether its usage policy asks for at most a request a second and light use (OSM's
@@ -126,9 +143,10 @@ impl Geocoder {
         matches!(self.host().as_str(), "nominatim.openstreetmap.org" | "photon.komoot.io")
     }
 
-    /// How long to wait between requests, in milliseconds.
+    /// How long to wait between requests, in milliseconds. Census is paced conservatively at
+    /// one a second; this is our single-record client policy, not a published service limit.
     pub fn spacing_ms(&self) -> u64 {
-        if self.asks_light_use() {
+        if self.asks_light_use() || (self.kind == Kind::Census && self.is_public()) {
             1100
         } else if self.is_public() {
             250
@@ -168,6 +186,9 @@ impl Geocoder {
         match self.kind {
             Kind::Nominatim => format!("{}/search?format=jsonv2&limit={limit}&q={}", self.base, encode(&q)),
             Kind::Photon => format!("{}/api/?limit={limit}&q={}", self.base, encode(&q)),
+            Kind::Census => {
+                format!("{}/locations/onelineaddress?address={}&benchmark=Public_AR_Current&format=json", self.base, encode(&q))
+            }
             Kind::Locatieserver => {
                 let boosts: String = LOCATIESERVER_BOOSTS.iter().map(|b| format!("&bq={}", encode(b))).collect();
                 format!(
@@ -189,9 +210,20 @@ impl Geocoder {
     /// The places in an answer, and how many of its entries were left out (no usable position).
     pub fn read(&self, bytes: &[u8]) -> Result<Found, String> {
         let v: Value = serde_json::from_slice(bytes).map_err(|_| "the geocoder's answer isn't JSON".to_string())?;
+        // A successful HTTP response can still contain a Census service error.
+        if self.kind == Kind::Census && v.get("errors").is_some() {
+            return Err("the Census geocoder reported an error".into());
+        }
         let (entries, place): (&Vec<Value>, fn(&Value) -> Option<Place>) = match self.kind {
             Kind::Nominatim => (v.as_array().ok_or("the geocoder's answer isn't a list of places")?, nominatim_place),
             Kind::Photon => (v.get("features").and_then(Value::as_array).ok_or("the geocoder's answer isn't GeoJSON")?, photon_place),
+            Kind::Census => (
+                v.get("result")
+                    .and_then(|r| r.get("addressMatches"))
+                    .and_then(Value::as_array)
+                    .ok_or("the geocoder's answer isn't Census's (no result.addressMatches)")?,
+                census_place,
+            ),
             Kind::Locatieserver => (
                 v.get("response")
                     .and_then(|r| r.get("docs"))
@@ -217,6 +249,18 @@ impl Geocoder {
         }
         Ok(found)
     }
+}
+
+/// Census returns longitude as x, latitude as y, and an address interpolated along a range.
+/// API: <https://geocoding.geo.census.gov/geocoder/Geocoding_Services_API.html>.
+fn census_place(p: &Value) -> Option<Place> {
+    let c = p.get("coordinates")?;
+    let (lon, lat) = (num(c.get("x"))?, num(c.get("y"))?);
+    if !valid(lon, lat) {
+        return None;
+    }
+    let name = p.get("matchedAddress").and_then(Value::as_str).unwrap_or("").chars().take(500).collect();
+    Some(Place { name, lon, lat, bbox: None })
 }
 
 /// A number given as a number or as text (Nominatim's).
@@ -316,7 +360,10 @@ fn encode(s: &str) -> String {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn search_blocking(g: &Geocoder, query: &str, limit: usize) -> Result<Found, String> {
     g.check_query(query)?;
-    g.read(&crate::cache::download_blocking(&g.url(query, limit))?)
+    let mut found = g.read(&crate::cache::download_blocking(&g.url(query, limit))?)?;
+    // Census has no result-limit parameter; honour the command's limit locally too.
+    found.places.truncate(limit.clamp(1, MAX_RESULTS));
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -371,6 +418,44 @@ mod tests {
         {"weergavenaam":"Damrak 1, 1012LG Amsterdam","centroide_ll":"POINT(4.89803846 52.37714446)"},
         {"weergavenaam":"Damrak, Amsterdam","centroide_ll":"POINT(4.89580599 52.37513402)"},
         {"weergavenaam":"Damrak 18-1, Amsterdam","centroide_ll":" point ( 4.89727884   52.37658789 ) "}]}}"#;
+
+    #[test]
+    fn census_requests_and_answers() {
+        let g = Geocoder::new(Some(" Census "), None).unwrap();
+        assert_eq!((g.kind, g.base.as_str()), (Kind::Census, CENSUS));
+        assert!(g.is_public() && !g.asks_light_use());
+        assert_eq!((g.spacing_ms(), g.batch_limit()), (1100, MAX_BATCH));
+        assert_eq!(
+            g.url(" 4600 Silver Hill Rd, Washington, DC 20233 ", 1),
+            "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=4600%20Silver%20Hill%20Rd%2C%20Washington%2C%20DC%2020233&benchmark=Public_AR_Current&format=json"
+        );
+        let own = Geocoder::new(Some("census"), Some("https://geo.example/geocoder/locations/onelineaddress/")).unwrap();
+        assert_eq!(own.base, "https://geo.example/geocoder");
+        assert_eq!(own.spacing_ms(), 0);
+        assert!(!Geocoder::new(Some("census"), Some("https://geocoding.geo.census.gov.example/geocoder")).unwrap().is_public());
+        // Minimal form of the official API example, retaining its coordinate precision.
+        let clean = br#"{"result":{"addressMatches":[{"matchedAddress":"4600 SILVER HILL RD, WASHINGTON, DC, 20233","coordinates":{"x":-76.92748724230096,"y":38.84601622386617}}]}}"#;
+        let f = g.read(clean).unwrap();
+        assert_eq!(
+            f,
+            Found {
+                places: vec![Place {
+                    name: "4600 SILVER HILL RD, WASHINGTON, DC, 20233".into(),
+                    lon: -76.92748724230096,
+                    lat: 38.84601622386617,
+                    bbox: None
+                }],
+                skipped: 0
+            }
+        );
+        assert_eq!(g.read(br#"{"result":{"addressMatches":[]}}"#).unwrap(), Found::default());
+        let mixed = br#"{"result":{"addressMatches":[{"coordinates":{"x":-76.9,"y":38.8}}, {"coordinates":{"x":-76.9,"y":91}}, {"coordinates":{"x":"NaN","y":38}}, null]}}"#;
+        let f = g.read(mixed).unwrap();
+        assert_eq!((f.places.len(), f.skipped), (1, 3));
+        for bad in [br#"{"errors":["bad benchmark"]}"#.as_slice(), br#"{"result":{}}"#, br#"{"result":{"addressMatches":[{}]}}"#] {
+            assert!(g.read(bad).is_err());
+        }
+    }
 
     #[test]
     fn locatieserver_requests() {
