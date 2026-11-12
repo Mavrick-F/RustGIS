@@ -731,7 +731,9 @@ impl Layer {
             let calculates = self.design.rules.iter().any(|r| {
                 r.kind == design::RuleKind::Calculation
                     && rustgis_data::query::parse_fields(&r.expression, &before).is_err()
-                    && r.expression.to_lowercase().split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == name)
+                    // Anywhere in the text: the earlier calculator reads names with spaces
+                    // (`Date issued + 1`), and matching too much only keeps the field text.
+                    && r.expression.to_lowercase().contains(&name)
             });
             if !calculates && filters.iter().all(|q| reads(q)) {
                 fields.clone_from_slice(&after.fields);
