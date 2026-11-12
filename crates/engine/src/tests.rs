@@ -39897,6 +39897,82 @@ fn rgbi_mosaics_keep_nir_without_alpha_and_reject_mixed_band_roles() {
     assert_eq!((r.band_count(), r.color.clone()), (4, ColorHint::Rgb { alpha: false }));
 }
 
+/// An ortho workspace's mosaic is made in the projected system its images share unless it sets
+/// one, and says so; images in different systems, or a cell size in degrees, keep degrees and say
+/// why; "EPSG:4326" asks for degrees, another geographic system is refused (#1743 step 3).
+#[test]
+fn ortho_mosaic_is_made_in_its_images_projected_system() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    use rustgis_map::raster::RasterLayer;
+    let mut s = Session::new(Project::default());
+    let utm = Crs::Epsg(32616);
+    let add = |s: &mut Session, name: &str, gt: GeoTransform, crs: Crs, value: f32| {
+        let r = Raster::new(name, 10, 10, vec![vec![value; 100]], gt, crs, None, ColorHint::Gray, "Float32").unwrap();
+        let bytes = geotiff::write(&r, 0).unwrap();
+        s.map_mut().add_raster(name, RasterLayer::from_bytes(r, format!("{name}.tif"), bytes));
+    };
+    // Two 100 m squares side by side in UTM zone 16N, and one in degrees nearby.
+    let at = |x: f64| GeoTransform { origin_x: x, origin_y: 3_900_100.0, pixel_width: 10.0, pixel_height: -10.0 };
+    add(&mut s, "west", at(500_000.0), utm, 1.0);
+    add(&mut s, "east", at(500_100.0), utm, 2.0);
+    let degrees = GeoTransform { origin_x: -87.0, origin_y: 35.24, pixel_width: 0.0001, pixel_height: -0.0001 };
+    add(&mut s, "nearby", degrees, Crs::LonLat, 3.0);
+    let build = |s: &mut Session, name: &str| {
+        let mark = s.notice_mark();
+        let v = s.run("imagery.mosaic", &json!({"name": name})).unwrap();
+        let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        let r = s.map().layer(v["layer"].as_u64().unwrap() as u32).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+        (r, v, notices)
+    };
+    // The images' system: their cells exactly, and it is said.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Fields", "images": ["west", "east"]})).unwrap();
+    let (r, v, notices) = build(&mut s, "Fields");
+    assert_eq!((r.crs, r.width, r.height, r.transform.pixel_width), (utm, 20, 10, 10.0), "{v}");
+    assert_eq!((r.value(0, 0, 0), r.value(0, 15, 9)), (Some(1.0), Some(2.0)));
+    let made = format!("made in {}, the coordinate system its images are in; set crs to EPSG:4326", utm.label());
+    assert!(v["messages"][0].as_str().unwrap().contains(&made), "{v}");
+    assert!(notices.iter().any(|n| n.starts_with("Fields: made in")), "{notices:?}");
+    // A system set, with a cell size in its units: nothing assumed, nothing said.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": "EPSG:32616", "cellSize": 20})).unwrap();
+    let (r, v, notices) = build(&mut s, "Fields");
+    assert_eq!((r.crs, r.width, r.height), (utm, 10, 5), "{v}");
+    assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    // Degrees asked for: the degree cell size, nothing said.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": "EPSG:4326", "cellSize": 0.0005})).unwrap();
+    let (r, v, notices) = build(&mut s, "Fields");
+    assert_eq!(r.crs, Crs::LonLat);
+    assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    // Back to none, with that cell size in degrees: degrees, and why.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": null})).unwrap();
+    let (r, v, _) = build(&mut s, "Fields");
+    assert_eq!(r.crs, Crs::LonLat);
+    assert!(v["messages"][0].as_str().unwrap().contains("as its cell size (0.0005) is in degrees"), "{v}");
+    // Another system drops the projected cell size; a geographic one other than degrees is refused.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": "EPSG:32616", "cellSize": 20})).unwrap();
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": 3857})).unwrap();
+    let w = s.project.workspaces.iter().find(|w| w.name == "Fields").unwrap();
+    assert_eq!((w.crs, w.projected_cell_size, w.cell_size), (Some(Crs::WebMercator), None, Some(0.0005)));
+    let e = s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": "EPSG:4269"})).unwrap_err();
+    assert!(e.contains("EPSG:4326 makes it in degrees"), "{e}");
+    assert_eq!(s.project.workspaces.iter().find(|w| w.name == "Fields").unwrap().crs, Some(Crs::WebMercator));
+    // Images in different systems: degrees, naming the projected one.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Mixed", "images": ["west", "nearby"]})).unwrap();
+    let (r, v, _) = build(&mut s, "Mixed");
+    assert_eq!(r.crs, Crs::LonLat);
+    let m = v["messages"][0].as_str().unwrap();
+    assert!(m.contains("different coordinate systems") && m.contains(&utm.label()), "{m}");
+    // Images in degrees: degrees, nothing said.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Plain", "images": ["nearby"]})).unwrap();
+    let (r, v, notices) = build(&mut s, "Plain");
+    assert_eq!(r.crs, Crs::LonLat);
+    assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    // The system and its cell size save with the project.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "cellSize": 30})).unwrap();
+    let p = crate::Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
+    let w = p.workspaces.iter().find(|w| w.name == "Fields").unwrap();
+    assert_eq!((w.crs, w.projected_cell_size, w.cell_size), (Some(Crs::WebMercator), Some(30.0), Some(0.0005)));
+}
+
 /// Add Data's and Load All's reads made before the command runs (the desktop app's, on a thread
 /// of their own) are the ones the command takes: it adds what they read, without reading again.
 #[cfg(not(target_arch = "wasm32"))]

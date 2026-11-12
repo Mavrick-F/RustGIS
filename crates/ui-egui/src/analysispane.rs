@@ -61,6 +61,9 @@ pub struct Workflow {
     /// The system the Wizard's layer was read in, and the one its surface is made in from it
     /// ([`rustgis_engine::analysis::layer_raster_crs`]), kept so it is worked out once.
     pub layer_system: Option<(rustgis_engine::data::raster::Crs, Option<rustgis_engine::data::raster::Crs>)>,
+    /// The coordinate system typed for a new ortho or reality workspace; empty: the images'
+    /// projected system, else degrees.
+    pub workspace_crs: String,
     /// The projected coordinate system typed for the environment's Set Coordinate System.
     pub env_crs: String,
     /// The cell size typed for the environment, apart from the Wizard's, which is the run's own.
@@ -1247,18 +1250,33 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 });
             }
+            ui.label(tl!("Coordinate system"));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.workflow.workspace_crs)
+                    .hint_text(tl!("the images' projected system, else degrees"))
+                    .desired_width(f32::INFINITY),
+            )
+            .on_hover_text(tl!("A projected system such as EPSG:32616, or EPSG:4326 for degrees"));
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("cell size °")).desired_width(80.0));
-                if ui.button(tl!("New Workspace From Visible Rasters")).clicked() {
-                    let images: Vec<String> =
-                        app.session.map().layers.iter().filter(|l| l.is_raster() && l.visible).map(|l| l.name.clone()).collect();
-                    let mut p = json!({"kind": kind, "images": images});
-                    if let Ok(c) = app.workflow.number.trim().parse::<f64>() {
-                        p["cellSize"] = json!(c);
-                    }
-                    run(app, "imagery.workspace", p);
-                }
+                // Without a system, a cell size is in degrees, as in older projects.
+                let hint = if app.workflow.workspace_crs.trim().is_empty() { tl!("cell size °") } else { tl!("cell size") };
+                ui.label(tl!("Cell size"));
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0))
+                    .on_hover_text(tl!("In the coordinate system's units, or degrees without one"));
             });
+            // On a line of its own: beside the cell size, its label ran past the pane's edge.
+            if ui.button(tl!("New Workspace From Visible Rasters")).clicked() {
+                let images: Vec<String> =
+                    app.session.map().layers.iter().filter(|l| l.is_raster() && l.visible).map(|l| l.name.clone()).collect();
+                let mut p = json!({"kind": kind, "images": images});
+                if !app.workflow.workspace_crs.trim().is_empty() {
+                    p["crs"] = json!(app.workflow.workspace_crs.trim());
+                }
+                if let Ok(c) = app.workflow.number.trim().parse::<f64>() {
+                    p["cellSize"] = json!(c);
+                }
+                run(app, "imagery.workspace", p);
+            }
             if kind == "reality" {
                 combo(ui, "wf_mesh", "Layer", &mut app.workflow.layer, &rasters);
                 if ui.button(tl!("Export Mesh (OBJ)…")).clicked() {
