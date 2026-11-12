@@ -20920,6 +20920,22 @@ fn geocoding_places_and_addresses() {
     assert!(crate::cmd::geocode::check_batch(&g, 101).unwrap_err().contains("100"));
 }
 
+/// Applying supplied answers does not require a network-capable Census endpoint, including
+/// in the browser where the public server lacks CORS.
+#[test]
+fn geocoding_census_supplied_answers_need_no_fetch() {
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"address\nA\n"})).unwrap();
+    let result = s
+        .run(
+            "layer.geocode",
+            &json!({"provider":"census", "table":"addresses", "address":"address",
+        "places":{"A":{"lon":-77.0,"lat":38.0,"name":"A"}}}),
+        )
+        .unwrap();
+    assert_eq!(result["matched"], 1);
+}
+
 /// Census's address response through both public commands, served locally so the test needs
 /// no network. A malformed candidate is reported; unmatched rows retain their attributes.
 #[test]
@@ -20939,7 +20955,8 @@ fn geocoding_with_census() {
     assert_eq!(result["count"], 1);
     assert_eq!(result["places"][0]["lon"], -76.92748724230096);
     assert_eq!(result["places"][0]["lat"], 38.84601622386617);
-    assert!(s.notices.is_empty());
+    assert_eq!(s.notices.len(), 1);
+    assert_eq!(s.notices[0].text, "Search candidates not shown: 1 (limit 1).");
     s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"id,address\n1,second\n2,missing\n"})).unwrap();
     let result = s.run("layer.geocode", &json!({"provider":"census", "url":base, "table":"addresses", "address":"address"})).unwrap();
     assert_eq!(result["matched"], 1);

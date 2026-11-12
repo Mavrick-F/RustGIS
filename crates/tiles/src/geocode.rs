@@ -59,11 +59,24 @@ pub const MAX_RESULTS: usize = 20;
 const MAX_QUERY: usize = 500;
 
 /// The places in an answer, and how many of the answer's entries were left out because they had no
-/// usable position (no coordinate, an unreadable or out-of-range one).
+/// usable position (no coordinate, an unreadable or out-of-range one), plus candidates withheld
+/// by the result limit.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Found {
     pub places: Vec<Place>,
     pub skipped: usize,
+    /// Candidates withheld by the parser's safety cap or the caller's search-result limit.
+    /// Entries past the safety cap are not parsed, so their positions may be unusable.
+    pub limited: usize,
+}
+
+impl Found {
+    /// Applies a requested result limit without silently discarding additional candidates.
+    pub fn limit(&mut self, limit: usize) {
+        let limit = limit.clamp(1, MAX_RESULTS);
+        self.limited = self.limited.saturating_add(self.places.len().saturating_sub(limit));
+        self.places.truncate(limit);
+    }
 }
 
 /// A place found.
@@ -108,16 +121,18 @@ impl Geocoder {
                 Kind::Census => CENSUS.to_string(),
             },
         };
-        let g = Geocoder { kind, base };
-        // Census documents JSONP rather than CORS for browser clients. Do not send a request
-        // that fetch cannot read; a user-supplied CORS-enabled proxy can serve the same API.
-        #[cfg(target_arch = "wasm32")]
-        if kind == Kind::Census && g.host() == "geocoding.geo.census.gov" {
+        Ok(Geocoder { kind, base })
+    }
+
+    /// Whether this client can fetch the answer. Constructing a provider also serves callers
+    /// applying supplied answers, so browser transport restrictions belong at fetch initiation.
+    pub fn check_fetch(&self) -> Result<(), String> {
+        if cfg!(target_arch = "wasm32") && self.kind == Kind::Census && self.host() == "geocoding.geo.census.gov" {
             return Err(
                 "the Census geocoder needs a CORS-enabled proxy URL in the web app; use the desktop app or CLI for direct access".into()
             );
         }
-        Ok(g)
+        Ok(())
     }
 
     /// The server's host, lowercased: the host itself, not a path or a look-alike host that
@@ -144,9 +159,9 @@ impl Geocoder {
     }
 
     /// How long to wait between requests, in milliseconds. Census is paced conservatively at
-    /// one a second; this is our single-record client policy, not a published service limit.
+    /// one a second, including through proxies; this is our client policy, not a published limit.
     pub fn spacing_ms(&self) -> u64 {
-        if self.asks_light_use() || (self.kind == Kind::Census && self.is_public()) {
+        if self.asks_light_use() || self.kind == Kind::Census {
             1100
         } else if self.is_public() {
             250
@@ -233,9 +248,11 @@ impl Geocoder {
             ),
         };
         let mut found = Found::default();
-        // The entries past the places asked for aren't read: a server sends what it was asked.
-        for e in entries {
+        // Bound parsing even when a service has no limit parameter (Census), while counting
+        // the candidates withheld. Their geometry is deliberately not inspected past the cap.
+        for (i, e) in entries.iter().enumerate() {
             if found.places.len() >= MAX_RESULTS {
+                found.limited = entries.len().saturating_sub(i);
                 break;
             }
             match place(e) {
@@ -359,10 +376,11 @@ fn encode(s: &str) -> String {
 /// Finds places, waiting for the answer (the command line; the app searches off the frame).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn search_blocking(g: &Geocoder, query: &str, limit: usize) -> Result<Found, String> {
+    g.check_fetch()?;
     g.check_query(query)?;
     let mut found = g.read(&crate::cache::download_blocking(&g.url(query, limit))?)?;
     // Census has no result-limit parameter; honour the command's limit locally too.
-    found.places.truncate(limit.clamp(1, MAX_RESULTS));
+    found.limit(limit);
     Ok(found)
 }
 
@@ -431,7 +449,9 @@ mod tests {
         );
         let own = Geocoder::new(Some("census"), Some("https://geo.example/geocoder/locations/onelineaddress/")).unwrap();
         assert_eq!(own.base, "https://geo.example/geocoder");
-        assert_eq!(own.spacing_ms(), 0);
+        assert_eq!(own.spacing_ms(), 1100);
+        assert!(own.check_fetch().is_ok());
+        assert_eq!(g.check_fetch().is_ok(), !cfg!(target_arch = "wasm32"));
         assert!(!Geocoder::new(Some("census"), Some("https://geocoding.geo.census.gov.example/geocoder")).unwrap().is_public());
         // Minimal form of the official API example, retaining its coordinate precision.
         let clean = br#"{"result":{"addressMatches":[{"matchedAddress":"4600 SILVER HILL RD, WASHINGTON, DC, 20233","coordinates":{"x":-76.92748724230096,"y":38.84601622386617}}]}}"#;
@@ -445,7 +465,8 @@ mod tests {
                     lat: 38.84601622386617,
                     bbox: None
                 }],
-                skipped: 0
+                skipped: 0,
+                limited: 0
             }
         );
         assert_eq!(g.read(br#"{"result":{"addressMatches":[]}}"#).unwrap(), Found::default());
@@ -455,6 +476,17 @@ mod tests {
         for bad in [br#"{"errors":["bad benchmark"]}"#.as_slice(), br#"{"result":{}}"#, br#"{"result":{"addressMatches":[{}]}}"#] {
             assert!(g.read(bad).is_err());
         }
+    }
+
+    #[test]
+    fn census_candidates_past_both_search_caps_are_counted() {
+        let g = Geocoder::new(Some("census"), None).unwrap();
+        let p = serde_json::json!({"matchedAddress":"address", "coordinates":{"x":-77.0,"y":38.0}});
+        let response = serde_json::json!({"result":{"addressMatches":vec![p;25]}});
+        let mut found = g.read(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!((found.places.len(), found.skipped, found.limited), (20, 0, 5));
+        found.limit(8);
+        assert_eq!((found.places.len(), found.limited), (8, 17));
     }
 
     #[test]
@@ -508,7 +540,11 @@ mod tests {
         let one = br#"{"response":{"docs":[{"weergavenaam":"Gemeente Utrecht","centroide_ll":"POINT(5.0747543 52.09113798)","type":"gemeente","score":9.78}]}}"#;
         assert_eq!(
             g.read(one).unwrap(),
-            Found { places: vec![Place { name: "Gemeente Utrecht".into(), lon: 5.0747543, lat: 52.09113798, bbox: None }], skipped: 0 }
+            Found {
+                places: vec![Place { name: "Gemeente Utrecht".into(), lon: 5.0747543, lat: 52.09113798, bbox: None }],
+                skipped: 0,
+                limited: 0
+            }
         );
         // Nothing found: no places, nothing left out.
         let none = br#"{"response":{"numFound":0,"start":0,"maxScore":0.0,"numFoundExact":true,"docs":[ ]}}"#;

@@ -54,6 +54,9 @@ fn find_place(s: &mut Session, p: &Value) -> CmdResult {
         if found.skipped > 0 {
             s.warn(skipped_notice(found.skipped));
         }
+        if found.limited > 0 {
+            s.notify(format!("Search candidates not shown: {} (limit {limit}).", found.limited), false);
+        }
         let places = found.places;
         if super::b(p, "go").unwrap_or(true)
             && let Some(first) = places.first()

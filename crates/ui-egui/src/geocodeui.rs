@@ -74,7 +74,16 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                 match r {
                     Ok(f) if f.places.is_empty() => app.dialogs.error = Some(tl!("No place found").to_string()),
                     Ok(mut f) => {
-                        f.places.truncate(8);
+                        f.limit(8);
+                        if f.limited > 0 {
+                            app.session.notify(
+                                i18n::fmt(
+                                    "Search candidates not shown: {n} (limit {limit}).",
+                                    &[("n", &f.limited.to_string()), ("limit", "8")],
+                                ),
+                                false,
+                            );
+                        }
                         app.dialogs.error = None;
                         st.places = f.places;
                         st.found_by = Some(kind);
@@ -205,7 +214,11 @@ pub fn find_place(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     });
     provider(app, ui);
     if go && !app.dialogs.a.trim().is_empty() {
-        match Geocoder::new(Some(app.dialogs.mode), Some(app.dialogs.b.as_str())).and_then(|g| g.check_query(&app.dialogs.a).map(|_| g)) {
+        match Geocoder::new(Some(app.dialogs.mode), Some(app.dialogs.b.as_str())).and_then(|g| {
+            g.check_fetch()?;
+            g.check_query(&app.dialogs.a)?;
+            Ok(g)
+        }) {
             Ok(g) => {
                 let slot = fetch(&g.url(&app.dialogs.a, 8));
                 app.ui.geocode.search = Some((g, slot));
@@ -360,6 +373,7 @@ pub fn geocode(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             params["url"] = json!(app.dialogs.b.trim());
         }
         let g = Geocoder::new(Some(app.dialogs.mode), Some(app.dialogs.b.as_str())).map_err(ui_error)?;
+        g.check_fetch().map_err(ui_error)?;
         let (_, queue) = rustgis_engine::cmd::geocode::addresses(&app.session, &params)?;
         if queue.is_empty() {
             return Err(tl!("The address fields are empty in every row.").to_string());
@@ -427,6 +441,28 @@ mod tests {
         assert!(h.state().ui.geocode.job.is_none());
         assert!(h.state().session.map().layers.is_empty());
         assert!(h.state().session.notices.iter().any(|n| n.text.contains("Geocoding cancelled")));
+    }
+
+    /// A Census search can return more candidates than requested. Report both the UI limit
+    /// and the parser's safety cap; a clean one-result answer has no such notice.
+    #[test]
+    fn census_search_reports_candidates_withheld_by_its_limit() {
+        for count in [1, 25] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let p = json!({"matchedAddress":"address", "coordinates":{"x":-77.0,"y":38.0}});
+            let response = json!({"result":{"addressMatches":vec![p;count]}});
+            let slot = Answer::default();
+            *slot.lock().unwrap() = Some(Ok(serde_json::to_vec(&response).unwrap()));
+            app.ui.geocode.search = Some((Geocoder::new(Some("census"), None).unwrap(), slot));
+            poll(&mut app, &egui::Context::default());
+            assert_eq!(app.ui.geocode.places.len(), count.min(8));
+            if count == 1 {
+                assert!(app.session.notices.is_empty());
+            } else {
+                assert_eq!(app.session.notices.len(), 1);
+                assert_eq!(app.session.notices[0].text, "Search candidates not shown: 17 (limit 8).");
+            }
+        }
     }
 
     /// The credit under the places is the geocoder's that found them, not the one picked since.

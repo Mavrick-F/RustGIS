@@ -574,13 +574,18 @@ For U.S. street addresses, `"provider": "census"` (**U.S. Census (addresses)**) 
 with the `Public_AR_Current` benchmark. Give a house number and street plus city/state or ZIP;
 it does not search general place names. Coordinates are calculated along address ranges, rather
 than surveyed building positions. RustGIS sends one single-record request at a time, at most one
-a second to the public server, with up to 10,000 distinct addresses a run; this pacing is a
+a second, including through a proxy, with up to 10,000 distinct addresses a run; this pacing is a
 RustGIS precaution, not a published Census rate limit. This uses the single-line endpoint, not
 Census's file-upload service. Puerto Rico addresses requiring Urbanization or Municipio are not
 supported by that endpoint. No Census geography attributes are added. Find Place credits the
 U.S. Census Bureau and zooms around the returned point. Direct access works in the desktop app
 and CLI; Census does not support CORS, so the web app requires a CORS-enabled proxy in **Server**
 (`"url"`), exposing the same `/locations/onelineaddress` endpoint.
+
+Find Place shows up to eight candidates; `map.findPlace` honours its `limit` (1–20). When
+the server returns additional candidates, a notice counts those not shown, including candidates
+not inspected past the parser's 20-result safety cap. Supplied `places` answers need no network
+access and can be applied without a proxy in the browser.
 
 An answer's places without a usable position (no coordinate, or one that can't be read) are left
 out, and a notice says how many; an answer with places but none usable counts as a failed
