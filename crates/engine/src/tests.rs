@@ -743,6 +743,11 @@ fn text_fields_convert_to_dates() {
     s.run("data.attributeRule", &rule).unwrap();
     let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "code", "type": "date"})).unwrap_err();
     assert!(err.starts_with("attribute rule 'Small' wouldn't read 'code' as dates"), "{err}");
+    s.run("data.attributeRule", &json!({"layer": "Cities", "name": "Small", "remove": true})).unwrap();
+    // So is one the labels' text expression would stop reading.
+    s.map_mut().layers.iter_mut().find(|l| l.name == "Cities").unwrap().labels.default.by.text = Some("code + 1".into());
+    let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "code", "type": "date"})).unwrap_err();
+    assert!(err.starts_with("the labels' text expression wouldn't read 'code' as dates"), "{err}");
 }
 
 /// A Shapefile read in place a view at a time says, once, the dates its view reads found weren't

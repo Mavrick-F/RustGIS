@@ -3287,12 +3287,12 @@ fn geopackage_dates_are_written_and_read_as_dates() {
     // The export says the text it wrote in a date field that isn't a date, and a date-time with a
     // time in one, which reads back empty too.
     let mut moment = Dataset::new("m", GeometryType::None, permits.fields.clone());
-    moment.push(None, vec![at("2026-03-05T14:30:00"), Value::Null]);
-    assert_eq!(crate::io::text_in_dates(moment.features.iter(), &moment.fields), [1, 0]);
+    moment.push(None, vec![at("2026-03-05T14:30:00"), Value::Int(1_772_700_000)]);
+    assert_eq!(crate::io::text_in_dates(moment.features.iter(), &moment.fields), [1, 1]);
     let text = crate::io::text_in_dates(permits.features.iter(), &permits.fields);
     assert_eq!(
         crate::io::text_in_dates_note(&permits.fields, &text, "permits.gpkg").as_deref(),
-        Some("permits.gpkg: 1 value isn't a date and was written as text, which reads back empty, in 'issued'")
+        Some("permits.gpkg: 2 values aren't dates and were written as they are, and read back empty, in 'issued', 'seen'")
     );
     // Dates by a declared type's own name, not a part of another.
     let ty = |d: &str| super::gpkg_blob::field_type(d);

@@ -467,6 +467,13 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(f) = l.display_filters.iter().find(|f| !reads(&f.where_)) {
         return Err(format!("display filter '{}' wouldn't read '{name}' as dates: change or remove it first", f.name));
     }
+    // Classes or labels by an expression would stop drawing by it, as Delete Field says.
+    if l.renderer.expression().is_some_and(|e| !reads(e)) {
+        return Err(format!("the symbology's expression wouldn't read '{name}' as dates: change it first"));
+    }
+    if l.labels.default.by.text.as_deref().is_some_and(|t| !reads(t)) {
+        return Err(format!("the labels' text expression wouldn't read '{name}' as dates: change it first"));
+    }
     // An attribute rule that stops reading would stop checking or calculating, without a word.
     let rule_reads = |r: &rustgis_map::design::AttributeRule, ds: &rustgis_data::Dataset| match r.kind {
         rustgis_map::design::RuleKind::Calculation => Calculation::parse(&r.expression, ds).is_ok(),
