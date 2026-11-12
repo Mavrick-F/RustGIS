@@ -2114,9 +2114,12 @@ fn mosaic_crs(w: &Workspace, imgs: &[Arc<Raster>]) -> Result<(Crs, Option<String
                 (!systems.is_empty()).then(|| format!("{}{more}", systems.join(", ")))
             };
             match (distinct(&|c| !c.is_geographic()), distinct(&|c| c.is_geographic() && c != Crs::LonLat)) {
-                (Some(projected), _) => format!(
-                    "made in degrees, as its images are in different coordinate systems (some in {projected}); set crs to make it in a projected one"
-                ),
+                (Some(projected), geographic) => {
+                    let all = geographic.map_or(projected.clone(), |g| format!("{projected}, {g}"));
+                    format!(
+                        "made in WGS 84 degrees (EPSG:4326), as its images are in different coordinate systems (some in {all}); set crs to make it in a projected one"
+                    )
+                }
                 (None, Some(geographic)) => format!(
                     "made in WGS 84 degrees (EPSG:4326), though its images are in different geographic systems (some in {geographic}); set a projected crs to make it in metres or feet"
                 ),

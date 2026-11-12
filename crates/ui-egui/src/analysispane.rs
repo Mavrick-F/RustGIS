@@ -64,6 +64,9 @@ pub struct Workflow {
     /// The coordinate system typed for a new ortho or reality workspace; empty: the images'
     /// projected system, else degrees.
     pub workspace_crs: String,
+    /// The projected system that text last read as (`None`: none, or degrees), so a cell size
+    /// typed for one system is cleared when another is typed, not at each keystroke.
+    pub workspace_system: Option<rustgis_engine::data::raster::Crs>,
     /// The projected coordinate system typed for the environment's Set Coordinate System.
     pub env_crs: String,
     /// The cell size typed for the environment, apart from the Wizard's, which is the run's own.
@@ -1260,18 +1263,34 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             } else {
                 tl!("degrees, as the cell size is in degrees")
             };
-            ui.label(tl!("Coordinate system"));
+            let system_label = ui.label(tl!("Coordinate system"));
             let system = ui
                 .add(egui::TextEdit::singleline(&mut app.workflow.workspace_crs).hint_text(crs_hint).desired_width(f32::INFINITY))
+                .labelled_by(system_label.id)
                 .on_hover_text(tl!("A projected system such as EPSG:32616, or EPSG:4326 for degrees"));
-            // A cell size typed for another system isn't sent in this one's units.
+            // A cell size typed for another system isn't sent in this one's units: it is cleared
+            // once the text reads as another system, and kept while it reads as none yet.
             if system.changed() {
-                app.workflow.number.clear();
+                let typed = app.workflow.workspace_crs.trim();
+                let now = if typed.is_empty() {
+                    Some(None)
+                } else {
+                    rustgis_engine::data::raster::Crs::parse(typed)
+                        .ok()
+                        .map(|c| Some(c).filter(|c| *c != rustgis_engine::data::raster::Crs::LonLat))
+                };
+                if let Some(now) = now
+                    && now != app.workflow.workspace_system
+                {
+                    app.workflow.workspace_system = now;
+                    app.workflow.number.clear();
+                }
             }
             ui.horizontal(|ui| {
                 let hint = if degrees { tl!("cell size °") } else { tl!("cell size") };
-                ui.label(tl!("Cell size"));
+                let size_label = ui.label(tl!("Cell size"));
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0))
+                    .labelled_by(size_label.id)
                     .on_hover_text(tl!("In the coordinate system's units, or degrees without one"));
             });
             // On a line of its own: beside the cell size, its label ran past the pane's edge.
@@ -1282,8 +1301,10 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 if !app.workflow.workspace_crs.trim().is_empty() {
                     p["crs"] = json!(app.workflow.workspace_crs.trim());
                 }
-                if let Ok(c) = app.workflow.number.trim().parse::<f64>() {
-                    p["cellSize"] = json!(c);
+                // Text that isn't a number goes as it is, for the command to say why.
+                let size = app.workflow.number.trim();
+                if !size.is_empty() {
+                    p["cellSize"] = size.parse::<f64>().ok().filter(|c| c.is_finite()).map_or_else(|| json!(size), |c| json!(c));
                 }
                 run(app, "imagery.workspace", p);
             }

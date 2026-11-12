@@ -39979,6 +39979,11 @@ fn ortho_mosaic_is_made_in_its_images_projected_system() {
     s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Datums", "images": ["nad83", "nearby"]})).unwrap();
     let (_, v, _) = build(&mut s, "Datums");
     assert!(v["messages"][0].as_str().unwrap().contains("different geographic systems (some in EPSG:4269)"), "{v}");
+    // Projected and other geographic systems mixed: both named, and the degrees are WGS 84's.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Both", "images": ["west", "nad83"]})).unwrap();
+    let (_, v, _) = build(&mut s, "Both");
+    let m = v["messages"][0].as_str().unwrap();
+    assert!(m.contains("WGS 84 degrees") && m.contains(&utm.label()) && m.contains("EPSG:4269"), "{m}");
     // Images in degrees: degrees, nothing said.
     s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Plain", "images": ["nearby"]})).unwrap();
     let (r, v, notices) = build(&mut s, "Plain");

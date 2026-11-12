@@ -1085,7 +1085,7 @@ pub fn mosaic(
     let to = if crs == Crs::LonLat { None } else { Some(crs.transformer()?) };
     let own = |r: &Raster, c: Coord| {
         let (cc, rr) = r.transform.to_pixel(c);
-        let (cc, rr) = (cc.floor(), rr.floor());
+        let (cc, rr) = (r.wrap_col(cc).floor(), rr.floor());
         (cc >= 0.0 && rr >= 0.0 && cc < f64::from(r.width) && rr < f64::from(r.height)).then_some((cc as i64, rr as i64))
     };
     // Each row as a slice of every band, for one thread to fill.
