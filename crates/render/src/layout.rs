@@ -583,6 +583,12 @@ fn attribution_inset((w, h): (f32, f32), tw: f32, labels: &[(Edge, [f32; 4])]) -
     (bottom, right)
 }
 
+/// A scale as `{scale}` prints it: `1:6,300,000`, or `1:6.300.000` with a decimal comma.
+pub fn scale_ratio_text(scale: f64, comma: bool) -> String {
+    let ratio = rustgis_map::graphics::scale_ratio(scale);
+    if comma { decimal(ratio, true) } else { ratio }
+}
+
 /// Expands layout text tokens: the page ones here, the map ones from the first frame.
 pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, rustgis_map::Camera)>) -> String {
     // The frame's scale, worked out once for both its forms below.
@@ -590,7 +596,7 @@ pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, ru
     // A layout with a decimal comma prints its scale with points between thousands: put in first,
     // so a page or layout name holding "{scale}" isn't read as the token.
     let t = match scale {
-        Some(scale) if layout.decimal_comma => t.replace("{scale}", &decimal(rustgis_map::graphics::scale_ratio(scale), true)),
+        Some(scale) if layout.decimal_comma => t.replace("{scale}", &scale_ratio_text(scale, true)),
         _ => t.to_string(),
     };
     let t = t
@@ -1056,6 +1062,9 @@ pub(crate) fn measured_lines(
     let given = g.step.clamp(0.0, rustgis_map::layout::MAX_MEASURED_STEP);
     let step = if given > 0.0 {
         given.max(rustgis_map::layout::MIN_MEASURED_STEP)
+    } else if g.mgrs {
+        // (At most 100 km apart, so MGRS's squares are drawn whole.)
+        nice_step(span, rustgis_map::layout::MIN_MEASURED_STEP).min(100_000.0)
     } else {
         nice_step(span, rustgis_map::layout::MIN_MEASURED_STEP)
     };
@@ -1122,17 +1131,22 @@ enum Edge {
 }
 
 /// The coordinate system of a measured grid on `map`: the grid's own, else the map's when it is
-/// projected, else the WGS 84 UTM zone at `center` (longitude/latitude). `None` for one that
-/// can't be read or isn't projected.
+/// projected, else the WGS 84 UTM zone at `center` (longitude/latitude). With MGRS labels, only a
+/// WGS 84 UTM zone: the one named, else the map's when it is one, else MGRS's zone at `center`.
+/// `None` for one that can't be read or isn't projected.
 pub fn measured_crs(g: &Grid, map: &Map, center: Coord) -> Option<rustgis_data::raster::Crs> {
     use rustgis_data::raster::Crs;
+    use rustgis_map::layout::utm_zone_of;
+    let utm = |(zone, north): (u8, bool)| Crs::from_epsg(if north { 32_600 } else { 32_700 } + u32::from(zone));
     let named = g.crs.as_deref().map(str::trim).filter(|c| !c.is_empty());
     let crs = match named {
         // (One longer than a command keeps, from a crafted project, isn't read each frame.)
         Some(c) if c.chars().count() > rustgis_map::layout::MAX_GRID_CRS => return None,
+        Some(c) if g.mgrs => utm(utm_zone_of(c)?)?,
         Some(c) => Crs::parse(c).ok()?,
         // The map's own: its code (a preset, EPSG:, ESRI: or local:) as its PROJ definition.
         None => match &map.projection {
+            rustgis_map::Projection::Custom(code) if g.mgrs => utm_zone_of(code).and_then(utm),
             rustgis_map::Projection::Custom(code) => rustgis_map::projection::lookup(code)
                 .ok()
                 .and_then(|(def, _)| Crs::parse(&def).ok())
@@ -1140,7 +1154,17 @@ pub fn measured_crs(g: &Grid, map: &Map, center: Coord) -> Option<rustgis_data::
                 .filter(|c| !c.is_geographic()),
             _ => None,
         }
-        .map_or_else(|| Crs::from_epsg(rustgis_map::layout::utm_epsg(center.x, center.y)), Some)?,
+        .map_or_else(
+            || {
+                // MGRS's zone at the centre keeps southern Norway's and Svalbard's wider zones.
+                let c = Coord::new((center.x + 180.0).rem_euclid(360.0) - 180.0, center.y);
+                match rustgis_geom::utm::utm_zone(c).filter(|_| g.mgrs) {
+                    Some(zone) => utm((zone, center.y >= 0.0)),
+                    None => Crs::from_epsg(rustgis_map::layout::utm_epsg(center.x, center.y)),
+                }
+            },
+            Some,
+        )?,
     };
     (!crs.is_geographic()).then_some(crs)
 }
@@ -1176,6 +1200,8 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) -> 
     // Each line: its points in longitude/latitude, its label, and whether it runs north–south
     // (labelled along the top and bottom first).
     let mut lines: Vec<(Vec<Coord>, String, bool)> = Vec::new();
+    // A measured grid's MGRS squares: each one's name and middle, in the frame's points.
+    let mut squares = Vec::new();
     match g.kind {
         GridKind::Graticule => {
             // Over the extent of the frame's corners and midpoints, as it always was (its step and
@@ -1190,8 +1216,16 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) -> 
         }
         GridKind::Measured => {
             let center = map.to_lonlat(view.camera.to_map(w / 2.0, h / 2.0, w, h)).unwrap_or_else(|| ext.center());
-            let Some(tr) = measured_crs(g, map, center).and_then(|c| c.transformer().ok()) else { return Vec::new() };
+            let Some(crs) = measured_crs(g, map, center) else { return Vec::new() };
+            let Ok(tr) = crs.transformer() else { return Vec::new() };
             measured_lines(g, &tr, &lonlats, comma, &mut lines);
+            if g.mgrs
+                && g.labels
+                && let Some((zone, _)) = rustgis_map::layout::utm_zone_of(&crs.epsg().to_string())
+            {
+                let size = |s: &str| (text::measure(s, MGRS_LABEL_PT, true), MGRS_LABEL_PT * 1.33 * 1.2);
+                squares = mgrs_squares(map, view, zone, &tr, size);
+            }
         }
     }
     // A tilted frame's lines break where they pass behind the eye.
@@ -1250,6 +1284,9 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) -> 
     if let Some(p) = pb.finish() {
         pm.stroke_path(&p, &paint_line, &stroke, Transform::identity(), None);
     }
+    for (s, x, y) in squares {
+        text::text_at(pm, &s, x * ppp, y * ppp, MGRS_LABEL_PT * 1.33 * ppp, label_color, true, text::Align::Center, true);
+    }
     // Labels sit just inside the frame, past the ticks.
     let inset = tick + 3.0 * ppp;
     let along = |edge: Edge, s: &str| match edge {
@@ -1277,6 +1314,78 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) -> 
         drawn.push((edge, [(cx - hw) / ppp, (cy - hh) / ppp, (cx + hw) / ppp, (cy + hh) / ppp]));
     }
     drawn
+}
+
+/// The size of a measured grid's MGRS square labels, in points.
+const MGRS_LABEL_PT: f32 = 10.0;
+/// The places across and down a frame where [`mgrs_squares`] looks which square shows.
+const MGRS_SAMPLES: u32 = 32;
+
+/// Where a measured grid in UTM zone `zone` (`tr` its transformer) names its MGRS 100 km squares on
+/// a frame showing `map` in `view`: each square of the zone, and of each latitude band, that shows,
+/// by its grid zone designation and letters (`32T MT`), at the middle of what shows of it, in the
+/// frame's points. Only where all of the label, `size(text)` points across and down, stays in its
+/// square and well inside the frame, clear of the edge labels. Squares the zone's eastings reach
+/// past its edges (a frame across two zones) are named in the other zone, so not here.
+fn mgrs_squares(
+    map: &Map,
+    view: &View,
+    zone: u8,
+    tr: &rustgis_data::raster::Transformer,
+    size: impl Fn(&str) -> (f32, f32),
+) -> Vec<(String, f32, f32)> {
+    use rustgis_geom::utm;
+    let (w, h) = (view.width, view.height);
+    // The square, and band, a place on the frame is in: none outside the zone.
+    let square = |sx: f64, sy: f64| -> Option<(i64, i64, char)> {
+        let c = map.to_lonlat(view.camera.to_map(sx, sy, w, h))?;
+        // (A copy of the world past ±180° is the same place.)
+        let c = Coord::new((c.x + 180.0).rem_euclid(360.0) - 180.0, c.y);
+        if utm::utm_zone(c)? != zone {
+            return None;
+        }
+        let band = utm::latitude_band(c.y)?;
+        let p = tr.from_lonlat(c)?;
+        // Across the Equator from the grid's hemisphere, the northing MGRS gives there: the other
+        // hemisphere's, 10,000 km apart.
+        let y = match (c.y < 0.0, p.y) {
+            (true, y) if y < 0.0 => y + 10_000_000.0,
+            (false, y) if y >= 10_000_000.0 => y - 10_000_000.0,
+            (_, y) => y,
+        };
+        let (e, n) = ((p.x / 100_000.0).floor(), (y / 100_000.0).floor());
+        (e.is_finite() && n.is_finite()).then_some((e as i64, n as i64, band))
+    };
+    // Each square's samples: their sum across and down, and how many.
+    let mut seen: std::collections::BTreeMap<(i64, i64, char), (f64, f64, u32)> = std::collections::BTreeMap::new();
+    for i in 0..MGRS_SAMPLES {
+        for j in 0..MGRS_SAMPLES {
+            let (sx, sy) = (w * (f64::from(i) + 0.5) / f64::from(MGRS_SAMPLES), h * (f64::from(j) + 0.5) / f64::from(MGRS_SAMPLES));
+            if let Some(k) = square(sx, sy) {
+                let e = seen.entry(k).or_default();
+                *e = (e.0 + sx, e.1 + sy, e.2 + 1);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for ((e, n, band), (sx, sy, count)) in seen {
+        let mid = |k: i64| (k as f64 + 0.5) * 100_000.0;
+        let Some((column, row)) = utm::square_letters(zone, mid(e), mid(n)) else { continue };
+        let text = format!("{zone:02}{band} {column}{row}");
+        let (tw, th) = size(&text);
+        let (cx, cy) = (sx / f64::from(count), sy / f64::from(count));
+        let (hw, hh) = (f64::from(tw) / 2.0 + 2.0, f64::from(th) / 2.0 + 2.0);
+        // Clear of the edges' labels: three label heights in from each edge.
+        let margin = 3.0 * f64::from(th);
+        if cx - hw < margin || cx + hw > w - margin || cy - hh < margin || cy + hh > h - margin {
+            continue;
+        }
+        let corners = [(cx - hw, cy - hh), (cx + hw, cy - hh), (cx - hw, cy + hh), (cx + hw, cy + hh)];
+        if corners.iter().all(|&(x, y)| square(x, y) == Some((e, n, band))) {
+            out.push((text, cx as f32, cy as f32));
+        }
+    }
+    out
 }
 
 /// The graticule labels drawn, of those at each edge crossing (`labels`: edge, place along it,
@@ -1454,6 +1563,57 @@ fn scale_number(v: f64, step: f64) -> String {
     if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
 }
 
+/// The share of its element's width a scale bar's length may take.
+const BAR_SHARE: f64 = 0.85;
+/// A scale bar's labels' size, and how far its bar starts in from the element's left edge, in
+/// pixels: at most as many points at a pixel a point or more, which [`scale_bar_width_pt`] counts.
+const BAR_LABEL_PT: f32 = 8.0;
+const BAR_INSET: f32 = 2.0;
+
+/// What a scale bar counts: its whole length in its unit, that unit in metres and its abbreviation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarPlan {
+    total: f64,
+    unit_m: f64,
+    abbr: &'static str,
+}
+
+/// The bar a scale bar draws in an element `width_pt` points wide at `ground_per_pt` ground metres
+/// a point: the roundest length within [`BAR_SHARE`] of the width. `None` when it draws none.
+fn bar_plan(ground_per_pt: f64, width_pt: f64, units: ScaleUnits) -> Option<BarPlan> {
+    if !(ground_per_pt.is_finite() && ground_per_pt > 0.0 && width_pt.is_finite()) {
+        return None;
+    }
+    let room_m = ground_per_pt * width_pt * BAR_SHARE;
+    let (unit_m, abbr) = units.resolve(rustgis_geom::nice_distance(room_m));
+    let total = rustgis_geom::nice_distance(room_m / unit_m);
+    (total > 0.0).then_some(BarPlan { total, unit_m, abbr })
+}
+
+/// A scale bar's label at division `i` of `divisions`, the last with the unit.
+fn bar_label(total: f64, divisions: usize, i: usize, abbr: &str, comma: bool) -> String {
+    let v = decimal(scale_number(total * i as f64 / divisions as f64, total / divisions as f64), comma);
+    if i == divisions { format!("{v} {abbr}") } else { v }
+}
+
+/// The narrowest element, in points, in which a scale bar draws the same bar as in one `width_pt`
+/// wide (its length, unit and divisions), its last label and `pad_pt` after it included, so a box
+/// can be the size of its bar (#1379). `width_pt` when no narrower one draws that bar; `None` when
+/// it draws none.
+pub fn scale_bar_width_pt(ground_per_pt: f64, width_pt: f64, bar: (ScaleUnits, usize), comma: bool, pad_pt: f64) -> Option<f64> {
+    let (units, divisions) = bar;
+    let plan = bar_plan(ground_per_pt, width_pt, units)?;
+    let divisions = divisions.clamp(1, rustgis_map::layout::MAX_SCALE_DIVISIONS);
+    let len = plan.total * plan.unit_m / ground_per_pt;
+    let last = bar_label(plan.total, divisions, divisions, plan.abbr, comma);
+    let half = f64::from(text::measure(&last, BAR_LABEL_PT, false)) / 2.0;
+    // A little over the share the bar takes, so the f32 rectangle an export rebuilds the width
+    // from (its error growing with the element's place on the page) doesn't pick the next shorter
+    // length: a ten-thousandth, 0.003 mm on a 30 mm box.
+    let w = (len / BAR_SHARE * (1.0 + 1e-4)).max(f64::from(BAR_INSET) + len + half + pad_pt);
+    Some(if w < width_pt && bar_plan(ground_per_pt, w, units) == Some(plan) { w } else { width_pt })
+}
+
 /// A scale bar filling most of the element's width, in `units`, with `divisions` labelled steps.
 /// `ground_per_pt` is ground metres per logical point of paper; `colors` are its lines, dark
 /// divisions and labels, then the alternating bar's light divisions.
@@ -1468,19 +1628,11 @@ fn scale_bar(
 ) {
     let (units, divisions, style) = bar;
     let (dark, light) = colors;
-    if !(ground_per_pt.is_finite() && ground_per_pt > 0.0) {
-        return;
-    }
     let divisions = divisions.clamp(1, rustgis_map::layout::MAX_SCALE_DIVISIONS);
-    let room_m = ground_per_pt * r.width() as f64 / ppp * 0.85;
-    let (unit_m, abbr) = units.resolve(rustgis_geom::nice_distance(room_m));
-    let total = rustgis_geom::nice_distance(room_m / unit_m);
-    if total <= 0.0 {
-        return;
-    }
+    let Some(BarPlan { total, unit_m, abbr }) = bar_plan(ground_per_pt, f64::from(r.width()) / ppp, units) else { return };
     let len = (total * unit_m / ground_per_pt * ppp) as f32;
     let bar_h = (r.height() * 0.28).min(6.0 * ppp as f32);
-    let (x0, y0) = (r.x() + 2.0, r.y() + r.height() * 0.62 - bar_h / 2.0);
+    let (x0, y0) = (r.x() + BAR_INSET, r.y() + r.height() * 0.62 - bar_h / 2.0);
     let seg = len / divisions as f32;
     let line = Stroke { width: 0.6 * ppp as f32, ..Stroke::default() };
     let stroke = |pm: &mut Canvas, pts: &[(f32, f32)], w: &Stroke| {
@@ -1526,15 +1678,10 @@ fn scale_bar(
     }
     // Labels at the divisions, the last with the unit; one that would touch its neighbour is left
     // out (never the ends).
-    let px = 8.0 * 1.33 * ppp as f32;
+    let px = BAR_LABEL_PT * 1.33 * ppp as f32;
     let ty = y0 - px * 0.7;
     let gap = 3.0 * ppp as f32;
-    let labels: Vec<(f32, String)> = (0..=divisions)
-        .map(|i| {
-            let v = decimal(scale_number(total * i as f64 / divisions as f64, total / divisions as f64), comma);
-            (x0 + seg * i as f32, if i == divisions { format!("{v} {abbr}") } else { v })
-        })
-        .collect();
+    let labels: Vec<(f32, String)> = (0..=divisions).map(|i| (x0 + seg * i as f32, bar_label(total, divisions, i, abbr, comma))).collect();
     let half = |s: &str| text::measure(s, px / 1.33, false) / 2.0;
     let last = labels.last().map(|(x, s)| x - half(s)).unwrap_or(f32::MAX);
     let mut right = f32::MIN;
@@ -4457,11 +4604,93 @@ Elaboração: RustGIS",
         let mut short = Vec::new();
         measured_lines(&Grid { short: true, ..utm.clone() }, &tr, &frame, false, &mut short);
         assert!(short.iter().any(|l| l.2 && l.1 == "79") && short.iter().any(|l| !l.2 && l.1 == "61"));
+        // MGRS labels: an interval picked for the frame is at most 100 km, a square's side.
+        let country: Vec<Coord> = [(3.0, 43.0), (15.0, 43.0), (15.0, 52.0), (3.0, 52.0)].iter().map(|&(x, y)| Coord::new(x, y)).collect();
+        let tr32 = rustgis_data::raster::Crs::from_epsg(32632).unwrap().transformer().unwrap();
+        let step_of = |g: &Grid| {
+            let mut l = Vec::new();
+            measured_lines(g, &tr32, &country, false, &mut l);
+            let mut xs: Vec<f64> = l.iter().filter(|l| l.2).filter_map(|l| l.1.parse::<f64>().ok()).collect();
+            xs.sort_by(f64::total_cmp);
+            xs.windows(2).map(|w| w[1] - w[0]).fold(f64::INFINITY, f64::min)
+        };
+        let plain = Grid { step: 0.0, ..utm.clone() };
+        assert_eq!(step_of(&plain), 200_000.0);
+        assert_eq!(step_of(&Grid { mgrs: true, ..plain }), 100_000.0);
         // A frame of no extent draws none.
         let mut none = Vec::new();
         measured_lines(&utm, &tr, &[], false, &mut none);
         assert!(none.is_empty());
         assert_eq!((nice_step(2000.0, 1.0), nice_step(7000.0, 1.0), nice_step(1.0, 1.0)), (500.0, 1000.0, 1.0));
+    }
+
+    /// A measured grid labelled as MGRS names each 100 km square that shows, by its grid zone
+    /// designation and letters, where the label fits in it: one square over Winterthur at
+    /// 1:25,000, several at 1:2,000,000, each label in the square it names; in zone 32 only on a
+    /// frame across its edge with zone 33; both bands across the Equator; none on a frame too small
+    /// for a label. The grid is in UTM 32N for MGRS on a map in it, and in the frame's MGRS zone
+    /// (Norway's and Svalbard's exceptions kept) over LV95 or Web Mercator.
+    #[test]
+    fn mgrs_labels_name_the_100_km_squares() {
+        use rustgis_map::layout::{Grid, GridKind};
+        let map = Map::new("m");
+        let tr = rustgis_data::raster::Crs::from_epsg(32632).unwrap().transformer().unwrap();
+        // (A label's size fixed, not measured: the fonts installed differ between machines.)
+        let size = |_: &str| (40.0_f32, 16.0_f32);
+        let view = |center: Coord, scale: f64, mm: f64| View {
+            width: mm * PT_PER_MM,
+            height: mm * PT_PER_MM,
+            pixels_per_point: 1.0,
+            camera: frame_camera(&map, center, scale, 0.0, 0.0),
+            sky: false,
+        };
+        let at = |v: &View, x: f32, y: f32| map.to_lonlat(v.camera.to_map(f64::from(x), f64::from(y), v.width, v.height)).unwrap();
+        let near = view(Coord::new(8.73, 47.5), 25_000.0, 80.0);
+        let one = mgrs_squares(&map, &near, 32, &tr, size);
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert_eq!(one[0].0, "32T MT");
+        assert!((f64::from(one[0].1) - near.width / 2.0).abs() < 2.0 && (f64::from(one[0].2) - near.height / 2.0).abs() < 2.0);
+        let wide = view(Coord::new(8.73, 47.5), 2_000_000.0, 80.0);
+        let many = mgrs_squares(&map, &wide, 32, &tr, size);
+        assert!(many.len() >= 2, "{many:?}");
+        for (text, x, y) in &many {
+            let named = rustgis_geom::to_mgrs(at(&wide, *x, *y), 0).unwrap().to_string();
+            assert_eq!(&named, text);
+        }
+        // Across the edge with zone 33 at 12° E: only zone 32's squares, west of it.
+        let edge = view(Coord::new(11.0, 47.5), 2_000_000.0, 80.0);
+        let west = mgrs_squares(&map, &edge, 32, &tr, size);
+        assert!(!west.is_empty() && west.iter().all(|(t, x, y)| t.starts_with("32") && at(&edge, *x, *y).x < 12.0), "{west:?}");
+        assert!(mgrs_squares(&map, &view(Coord::new(8.73, 47.5), 25_000.0, 15.0), 32, &tr, size).is_empty());
+        // Across the Equator, a northern zone's grid names the southern squares too, as MGRS does.
+        let equator = view(Coord::new(9.0, 0.0), 2_000_000.0, 80.0);
+        let both = mgrs_squares(&map, &equator, 32, &tr, size);
+        for band in ["32N ", "32M "] {
+            assert!(both.iter().any(|(t, ..)| t.starts_with(band)), "{band}: {both:?}");
+        }
+        for (text, x, y) in &both {
+            assert_eq!(&rustgis_geom::to_mgrs(at(&equator, *x, *y), 0).unwrap().to_string(), text);
+        }
+        // Its system: UTM 32N on a map in it or over LV95 (the frame's zone), the one named.
+        let g = Grid { kind: GridKind::Measured, mgrs: true, ..Grid::default() };
+        let c = Coord::new(8.73, 47.5);
+        let on = |code: &str| {
+            let mut m = Map::new("m");
+            m.projection = rustgis_map::Projection::Custom(code.into());
+            m
+        };
+        assert_eq!(measured_crs(&g, &on("EPSG:32632"), Coord::new(14.0, 47.5)).map(|c| c.epsg()), Some(32632));
+        assert_eq!(measured_crs(&g, &on("EPSG:2056"), c).map(|c| c.epsg()), Some(32632));
+        assert_eq!(measured_crs(&g, &map, c).map(|c| c.epsg()), Some(32632));
+        // MGRS's zone at the centre: Bergen's 32V, Svalbard's 33X; a plain measured grid's 6° one.
+        assert_eq!(measured_crs(&g, &map, Coord::new(5.3, 60.4)).map(|c| c.epsg()), Some(32632));
+        assert_eq!(measured_crs(&g, &map, Coord::new(10.0, 78.0)).map(|c| c.epsg()), Some(32633));
+        assert_eq!(measured_crs(&g, &map, Coord::new(9.0, -1.0)).map(|c| c.epsg()), Some(32732));
+        let plain = Grid { mgrs: false, ..g.clone() };
+        assert_eq!(measured_crs(&plain, &map, Coord::new(5.3, 60.4)).map(|c| c.epsg()), Some(32631));
+        let named = Grid { crs: Some("EPSG:32733".into()), ..g.clone() };
+        assert_eq!(measured_crs(&named, &map, c).map(|c| c.epsg()), Some(32733));
+        assert_eq!(measured_crs(&Grid { crs: Some("EPSG:2056".into()), ..g }, &map, c), None);
     }
 
     #[test]
@@ -4729,6 +4958,58 @@ Elaboração: RustGIS",
             assert!(dark < 20, "{style:?}: {dark} dark pixels across the bar");
             assert_ne!(pm.data(), four.data());
         }
+    }
+
+    /// The narrowest element keeps its bar where an export rebuilds it from an f32 rectangle: near
+    /// an A2 sheet's right edge, at 300 and 600 dpi (#1379).
+    #[test]
+    fn a_scale_bar_keeps_its_bar_near_the_right_edge_at_print_density() {
+        // As an export places an element: page mm at `k` pixels a mm, `ppp` pixels a point.
+        let pt_per_mm = rustgis_map::layout::PT_PER_MM;
+        for i in 0..400 {
+            let ground = 10f64.powf(-1.0 + 4.0 * f64::from(i) / 400.0);
+            for widest_mm in [25.0, 63.0, 126.0] {
+                let w_pt = scale_bar_width_pt(ground, widest_mm * pt_per_mm, (ScaleUnits::Auto, 4), false, 4.0).unwrap();
+                let plan = bar_plan(ground, w_pt, ScaleUnits::Auto);
+                for (x_mm, dpi) in [(380.0, 300.0), (560.0, 300.0), (380.0, 600.0), (560.0, 600.0)] {
+                    let k = dpi / 25.4;
+                    let ppp = k / pt_per_mm;
+                    let r = Rect::from_xywh((x_mm * k) as f32, 0.0, (w_pt / pt_per_mm * k) as f32, 10.0).unwrap();
+                    let drawn = bar_plan(ground, f64::from(r.width()) / ppp, ScaleUnits::Auto);
+                    assert_eq!(drawn, plan, "{ground} m a point, {widest_mm} mm at most, x {x_mm} mm, {dpi} dpi");
+                }
+            }
+        }
+    }
+
+    /// The narrowest element for a scale bar draws the very bar a wider one does, labels and all,
+    /// within itself (#1379).
+    #[test]
+    fn a_scale_bar_draws_the_same_in_its_narrowest_element() {
+        let draw = |ground: f64, width: f32| {
+            let mut pm = Pixmap::new(320, 60).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            let r = Rect::from_xywh(0.0, 0.0, width, 60.0).unwrap();
+            let colors = (Rgba::rgb(0x22, 0x22, 0x22), Rgba::rgb(0xFF, 0xFF, 0xFF));
+            crate::canvas::with_canvas(&mut pm, |c| {
+                scale_bar(c, r, ground, (ScaleUnits::Auto, 4, ScaleBarStyle::Alternating), colors, 1.0, true)
+            });
+            pm
+        };
+        // 20 km on a bar of 300 points takes two thirds of it; 10 km at 37.2 m a point, a third.
+        for (ground, narrower_than) in [(100.0, 260.0), (37.2, 190.0), (78.4, 300.0)] {
+            let w = scale_bar_width_pt(ground, 300.0, (ScaleUnits::Auto, 4), true, 4.0).unwrap();
+            assert!(w < narrower_than, "{ground} m a point: {w} points");
+            let (wide, narrow) = (draw(ground, 300.0), draw(ground, w as f32));
+            assert_eq!(wide.data(), narrow.data(), "{ground} m a point: the same bar in {w} points");
+            let past =
+                (w.ceil() as u32..320).flat_map(|x| (0..60).map(move |y| (x, y))).filter(|&(x, y)| narrow.pixel(x, y).is_some_and(ink));
+            assert_eq!(past.count(), 0, "{ground} m a point: nothing drawn past {w} points");
+        }
+        assert_eq!(scale_bar_width_pt(0.0, 300.0, (ScaleUnits::Auto, 4), false, 4.0), None);
+        // Miles count in other lengths: the box still draws the same bar.
+        let w = scale_bar_width_pt(100.0, 300.0, (ScaleUnits::Miles, 4), false, 4.0).unwrap();
+        assert!(w <= 300.0 && bar_plan(100.0, w, ScaleUnits::Miles) == bar_plan(100.0, 300.0, ScaleUnits::Miles));
     }
 
     #[test]

@@ -255,6 +255,11 @@ impl Geocoder {
                 found.limited = entries.len().saturating_sub(i);
                 break;
             }
+            if self.kind == Kind::Census
+                && e.get("matchedAddress").and_then(Value::as_str).is_some_and(|name| name.chars().nth(500).is_some())
+            {
+                return Err("the Census geocoder's matched address exceeds 500 characters".into());
+            }
             match place(e) {
                 Some(p) => found.places.push(p),
                 None => found.skipped += 1,
@@ -469,6 +474,20 @@ mod tests {
                 limited: 0
             }
         );
+        // A service label at the bound is preserved; one beyond it is refused, never cut silently.
+        for n in [500, 501] {
+            let name = "é".repeat(n);
+            let bytes = serde_json::to_vec(&serde_json::json!({"result":{"addressMatches":[
+                {"matchedAddress":name,"coordinates":{"x":-77,"y":38}}
+            ]}}))
+            .unwrap();
+            let answer = g.read(&bytes);
+            if n == 500 {
+                assert_eq!(answer.unwrap().places[0].name, name);
+            } else {
+                assert!(answer.unwrap_err().contains("exceeds 500 characters"));
+            }
+        }
         assert_eq!(g.read(br#"{"result":{"addressMatches":[]}}"#).unwrap(), Found::default());
         let mixed = br#"{"result":{"addressMatches":[{"coordinates":{"x":-76.9,"y":38.8}}, {"coordinates":{"x":-76.9,"y":91}}, {"coordinates":{"x":"NaN","y":38}}, null]}}"#;
         let f = g.read(mixed).unwrap();

@@ -183,6 +183,10 @@ fn rustgis_tiles_max() -> usize {
     crate::render::rustgis_tiles::geocode::MAX_BATCH
 }
 
+/// Turns addresses into points; desktop dialogs fetch off-frame and supply `places`.
+/// Without `places`, native lookup is synchronous, including the existing Script pane
+/// fallback, with no progress or Cancel. Moving that path off-frame needs cached network
+/// answers for script replay, so requests and later row-dependent commands are not repeated.
 fn geocode(s: &mut Session, p: &Value) -> CmdResult {
     let g = geocoder(p)?;
     let (rows, distinct) = addresses(s, p)?;

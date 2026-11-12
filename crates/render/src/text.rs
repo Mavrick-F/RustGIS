@@ -928,6 +928,7 @@ impl Edt {
             z[k + 1] = f64::INFINITY;
         }
         k = 0;
+        // (`out` holds `n` values, one for each q.)
         for (q, out) in self.out.iter_mut().enumerate() {
             while z[k + 1] < q as f64 {
                 k += 1;
