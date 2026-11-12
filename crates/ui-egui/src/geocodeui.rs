@@ -25,6 +25,10 @@ pub struct State {
     /// Whether a search is under way.
     pub searching: bool,
     job: Option<Job>,
+    /// Batch pacing survives completion and cancellation, so a restart cannot reset it.
+    sent: Option<Instant>,
+    /// A cancelled run's request must finish before another batch can send anything.
+    cancelled: Option<Answer>,
 }
 
 /// A table's addresses being geocoded.
@@ -36,7 +40,6 @@ struct Job {
     next: usize,
     found: Map<String, Value>,
     waiting: Option<(String, Answer)>,
-    sent: Option<Instant>,
     /// Requests that failed (not "not found"), and how many in a row; the last error.
     failed: usize,
     in_a_row: usize,
@@ -96,7 +99,14 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             None => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
         }
     }
-    let Some(job) = &mut app.ui.geocode.job else { return };
+    if let Some(slot) = &st.cancelled {
+        if take(slot).is_none() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        st.cancelled = None;
+    }
+    let Some(job) = &mut st.job else { return };
     if let Some((q, slot)) = &job.waiting {
         let Some(r) = take(slot) else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -134,17 +144,17 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             ctx.request_repaint();
             return;
         }
-        let due = job.sent.is_none_or(|t| t.elapsed().as_millis() as u64 >= job.g.spacing_ms());
+        let due = st.sent.is_none_or(|t| t.elapsed().as_millis() as u64 >= job.g.spacing_ms());
         if due {
             job.waiting = Some((q.clone(), fetch(&job.g.url(q, 1))));
-            job.sent = Some(Instant::now());
+            st.sent = Some(Instant::now());
             job.next += 1;
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
         return;
     }
     // Every answer is in: the layer.
-    let Some(job) = app.ui.geocode.job.take() else { return };
+    let Some(job) = st.job.take() else { return };
     if job.skipped > 0 {
         app.session.warn(skipped(job.skipped));
     }
@@ -183,7 +193,8 @@ fn ui_error(error: String) -> String {
 }
 
 /// Progress stays visible after the dialog closes. Cancel discards this run, including an
-/// answer already in flight: its download may finish, but cannot add a layer or send more work.
+/// answer already in flight: its download may finish, but cannot add a layer. A restarted batch
+/// waits for that download and keeps the previous request's pacing timestamp.
 pub fn status(app: &mut RustGisApp, ui: &mut egui::Ui) {
     let Some(job) = &app.ui.geocode.job else { return };
     ui.separator();
@@ -197,7 +208,11 @@ pub fn status(app: &mut RustGisApp, ui: &mut egui::Ui) {
             .desired_height(12.0),
     );
     if ui.small_button(tl!("Cancel")).clicked() {
-        app.ui.geocode.job = None;
+        if let Some(job) = app.ui.geocode.job.take()
+            && let Some((_, slot)) = job.waiting
+        {
+            app.ui.geocode.cancelled = Some(slot);
+        }
         app.session.notify(tl!("Geocoding cancelled; no layer was added.").to_string(), false);
     }
 }
@@ -399,7 +414,6 @@ pub fn geocode(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             next: 0,
             found: Map::new(),
             waiting: None,
-            sent: None,
             failed: 0,
             in_a_row: 0,
             error: None,
@@ -422,6 +436,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
         let slot = Answer::default();
+        app.ui.geocode.sent = Some(Instant::now() - std::time::Duration::from_secs(2));
         app.ui.geocode.job = Some(Job {
             g: Geocoder::new(Some("census"), None).unwrap(),
             params: json!({"provider":"census", "table":"addresses", "address":"address"}),
@@ -429,7 +444,6 @@ mod tests {
             next: 1,
             found: Map::new(),
             waiting: Some(("first".into(), slot.clone())),
-            sent: Some(Instant::now()),
             failed: 0,
             in_a_row: 0,
             error: None,
@@ -450,9 +464,37 @@ mod tests {
         h.get_by_label("Cancel").click();
         h.step();
         assert!(h.state().ui.geocode.job.is_none());
+        assert!(h.state().ui.geocode.cancelled.is_some());
+        let sent = h.state().ui.geocode.sent;
+        // Restart before the cancelled download answers: even after its pacing interval,
+        // a new batch must not put a second request on the wire.
+        h.state_mut().ui.geocode.job = Some(Job {
+            g: Geocoder::new(Some("census"), Some("http://127.0.0.1:1")).unwrap(),
+            params: json!({"provider":"census", "table":"addresses", "address":"address"}),
+            queue: vec!["third".into()],
+            next: 0,
+            found: Map::new(),
+            waiting: None,
+            failed: 0,
+            in_a_row: 0,
+            error: None,
+            skipped: 0,
+            limited: 0,
+        });
+        h.step();
+        let restart = h.state().ui.geocode.job.as_ref().unwrap();
+        assert_eq!(restart.next, 0);
+        assert!(restart.waiting.is_none());
+        assert_eq!(h.state().ui.geocode.sent, sent, "restarting preserves the last send time");
+        // Cancelling a run which has not sent anything must retain the older download.
+        h.get_by_label("Cancel").click();
+        h.step();
+        assert!(h.state().ui.geocode.cancelled.is_some());
         *slot.lock().unwrap() = Some(Ok(br#"{"result":{"addressMatches":[{"coordinates":{"x":-77,"y":38}}]}}"#.to_vec()));
         h.step();
         assert!(h.state().ui.geocode.job.is_none());
+        assert!(h.state().ui.geocode.cancelled.is_none());
+        assert_eq!(h.state().ui.geocode.sent, sent);
         assert!(h.state().session.map().layers.is_empty());
         assert!(h.state().session.notices.iter().any(|n| n.text.contains("Geocoding cancelled")));
     }
@@ -496,7 +538,6 @@ mod tests {
                 next: 1,
                 found: Map::new(),
                 waiting: Some(("A".into(), slot)),
-                sent: None,
                 failed: 0,
                 in_a_row: 0,
                 error: None,
