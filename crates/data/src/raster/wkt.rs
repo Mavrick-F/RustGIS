@@ -151,7 +151,7 @@ impl Parser<'_> {
         let close = match self.peek() {
             Some(b'[') => b']',
             Some(b'(') => b')',
-            _ => return Err(format!("expected '[' after {name}")),
+            _ => return Err(format!("expected '[' after {}", clip(&name))),
         };
         self.at += 1;
         let mut items = Vec::new();
@@ -173,7 +173,7 @@ impl Parser<'_> {
                     self.at += 1;
                     return Ok(Node { name, items });
                 }
-                _ => return Err(format!("unexpected text in {name}")),
+                _ => return Err(format!("unexpected text in {}", clip(&name))),
             };
             items.push(item);
             match self.peek() {
@@ -182,7 +182,7 @@ impl Parser<'_> {
                     self.at += 1;
                     return Ok(Node { name, items });
                 }
-                _ => return Err(format!("expected ',' in {name}")),
+                _ => return Err(format!("expected ',' in {}", clip(&name))),
             }
         }
     }
@@ -216,7 +216,7 @@ impl Parser<'_> {
             self.at += 1;
         }
         let t = std::str::from_utf8(self.s.get(start..self.at).unwrap_or_default()).unwrap_or("");
-        t.parse().map_err(|_| format!("'{t}' isn't a number"))
+        t.parse().map_err(|_| format!("'{}' isn't a number", clip(t)))
     }
 }
 
@@ -303,6 +303,37 @@ pub fn read_wkt_over_code(text: &str, code: u32) -> Option<Result<(Crs, Option<S
     Some(read_tree(&root, Some(code)))
 }
 
+/// What is said when WKT `text` gives a shift to WGS 84 other than PROJ definition `def`'s, and
+/// the system is read by `def` (named `name`) all the same, because of `why`. `None` when the
+/// text gives no shift, or `def`'s, as [`read_wkt_over_code`] tells them apart.
+///
+/// A definition that gives no shift counts as a shift of zero only on WGS 84 or GRS 1980
+/// ([`bundled_shift`]). On another ellipsoid it matches no shift the text gives, not even zero:
+/// proj4rs then changes no datum, not even the ellipsoid, which any shift, zero too, would change.
+/// The note then says the ellipsoid beside the shift.
+pub(crate) fn set_aside_shift_note(text: &str, name: &str, def: &str, why: &str) -> Option<String> {
+    let defs_shift = bundled_shift(def);
+    let (another, zero) = match tree(text) {
+        Ok(root) => {
+            let shift = towgs84(geogcs(&root).and_then(|g| g.child("DATUM")));
+            (shift.as_ref().is_some_and(|s| !matches_shift(defs_shift, s)), shift.is_some_and(|s| s.iter().all(|v| *v == 0.0)))
+        }
+        // A bound system that can't be read still gives a transformation.
+        Err(_) => (parse(text).is_ok_and(|n| has_bound_transformation(&n, 0)), false),
+    };
+    let codes_shift = defs_shift.is_some_and(|s| s.iter().any(|v| *v != 0.0));
+    let ellipsoid = "is read on its own ellipsoid without it, so positions may be off by";
+    another.then(|| match (defs_shift, zero) {
+        (None, true) => format!(
+            "the file's shift of zero to WGS 84 is set aside, because {why}, and {name} {ellipsoid} the difference between that ellipsoid and WGS 84's"
+        ),
+        (None, false) => format!(
+            "the file's own shift to WGS 84 is set aside, because {why}, and {name} {ellipsoid} as much as that shift and the difference between that ellipsoid and WGS 84's"
+        ),
+        _ => set_aside_wording(name, codes_shift, why),
+    })
+}
+
 /// Whether a parsed WKT2 text holds a `BOUNDCRS` with a transformation of its own, whether or not
 /// [`bound`] can read it. The bound system may be nested: a compound system's horizontal part,
 /// or another bound system's source. A transformation outside a `BOUNDCRS` shifts no system.
@@ -367,14 +398,20 @@ fn code_with_shift(crs: Crs) -> Option<u16> {
 /// ([`unapplied`]), or of a bound system without a transformation ([`untransformed`]); `whose`
 /// says whose it is (`the file's`), and `crs` is the system it is read as.
 fn dropped_note(root: &Node, whose: &str, crs: Crs) -> Option<String> {
+    dropped_note_by(root, whose, code_with_shift(crs).map(|code| format!("EPSG:{code}")).as_deref())
+}
+
+/// [`dropped_note`] for a system read by `by`, a code whose own shift to WGS 84 is used in place
+/// of one the file gives that isn't applied, or by none.
+fn dropped_note_by(root: &Node, whose: &str, by: Option<&str>) -> Option<String> {
     let datum = geogcs(root).and_then(|g| g.child("DATUM"));
     // On the source's datum, or on the source itself when it has none ([`put_mark`]).
     if let Some(what) = unapplied(datum).or_else(|| mark(Some(root), UNAPPLIED)) {
         let what = clip(&what);
-        // Read by an EPSG code whose own shift is applied in its place: off by the difference.
-        return Some(match code_with_shift(crs) {
+        // Read by a code whose own shift is applied in its place: off by the difference.
+        return Some(match by {
             Some(code) => format!(
-                "{whose} {what} isn't applied; EPSG:{code}'s own shift to WGS 84 is used in its place, so positions may be off by the difference between the two"
+                "{whose} {what} isn't applied; {code}'s own shift to WGS 84 is used in its place, so positions may be off by the difference between the two"
             ),
             None => format!("{whose} {what} isn't applied, so positions may be off by as much as that shift"),
         });
@@ -388,6 +425,13 @@ fn dropped_note(root: &Node, whose: &str, crs: Crs) -> Option<String> {
 /// note. `None` for text that isn't WKT.
 pub fn unapplied_note(text: &str, crs: Crs) -> Option<String> {
     dropped_note(&tree(text).ok()?, "the definition's", crs)
+}
+
+/// [`unapplied_note`] for a system read by PROJ definition `def`, named `name` (an Esri code), whose
+/// own shift to WGS 84, when it has one, is used in place of the one the text gives.
+pub(crate) fn unapplied_note_beside(text: &str, name: &str, def: &str) -> Option<String> {
+    let by = bundled_shift(def).is_some_and(|s| s.iter().any(|v| *v != 0.0)).then_some(name);
+    dropped_note_by(&tree(text).ok()?, "the definition's", by)
 }
 
 /// The notes a coordinate system given as text keeps when [`Crs::parse`] reads it as `crs`: its
@@ -443,11 +487,16 @@ fn set_aside_note(code: u32, by_code: Crs, why: &str) -> String {
     // either.
     let codes_shift = !matches!(by_code, Crs::LonLat | Crs::WebMercator)
         && u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift).is_some_and(|s| s.iter().any(|v| *v != 0.0));
+    set_aside_wording(&format!("EPSG:{code}"), codes_shift, why)
+}
+
+/// [`set_aside_note`] for the system `name`, which has a shift of its own (`codes_shift`) or none.
+fn set_aside_wording(name: &str, codes_shift: bool, why: &str) -> String {
     if codes_shift {
-        format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {why}")
+        format!("the file's own shift to WGS 84 is set aside for {name}'s, because {why}")
     } else {
         format!(
-            "the file's own shift to WGS 84 is set aside, because {why}, and EPSG:{code} is read without it, so positions may be off by as much as that shift"
+            "the file's own shift to WGS 84 is set aside, because {why}, and {name} is read without it, so positions may be off by as much as that shift"
         )
     }
 }
@@ -489,7 +538,7 @@ fn read_system(root: &Node) -> Result<(Crs, Option<String>), String> {
             let note = with_projection_note(note, root, crs);
             Ok((crs, note))
         }
-        other => Err(format!("{other} coordinate systems aren't supported")),
+        other => Err(format!("{} coordinate systems aren't supported", clip(other))),
     }
 }
 
@@ -723,7 +772,7 @@ fn geographic2(g: &Node, top: bool) -> Result<Node, String> {
         && let Some(Item::Word(kind)) = cs.items.first()
         && !kind.eq_ignore_ascii_case("ellipsoidal")
     {
-        return Err(format!("{kind} coordinate systems aren't supported"));
+        return Err(format!("{} coordinate systems aren't supported", clip(kind)));
     }
     // Longitudes counted west (planetographic ones, on most bodies) would be read as east, which
     // mirrors the data. Such a system is refused here unless it is read by its EPSG code. Its
@@ -740,7 +789,7 @@ fn geographic2(g: &Node, top: bool) -> Result<Node, String> {
         let mut datum = Vec::new();
         if let Some(e) = d.child_of(&["ELLIPSOID", "SPHEROID"]) {
             let to_m = factor(e.child_of(&LENGTH_UNIT)).unwrap_or(1.0);
-            let a = e.num(0).ok_or_else(|| format!("the ellipsoid {} has no semi-major axis", e.title()))?;
+            let a = e.num(0).ok_or_else(|| format!("the ellipsoid {} has no semi-major axis", clip(e.title())))?;
             let axes = std::iter::once(a * to_m).chain(e.num(1)).map(Item::Num);
             datum.push(Item::Node(Node::new("SPHEROID", e.title(), axes)));
         }
@@ -1042,7 +1091,7 @@ fn onward_shift(target: &Node) -> Result<[f64; 7], String> {
                 "" => "the bound system's target",
                 t => t,
             };
-            return Err(format!("{name} gives a shift of zero to WGS 84 where its datum has one"));
+            return Err(format!("{} gives a shift of zero to WGS 84 where its datum has one", clip(name)));
         }
         return Ok(std::array::from_fn(|i| shift.get(i).copied().unwrap_or(0.0)));
     }
@@ -1058,7 +1107,7 @@ fn onward_shift(target: &Node) -> Result<[f64; 7], String> {
                 "" => "the bound system's target",
                 t => t,
             };
-            Err(format!("the shift from {name} to WGS 84 isn't known"))
+            Err(format!("the shift from {} to WGS 84 isn't known", clip(name)))
         }
     }
 }
@@ -1098,10 +1147,6 @@ fn compose(first: &[f64], second: [f64; 7]) -> Result<Vec<f64>, String> {
 /// the datums taken for it and Web Mercator. A datum with no bundled shift (NAD 27's is a grid)
 /// matches none.
 fn matches_bundled_shift(code: u32, shift: &[f64]) -> bool {
-    // Writers round the last digit differently: GDAL writes Hong Kong 1980's rotations as
-    // -2.243648″ and -1.158828″, the bundled shift has -2.243649″ and -1.158827″. Differences
-    // under 1e-5 (metres, arc-seconds or parts per million) move a point less than a millimetre.
-    const ROUNDING: f64 = 1e-5;
     // Web Mercator's datum is WGS 84, so its shift is none. (It projects as if on a sphere, which
     // EPSG:3785 gives as its datum's ellipsoid.)
     let bundled = if Crs::from_epsg(code) == Some(Crs::WebMercator) {
@@ -1109,6 +1154,16 @@ fn matches_bundled_shift(code: u32, shift: &[f64]) -> bool {
     } else {
         u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift)
     };
+    matches_shift(bundled, shift)
+}
+
+/// Whether `shift` (three or seven parameters) is `bundled`, a definition's shift
+/// ([`bundled_shift`]). `None` matches none.
+fn matches_shift(bundled: Option<[f64; 7]>, shift: &[f64]) -> bool {
+    // Writers round the last digit differently: GDAL writes Hong Kong 1980's rotations as
+    // -2.243648″ and -1.158828″, the bundled shift has -2.243649″ and -1.158827″. Differences
+    // under 1e-5 (metres, arc-seconds or parts per million) move a point less than a millimetre.
+    const ROUNDING: f64 = 1e-5;
     let Some(bundled) = bundled else { return false };
     bundled.iter().enumerate().all(|(i, b)| (shift.get(i).copied().unwrap_or(0.0) - b).abs() < ROUNDING)
 }
@@ -1143,7 +1198,7 @@ fn geographic(g: &Node) -> Result<Crs, String> {
     if let Some(f) = g.child("UNIT").and_then(|u| u.num(0))
         && (f - 1f64.to_radians()).abs() > 1e-9
     {
-        return Err(format!("angles in {} aren't supported", g.child("UNIT").map_or("", Node::title)));
+        return Err(format!("angles in {} aren't supported", clip(g.child("UNIT").map_or("", Node::title))));
     }
     let datum = g.child("DATUM");
     let greenwich = g.child("PRIMEM").and_then(|m| m.num(0)).is_none_or(|pm| pm == 0.0);
@@ -1440,8 +1495,8 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
     // and PROJ alike (the Swiss case is `somerc` below), so refuse it instead of placing points
     // wrong.
     let omerc = |no_uoff: bool| -> Result<String, String> {
-        let azimuth =
-            get(&["AZIMUTH"]).ok_or_else(|| format!("the {} projection has no azimuth", p.child("PROJECTION").map_or("", Node::title)))?;
+        let azimuth = get(&["AZIMUTH"])
+            .ok_or_else(|| format!("the {} projection has no azimuth", clip(p.child("PROJECTION").map_or("", Node::title))))?;
         if (azimuth.rem_euclid(180.0) - 90.0).abs() < 1e-10 {
             return Err("a Hotine projection with its azimuth at 90° (or 270°) isn't supported".into());
         }
@@ -1561,7 +1616,7 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
         {
             return Err(format!(
                 "the {} projection with a parameter that isn't a finite number isn't supported",
-                p.child("PROJECTION").map_or("", Node::title)
+                clip(p.child("PROJECTION").map_or("", Node::title))
             ));
         }
         // None of the three has a scale factor, and PROJ ignores one. A definition with a scale
@@ -1570,7 +1625,7 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
         "NATURAL_EARTH" | "ECKERT_IV" | "WINKEL_TRIPEL" if k0 != 1.0 => {
             return Err(format!(
                 "the {} projection with a scale factor other than 1 isn't supported",
-                p.child("PROJECTION").map_or("", Node::title)
+                clip(p.child("PROJECTION").map_or("", Node::title))
             ));
         }
         "NATURAL_EARTH" => format!("+proj=natearth {at}"),
@@ -1585,7 +1640,7 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
         "ORTHOGRAPHIC" | "ORTHOGRAPHIC_SPHERICAL" => format!("+proj=ortho +lat_0={lat0} {at}"),
         "MILLER_CYLINDRICAL" => format!("+proj=mill {at}"),
         "" => return Err("the projection isn't named".into()),
-        _ => return Err(format!("the {} projection isn't supported", p.child("PROJECTION").map_or("", Node::title))),
+        _ => return Err(format!("the {} projection isn't supported", clip(p.child("PROJECTION").map_or("", Node::title)))),
     };
     let units = if (to_m - 1.0).abs() > 1e-12 { format!("+to_meter={to_m}") } else { "+units=m".to_string() };
     let mut flip = axis_flip(p)?;
@@ -1757,8 +1812,9 @@ fn untransformed(datum: Option<&Node>) -> Option<String> {
     mark(datum, UNTRANSFORMED)
 }
 
-/// At most 120 characters of `s`, for a notice: the names in it come from the file.
-fn clip(s: &str) -> String {
+/// At most 120 characters of `s`, for a notice: the names in it come from the file. A notice
+/// over 16 KiB isn't shown at all (`diagnostics::redact`), so a name left whole could hide it.
+pub(crate) fn clip(s: &str) -> String {
     let mut out: String = s.chars().take(120).collect();
     if out.len() < s.len() {
         out.push('…');
@@ -1793,7 +1849,7 @@ fn datum_note(geog: Option<&Node>) -> Option<String> {
     }
     Some(format!(
         "the datum {} has no conversion to WGS 84 in the file, so positions may be off by up to a few hundred metres",
-        datum.title()
+        clip(datum.title())
     ))
 }
 
@@ -4389,5 +4445,76 @@ pub(crate) mod tests {
             sampled += 1;
         }
         assert!(sampled >= 12, "{sampled}");
+    }
+
+    /// #1866: a name from the file is cut short in every notice and error it is put in. A notice
+    /// over 16 KiB isn't shown at all (`diagnostics::redact` omits it whole), so a name left whole
+    /// would hide what the notice says; cut, the notice keeps it.
+    #[test]
+    fn a_long_name_from_the_file_is_cut_short_in_what_is_said() {
+        use crate::raster::planetary;
+        let long = "x".repeat(20_000);
+        let said = |m: &str, ends: &str| {
+            let head: String = m.chars().take(200).collect();
+            assert!(m.chars().count() < 400 && m.contains('…') && m.ends_with(ends), "{head}");
+            assert!(!crate::diagnostics::Redacted::new(m).as_str().contains("omitted"), "{head}");
+        };
+        // A datum without a shift to WGS 84.
+        let datum = format!(
+            r#"GEOGCS["g",DATUM["{long}",SPHEROID["Clarke 1880",6378249.145,293.465]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#
+        );
+        said(&read_wkt(&datum).unwrap().1.unwrap(), "positions may be off by up to a few hundred metres");
+        // A bound system's target whose shift isn't known, and one whose zero shift may be a
+        // placeholder.
+        let unknown = BESSEL_WKT2.replace("Local", &long);
+        said(&crs_from_wkt(&bound_crs(BESSEL_WKT2, &unknown, &BESSEL_SHIFT)).unwrap_err(), "to WGS 84 isn't known");
+        let ed50_zero = format!(
+            r#"GEOGCS["{long}",DATUM["European_Datum_1950",SPHEROID["International 1924",6378388,297],TOWGS84[0,0,0,0,0,0,0]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#
+        );
+        said(&crs_from_wkt(&bound_crs(BESSEL_WKT2, &ed50_zero, &BESSEL_SHIFT)).unwrap_err(), "where its datum has one");
+        // An ellipsoid without its axis, a projection, an angle unit and a kind of system this
+        // doesn't read.
+        let no_axis = format!(
+            r#"GEOGCRS["g",DATUM["d",ELLIPSOID["{long}"]],CS[ellipsoidal,2],AXIS["lat",north],AXIS["lon",east],ANGLEUNIT["degree",0.0174532925199433]]"#
+        );
+        said(&read_wkt(&no_axis).unwrap_err(), "has no semi-major axis");
+        let projection = format!(
+            r#"PROJCS["p",GEOGCS["g",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["{long}"],UNIT["metre",1]]"#
+        );
+        said(&read_wkt(&projection).unwrap_err(), "projection isn't supported");
+        // A world projection's name with a long run of spaces in it is still read as its method,
+        // which refuses a scale factor and a parameter that isn't a finite number.
+        let natural_earth =
+            projection.replace(&format!(r#"PROJECTION["{long}"]"#), &format!(r#"PROJECTION["Natural{}Earth"]"#, " ".repeat(20_000)));
+        assert_ne!(natural_earth, projection);
+        for parameter in [r#"PARAMETER["scale_factor",0.5]"#, r#"PARAMETER["central_meridian",1e400]"#] {
+            let refused = natural_earth.replace(r#",UNIT["metre",1]]"#, &format!(r#",{parameter},UNIT["metre",1]]"#));
+            assert_ne!(refused, natural_earth);
+            said(&read_wkt(&refused).unwrap_err(), "isn't supported");
+        }
+        let unit =
+            format!(r#"GEOGCS["g",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["{long}",0.5]]"#);
+        said(&read_wkt(&unit).unwrap_err(), "aren't supported");
+        let kind = format!(
+            r#"GEOGCRS["g",DATUM["d",ELLIPSOID["WGS 84",6378137,298.257223563]],CS[{long},2],AXIS["lat",north],AXIS["lon",east],ANGLEUNIT["degree",0.0174532925199433]]"#
+        );
+        said(&read_wkt(&kind).unwrap_err(), "coordinate systems aren't supported");
+        said(&read_wkt(&format!(r#"{long}["g"]"#)).unwrap_err(), "coordinate systems aren't supported");
+        // Text that can't be parsed.
+        said(&read_wkt(&long).unwrap_err(), "…");
+        said(&read_wkt(&format!("{long}[?]")).unwrap_err(), "…");
+        said(&read_wkt(&format!(r#"{long}["a" "b"]"#)).unwrap_err(), "…");
+        said(&read_wkt(&format!(r#"GEOGCS["g",DATUM["d",SPHEROID["s",1{}]]]"#, "e".repeat(20_000))).unwrap_err(), "isn't a number");
+        // Another body's system: read, refused, kept by none, and exported. Its radius is this
+        // test's own: a custom system is shared by its definition, so one another test reads
+        // first would keep that test's name.
+        let mars = format!(
+            r#"GEOGCS["{long}",DATUM["D_Mars",SPHEROID["Mars",3396190.1866,0.0]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]]"#
+        );
+        let (crs, note) = read_wkt(&mars).unwrap();
+        said(&note.unwrap(), "as if on the Earth");
+        said(&planetary::refused(&long, planetary::PROJECTED), "it would land in the wrong place");
+        said(&planetary::code_note(&long), "as if on the Earth");
+        said(&planetary::export_error(crs, Crs::WebMercator).unwrap(), "or as longitude/latitude");
     }
 }

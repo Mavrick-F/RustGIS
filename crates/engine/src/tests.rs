@@ -1674,6 +1674,240 @@ fn qgis_layer_tree_groups_import_as_layer_groups() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A QGIS project's bookmarks come in at their places (turned as QGIS turns them), its relations
+/// as relationships, its map's rotation as the bearing, and its layers' time settings as time
+/// slider bindings, the slider left off as QGIS opens a project (every feature drawn).
+#[test]
+fn qgis_bookmarks_relations_rotation_and_time_import() {
+    let dir = std::env::temp_dir().join(format!("rustgis-qgis-structure-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |id: &str, props: &[&str]| {
+        let features: Vec<String> = props
+            .iter()
+            .map(|p| format!(r#"{{"type":"Feature","properties":{p},"geometry":{{"type":"Point","coordinates":[8.5,47.4]}}}}"#))
+            .collect();
+        std::fs::write(dir.join(format!("{id}.geojson")), format!(r#"{{"type":"FeatureCollection","features":[{}]}}"#, features.join(",")))
+            .unwrap();
+    };
+    file("parcels", &[r#"{"id":1}"#, r#"{"id":2}"#]);
+    file("owners", &[r#"{"pid":1}"#, r#"{"pid":2}"#]);
+    file("Owners", &[r#"{"pid":1,"when":"soon"}"#]);
+    // Two date fields: QGIS's is the second.
+    file("events", &[r#"{"made":"2019-01-01","when":"2020-03-01","note":"a"}"#, r#"{"made":"2019-02-01","when":"2021-05-01","note":"b"}"#]);
+    // A file of several layers (waypoints, tracks, track points), each with a name field: QGIS's
+    // layer is one of them (`layerid`).
+    std::fs::write(
+        dir.join("trip.gpx"),
+        r#"<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1"><wpt lat="47.4" lon="8.5"><name>a</name></wpt><trk><name>b</name><trkseg><trkpt lat="47.4" lon="8.5"/><trkpt lat="47.5" lon="8.6"/></trkseg></trk></gpx>"#,
+    )
+    .unwrap();
+    let layer = |id: &str, temporal: &str| {
+        format!(
+            r#"<maplayer type="vector"><id>{id}_1</id><datasource>./{id}.geojson</datasource><layername>{id}</layername><provider>ogr</provider>{temporal}</maplayer>"#
+        )
+    };
+    let on = |field: &str| format!(r#"<temporal enabled="1" mode="1" startField="{field}" accumulate="0" limitMode="0"/>"#);
+    let layers = [layer("parcels", &on("nope")), layer("owners", ""), layer("events", &on("when")), layer("Owners", &on("when"))].concat()
+        + r#"<maplayer type="vector"><id>trip_1</id><datasource>./trip.gpx|layerid=1</datasource><layername>trip</layername><provider>ogr</provider></maplayer>"#;
+    let qgs = format!(
+        r#"<qgis version="4.2.3">
+      <projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs>
+      <mapcanvas name="theMapCanvas"><extent><xmin>930000</xmin><ymin>6000000</ymin><xmax>960000</xmax><ymax>6030000</ymax></extent><rotation>15</rotation></mapcanvas>
+      <projectlayers>{layers}</projectlayers>
+      <relations>
+        <relation id="own" name="Owners of parcel" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/></relation>
+        <relation id="gone" name="To nowhere" referencedLayer="parcels_1" referencingLayer="missing_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/></relation>
+        <relation id="trip" name="Trip names" referencedLayer="trip_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="name" referencingField="pid"/></relation>
+      </relations>
+      <Bookmarks>
+        <Bookmark extent="Polygon ((8.4 47.3, 8.6 47.3, 8.6 47.45, 8.4 47.45, 8.4 47.3))" group="" id="a" name="Zurich" rotation="0"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+        <Bookmark extent="Polygon ((900000 5900000, 1000000 5900000, 1000000 6000000, 900000 6000000, 900000 5900000))" group="" id="b" name="Web" rotation="30"/>
+        <Bookmark extent="Polygon ((2680000 1240000, 2700000 1240000, 2700000 1260000, 2680000 1260000, 2680000 1240000))" group="" id="c" name="Zurich" rotation="0"><spatialrefsys><authid>EPSG:2056</authid></spatialrefsys></Bookmark>
+        <Bookmark extent="Polygon ((1 1, 2 1, 2 2, 1 2, 1 1))" group="" id="d" name="Odd" rotation="0"><spatialrefsys><authid>EPSG:999999</authid></spatialrefsys></Bookmark>
+        <Bookmark extent="Polygon ((-400 0, 10 0, 10 10, -400 10, -400 0))" group="" id="e" name="Beyond" rotation="0"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+      </Bookmarks>
+    </qgis>"#
+    );
+    let mut s = world();
+    let out = s.run("project.importQgis", &json!({"text": qgs, "dir": dir.display().to_string()})).unwrap();
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    let m = s.map();
+    let turned = |bearing: f64, by: f64| (bearing + by).rem_euclid(360.0).min((-(bearing + by)).rem_euclid(360.0)) < 1e-9;
+    // The map turned 15° clockwise: north 15° east of up.
+    assert!(turned(m.camera.bearing, 15.0), "{}", m.camera.bearing);
+    let names: Vec<&str> = m.bookmarks.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, ["Zurich", "Web", "Zurich 2"], "{notes}");
+    let centre = |i: usize| m.to_lonlat(m.bookmarks[i].camera.center).unwrap();
+    let (zurich, lv95) = (centre(0), centre(2));
+    assert!((zurich.x - 8.5).abs() < 1e-6 && (zurich.y - 47.375).abs() < 0.01, "{zurich:?}");
+    // LV95 2690000/1250000 is 8.631°E 47.395°N.
+    assert!((lv95.x - 8.631).abs() < 0.001 && (lv95.y - 47.395).abs() < 0.001, "{lv95:?}");
+    assert!(turned(m.bookmarks[1].camera.bearing, 30.0), "{}", m.bookmarks[1].camera.bearing);
+    assert!(turned(m.bookmarks[0].camera.bearing, 0.0));
+    // Fitted facing north whatever came before (the map turned 15°, the bookmark not): the zoom
+    // a north-up map fitting the same place takes.
+    let mut north = rustgis_map::Map::new("north");
+    north.fit_lonlat(&rustgis_geom::Extent::new(8.4, 47.3, 8.6, 47.45), s.view_size.0, s.view_size.1);
+    assert!(
+        (m.bookmarks[0].camera.res - north.camera.res).abs() < 1e-6 * north.camera.res,
+        "{} {}",
+        m.bookmarks[0].camera.res,
+        north.camera.res
+    );
+    assert!(notes.contains("its bookmarks in a coordinate system RustGIS can't read (1: Odd)"), "{notes}");
+    assert!(notes.contains("its bookmarks whose place lies outside their coordinate system's area (1: Beyond)"), "{notes}");
+    let rels = &m.editing.relationships;
+    assert_eq!(rels.len(), 1, "{notes}");
+    let r = &rels[0];
+    assert_eq!(
+        (r.name.as_str(), r.origin.as_str(), r.origin_key.as_str(), r.destination.as_str(), r.destination_key.as_str()),
+        // Another layer's name differs only by case: layers' names are kept apart, the relation
+        // following the one renamed.
+        ("Owners of parcel", "parcels", "id", "owners (2)", "pid")
+    );
+    assert!(notes.contains("its relations between layers that didn't come in or haven't the fields (1: To nowhere)"), "{notes}");
+    // Its layer came in as two with the field: not related to either, and said.
+    assert!(
+        notes
+            .contains("its relations to a layer that came in as several tables with the field, any of which it could mean (1: Trip names)"),
+        "{notes}"
+    );
+    // Bound, the slider off: every feature shows, as QGIS opens a project.
+    let events = m.layer_by_name("events").unwrap();
+    assert_eq!(events.time.as_ref().map(|t| t.field.as_str()), Some("when"));
+    assert!(m.time.is_none());
+    assert!(events.time.as_ref().unwrap().keeps(&events.dataset).is_none());
+    assert!(m.layer_by_name("parcels").unwrap().time.is_none());
+    assert!(notes.contains("its time settings, by the field nope, which the layer hasn't"), "{notes}");
+    assert!(notes.contains("its time settings, by the field when, none of whose values read as dates"), "{notes}");
+    // Related Data selects through it.
+    let id = s.map().layer_by_name("parcels").unwrap().id;
+    s.map_mut().layer_mut(id).unwrap().selection = vec![0];
+    s.run("data.related", &json!({"name": "Owners of parcel"})).unwrap();
+    assert_eq!(s.map().layer_by_name("owners (2)").unwrap().selection.len(), 1);
+    // Turned on for it (as the Time Slider button does), the slider keeps its field and spans its
+    // dates.
+    let on = s.run("time.bind", &json!({"layer": "events"})).unwrap();
+    assert_eq!(on["field"], "when", "{on}");
+    assert_eq!((&on["start"], &on["end"]), (&json!("2020-03"), &json!("2021-05")), "{on}");
+    // Bound to a field with no dates, it takes one that has them, as before.
+    let id = s.map().layer_by_name("events").unwrap().id;
+    s.map_mut().layer_mut(id).unwrap().time = Some(rustgis_map::time::TimeBinding::new("note"));
+    let on = s.run("time.bind", &json!({"layer": "events"})).unwrap();
+    assert_ne!(on["field"], "note", "{on}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A bookmark the map's projection doesn't reach isn't saved with another place's view, and a
+/// name past a bookmark's longest is cut, both noted.
+#[test]
+fn qgis_bookmarks_the_map_cannot_show_or_name_are_noted() {
+    let long = "N".repeat(130);
+    // A name that fits, twice: the second is shortened to make room for its number.
+    let fits = "M".repeat(119);
+    let qgs = format!(
+        r#"<qgis version="4.2.3"><projectCrs><spatialrefsys><authid>EPSG:32631</authid></spatialrefsys></projectCrs><Bookmarks>
+      <Bookmark extent="Polygon ((2.2 48.8, 2.5 48.8, 2.5 48.9, 2.2 48.9, 2.2 48.8))" name="{fits}"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+      <Bookmark extent="Polygon ((2.2 48.8, 2.5 48.8, 2.5 48.9, 2.2 48.9, 2.2 48.8))" name="{fits}"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+      <Bookmark extent="Polygon ((2.2 48.8, 2.5 48.8, 2.5 48.9, 2.2 48.9, 2.2 48.8))" name="Paris"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+      <Bookmark extent="Polygon ((-74.1 40.6, -73.8 40.6, -73.8 40.9, -74.1 40.9, -74.1 40.6))" name="New York"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+      <Bookmark extent="Polygon ((2.2 48.8, 2.5 48.8, 2.5 48.9, 2.2 48.9, 2.2 48.8))" name="{long}"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+      <Bookmark extent="Polygon ((440000 5400000, 460000 5400000, 460000 5420000, 440000 5420000, 440000 5400000))" name="In the project's"/>
+    </Bookmarks></qgis>"#
+    );
+    let mut s = world();
+    let out = s.run("project.importQgis", &json!({"text": qgs})).unwrap();
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    let names: Vec<usize> = s.map().bookmarks.iter().map(|b| b.name.chars().count()).collect();
+    assert_eq!(names, [119, 120, 5, 120, 16], "{notes}");
+    assert!(s.map().bookmarks[1].name.ends_with("M 2"));
+    assert!(notes.contains("its bookmarks whose place the map's projection doesn't reach (1: New York)"), "{notes}");
+    assert!(notes.contains("bookmark names cut to 120 characters (2)"), "{notes}");
+    // One read in the project's coordinate system, said.
+    assert!(notes.contains("its bookmarks with no coordinate system of their own, read in the project's (1: In the project's)"), "{notes}");
+    // On a Web Mercator map, one reaching past its 85° is fitted to the part it shows, and said.
+    let polar = r#"<qgis version="4.2.3"><projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs><Bookmarks>
+      <Bookmark extent="Polygon ((10 80, 20 80, 20 89, 10 89, 10 80))" name="Polar"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+      <Bookmark extent="Polygon ((10 70, 20 70, 20 80, 10 80, 10 70))" name="Arctic"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+      <Bookmark extent="Polygon ((10 86, 20 86, 20 89, 10 89, 10 86))" name="Pole"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
+    </Bookmarks></qgis>"#;
+    let mut s = world();
+    let out = s.run("project.importQgis", &json!({"text": polar})).unwrap();
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    assert_eq!(s.map().bookmarks.len(), 2, "{notes}");
+    // One wholly past them shows nothing: not added, and said.
+    assert!(notes.contains("its bookmarks whose place the map's projection doesn't reach (1: Pole)"), "{notes}");
+    assert!(
+        notes.contains("its bookmarks reaching past the 85° a Web Mercator map shows, fitted to the part it does (1: Polar)"),
+        "{notes}"
+    );
+}
+
+/// A QGIS style's time settings bind a streamed layer on its date field, though its rows aren't
+/// read until it is drawn; a field it hasn't is still refused, and noted.
+#[test]
+fn qgis_time_settings_bind_a_streamed_layer() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let mut ds = Dataset::new("dated", GeometryType::Point, vec![Field::new("when", FieldType::Text)]);
+    for (i, d) in ["2020-01-01", "2021-06-01"].iter().enumerate() {
+        ds.push(Some(Geometry::Point(Coord::new(8.0 + i as f64, 47.0))), vec![V::Text((*d).into())]);
+    }
+    let path = std::env::temp_dir().join(format!("rustgis-engine-{}-dated.fgb", std::process::id()));
+    rustgis_data::io::write_path(&ds, &path).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap();
+    assert!(s.map().layers[0].is_streamed() && s.map().layers[0].dataset.features.is_empty());
+    let qml = |field: &str| {
+        format!(r#"<qgis version="4.2.3"><temporal enabled="1" mode="1" startField="{field}" accumulate="0" limitMode="0"/></qgis>"#)
+    };
+    let out = s.run("style.importQgis", &json!({"layer": "dated", "text": qml("when")})).unwrap();
+    assert_eq!(s.map().layers[0].time.as_ref().map(|t| t.field.as_str()), Some("when"), "{out}");
+    // Its dates aren't read yet: said.
+    assert!(out.to_string().contains("bound before its features are read"), "{out}");
+    s.map_mut().layers[0].time = None;
+    let out = s.run("style.importQgis", &json!({"layer": "dated", "text": qml("nope")})).unwrap();
+    assert!(s.map().layers[0].time.is_none());
+    assert!(out.to_string().contains("its time settings, by the field nope, which the layer hasn't"), "{out}");
+    let _ = std::fs::remove_file(path);
+}
+
+/// Bookmarks in more coordinate systems than an import reads: those past the first 100 systems
+/// are left out, and noted.
+#[test]
+fn qgis_bookmarks_in_too_many_coordinate_systems_are_noted() {
+    let mark = |i: u32, code: u32| {
+        format!(
+            r#"<Bookmark extent="Polygon ((500000 0, 500100 0, 500100 100, 500000 100, 500000 0))" name="B{i}"><spatialrefsys><authid>EPSG:{code}</authid></spatialrefsys></Bookmark>"#
+        )
+    };
+    // 101 UTM zones, north and south.
+    let codes = (32601..=32660).chain(32701..=32741);
+    let marks: String = codes.enumerate().map(|(i, c)| mark(i as u32, c)).collect();
+    let qgs = format!(r#"<qgis version="4.2.3"><Bookmarks>{marks}</Bookmarks></qgis>"#);
+    let mut s = world();
+    let out = s.run("project.importQgis", &json!({"text": qgs})).unwrap();
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    assert!(notes.contains("its bookmarks in coordinate systems past the first 100 (1: B100)"), "{notes}");
+    assert!(!s.map().bookmarks.iter().any(|b| b.name == "B100"));
+}
+
+/// Many bookmarks of one name come in numbered, quickly (each name's next number remembered).
+#[test]
+fn many_qgis_bookmarks_of_one_name_come_in_numbered() {
+    let mark = r#"<Bookmark extent="Polygon ((8.4 47.3, 8.6 47.3, 8.6 47.45, 8.4 47.45, 8.4 47.3))" name="Here"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>"#;
+    let qgs = format!(r#"<qgis version="4.2.3"><Bookmarks>{}</Bookmarks></qgis>"#, mark.repeat(5000));
+    let mut s = world();
+    let started = std::time::Instant::now();
+    s.run("project.importQgis", &json!({"text": qgs})).unwrap();
+    let m = s.map();
+    assert_eq!(m.bookmarks.len(), 5000);
+    assert_eq!(
+        (m.bookmarks[0].name.as_str(), m.bookmarks[1].name.as_str(), m.bookmarks[4999].name.as_str()),
+        ("Here", "Here 2", "Here 5000")
+    );
+    assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
+}
+
 /// A picture whose aspect is locked keeps it on the map, as QGIS fits it on its canvas: in a
 /// project in degrees (drawn as plate carrée) its box in degrees, in a Web Mercator one its box in
 /// Mercator metres, has the picture's 2:1 aspect, the layer being in degrees either way.
@@ -7489,6 +7723,11 @@ fn layout_colorbars_follow_a_raster() {
     assert_eq!(s.project.layouts[0].element(id).map(|e| e.visible), Some(true), "undo brings it back");
 }
 
+/// The middle of a layout's frame, across.
+fn frame_x_mid(s: &Session, li: usize, frame: u32) -> f64 {
+    s.project.layouts[li].element(frame).map(|e| e.x + e.w / 2.0).unwrap()
+}
+
 /// `layout.publication` (#682): every profile builds a layout that fits its page, the map frame
 /// at a round scale that still fits the extent, the footer boxed in two columns below the map
 /// with long lines wrapped, the tokens filled from the map; a figure leaves its title to the
@@ -7500,6 +7739,7 @@ fn publication_layouts_fit_their_pages() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut s = world();
     let piaui = json!([-46.8, -11.6, -38.5, -2.2]);
+    let mut narrower = 0;
     let long =
         "NDVI: MOD13Q1 v6.1 (NASA LP DAAC), 16-day composites at 250 m, read through the Brazil Data Cube (INPE) and averaged to 1 km";
     let profiles = [
@@ -7547,6 +7787,20 @@ fn publication_layouts_fit_their_pages() {
         let (a, b) = (named("Legend Box"), named("Scale Box"));
         let apart = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
         assert!(apart, "{profile}: the legend reaches the scale bar");
+        // The scale bar's box is the size of its bar (#1379): at most the 30 % of the frame (25 mm
+        // at least) it used to take, and its bar the length that width draws.
+        let bar = named("Scale Bar");
+        let widest = (frame.w * 0.3).max(25.0);
+        // The bar a box `w` wide draws, as the renderer picks it: its unit, then its length in it.
+        let per_mm = scale * rustgis_map::layout::PAPER_M_PER_PT * rustgis_map::layout::PT_PER_MM;
+        let drawn = |w: f64| {
+            let room = per_mm * w * 0.85;
+            let (unit, abbr) = rustgis_map::layout::ScaleUnits::Auto.resolve(rustgis_geom::nice_distance(room));
+            (rustgis_geom::nice_distance(room / unit), abbr)
+        };
+        assert!(b.w <= widest + 1e-9 && bar.w == b.w, "{profile}: a {} mm box for a {} mm bar, {widest} mm at most", b.w, bar.w);
+        assert_eq!(drawn(b.w), drawn(widest), "{profile}: the bar in a {} mm box", b.w);
+        narrower += usize::from(b.w < widest - 1.0);
         // A round scale, two significant figures, at which the extent still fits.
         let unit = 10f64.powf(scale.log10().floor() - 1.0);
         assert!(((scale / unit) - (scale / unit).round()).abs() < 1e-6, "{profile}: 1:{scale}");
@@ -7599,6 +7853,62 @@ fn publication_layouts_fit_their_pages() {
         assert!(std::fs::metadata(&png).unwrap().len() > 1000, "{profile}");
     }
     assert_eq!(s.project.layouts.len(), profiles.len(), "a layout each, the earlier ones untouched");
+    assert!(narrower > 0, "no profile's scale bar box is narrower than 30 % of its frame");
+    // The frame drawn at another scale: the box is measured again, its scale written in it and
+    // the box, bar and scale one width (#1379).
+    let li = s.project.layouts.len() - 1;
+    let frame = s.project.layouts[li].elements.iter().find(|e| e.kind.code() == "mapFrame").map(|e| e.id).unwrap();
+    // The scale written there is its `{scale}` token, filled from the frame as it is drawn; a text
+    // of one's own around it is measured too.
+    let id_of = |s: &Session, n: &str| s.project.layouts[li].elements.iter().find(|e| e.name == n).map(|e| e.id).unwrap();
+    let scale_text = id_of(&s, "Scale");
+    for (scale, text) in [
+        (40_000_000.0, "{scale}"),
+        (1_500_000.0, "{scale}"),
+        (25_000_000.0, "Escala aproximada {scale}"),
+        (2_500_000.0, "{scale} · {map} · {date}"),
+    ] {
+        s.run("layout.update", &json!({"layout": li, "element": scale_text, "text": text})).unwrap();
+        s.run("layout.update", &json!({"layout": li, "element": frame, "scale": scale})).unwrap();
+        let l = &s.project.layouts[li];
+        let named = |n: &str| l.elements.iter().find(|e| e.name == n).unwrap();
+        let (b, bar, written) = (named("Scale Box"), named("Scale Bar"), named("Scale"));
+        let ElementKind::Text { text: stored, size, .. } = &written.kind else { panic!() };
+        assert_eq!(stored, text);
+        let ElementKind::MapFrame { map, .. } = &l.element(frame).unwrap().kind else { panic!() };
+        let filled = stored
+            .replace("{scale}", &crate::render::layout::scale_ratio_text(scale, l.decimal_comma))
+            .replace("{map}", map)
+            .replace("{date}", "0000-00-00");
+        let Some(ElementKind::MapFrame { scale: drawn, .. }) = l.element(frame).map(|e| &e.kind) else { panic!() };
+        assert_eq!(*drawn, scale);
+        let wide = crate::render::report::width_mm(&filled, *size as f32, false);
+        assert!(wide < b.w && bar.w == b.w && written.w == b.w && bar.x == b.x, "{filled}: {wide} mm of text in a {} mm box", b.w);
+    }
+    // A box that would now cover the north arrow stays as it was, which is said: from a narrow
+    // box, a long text makes it grow towards the arrow put beside it.
+    s.run("layout.update", &json!({"layout": li, "element": scale_text, "text": "{scale}"})).unwrap();
+    s.run("layout.update", &json!({"layout": li, "element": frame, "scale": 1_500_000.0})).unwrap();
+    let (b, arrow) = (id_of(&s, "Scale Box"), id_of(&s, "North Arrow"));
+    let boxed = s.project.layouts[li].element(b).cloned().unwrap();
+    // Beside it on the side it grows to: the left one when it keeps its right edge.
+    let x = if boxed.x + boxed.w / 2.0 > frame_x_mid(&s, li, frame) { boxed.x - 5.5 } else { boxed.x + boxed.w + 0.5 };
+    s.run("layout.update", &json!({"layout": li, "element": arrow, "x": x, "y": boxed.y, "w": 5.0, "h": 5.0})).unwrap();
+    s.run("layout.update", &json!({"layout": li, "element": scale_text, "text": "Escala aproximada da folha {scale}"})).unwrap();
+    let mark = s.notices.len();
+    s.run("layout.update", &json!({"layout": li, "element": frame, "scale": 30_000_000.0})).unwrap();
+    let after = s.project.layouts[li].element(b).cloned().unwrap();
+    assert_eq!((after.x, after.w), (boxed.x, boxed.w), "the box stays");
+    assert!(s.notices[mark..].iter().any(|n| n.text.contains("would now cover the north arrow")), "said");
+    // A text longer than the widest box, its box widened by hand for it: the width is kept.
+    s.run("layout.update", &json!({"layout": li, "element": arrow, "x": 0.0, "y": 0.0})).unwrap();
+    let long = "Escala aproximada da folha impressa em papel de formato A4 {scale}";
+    s.run("layout.update", &json!({"layout": li, "element": scale_text, "text": long})).unwrap();
+    for name in ["Scale Box", "Scale Bar", "Scale"] {
+        s.run("layout.update", &json!({"layout": li, "element": id_of(&s, name), "w": 120.0})).unwrap();
+    }
+    s.run("layout.update", &json!({"layout": li, "element": frame, "scale": 12_000_000.0})).unwrap();
+    assert_eq!(s.project.layouts[li].element(b).map(|e| e.w), Some(120.0), "the width set by hand");
     // A long title wraps within the frame, and pushes the map down; the result names every
     // element for layout.update.
     let r = s.run("layout.publication", &json!({"extent": piaui, "title": long})).unwrap();
@@ -20986,6 +21296,81 @@ fn geocoding_places_and_addresses() {
     // A public server takes a hundred addresses a run.
     let g = Geocoder::new(None, None).unwrap();
     assert!(crate::cmd::geocode::check_batch(&g, 101).unwrap_err().contains("100"));
+}
+
+/// Applying supplied answers does not require a network-capable Census endpoint, including
+/// in the browser where the public server lacks CORS.
+#[test]
+fn geocoding_census_supplied_answers_need_no_fetch() {
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"address\nA\n"})).unwrap();
+    let result = s
+        .run(
+            "layer.geocode",
+            &json!({"provider":"census", "table":"addresses", "address":"address",
+        "places":{"A":{"lon":-77.0,"lat":38.0,"name":"A"}}}),
+        )
+        .unwrap();
+    assert_eq!(result["matched"], 1);
+}
+
+/// Census's address response through both public commands, served locally so the test needs
+/// no network. A malformed candidate is reported; unmatched rows retain their attributes.
+#[test]
+fn geocoding_with_census() {
+    let clean = br#"{"result":{"addressMatches":[{"matchedAddress":"4600 SILVER HILL RD, WASHINGTON, DC, 20233","coordinates":{"x":-76.92748724230096,"y":38.84601622386617}}, {"matchedAddress":"SECOND CANDIDATE","coordinates":{"x":-77,"y":38}}]}}"#;
+    let lossy = br#"{"result":{"addressMatches":[{}, {"matchedAddress":"SECOND ADDRESS","coordinates":{"x":-77.0,"y":38.9}}]}}"#;
+    let path = |q: &str| format!("/locations/onelineaddress?address={q}&benchmark=Public_AR_Current&format=json");
+    let (base, asked) = serve_files(vec![
+        (path("4600%20Silver%20Hill%20Rd%2C%20Washington%2C%20DC%2020233"), clean.to_vec()),
+        (path("second"), lossy.to_vec()),
+        (path("missing"), br#"{"result":{"addressMatches":[]}}"#.to_vec()),
+    ]);
+    let mut s = Session::new(Project::default());
+    let result = s
+        .run("map.findPlace", &json!({"provider":"census", "url":base, "query":"4600 Silver Hill Rd, Washington, DC 20233", "limit":1}))
+        .unwrap();
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["places"][0]["lon"], -76.92748724230096);
+    assert_eq!(result["places"][0]["lat"], 38.84601622386617);
+    assert_eq!(s.notices.len(), 1);
+    assert_eq!(s.notices[0].text, "Search candidates not shown: 1 (limit 1).");
+    s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"id,address\n1,second\n2,missing\n"})).unwrap();
+    let result = s.run("layer.geocode", &json!({"provider":"census", "url":base, "table":"addresses", "address":"address"})).unwrap();
+    assert_eq!(result["matched"], 1);
+    assert_eq!(result["unmatched"], 1);
+    let l = s.map().layer_by_name("addresses (geocoded)").unwrap();
+    assert_eq!(l.dataset.features[0].geometry, Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(-77.0, 38.9))));
+    assert!(l.dataset.features[1].geometry.is_none());
+    assert_eq!(l.dataset.value(1, 1).to_string(), "missing");
+    assert_eq!(s.notices.iter().filter(|n| n.text.starts_with("1 of the geocoder's places")).count(), 1);
+    assert_eq!(asked.lock().unwrap().len(), 3);
+}
+
+/// The command reports alternatives omitted by batch geocoding, including the parser cap;
+/// an unambiguous match produces no notice.
+#[test]
+fn geocoding_census_batch_reports_unused_candidates() {
+    for count in [1, 3, 25] {
+        let p = json!({"matchedAddress":"A", "coordinates":{"x":-77.0,"y":38.0}});
+        let response = serde_json::to_vec(&json!({"result":{"addressMatches":vec![p;count]}})).unwrap();
+        let (base, _) = serve_files(vec![("/locations/onelineaddress?address=A&benchmark=Public_AR_Current&format=json".into(), response)]);
+        let mut s = Session::new(Project::default());
+        s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"address\nA\n"})).unwrap();
+        let mark = s.notice_mark();
+        let result = s.run("layer.geocode", &json!({"provider":"census", "url":base, "table":"addresses", "address":"address"})).unwrap();
+        assert_eq!(result["matched"], 1);
+        let notices = s.notices_since(mark);
+        if count == 1 {
+            assert!(notices.is_empty(), "{notices:?}");
+        } else {
+            assert_eq!(notices.len(), 1);
+            assert_eq!(
+                notices[0].text,
+                format!("{} additional geocoding candidates were not used; the first match was kept for each address.", count - 1)
+            );
+        }
+    }
 }
 
 /// PDOK's Locatieserver as the geocoder (a local server answering as it does): places found by
@@ -40224,6 +40609,129 @@ fn rgbi_mosaics_keep_nir_without_alpha_and_reject_mixed_band_roles() {
     assert_eq!((r.band_count(), r.color.clone()), (4, ColorHint::Rgb { alpha: false }));
 }
 
+/// An ortho workspace's mosaic is made in the projected system its images share unless it sets
+/// one, and says so; images in different systems, or a cell size in degrees, keep degrees and say
+/// why; "EPSG:4326" asks for degrees, another geographic system is refused (#1743 step 3).
+#[test]
+fn ortho_mosaic_is_made_in_its_images_projected_system() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    use rustgis_map::raster::RasterLayer;
+    let mut s = Session::new(Project::default());
+    let utm = Crs::Epsg(32616);
+    let add = |s: &mut Session, name: &str, gt: GeoTransform, crs: Crs, value: f32| {
+        let r = Raster::new(name, 10, 10, vec![vec![value; 100]], gt, crs, None, ColorHint::Gray, "Float32").unwrap();
+        let bytes = geotiff::write(&r, 0).unwrap();
+        s.map_mut().add_raster(name, RasterLayer::from_bytes(r, format!("{name}.tif"), bytes));
+    };
+    // Two 100 m squares side by side in UTM zone 16N, and one in degrees nearby.
+    let at = |x: f64| GeoTransform { origin_x: x, origin_y: 3_900_100.0, pixel_width: 10.0, pixel_height: -10.0 };
+    add(&mut s, "west", at(500_000.0), utm, 1.0);
+    add(&mut s, "east", at(500_100.0), utm, 2.0);
+    let degrees = GeoTransform { origin_x: -87.0, origin_y: 35.24, pixel_width: 0.0001, pixel_height: -0.0001 };
+    add(&mut s, "nearby", degrees, Crs::LonLat, 3.0);
+    let build = |s: &mut Session, name: &str| {
+        let mark = s.notice_mark();
+        let v = s.run("imagery.mosaic", &json!({"name": name})).unwrap();
+        let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        let r = s.map().layer(v["layer"].as_u64().unwrap() as u32).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+        (r, v, notices)
+    };
+    // The images' system: their cells exactly, and it is said.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Fields", "images": ["west", "east"]})).unwrap();
+    let (r, v, notices) = build(&mut s, "Fields");
+    assert_eq!((r.crs, r.width, r.height, r.transform.pixel_width), (utm, 20, 10, 10.0), "{v}");
+    assert_eq!((r.value(0, 0, 0), r.value(0, 15, 9)), (Some(1.0), Some(2.0)));
+    let made = format!("made in {}, the coordinate system its images are in; set crs to EPSG:4326", utm.label());
+    assert!(v["messages"][0].as_str().unwrap().contains(&made), "{v}");
+    assert!(notices.iter().any(|n| n.starts_with("Fields: made in")), "{notices:?}");
+    // A system set, with a cell size in its units: nothing assumed, nothing said.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": "EPSG:32616", "cellSize": 20})).unwrap();
+    let (r, v, notices) = build(&mut s, "Fields");
+    assert_eq!((r.crs, r.width, r.height), (utm, 10, 5), "{v}");
+    assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    // Degrees asked for: the degree cell size, nothing said.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": "EPSG:4326", "cellSize": 0.0005})).unwrap();
+    let (r, v, notices) = build(&mut s, "Fields");
+    assert_eq!(r.crs, Crs::LonLat);
+    assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    // Back to none, with that cell size in degrees: degrees, and why.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": null})).unwrap();
+    let (r, v, _) = build(&mut s, "Fields");
+    assert_eq!(r.crs, Crs::LonLat);
+    assert!(v["messages"][0].as_str().unwrap().contains("as its cell size (0.0005) is in degrees"), "{v}");
+    // Another system drops the projected cell size; a geographic one other than degrees is refused.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": "EPSG:32616", "cellSize": 20})).unwrap();
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": 3857})).unwrap();
+    let w = s.project.workspaces.iter().find(|w| w.name == "Fields").unwrap();
+    assert_eq!((w.crs, w.projected_cell_size, w.cell_size), (Some(Crs::WebMercator), None, Some(0.0005)));
+    // The degree size it keeps isn't used in that system, and that is said.
+    let (r, v, _) = build(&mut s, "Fields");
+    assert_eq!(r.crs, Crs::WebMercator);
+    assert!(v["messages"][0].as_str().unwrap().contains("its cell size (0.0005) is in degrees"), "{v}");
+    let e = s.run("imagery.workspaceOptions", &json!({"name": "Fields", "crs": "EPSG:4269"})).unwrap_err();
+    assert!(e.contains("EPSG:4326 makes it in degrees"), "{e}");
+    assert_eq!(s.project.workspaces.iter().find(|w| w.name == "Fields").unwrap().crs, Some(Crs::WebMercator));
+    // Images in different systems: degrees, naming the projected one.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Mixed", "images": ["west", "nearby"]})).unwrap();
+    let (r, v, _) = build(&mut s, "Mixed");
+    assert_eq!(r.crs, Crs::LonLat);
+    let m = v["messages"][0].as_str().unwrap();
+    assert!(m.contains("different coordinate systems") && m.contains(&utm.label()), "{m}");
+    // A projected system set over them: the degree image is found through longitude/latitude,
+    // over the west square it overlaps but for its eastern strip.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Over", "images": ["nearby", "west"], "crs": "EPSG:32616"})).unwrap();
+    let (r, v, notices) = build(&mut s, "Over");
+    assert_eq!(r.crs, utm, "{v}");
+    assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    let values: Vec<f32> = r.bands[0].data.iter().copied().filter(|v| *v != rustgis_analysis::rasterops::NODATA).collect();
+    assert!(values.contains(&3.0) && values.contains(&1.0), "{values:?}");
+    // Images in another geographic system: WGS 84 degrees, and that is said.
+    add(&mut s, "nad83", degrees, Crs::Epsg(4269), 4.0);
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Datum", "images": ["nad83"]})).unwrap();
+    let (r, v, _) = build(&mut s, "Datum");
+    assert_eq!(r.crs, Crs::LonLat);
+    let m = v["messages"][0].as_str().unwrap();
+    assert!(m.contains("made in WGS 84 degrees (EPSG:4326), though its images are in EPSG:4269"), "{m}");
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Datums", "images": ["nad83", "nearby"]})).unwrap();
+    let (_, v, _) = build(&mut s, "Datums");
+    assert!(v["messages"][0].as_str().unwrap().contains("different geographic systems (some in EPSG:4269)"), "{v}");
+    // Projected and other geographic systems mixed: both named, and the degrees are WGS 84's.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Both", "images": ["west", "nad83"]})).unwrap();
+    let (_, v, _) = build(&mut s, "Both");
+    let m = v["messages"][0].as_str().unwrap();
+    assert!(m.contains("WGS 84 degrees") && m.contains(&utm.label()) && m.contains("EPSG:4269"), "{m}");
+    // Images in degrees: degrees, nothing said.
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Plain", "images": ["nearby"]})).unwrap();
+    let (r, v, notices) = build(&mut s, "Plain");
+    assert_eq!(r.crs, Crs::LonLat);
+    assert!(v.get("messages").is_none() && notices.is_empty(), "{v} {notices:?}");
+    // A grid's corners fall on the finest image's in its system, however far off the others are,
+    // and a whole number sent as a float is an EPSG code.
+    let off = GeoTransform { origin_x: 499_993.7, origin_y: 3_900_103.0, pixel_width: 20.0, pixel_height: -20.0 };
+    add(&mut s, "off", off, utm, 5.0);
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Snapped", "images": ["off", "west"], "crs": 32616.0})).unwrap();
+    let (r, v, _) = build(&mut s, "Snapped");
+    assert_eq!((r.crs, r.transform.pixel_width), (utm, 10.0), "{v}");
+    let corner = (r.transform.origin_x - 500_000.0) / 10.0;
+    assert!((corner - corner.round()).abs() < 1e-9 && r.transform.origin_x <= 499_993.7, "{:?}", r.transform);
+    assert_eq!(
+        r.value(0, ((500_005.0 - r.transform.origin_x) / 10.0) as i64, ((r.transform.origin_y - 3_900_095.0) / 10.0) as i64),
+        Some(5.0)
+    );
+    let e = s.run("imagery.workspaceOptions", &json!({"name": "Snapped", "crs": "EPSG:4978"})).unwrap_err();
+    assert!(!e.contains("EPSG:4326"), "{e}");
+    // A cell size a damaged project holds is refused, not replaced.
+    let at = s.project.workspaces.iter().position(|w| w.name == "Over").unwrap();
+    s.project.workspaces[at].projected_cell_size = Some(-5.0);
+    let e = s.run("imagery.mosaic", &json!({"name": "Over"})).unwrap_err();
+    assert!(e.contains("cell size, -5, isn't a size above 0"), "{e}");
+    // The system and its cell size save with the project.
+    s.run("imagery.workspaceOptions", &json!({"name": "Fields", "cellSize": 30})).unwrap();
+    let p = crate::Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
+    let w = p.workspaces.iter().find(|w| w.name == "Fields").unwrap();
+    assert_eq!((w.crs, w.projected_cell_size, w.cell_size), (Some(Crs::WebMercator), Some(30.0), Some(0.0005)));
+}
+
 /// Add Data's and Load All's reads made before the command runs (the desktop app's, on a thread
 /// of their own) are the ones the command takes: it adds what they read, without reading again.
 #[cfg(not(target_arch = "wasm32"))]
@@ -43205,6 +43713,204 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
     // A layer that wasn't read from such a file has nothing to compare with.
     assert!(s.run("source.syncState", &json!({"layer": "Cities"})).is_err());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A sheet's footer lines its right column up with a legend at the right of the frame, between
+/// 45 % and 70 % of its width (#1379), its texts wrapped again to the new widths; it stays as it
+/// is for a legend elsewhere, or when the texts would need a taller box.
+#[test]
+fn the_footer_lines_up_with_a_legend_at_the_right() {
+    use crate::cmd::layout::align_footer;
+    use rustgis_map::layout::{ElementKind, FontFamily, TextAlign};
+    let text = |t: &str, size: f64| ElementKind::Text {
+        text: t.into(),
+        size,
+        color: rustgis_map::Rgba::rgb(0, 0, 0),
+        bold: false,
+        italic: false,
+        align: TextAlign::Left,
+        letter_spacing: 0.0,
+        font: FontFamily::Sans,
+        font_name: None,
+        rotation: 0.0,
+    };
+    let card = || ElementKind::Rectangle {
+        fill: rustgis_map::Rgba::new(0, 0, 0, 0),
+        outline: rustgis_map::Rgba::rgb(0, 0, 0),
+        width: 0.5,
+        radius: 0.0,
+        dash: None,
+    };
+    // An A4 footer, two boxes 88 mm wide 4 mm apart, under a frame 180 mm wide from x = 15.
+    let footer = || {
+        vec![
+            ("Sources Box".to_string(), (15.0, 250.0, 88.0, 14.0), card()),
+            ("Sources Heading".to_string(), (17.5, 252.5, 83.0, 3.0), text("SOURCES", 7.5)),
+            ("Sources".to_string(), (17.5, 255.5, 83.0, 3.0), text("Boundaries: IBGE", 7.0)),
+            ("Reference Box".to_string(), (107.0, 250.0, 88.0, 14.0), card()),
+            ("Reference Heading".to_string(), (109.5, 252.5, 83.0, 3.0), text("REFERENCE", 7.5)),
+            ("Reference".to_string(), (109.5, 255.5, 83.0, 3.0), text("UTM zone 24S", 7.0)),
+        ]
+    };
+    // One line each however wide; the reference in three under 70 mm.
+    let short = |_: f64, _: f64, _: f64| {
+        vec![
+            ("Sources", vec!["SOURCES".to_string()], vec!["Boundaries: IBGE".to_string()]),
+            ("Reference", vec!["REFERENCE".to_string()], vec!["UTM zone 24S".to_string()]),
+        ]
+    };
+    let long = |tw: f64, _: f64, _: f64| {
+        let n = if tw < 70.0 { 3 } else { 1 };
+        vec![
+            ("Sources", vec!["SOURCES".to_string()], vec!["IBGE".to_string()]),
+            ("Reference", vec!["REFERENCE".to_string()], vec!["UTM".to_string(); n]),
+        ]
+    };
+    let rect = |around: &[(String, (f64, f64, f64, f64), ElementKind)], name: &str| around.iter().find(|e| e.0 == name).unwrap().1;
+    // A legend from 60 % of the frame to its right edge: the right column starts there.
+    let mut around = footer();
+    align_footer(&mut around, (123.0, 200.0, 72.0, 40.0), (15.0, 180.0), &short);
+    assert_eq!(rect(&around, "Reference Box"), (123.0, 250.0, 72.0, 14.0));
+    assert_eq!(rect(&around, "Sources Box"), (15.0, 250.0, 104.0, 14.0));
+    assert_eq!(rect(&around, "Reference Heading").0, 125.5);
+    assert_eq!(rect(&around, "Reference").2, 67.0);
+    // Elsewhere: at 30 %, short of the right edge, or texts needing a taller box.
+    type Sections = dyn Fn(f64, f64, f64) -> Vec<(&'static str, Vec<String>, Vec<String>)>;
+    let cases: [((f64, f64, f64, f64), &Sections); 3] =
+        [((69.0, 200.0, 126.0, 40.0), &short), ((123.0, 200.0, 20.0, 40.0), &short), ((123.0, 200.0, 72.0, 40.0), &long)];
+    for (legend, sections) in cases {
+        let mut around = footer();
+        align_footer(&mut around, legend, (15.0, 180.0), sections);
+        assert_eq!(around, footer(), "{legend:?}");
+    }
+}
+
+/// `layout.publication` itself lines the footer's right column up with a legend placed at the
+/// right (#1379): with `"arrangement": "legendRight"` and a legend wide enough to start between
+/// 45 % and 70 % of the frame's width, the Reference Box starts where the Legend Box does.
+#[test]
+fn a_publication_footer_lines_up_with_its_legend() {
+    let piaui = json!([-46.8, -11.6, -38.5, -2.2]);
+    let mut seen = Vec::new();
+    for name in [
+        "Countries of the world",
+        "Countries of the world, Natural Earth",
+        "Countries of the world, Natural Earth data",
+        "Countries of the world, Natural Earth 1:110m",
+        "Countries of the world, Natural Earth 1:110m (public domain)",
+    ] {
+        let mut s = world();
+        s.run("layer.rename", &json!({"layer": "Countries", "name": name})).unwrap();
+        s.run(
+            "layout.publication",
+            &json!({"profile": "a4-portrait", "extent": piaui, "arrangement": "legendRight", "author": "", "sources": "Natural Earth"}),
+        )
+        .unwrap();
+        let l = s.project.layouts.last().unwrap();
+        let named = |n: &str| l.elements.iter().find(|e| e.name == n).unwrap();
+        let frame = l.elements.iter().find(|e| e.kind.code() == "mapFrame").unwrap();
+        let (legend, reference, sources) = (named("Legend Box"), named("Reference Box"), named("Sources Box"));
+        let at = (legend.x - frame.x) / frame.w;
+        let right = legend.x + legend.w >= frame.x + 0.9 * frame.w;
+        seen.push((name, at, right, reference.x, legend.x));
+        if (0.45..=0.70).contains(&at) && right {
+            // A legend that starts within half a millimetre of the column leaves the footer as it
+            // is (`align_footer`: "the move a real one"). Where it starts follows the fonts the
+            // machine has, so a name may land there on one platform (macOS: 0.13 mm) and not on
+            // another: the next name is tried.
+            let off = (reference.x - legend.x).abs();
+            if (1e-9..0.5).contains(&off) {
+                continue;
+            }
+            assert!(off < 1e-9, "{name}: the Reference Box at {} mm, the legend at {} mm", reference.x, legend.x);
+            assert!(sources.x + sources.w < reference.x && reference.x + reference.w <= frame.x + frame.w + 1e-9, "{name}");
+            return;
+        }
+    }
+    panic!("no legend fell between 45 % and 70 % of the frame at its right: {seen:?}");
+}
+
+/// Arrangements saved by name (#1379): `layout.arrangement` saves, lists and removes them, within
+/// limits and refusing what it can't keep; `layout.publication` takes one by name, `best` tries
+/// them after the built-in ones, and a favourite named after one removed keeps its corners.
+#[test]
+fn arrangements_are_saved_by_name() {
+    use crate::cmd::layout::{MAX_ARRANGEMENT_NAME, MAX_SAVED_ARRANGEMENTS, arrangements_to_try, read_saved_arrangements};
+    let mut s = world();
+    let atlas = json!({"locator": "bottom-left", "northArrow": "top-left", "legend": "top-right", "scaleBar": "bottom-right"});
+    let r = s.run("layout.arrangement", &json!({"save": "Atlas", "arrangement": atlas})).unwrap();
+    assert_eq!(r["saved"]["Atlas"], atlas, "{r}");
+    assert_eq!(r["arrangements"].as_array().unwrap().last(), Some(&json!("Atlas")), "{r}");
+    // A name copies that arrangement's corners.
+    let r = s.run("layout.arrangement", &json!({"save": "Copy", "arrangement": "mirrored"})).unwrap();
+    assert_eq!(r["saved"]["Copy"]["locator"], "top-right", "{r}");
+    // Taken by name, case aside, and named in the answer as it is kept.
+    let homes = |v: &Value| crate::cmd::layout::parse_arrangement(v, &Default::default()).unwrap();
+    assert_eq!(arrangements_to_try(&s, &json!("atlas")).unwrap(), vec![("Atlas".to_string(), homes(&atlas))]);
+    let extent = json!([-46.8, -11.6, -38.5, -2.2]);
+    let r = s.run("layout.publication", &json!({"extent": extent, "author": "", "arrangement": "ATLAS"})).unwrap();
+    assert_eq!(r["arrangement"], "Atlas", "{r}");
+    // Best tries it after the built-in ones; one with a built-in's corners only once.
+    let tried = arrangements_to_try(&s, &json!("best")).unwrap();
+    let names: Vec<&str> = tried.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["classic", "mirrored", "legendRight", "legendTop", "Atlas"]);
+    assert_eq!(arrangements_to_try(&s, &Value::Null).unwrap(), tried);
+    // A favourite given corner by corner as a saved one is called by its name.
+    s.run("layout.arrangement", &json!({"favourite": atlas})).unwrap();
+    assert_eq!(arrangements_to_try(&s, &json!("favourite")).unwrap()[0].0, "Atlas");
+    assert_eq!(arrangements_to_try(&s, &atlas).unwrap()[0].0, "Atlas");
+    // Case aside beyond ASCII too.
+    s.run("layout.arrangement", &json!({"save": "Écran", "arrangement": "legendTop"})).unwrap();
+    assert_eq!(arrangements_to_try(&s, &json!("écran")).unwrap()[0].0, "Écran");
+    s.run("layout.arrangement", &json!({"remove": "écran"})).unwrap();
+    // The favourite by its name; removed, it keeps its corners, which is said.
+    s.run("layout.arrangement", &json!({"favourite": "Atlas"})).unwrap();
+    assert_eq!(arrangements_to_try(&s, &json!("favourite")).unwrap()[0].0, "Atlas");
+    let r = s.run("layout.arrangement", &json!({"remove": "atlas"})).unwrap();
+    assert_eq!((s.layout_favourite.clone(), r["corners"].clone()), (atlas.clone(), atlas.clone()), "{r}");
+    assert!(r["warnings"][0].as_str().unwrap().contains("keeps its corners"), "{r}");
+    assert!(r["saved"].get("Atlas").is_none() && s.layout_arrangements.len() == 1);
+    // Removed with another favourite given, nothing is said of keeping its corners.
+    s.run("layout.arrangement", &json!({"save": "Spare", "arrangement": "legendTop", "favourite": "Spare"})).unwrap();
+    let r = s.run("layout.arrangement", &json!({"remove": "Spare", "favourite": atlas})).unwrap();
+    assert!(r["warnings"].as_array().unwrap().is_empty() && s.layout_favourite == atlas, "{r}");
+    // Saved again under a name in other capitals, it replaces it, which is said.
+    let r = s.run("layout.arrangement", &json!({"save": "COPY", "arrangement": "classic"})).unwrap();
+    assert_eq!((s.layout_arrangements.len(), r["saved"]["COPY"]["locator"].clone()), (1, json!("top-left")), "{r}");
+    assert!(r["warnings"][0].as_str().unwrap().contains("is replaced"), "{r}");
+    // Refused, naming what is wrong, with nothing changed.
+    let long = "x".repeat(MAX_ARRANGEMENT_NAME + 1);
+    for (bad, why) in [
+        (json!({"save": "Best", "arrangement": "classic"}), "names an arrangement already"),
+        (json!({"save": "Classic", "arrangement": "mirrored"}), "names an arrangement already"),
+        (json!({"save": " ", "arrangement": "classic"}), "1 to 40 characters"),
+        (json!({"save": long, "arrangement": "classic"}), "1 to 40 characters"),
+        (json!({"save": "a\tb", "arrangement": "classic"}), "1 to 40 characters"),
+        (json!({"save": "Atlas"}), "save takes \"arrangement\""),
+        (json!({"save": "Atlas", "arrangement": "tidy"}), "\"COPY\", or a corner"),
+        (json!({"save": 3, "arrangement": "classic"}), "save is a name"),
+        (json!({"arrangement": "legendTop"}), "saved under a name given as \"save\""),
+        (json!({"remove": "Atlas"}), "no arrangement is saved as \"Atlas\""),
+        (json!({"remove": "COPY", "favourite": "COPY"}), "not \"COPY\""),
+    ] {
+        let e = s.run("layout.arrangement", &bad).unwrap_err();
+        assert!(e.contains(why), "{bad}: {e}");
+        assert_eq!((s.layout_arrangements.len(), s.layout_favourite.clone()), (1, atlas.clone()), "{bad}");
+    }
+    // At most so many.
+    for i in 1..MAX_SAVED_ARRANGEMENTS {
+        s.run("layout.arrangement", &json!({"save": format!("Mine {i}"), "arrangement": "legendTop"})).unwrap();
+    }
+    let e = s.run("layout.arrangement", &json!({"save": "One more", "arrangement": "classic"})).unwrap_err();
+    assert!(e.contains("at most 20 arrangements"), "{e}");
+    assert_eq!(s.layout_arrangements.len(), MAX_SAVED_ARRANGEMENTS);
+    // As the preferences keep them: what can't be used is counted, the rest kept.
+    let text = json!({"Ok": atlas, "best": atlas, "Half": {"locator": "top-left"}, "ok": atlas, "Not": "classic"}).to_string();
+    let (kept, passed) = read_saved_arrangements(&text).unwrap();
+    assert_eq!((kept.keys().map(String::as_str).collect::<Vec<_>>(), passed.len()), (vec!["Ok"], 4));
+    assert_eq!(passed["Half"], json!({"locator": "top-left"}), "kept as it was");
+    assert_eq!(read_saved_arrangements("not json"), None);
+    assert_eq!(read_saved_arrangements("{}"), Some(Default::default()));
 }
 
 /// `"coverage"` (#1379) writes the grid the placement searched as a PNG, three pixels a cell: dark

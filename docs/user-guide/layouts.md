@@ -17,8 +17,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   - **Sheets** (A4, A3 or A2, portrait or landscape): a frame and margin, the title and subtitle,
     the map, and a footer of two boxed columns (sources, and the cartographic reference; one
     with nothing in it is left out, the other taking the width) with a note and the authorship
-    under them. Text sizes follow the sheet: an A3's are 1.41 times an
-    A4's. Given its size alone (`"a4"`, the default, `"a3"` or `"a2"`), a sheet is turned to
+    under them. When the legend sits at the right of the map (its right edge in the frame's
+    right tenth), starting between 45 % and 70 % of the frame's width, the right column starts
+    where the legend does, unless its texts would then need a taller box. Text sizes follow the
+    sheet: an A3's are 1.41 times an A4's. Given its size alone (`"a4"`, the default, `"a3"`
+    or `"a2"`), a sheet is turned to
     portrait or landscape, whichever the map comes out larger on: the area's extent east to west
     against north to south, on the map's projection, with the room the style leaves the map. The
     result names the profile chosen (`"profile": "a4-landscape"`); give it with its orientation
@@ -32,8 +35,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     take inside the frame. A graticule's step follows the extent (2° for a state, 15′ for a city),
     with labels on every edge of a sheet.
     The north arrow, the legend (sized to what it lists), the scale bar with the numeric scale
-    under it and the locator sit in the frame's corners, clear of the graticule's
-    labels. The **arrangement** says which corner is each one's. `classic` (the default favourite) puts the
+    under it (in a box the size of the bar) and the locator sit in the frame's corners, clear of
+    the graticule's labels. The **arrangement** says which corner is each one's. `classic` (the default favourite) puts the
     locator at the top left, the arrow at the top right, the legend at the bottom left and the
     scale at the bottom right. `mirrored` swaps left and right, `legendRight` swaps the legend and
     the scale, and `legendTop` swaps the legend and the locator. `"arrangement"` also takes a
@@ -45,8 +48,12 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     with another surround. The largest is placed first (the legend, as a rule), so it takes the
     freest place, and a smaller one whose corner it took moves out of its way.
     Your favourite arrangement, set with **`layout.arrangement {"favourite": …}`** and kept with
-    the app's preferences, is the one tried first. `"arrangement": "best"`, the default, lays out
-    the favourite and every arrangement by name, and keeps the one that moves the least
+    the app's preferences, is the one tried first. Arrangements of your own are saved by name with
+    **`layout.arrangement {"save": "Atlas", "arrangement": {…}}`** (up to 20, kept with the
+    preferences too) and removed with `{"remove": "Atlas"}`; `"arrangement": "Atlas"` then takes
+    one as it takes a built-in one, and a favourite can name one. `"arrangement": "best"`, the
+    default, lays out the favourite, every arrangement by name and every saved one, and keeps the
+    one that moves the least
     (by area, so moving the north arrow costs less than moving the legend), then the one leaving
     the least over the data; the favourite wins a tie. `"favourite"` always takes the favourite.
     The answer names the arrangement taken (`"arrangement"`) and the surrounds

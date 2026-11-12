@@ -188,6 +188,8 @@ pub const TOOL_FILE_PICK: &str = "\u{1}toolfile:";
 const RASTER_DEFAULTS_PREF: &str = "raster_default_style";
 /// The preference holding the favourite arrangement of publication layouts (`layout.arrangement`).
 const LAYOUT_FAVOURITE_PREF: &str = "layout_favourite_arrangement";
+/// The preference holding the arrangements of publication layouts saved by name.
+const LAYOUT_ARRANGEMENTS_PREF: &str = "layout_saved_arrangements";
 
 /// A result an asynchronous service fills in when it's done (the app polls it each frame).
 pub type Slot<T> = std::sync::Arc<std::sync::Mutex<Option<T>>>;
@@ -902,6 +904,13 @@ pub struct UiState {
     pub raster_defaults_saved: rustgis_engine::map::RasterDefaults,
     /// The favourite arrangement last saved, to save it again only when it changes.
     pub layout_favourite_saved: Value,
+    /// The arrangements saved by name last kept in the preferences, likewise.
+    pub layout_arrangements_saved: serde_json::Map<String, Value>,
+    /// Entries of that preference this version can't use (a newer one's), saved again with it as
+    /// they were.
+    pub layout_arrangements_unread: serde_json::Map<String, Value>,
+    /// That preference couldn't be read at all: it is left as it is, never saved over.
+    pub layout_arrangements_unreadable: bool,
     /// Home › Add › Add Data › Zarr…: its store, choices and fetches.
     pub zarr: zarrui::State,
     /// Independent Zarr reads for imported GeoLibre layers; does not share the picker state.
@@ -1053,6 +1062,9 @@ impl Default for UiState {
             connections_saved: 0,
             raster_defaults_saved: Default::default(),
             layout_favourite_saved: Value::Null,
+            layout_arrangements_saved: Default::default(),
+            layout_arrangements_unread: Default::default(),
+            layout_arrangements_unreadable: false,
             zarr: Default::default(),
             geolibre_zarr: Vec::new(),
             hidden_tabs: Vec::new(),
@@ -1361,8 +1373,12 @@ impl RustGisApp {
         }
         // The favourite arrangement counts as saved until a command changes it, so one never set
         // isn't written to the preferences.
-        let ui =
-            UiState { keymap: keymap::Keymap::new(&s.registry), layout_favourite_saved: s.layout_favourite.clone(), ..UiState::default() };
+        let ui = UiState {
+            keymap: keymap::Keymap::new(&s.registry),
+            layout_favourite_saved: s.layout_favourite.clone(),
+            layout_arrangements_saved: s.layout_arrangements.clone(),
+            ..UiState::default()
+        };
         RustGisApp {
             session: s,
             ui,
@@ -1506,12 +1522,40 @@ impl RustGisApp {
             self.session.raster_defaults = d.sanitized();
         }
         self.ui.raster_defaults_saved = self.session.raster_defaults.clone();
+        // The arrangements saved by name, before the favourite, which may name one; those this
+        // version can't use are said, and kept as they are with the preference. Text that isn't a
+        // list of them is said and never saved over: arrangements saved then last the session.
+        if let Some(text) = self.services.load_pref.as_ref().and_then(|load| load(LAYOUT_ARRANGEMENTS_PREF)) {
+            match rustgis_engine::cmd::layout::read_saved_arrangements(&text) {
+                Some((kept, unread)) => {
+                    if !unread.is_empty() {
+                        self.session.notify(
+                            crate::i18n::fmt(
+                                "Saved arrangements of publication layouts left out: {count} (not usable by this version, a second name for one kept, or past the limit of 20). They are kept with the preferences.",
+                                &[("count", &unread.len().to_string())],
+                            ),
+                            false,
+                        );
+                    }
+                    (self.session.layout_arrangements, self.ui.layout_arrangements_unread) = (kept, unread);
+                }
+                None => {
+                    self.ui.layout_arrangements_unreadable = true;
+                    self.session.notify(
+                        tl!("The saved arrangements of publication layouts can't be read: they are left as they are, and arrangements saved now last only until the app closes.").to_string(),
+                        false,
+                    );
+                }
+            }
+        }
+        self.ui.layout_arrangements_saved = self.session.layout_arrangements.clone();
         // The favourite arrangement of publication layouts; one no longer valid is passed over,
         // said, and classic used.
         if let Some(text) = self.services.load_pref.as_ref().and_then(|load| load(LAYOUT_FAVOURITE_PREF)) {
+            let saved = &self.session.layout_arrangements;
             let read = serde_json::from_str::<Value>(&text)
                 .map_err(|e| e.to_string())
-                .and_then(|v| rustgis_engine::cmd::layout::parse_arrangement(&v).map(|_| v));
+                .and_then(|v| rustgis_engine::cmd::layout::parse_arrangement(&v, saved).map(|_| v));
             match read {
                 // A saved null is the default, named.
                 Ok(v) if v.is_null() => self.session.layout_favourite = Value::String("classic".into()),
@@ -2861,8 +2905,28 @@ impl RustGisApp {
         });
     }
 
-    /// Saves the favourite arrangement of publication layouts when `layout.arrangement` changed it.
+    /// Saves the favourite arrangement of publication layouts, and those saved by name, when
+    /// `layout.arrangement` changed them.
     fn save_layout_favourite(&mut self) {
+        if self.session.layout_arrangements != self.ui.layout_arrangements_saved && !self.ui.layout_arrangements_unreadable {
+            // An arrangement removed here takes with it the entries passed over beside it under
+            // the same name but for case, so it doesn't come back at the next start.
+            let kept = &self.session.layout_arrangements;
+            let removed: Vec<String> =
+                self.ui.layout_arrangements_saved.keys().filter(|k| !kept.contains_key(*k)).map(|k| k.to_lowercase()).collect();
+            // Only those this version would use: one it can't read stays as it was.
+            self.ui.layout_arrangements_unread.retain(|name, corners| {
+                !removed.contains(&name.to_lowercase()) || !rustgis_engine::cmd::layout::usable_saved_arrangement(name, corners)
+            });
+            self.ui.layout_arrangements_saved = self.session.layout_arrangements.clone();
+            // Those this version couldn't use go back as they were, but where one saved here took
+            // their very name.
+            let mut all = self.ui.layout_arrangements_unread.clone();
+            all.extend(self.session.layout_arrangements.clone());
+            if let Some(save) = &self.services.save_pref {
+                save(LAYOUT_ARRANGEMENTS_PREF, &Value::Object(all).to_string());
+            }
+        }
         if self.session.layout_favourite == self.ui.layout_favourite_saved {
             return;
         }
@@ -2944,17 +3008,17 @@ impl RustGisApp {
             }
             // The Layer Properties pane (#1803), on `{"layer": id}` when given (a layer's
             // right-click menu), as the Labeling pane is; feature and raster layers alike. With
-            // `{"tab": "general"|"source"|"display"|"query"}` it shows that tab (Data › Definition
-            // Query asks for "query", a feature layer's only).
+            // `{"tab": "general"|"source"|"display"|"query"|"time"}` it shows that tab (Data ›
+            // Definition Query asks for "query"; "query" and "time" are a feature layer's only).
             "ui.pane.layerProperties" => {
                 let given = match p.get("layer").filter(|l| !l.is_null()) {
                     Some(_) => Some(self.session.layer_id(p)?),
                     None => None,
                 };
                 let tab = match p.get("tab").filter(|t| !t.is_null()) {
-                    Some(t) => {
-                        Some(t.as_str().and_then(layerprops::Topic::parse).ok_or("unknown tab: give general, source, display or query")?)
-                    }
+                    Some(t) => Some(
+                        t.as_str().and_then(layerprops::Topic::parse).ok_or("unknown tab: give general, source, display, query or time")?,
+                    ),
                     None => None,
                 };
                 let layer = given.or(self.session.active_layer).and_then(|id| self.session.map().layer(id));
@@ -2962,8 +3026,10 @@ impl RustGisApp {
                 if (given.is_some() || tab.is_some() || !self.ui.right_open.contains(&RightPane::LayerProperties)) && layer.is_none() {
                     return Err("select a layer in the Layers pane first".into());
                 }
-                if tab == Some(layerprops::Topic::Query) && layer.is_some_and(|l| l.is_raster()) {
-                    return Err("a raster layer has no definition query: the Query tab is a feature layer's".into());
+                if tab.is_some_and(layerprops::Topic::feature_only) && layer.is_some_and(|l| l.is_raster()) {
+                    return Err(
+                        "a raster layer has no definition query or time binding: the Query and Time tabs are a feature layer's".into()
+                    );
                 }
                 if let Some(id) = given {
                     self.session.run("layer.select", &json!({"layer": id}))?;
@@ -5734,6 +5800,8 @@ impl RustGisApp {
         // See `logic`.
         rustgis_engine::render::on_the_interface_thread();
         let ctx = ui.ctx().clone();
+        // The graphics card's error handler, on the first frame with a device, whatever it shows.
+        mapview::handle_gpu_errors_once(self, &ctx);
         // Fonts installed by `logic` take effect on the next frame.
         if self.fonts_frames < 2 {
             self.fonts_frames += 1;
