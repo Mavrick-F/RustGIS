@@ -4077,6 +4077,7 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     };
     // Defaults only when a value is not given: a bad one is refused, not replaced.
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize"])?;
     let cell = match num(p, "pixelSize") {
         Some(c) if c > 0.0 => c,
         _ if given("pixelSize") => return Err("the pixel size must be more than zero".into()),
@@ -4088,7 +4089,8 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         None => 2.0,
     };
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
-    let r = crate::rasterops::idw(&pts, &extent, cell, power, 0, &name, crs).map_err(|e| with_note(e, &beyond_note))?;
+    let r =
+        crate::rasterops::idw(&pts, &extent, cell, power, 0, &name, crs).map_err(|e| with_note(with_note(e, &beyond_note), &crs_note))?;
     let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
     let msg = format!("IDW Interpolation: {} × {} cells from {} points", r.width, r.height, pts.len());
     Ok(ToolResult {
@@ -4189,6 +4191,7 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         }
     };
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize", "range"])?;
     let neighbours = match num(p, "neighbours") {
         Some(n) if n >= 2.0 => (n as usize).min(32),
         Some(_) => return Err("neighbours must be at least 2".into()),
@@ -4225,7 +4228,8 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     }
 
     let name = out_name(p, format!("{}_{field}_kriging", ds.name));
-    let r = crate::kriging::kriging(&pts, &extent, cell, &params, neighbours, &name, crs).map_err(|e| with_note(e, &beyond_note))?;
+    let r = crate::kriging::kriging(&pts, &extent, cell, &params, neighbours, &name, crs)
+        .map_err(|e| with_note(with_note(e, &beyond_note), &crs_note))?;
     let pred_bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
     let var_bytes = rustgis_data::raster::geotiff::write(&r, 1).map_err(|e| e.to_string())?;
     let var_name = format!("{name}_variance");
@@ -4274,7 +4278,7 @@ pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<Str
             Some(Ok(c)) => (
                 c,
                 Some(format!(
-                    "{tool}: made in {}, the coordinate system {} was read in, with its units for the extent and cell size; set crs to EPSG:4326 to make it in degrees",
+                    "{tool}: made in {}, the coordinate system {} was read in, with its units for the extent and sizes; set crs to EPSG:4326 to make it in degrees",
                     c.label(),
                     ds.name
                 )),
@@ -4284,7 +4288,10 @@ pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<Str
         // Asked for by name: degrees, with nothing to say.
         text if Crs::parse(text).is_ok_and(|c| c == Crs::LonLat) => Ok((Crs::LonLat, None)),
         text => {
-            let (crs, note) = projected_crs(text)?;
+            let (crs, note) = projected_crs(text).map_err(|e| match Crs::parse(text) {
+                Ok(c) if c.is_geographic() => format!("{e}; EPSG:4326 makes it in degrees"),
+                _ => e,
+            })?;
             Ok((crs, note.map(|note| format!("{tool}: its coordinate system: {note}"))))
         }
     }
@@ -4338,6 +4345,33 @@ fn in_projected(crs: Crs, to: &Transformer, c: Coord) -> Option<Coord> {
     // past it through, onto the edge.
     let held = crs != Crs::WebMercator || c.y.abs() <= rustgis_geom::MAX_LAT;
     held.then(|| to.from_lonlat(c)).flatten().filter(|p| p.is_finite() && to.to_lonlat(*p).is_some_and(|back| (back.y - c.y).abs() < 1e-4))
+}
+
+/// The note on a system an interpolation took from the layer (`p`'s `crs` empty), naming the values
+/// among `keys` that `p` gives, read in its units: a script written when these tools worked in
+/// degrees is told, not answered in metres without a word (#1743). An `extent` that holds none of
+/// `pts` in those units is refused, as degrees read as metres would be.
+pub fn in_its_units(
+    p: &Json,
+    crs: Crs,
+    note: Option<String>,
+    extent: &Extent,
+    pts: &[(Coord, f64)],
+    keys: &[&str],
+) -> Result<Option<String>, String> {
+    let Some(note) = note else { return Ok(None) };
+    if crs == Crs::LonLat || !s(p, "crs").trim().is_empty() {
+        return Ok(Some(note));
+    }
+    let given: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|k| p.get(*k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty())))
+        .collect();
+    if given.contains(&"extent") && !pts.iter().any(|(c, _)| extent.contains(*c)) {
+        return Err(format!("the extent holds none of the points in {}'s units ({note})", crs.label()));
+    }
+    Ok(Some(if given.is_empty() { note } else { format!("{note} ({} as given, in its units)", given.join(", ")) }))
 }
 
 /// `e` with `note` after it, when there is one: what was left out can be why a run failed.
@@ -9989,6 +10023,17 @@ mod tests {
             let r = crate::run(tool, &m_unknown, &serde_json::json!({"input": "wells", "field": "v"}))
                 .unwrap_or_else(|e| panic!("{tool}: {e}"));
             assert!(r.messages.iter().any(|m| m.contains("made in degrees") && m.contains("can't project to")), "{tool}: {:?}", r.messages);
+            // Values a script gave in degrees, read in the layer's metres, are said, not taken quietly:
+            // an extent holding no points is refused, and too many cells say the units.
+            let run = |p: serde_json::Value| crate::run(tool, &m, &p);
+            let e = run(serde_json::json!({"input": "wells", "field": "v", "extent": "-90.1,35.05,-89.9,35.25"})).err().unwrap_or_default();
+            assert!(e.contains("holds none of the points") && e.contains("EPSG:4326"), "{tool}: {e}");
+            let e = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 0.01})).err().unwrap_or_default();
+            assert!(e.contains(&format!("made in {label}")), "{tool}: {e}");
+            let r = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 500})).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(r.messages.iter().any(|m| m.contains("(pixelSize as given, in its units)")), "{tool}: {:?}", r.messages);
+            let e = run(serde_json::json!({"input": "wells", "field": "v", "crs": "EPSG:4269"})).err().unwrap_or_default();
+            assert!(e.contains("EPSG:4326 makes it in degrees"), "{tool}: {e}");
             // EPSG:4326 asks for degrees, with nothing to say.
             let (crs, messages) = made_in(serde_json::json!({"input": "wells", "field": "v", "crs": "EPSG:4326"}));
             assert_eq!(crs, Crs::LonLat, "{tool}");

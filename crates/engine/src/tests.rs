@@ -39536,6 +39536,10 @@ fn interpolation_in_a_projected_coordinate_system() {
     let (crs, _, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
     assert_eq!(crs, Crs::Epsg(32616));
     assert!(assumed(&notices), "{notices:?}");
+    // A cell size given in degrees by a script from before is read in metres, and too many cells
+    // say so.
+    let e = s.run("analysis.interpolate", &json!({"layer": "wells", "field": "depth", "cellSize": 0.01})).unwrap_err();
+    assert!(e.contains("cellSize as given, in its units") && e.contains("EPSG:4326"), "{e}");
     let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326", "cellSize": 0.01}));
     assert_eq!((crs, cell), (Crs::LonLat, 0.01));
     assert!(!assumed(&notices), "{notices:?}");
