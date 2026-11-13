@@ -250,6 +250,10 @@ pub(crate) fn raw_table(dbf: &[u8]) -> Option<RawTable<'_>> {
         return None;
     }
     let body = dbf.get(header_len..)?;
+    // Fewer records than the header counts: not a table this can compare.
+    if body.len() < count.checked_mul(record_len)? {
+        return None;
+    }
     let (mut records, mut deleted) = (Vec::new(), 0);
     for record in body.chunks_exact(record_len).take(count) {
         if record.first() == Some(&b'*') {

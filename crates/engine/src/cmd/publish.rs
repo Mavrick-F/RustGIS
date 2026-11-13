@@ -40,8 +40,10 @@ fn record(l: &rustgis_map::Layer) -> Result<(&rustgis_data::sync::Synced, &str),
 /// `p` names back over the Shapefile it was read from ([`rustgis_data::publish::shapefile`],
 /// which says what it checks first), when it has edits the file lacks. Its work grows with the
 /// file (hashed, read, written twice in memory and read back): the desktop app runs it on a
-/// thread of its own with progress and Cancel. Once written, the layer's record is of the files
-/// written and the rows published, so it reads `inSync`; the project then has a change to save.
+/// thread of its own with progress and Cancel. Once written, the layer holds its rows as the file
+/// reads them (the same, but for what a Shapefile can't tell apart: an empty text and no value),
+/// and its record is of the files written and those rows, so it reads `inSync`; the project then
+/// has a change to save.
 pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("the layer no longer exists")?;
@@ -79,8 +81,25 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 });
             }
             let published = rustgis_data::publish::shapefile(&dataset, std::path::Path::new(&path), &synced).map_err(|e| e.to_string())?;
-            let read = (published.rows != rows).then_some(published.rows);
-            let new = rustgis_data::sync::Synced { files: published.files, rows, read };
+            // The layer as the file now reads it, its features keeping their ids: what the layer
+            // holds once published, and its record (the file reads so next time too).
+            let mut held = dataset.clone();
+            let ids: Vec<u64> = dataset.features.iter().map(|f| f.id).collect();
+            held.features = published
+                .read
+                .features
+                .iter()
+                .zip(&ids)
+                .map(|(f, id)| rustgis_data::Feature { id: *id, ..f.clone() })
+                .collect::<Vec<_>>()
+                .into();
+            held.fields = published.read.fields.clone();
+            // Already hashed before the files were placed: Cancel must not leave a successful
+            // write without its sync record. Feature ids do not contribute to the digest.
+            let read = published.rows;
+            // Unchanged when the file reads as the layer is.
+            let held = (read != rows).then_some(held);
+            let new = rustgis_data::sync::Synced { files: published.files, rows: read };
             let (said, written_path) = (path.clone(), Some(path.clone()));
             let then: Then = Box::new(move |s: &mut Session, _: &mut Value| {
                 // The record follows the file: the layer read from it takes the record of what
@@ -89,6 +108,19 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 match live {
                     Some(l) if l.synced.as_ref() == Some(&synced) && l.dataset.source.as_deref() == Some(said.as_str()) => {
                         l.synced = Some(new);
+                        // Not edited meanwhile: it takes what the file holds (an empty text as no
+                        // value, whole numbers as integers). Edited, it keeps its edits, which
+                        // the file then lacks.
+                        if let Some(held) = held
+                            && l.dataset.features.shares(&dataset.features)
+                            && l.dataset.fields == dataset.fields
+                            && l.dataset.crs == dataset.crs
+                        {
+                            l.dataset.features = held.features;
+                            l.dataset.fields = held.fields;
+                            l.touch_geometry();
+                            s.revision = s.revision.wrapping_add(1);
+                        }
                         s.mark_unsaved();
                     }
                     _ => s.warn(format!("{said} was written, but {name} changed while it was: add the file again to compare them")),

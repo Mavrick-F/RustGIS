@@ -44755,6 +44755,40 @@ fn a_layer_publishes_its_edits_to_its_shapefile() {
     assert_eq!(state(&mut s), "edited");
     s.run("edit.redo", &Value::Null).unwrap();
     assert_eq!(state(&mut s), "inSync");
+    // An empty text, which the file holds as no value: the layer takes it as the file reads it,
+    // and is in step with it.
+    s.run("edit.setValue", &json!({"layer": id, "row": 2, "field": "name", "value": ""})).unwrap();
+    s.run("source.publish", &json!({"layer": id})).unwrap();
+    assert_eq!(state(&mut s), "inSync");
+    let l = s.map().layer(id as u32).unwrap();
+    let name = l.dataset.fields.iter().position(|f| f.name == "name").unwrap();
+    assert!(l.dataset.features.get(2).unwrap().attrs[name].is_null());
+    // Cancel arriving after the final .shp rename cannot turn a committed publish into an
+    // error or leave its old sync record. The probe observes the real file, not an internal hook.
+    struct CancelAfterPlacement {
+        path: std::path::PathBuf,
+        before: Vec<u8>,
+    }
+    impl rustgis_data::progress::Probe for CancelAfterPlacement {
+        /// Changes only after the last .shp rename, the publication commit point.
+        fn cancelled(&self) -> bool {
+            std::fs::read(&self.path).is_ok_and(|bytes| bytes != self.before)
+        }
+        fn begin(&self, _: u64) {}
+        fn advance(&self, _: u64) {}
+    }
+    s.run("edit.setGeometry", &json!({"layer": id, "row": 0, "geometry": {"type": "Point", "coordinates": [1, 2]}})).unwrap();
+    {
+        let probe = std::sync::Arc::new(CancelAfterPlacement { path: path.clone(), before: std::fs::read(&path).unwrap() });
+        let _installed = rustgis_data::progress::install(Some(probe.clone()));
+        // Run the real worker directly: synchronous Session dispatch installs its own probe.
+        let work = crate::cmd::publish::publish_work(&s, &json!({"layer": id})).unwrap();
+        let mut wrote = work().unwrap();
+        assert_eq!(wrote.answer["published"], true);
+        wrote.then.take().unwrap()(&mut s, &mut wrote.answer).unwrap();
+        assert!(rustgis_data::progress::Probe::cancelled(probe.as_ref()), "the probe saw the committed shape");
+    }
+    assert_eq!(state(&mut s), "inSync");
     // Changed since: refused, the file left as it was.
     s.run("edit.setValue", &json!({"layer": id, "row": 1, "field": "name", "value": "Mine"})).unwrap();
     let mut theirs = dbf();

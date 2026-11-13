@@ -736,7 +736,7 @@ pub(crate) fn temp_beside(path: &Path) -> std::io::Result<std::path::PathBuf> {
 /// removes it on failure.
 #[cfg(test)]
 fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    write_new_with(path, |w| w.write_all(bytes))
+    write_new_with(path, |_, w| w.write_all(bytes))
 }
 
 /// [`write_new`], the new file taking the mode of the file at `like` (on Unix, when there is one)
@@ -753,25 +753,29 @@ fn write_new_like(path: &Path, like: &Path, bytes: &[u8]) -> std::io::Result<()>
     };
     #[cfg(not(unix))]
     let _ = like;
-    write_new_with(path, |w| {
+    write_new_with(path, |file, w| {
+        // Through the handle opened, not the path, which could name another file by now.
         #[cfg(unix)]
         if let Some(mode) = mode {
             use std::os::unix::fs::PermissionsExt;
-            if std::fs::metadata(path)?.permissions().mode() != mode.mode() {
-                std::fs::set_permissions(path, mode)?;
+            if file.metadata()?.permissions().mode() != mode.mode() {
+                file.set_permissions(mode)?;
             }
         }
+        #[cfg(not(unix))]
+        let _ = file;
         w.write_all(bytes)
     })
 }
 
-/// [`write_new`] with the content written by `write`, through a buffer, as it goes.
-fn write_new_with(path: &Path, write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>) -> std::io::Result<()> {
+/// [`write_new`] with the content written by `write`, through a buffer, as it goes; `write` is
+/// also given the file opened, before anything is written to it.
+fn write_new_with(path: &Path, write: impl FnOnce(&std::fs::File, &mut dyn std::io::Write) -> std::io::Result<()>) -> std::io::Result<()> {
     use std::io::Write;
     let f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     let res = (|| {
         let mut w = std::io::BufWriter::new(&f);
-        write(&mut w)?;
+        write(&f, &mut w)?;
         w.flush()?;
         drop(w);
         f.sync_all()
@@ -2919,6 +2923,13 @@ pub fn shapefile_values_notes(ds: &Dataset, target: &str) -> Vec<String> {
         notes.push(format!("{target}: {what} rounded to fit dBase field precision, in {fields}"));
     }
     notes
+}
+
+/// The names of the `.dbf` columns a Shapefile written from `fields` has, in order
+/// ([`dbf_names`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn shapefile_column_names(fields: &[Field]) -> Vec<String> {
+    dbf_names(fields)
 }
 
 /// dBase field names (at most 10 bytes, unique without regard to case) for the fields.

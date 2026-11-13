@@ -30,22 +30,8 @@ pub struct FileStamp {
 pub struct Synced {
     /// The files, as they were.
     pub files: FileSync,
-    /// The layer's [`rows_digest`] then.
+    /// The layer's [`rows_digest`] then: the file's as it read then too.
     pub rows: u64,
-    /// The [`rows_digest`] of the file as it reads then, where that isn't `rows`: after a
-    /// publish, the file holds the layer as a Shapefile can (an empty text reads as no value, a
-    /// column of whole numbers as integers, an edited shape in another system back through its
-    /// projection). Not saved when it is `rows`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub read: Option<u64>,
-}
-
-impl Synced {
-    /// The [`rows_digest`] of the file as it read at the sync: what reading it now must give
-    /// for its rows that weren't edited to be the file's.
-    pub fn file_rows(&self) -> u64 {
-        self.read.unwrap_or(self.rows)
-    }
 }
 
 /// A hash of what a dataset holds: its fields, coordinate system, and each row's geometry and

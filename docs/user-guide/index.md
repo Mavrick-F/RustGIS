@@ -406,6 +406,8 @@ refuses, with nothing written, when:
 
 - the file changed since the layer was read (`source.syncState` would say `sourceChanged` or
   `both`): writing would overwrite that change;
+- the layer was read otherwise than the file reads now (by an older RustGIS), so rows that
+  weren't edited could change;
 - the file, read and written again, wouldn't be the same file: shapes with Z or M values, records
   without a shape, multipatches, records marked deleted, text with spaces before it, numbers with
   more digits than RustGIS holds exactly, columns of a type RustGIS doesn't write (memo, binary),
@@ -414,25 +416,30 @@ refuses, with nothing written, when:
   bytes, text in characters the file's code page lacks.
 
 The file keeps its code page (its `.cpg` and the language driver in its `.dbf`), each column's
-width, decimals and type where the values still fit, and its `.prj`. A column too narrow for an
-edited value is made wider, and a notice says which. A layer read in another coordinate system
-than its `.prj` names gets a `.prj` for that system, said too. A shape that wasn't edited is
+width, decimals and type where the values still fit, and its `.prj`. A column that can't hold
+an edited value gets one that can, and a notice names it with its old and new form; a field
+deleted or renamed in the layer leaves its column out of the file, and a notice names it too. A layer read in another
+coordinate system than its `.prj` names gets a `.prj` for that system, said too. A shape that wasn't edited is
 written with the coordinates the file holds, so a projected file's untouched shapes stay as they
 were to the bit. An edited shape in a projected system is converted from longitude/latitude, as
 RustGIS holds it, and read back: publishing refuses one that would move by more than one part in
 10¹¹ of its coordinates (a tenth of a millimetre at ten thousand kilometres).
 
 The new parts are written beside the old ones, with the old parts' file permissions, checked,
-and then renamed into place, the `.shp` last. If one fails to land, the old parts are put back;
+and then renamed into place, the `.shp` last. An OS lock prevents two RustGIS processes from
+publishing the same source at once; a competing publish refuses immediately. The empty
+`.filename.shp.rustgis-lock` sidecar stays beside the source for reuse; the OS releases its lock
+when the publisher finishes or exits. Other programs do not follow this locking protocol. If one fails to land, the old parts are put back;
 should putting one back fail too, the message names the temporary file that holds it, beside the
 Shapefile, so it can be renamed back by hand. Sidecars RustGIS doesn't write, such as `.shp.xml`
 metadata, are left alone. The spatial indexes that would no longer match (`.qix`, `.sbn`, `.sbx`)
 are removed where they can be; one that can't be (held open by another program) is left, and
 should be deleted before that program uses the file.
 
-Once published, the layer reads `inSync`, and the project has a change to save (its record of
-the file). Undo doesn't change the file: undoing an edit made before publishing shows the layer
-as `edited` again. A layer with no edits writes nothing. GeoJSON and layers read in place can't
+Once published, the layer holds its rows as the file reads them, which differs only where a
+Shapefile can't tell values apart (an empty text reads as no value, a column of whole numbers as
+integers), so it reads `inSync`; the project has a change to save. Undo doesn't change the file:
+undoing an edit made before publishing shows the layer as `edited` again. A layer with no edits writes nothing. GeoJSON and layers read in place can't
 be published yet.
 
 On the desktop, make the layer active and choose **Publish to Source** in Command Search; it runs

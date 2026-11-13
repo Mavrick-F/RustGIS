@@ -36,12 +36,15 @@ use std::path::{Path, PathBuf};
 /// a tenth of a millimetre at ten thousand kilometres; anything more is refused.
 const PROJECTED_TOLERANCE: f64 = 1e-11;
 
-/// A layer written back over its Shapefile: the files as they were written and the
-/// [`crate::sync::rows_digest`] of the file as it reads now, to record as the layer's new sync
-/// point, the features written, and what it says (fields given other columns, a `.prj` that now
-/// says another system).
+/// A layer written back over its Shapefile: the files as they were written, and the layer as the
+/// file now reads (`read`: its rows in the same order, as a Shapefile holds them: an empty text as
+/// no value, a column of whole numbers as integers, an edited shape in another system back through
+/// its projection), to record as the layer's new sync point; the features written, and what it
+/// says (fields given other columns or left out, a `.prj` that now says another system).
 pub struct Published {
     pub files: FileSync,
+    pub read: Dataset,
+    /// Digest of `read`, computed before placement so cancellation cannot interrupt completion.
     pub rows: u64,
     pub features: usize,
     pub notes: Vec<String>,
@@ -50,6 +53,37 @@ pub struct Published {
 /// A refusal: nothing was written.
 fn refused(path: &Path, why: impl std::fmt::Display) -> DataError {
     DataError::Format(format!("{}: {why}; nothing was written", path.display()))
+}
+
+/// Holds an exclusive OS lock on a persistent sidecar through publication. The sidecar is
+/// never unlinked: deleting it could let a third process lock a different inode while another
+/// still holds the old one. Dropping the handle (including on process exit) releases the lock;
+/// contention refuses immediately. This coordinates RustGIS publishers, not other programs.
+fn source_lock(path: &Path) -> Result<std::fs::File> {
+    let target = path.canonicalize()?;
+    let mut name = std::ffi::OsString::from(".");
+    name.push(target.file_name().ok_or_else(|| refused(path, "it has no file name"))?);
+    name.push(".rustgis-lock");
+    let lock_path = target.with_file_name(name);
+    if std::fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.file_type().is_file()) {
+        return Err(refused(path, format!("{} isn't a regular lock file", lock_path.display())));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
+    }
+    let file = options.open(&lock_path).map_err(|e| refused(path, format!("couldn't open {}: {e}", lock_path.display())))?;
+    if !file.metadata()?.is_file() {
+        return Err(refused(path, "its lock isn't a regular file"));
+    }
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => refused(path, "another RustGIS publisher holds this source; try again after it finishes"),
+        std::fs::TryLockError::Error(e) => refused(path, format!("couldn't lock {}: {e}", lock_path.display())),
+    })?;
+    Ok(file)
 }
 
 /// The Shapefile at `path`'s parts as they are, read into memory, with its `.cpg`'s path.
@@ -115,8 +149,11 @@ impl Original {
 /// and what it keeps. Its work grows with the file: it is hashed twice, read twice, written in
 /// memory twice and read back, the hashing and writing counting progress, and it stops once the
 /// run is cancelled (before the last part is placed, which puts the old file back). Reading the
-/// file into memory and back are single steps without a check.
+/// file into memory and back, and comparing the shapes, table and rows (one pass each, without
+/// a check), are steps that run to their end before Cancel is seen. Hashing the prepared bytes
+/// and writing/syncing each staged part likewise run as single steps.
 pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> {
+    let _lock = source_lock(path)?;
     let unchanged = |when: &str| -> Result<()> {
         let changed = synced.files.changed(path)?;
         if changed.is_empty() {
@@ -157,7 +194,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     // 1. It reads as the layer was read: in the layer's system, and in the file's own
     // coordinates (the system taken for longitude/latitude, which converts nothing).
     let (as_read, _) = crate::io::read_shapefile_parts(original.parts(), &name, crs)?;
-    if crate::sync::rows_digest(&as_read)? != synced.file_rows() {
+    if crate::sync::rows_digest(&as_read)? != synced.rows {
         return Err(refused(
             path,
             "it reads otherwise now than when the layer was read (RustGIS reads it more fully since), so rows that weren't edited could change: add the file again to read it as it is",
@@ -203,8 +240,21 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     if let Some(why) = same_rows(ds, &read_back, if crs.is_some() { PROJECTED_TOLERANCE } else { 0.0 }) {
         return Err(refused(path, format!("the file couldn't hold the layer as it is: {why}")));
     }
-    // The file as the next publish will read it.
-    let rows = crate::sync::rows_digest(&read_back)?;
+
+    // The file's columns no field of the layer has now (deleted or renamed): left out, and said.
+    let kept_names = crate::io::shapefile_column_names(&ds.fields);
+    let gone: Vec<String> =
+        table.columns.iter().filter(|c| !kept_names.iter().any(|n| n.as_bytes() == c.name.as_slice())).map(column).collect();
+    if !gone.is_empty() {
+        let shown: Vec<&str> = gone.iter().take(5).map(String::as_str).collect();
+        let more = if gone.len() > 5 { format!(" and {} more", gone.len() - 5) } else { String::new() };
+        notes.push(format!(
+            "{}: {} left out, as no field of the layer has its name now: {}{more}",
+            path.display(),
+            if gone.len() == 1 { "1 column of the file was".to_string() } else { format!("{} columns of the file were", gone.len()) },
+            shown.join(", ")
+        ));
+    }
     if !widened.is_empty() {
         let shown: Vec<&str> = widened.iter().take(5).map(String::as_str).collect();
         let more = if widened.len() > 5 { format!(" and {} more", widened.len() - 5) } else { String::new() };
@@ -236,6 +286,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     if let Some((cpg, bytes)) = &original.cpg {
         targets.push((cpg.clone(), bytes.clone()));
     }
+    let rows = crate::sync::rows_digest(&read_back)?;
     // The record of the files as they will be, made before any is placed: once they are, the
     // publish has happened, whatever comes after.
     let files = FileSync::of_written(path, &targets)?;
@@ -255,7 +306,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
         return Err(e);
     }
     crate::io::place_shapefile(path, &staged)?;
-    Ok(Published { files, rows, features: ds.features.len(), notes })
+    Ok(Published { files, read: read_back, rows, features: ds.features.len(), notes })
 }
 
 /// `ds` in the file's coordinate system `crs` (`None`: longitude/latitude, as it is held). Given
@@ -271,6 +322,8 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
     let at: std::collections::HashMap<u64, usize> = read.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
     let mut rows = Vec::with_capacity(ds.features.len());
     for f in ds.features.iter() {
+        // A shape taken as the file holds it is quick, but a layer of many is not.
+        crate::progress::check()?;
         let held = at.get(&f.id).and_then(|&i| read.get(i).filter(|r| r.geometry == f.geometry).and(raw.get(i)));
         let mut row = f.clone();
         match held {
@@ -616,7 +669,7 @@ mod tests {
     fn read(path: &Path) -> (Dataset, Synced) {
         let (read, files) = FileSync::around(path, || crate::io::read_path(path).unwrap()).unwrap();
         let rows = crate::sync::rows_digest(&read.0).unwrap();
-        (read.0, Synced { files: files.unwrap(), rows, read: None })
+        (read.0, Synced { files: files.unwrap(), rows })
     }
 
     /// An edit is written back: the file reads as the layer, keeps its columns and `.prj`, and
@@ -638,9 +691,29 @@ mod tests {
         assert_eq!(std::fs::read(path.with_extension("prj")).unwrap(), prj);
         assert_eq!(crate::dbf::raw_table(&std::fs::read(path.with_extension("dbf")).unwrap()).unwrap().columns, columns);
         assert!(published.files.changed(&path).unwrap().is_empty());
-        // Nothing left beside it.
+        // Only the reusable lock sidecar remains; no staged or backup parts.
         let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-        assert!(names.iter().all(|n| !n.starts_with('.')), "{names:?}");
+        assert!(names.iter().all(|n| !n.starts_with('.') || n == ".parcels.shp.rustgis-lock"), "{names:?}");
+    }
+
+    /// An independent handle represents a concurrent publisher. Its lock refuses a publish
+    /// without touching the source, and is reusable after closing, with no stale-lock cleanup.
+    #[test]
+    fn a_concurrent_publisher_is_refused_until_the_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (mut ds, sync) = written(&parcels(), &path);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text("Smyth".into());
+        ds.features = rows.into();
+        let held = source_lock(&path).unwrap();
+        let e = shapefile(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("another RustGIS publisher") && e.contains("nothing was written"), "{e}");
+        assert!(sync.files.changed(&path).unwrap().is_empty());
+        drop(held);
+        shapefile(&ds, &path, &sync).unwrap();
+        // A second publisher that loaded the old baseline now sees the committed change.
+        assert!(shapefile(&ds, &path, &sync).err().unwrap().to_string().contains("changed since the layer was read"));
     }
 
     /// A layer read otherwise than the file reads now (by an older RustGIS, or saved in a
@@ -702,8 +775,8 @@ mod tests {
         assert!(e.contains("code page 863") && e.contains("nothing was written"), "{e}");
     }
 
-    /// Once published, a layer the file holds otherwise than the layer does (an empty text reads
-    /// back as no value) publishes again: its record holds the file as it reads.
+    /// Once published, the layer as the file reads it (an empty text as no value) is its record:
+    /// it publishes again.
     #[test]
     fn a_layer_the_file_reads_otherwise_publishes_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -713,13 +786,40 @@ mod tests {
         rows[0].attrs[0] = Value::Text(String::new());
         ds.features = rows.into();
         let published = shapefile(&ds, &path, &sync).unwrap();
-        let rows_now = crate::sync::rows_digest(&ds).unwrap();
-        assert_ne!(published.rows, rows_now, "the file reads the empty text as no value");
-        let synced = Synced { files: published.files, rows: rows_now, read: Some(published.rows) };
+        assert_eq!(published.read.features.iter().next().unwrap().attrs[0], Value::Null);
+        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap() };
+        let mut ds = published.read;
         let mut rows: Vec<_> = ds.features.iter().cloned().collect();
         rows[1].attrs[0] = Value::Text("Jonas".into());
         ds.features = rows.into();
         shapefile(&ds, &path, &synced).unwrap();
+    }
+
+    /// A field deleted from the layer leaves the file's column out, and says so.
+    #[test]
+    fn a_deleted_field_leaves_its_column_out_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (mut ds, sync) = written(&parcels(), &path);
+        ds.fields.remove(2);
+        let rows: Vec<_> = ds
+            .features
+            .iter()
+            .cloned()
+            .map(|mut f| {
+                f.attrs.remove(2);
+                f
+            })
+            .collect();
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        assert!(
+            published.notes.iter().any(|n| n.contains("1 column of the file was left out") && n.contains("'UNITS' N(18,0)")),
+            "{:?}",
+            published.notes
+        );
+        let columns = crate::dbf::raw_table(&std::fs::read(path.with_extension("dbf")).unwrap()).unwrap().columns;
+        assert_eq!(columns.len(), 2);
     }
 
     /// A file with records marked deleted is refused: writing it again would drop them, shapes and
@@ -768,7 +868,7 @@ mod tests {
         ds.features = rows.clone().into();
         let published = shapefile(&ds, &path, &sync).unwrap();
         // The record of what was published, as the layer takes it.
-        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&ds).unwrap(), read: Some(published.rows) };
+        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap() };
         let dbf = std::fs::read(path.with_extension("dbf")).unwrap();
         assert!(dbf.windows(5).any(|w| w == b"Mu\xf1oz"), "written in Windows-1252");
         assert_eq!(std::fs::read(path.with_extension("cpg")).unwrap(), b"1252");
