@@ -1836,8 +1836,9 @@ pub(crate) fn text_type<'a>(vals: impl Iterator<Item = &'a str>) -> FieldType {
 
 /// Whether a number's text reads as a finite Double that, written with as many significant digits,
 /// gives the same digits back, so no digit is lost: `1.50`, `0.1`, `1e300` and
-/// `0.10000000000000001` (0.1 to 17 digits) are; `12345678901234567891` and
-/// `0.12345678901234567891`, past the 17 digits a Double holds, aren't.
+/// `0.10000000000000001` (0.1 to 17 digits) and `0.00000000023283064365386962890625` (2^-32
+/// exactly) are; `12345678901234567891` and `0.12345678901234567891` aren't. No Double's exact
+/// value has more than 767 significant digits, so longer text isn't one, and isn't formatted.
 fn double_holds(v: &str) -> bool {
     /// The digits of a number's mantissa without leading or trailing zeros.
     fn digits(s: &str) -> String {
@@ -1847,7 +1848,7 @@ fn double_holds(v: &str) -> bool {
     }
     let want = digits(v);
     v.parse::<f64>()
-        .is_ok_and(|x| x.is_finite() && (want.is_empty() || want.len() <= 17 && digits(&format!("{x:.*e}", want.len() - 1)) == want))
+        .is_ok_and(|x| x.is_finite() && (want.is_empty() || want.len() <= 767 && digits(&format!("{x:.*e}", want.len() - 1)) == want))
 }
 
 /// Types a dataset's Text columns from their values (see [`text_type`]), for readers whose
@@ -4462,6 +4463,8 @@ mod tests {
         // A number written to 17 digits, as `%.17g` writes 0.1, is a Double.
         let (ds, _) = read_csv("v\n0.10000000000000001\n2.5\n", "t").unwrap();
         assert_eq!((ds.fields[0].ty, ds.value(0, 0)), (FieldType::Double, &Value::Float(0.1)));
+        // So is one written out exactly, however many digits that takes.
+        assert!(double_holds("0.00000000023283064365386962890625") && !double_holds(&"1".repeat(800)));
         // A whole number beside a decimal: 2^60 is a Double exactly, 10^18 + 100 isn't.
         let (ds, _) = read_csv("a,b\n1152921504606846976,1000000000000000100\n0.5,0.5\n", "t").unwrap();
         assert_eq!((ds.fields[0].ty, ds.fields[1].ty), (FieldType::Double, FieldType::Text));
