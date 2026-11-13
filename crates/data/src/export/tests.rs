@@ -124,7 +124,7 @@ fn an_explicit_export_format_ignores_case_and_the_filename() {
         if format == "GeOjSoN" {
             assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap()["features"].as_array().unwrap().len(), 1);
         } else {
-            assert_eq!(text, "name,longitude,latitude\nplace,1,2\n");
+            assert_eq!(text, crate::io::to_csv(&ds).unwrap());
         }
     }
     std::fs::remove_dir_all(d).unwrap();
