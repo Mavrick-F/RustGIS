@@ -461,11 +461,28 @@ struct Column {
     ty: String,
 }
 
-/// Column types the GeoParquet provider reads as they are; others are written as text.
+/// Column types the GeoParquet provider reads as they are; others are written as text. Dates and
+/// timestamps are written as Parquet's own (a `TIMESTAMPTZ` as a UTC instant); a `TIMESTAMP_NS`
+/// stays text, which keeps its nanoseconds.
 fn kept_as_is(ty: &str) -> bool {
     matches!(
         ty,
-        "BOOLEAN" | "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "UTINYINT" | "USMALLINT" | "UINTEGER" | "FLOAT" | "DOUBLE" | "VARCHAR"
+        "BOOLEAN"
+            | "TINYINT"
+            | "SMALLINT"
+            | "INTEGER"
+            | "BIGINT"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "FLOAT"
+            | "DOUBLE"
+            | "VARCHAR"
+            | "DATE"
+            | "TIMESTAMP"
+            | "TIMESTAMP_S"
+            | "TIMESTAMP_MS"
+            | "TIMESTAMP WITH TIME ZONE"
     ) || ty.starts_with("DECIMAL(")
 }
 
@@ -1088,12 +1105,24 @@ mod tests {
         // No geometry column.
         let e = select(&cols(&[("a", "INTEGER")]), None, "x").unwrap_err();
         assert!(e.to_string().contains("no geometry column"), "{e}");
-        // Types the provider doesn't read become text; a second geometry, WKT.
-        let (s, g) =
-            select(&cols(&[("d", "DATE"), ("geom", "GEOMETRY"), ("n", "DECIMAL(10,2)"), ("g2", "GEOMETRY('EPSG:3857')")]), None, "x")
-                .unwrap();
+        // Types the provider doesn't read become text; dates stay dates; a second geometry, WKT.
+        let (s, g) = select(
+            &cols(&[
+                ("d", "DATE"),
+                ("geom", "GEOMETRY"),
+                ("n", "DECIMAL(10,2)"),
+                ("g2", "GEOMETRY('EPSG:3857')"),
+                ("t", "TIMESTAMP WITH TIME ZONE"),
+                ("ns", "TIMESTAMP_NS"),
+                ("l", "INTEGER[]"),
+            ]),
+            None,
+            "x",
+        )
+        .unwrap();
         assert_eq!(g, "geom");
-        assert!(s.contains("CAST(\"d\" AS VARCHAR)") && s.contains("ST_Force2D(\"geom\") AS \"geom\""), "{s}");
+        assert!(s.contains("(SELECT \"d\", ") && s.contains(", \"t\", ") && s.contains("ST_Force2D(\"geom\") AS \"geom\""), "{s}");
+        assert!(s.contains("CAST(\"ns\" AS VARCHAR)") && s.contains("CAST(\"l\" AS VARCHAR)"), "{s}");
         assert!(s.contains(", \"n\",") && s.contains("ST_AsText(\"g2\")"), "{s}");
         // A geometry that says its coordinate system is converted; one given is used.
         let (s, _) = select(&cols(&[("g", "GEOMETRY('EPSG:3857')")]), None, "x").unwrap();
@@ -1188,13 +1217,15 @@ mod tests {
         assert_eq!(info.count, Some(2));
         assert!(info.indexed, "the bbox covering is found");
         assert_eq!(info.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["id", "name", "day"]);
-        assert_eq!(info.fields[2].ty, crate::FieldType::Text);
+        assert_eq!(info.fields[2].ty, crate::FieldType::Date);
         let b = pts.read(&crate::source::Request { extent: Some(rustgis_geom::Extent::new(10.5, 20.5, 12.0, 22.0)), limit: 10 }).unwrap();
         assert_eq!(b.features.len(), 1, "the extent query reads the covering");
         assert_eq!(b.features[0].geometry.as_ref().unwrap().extent(), rustgis_geom::Extent::new(11.0, 21.0, 11.0, 21.0));
         let all_points = pts.read(&crate::source::Request { extent: None, limit: 10 }).unwrap();
         assert_eq!(all_points.features.len(), 2);
         assert!(all_points.features.iter().all(|f| f.geometry.as_ref().unwrap().kind() == crate::GeometryType::Point));
+        let days: Vec<String> = all_points.features.iter().map(|f| f.attrs[2].to_string()).collect();
+        assert!(days.contains(&"2020-01-02".to_string()) && all_points.unread_dates.is_empty(), "{days:?}");
         // No temporary files are left.
         let names: Vec<String> =
             std::fs::read_dir(&cache).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
