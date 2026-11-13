@@ -309,21 +309,59 @@ fn feature_changes(x: &Feature, y: &Feature, map: &[(usize, Option<usize>)], fie
     out
 }
 
+/// The renames notices say, written `'old' → 'new'`.
+fn renames(notices: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for n in notices {
+        for (i, _) in n.match_indices("' → '") {
+            let old = n[..i].rsplit('\'').next().unwrap_or_default();
+            let new = n[i + "' → '".len()..].split('\'').next().unwrap_or_default();
+            out.push((old.to_string(), new.to_string()));
+        }
+    }
+    out
+}
+
 /// What changed between a layer and the layer read back. Features are matched by content, since
 /// a format may reorder them (FlatGeobuf sorts them along its spatial index); fields by name, and
-/// a format may add its own.
-fn changes(a: &Dataset, b: &Dataset) -> Vec<Change> {
+/// a format may add its own. `renamed` pairs a field with the column it became.
+fn changes(a: &Dataset, b: &Dataset, renamed: &[(String, String)]) -> Vec<Change> {
     let mut out = Vec::new();
     let mut map = Vec::new();
+    // Each column read back stands for one field at most: the names notices said first, then
+    // exact names, then names that differ in case.
+    let mut taken = vec![false; b.fields.len()];
+    let mut exact: Vec<Option<usize>> = vec![None; a.fields.len()];
+    for (i, f) in a.fields.iter().enumerate() {
+        let new = renamed.iter().find(|(old, _)| *old == f.name).map(|(_, new)| new);
+        let j = new.and_then(|new| (0..b.fields.len()).find(|&j| !taken[j] && b.fields[j].name == *new));
+        if let Some(j) = j {
+            taken[j] = true;
+            exact[i] = Some(j);
+        }
+    }
+    for (i, f) in a.fields.iter().enumerate() {
+        if exact[i].is_some() {
+            continue;
+        }
+        let j = (0..b.fields.len()).find(|&j| !taken[j] && b.fields[j].name == f.name);
+        if let Some(j) = j {
+            taken[j] = true;
+        }
+        exact[i] = j;
+    }
     for (i, f) in a.fields.iter().enumerate() {
         // A field holding only nulls gives a reader that types fields from their values nothing
         // to go on.
         let nulls = if a.features.iter().all(|x| x.attrs.get(i).is_none_or(|v| *v == Value::Null)) { " of nulls" } else { "" };
-        let exact = b.fields.iter().position(|g| g.name == f.name);
-        let j = exact.or_else(|| b.fields.iter().position(|g| g.name.eq_ignore_ascii_case(&f.name)));
+        let exact = exact.get(i).copied().flatten();
+        let j = exact.or_else(|| (0..b.fields.len()).find(|&j| !taken[j] && b.fields[j].name.eq_ignore_ascii_case(&f.name)));
+        if let Some(j) = j {
+            taken[j] = true;
+        }
         let change = match j.and_then(|j| b.fields.get(j)) {
             None => Some(format!("field{nulls} missing ({})", f.name)),
-            Some(g) if exact.is_none() => Some(format!("field renamed ({} → {})", f.name, g.name)),
+            Some(g) if g.name != f.name => Some(format!("field renamed ({} → {})", f.name, g.name)),
             Some(g) if g.ty != f.ty => Some(format!("field{nulls} type changed {:?} → {:?} ({})", f.ty, g.ty, f.name)),
             Some(_) => None,
         };
@@ -365,12 +403,11 @@ fn an_export_that_changes_a_layer_says_so() {
             let sub = dir.join(ext);
             let _ = std::fs::remove_dir_all(&sub);
             std::fs::create_dir_all(&sub).unwrap();
+            // A refusal says why, but a crash caught by `Session::run`, writing or reading, is a bug.
+            let crashed = |e: &str| e.contains("failed unexpectedly") || e.contains("stopped unexpectedly");
             let (said, back) = match trip(&ds, ext, &sub) {
+                Ok((_, Err(e))) | Err(e) if crashed(&e) => return Err(TestCaseError::fail(format!("{ext}: {e}"))),
                 Ok(trip) => trip,
-                // A refusal says why, but a crash caught by `Session::run` is a bug.
-                Err(e) if e.contains("failed unexpectedly") || e.contains("stopped unexpectedly") => {
-                    return Err(TestCaseError::fail(format!("{ext}: {e}")));
-                }
                 Err(_) => continue,
             };
             *written.borrow_mut().entry(ext).or_default() += 1;
@@ -392,7 +429,21 @@ fn an_export_that_changes_a_layer_says_so() {
                     }
                 }
             }
-            let found = back.map_or_else(|e| vec![(format!("not read back: {e}"), None)], |back| changes(&held, &back));
+            let found = back.map_or_else(
+                |e| vec![(format!("not read back: {e}"), None)],
+                |back| {
+                    let notices: Vec<String> = said.export.iter().chain(&said.read).cloned().collect();
+                    let mut renamed = renames(&notices);
+                    // KML and GPX write the first field named like `name` as each feature's
+                    // name, which reads back as `name`.
+                    if matches!(ext, "kml" | "gpx")
+                        && let Some(f) = held.fields.iter().find(|f| f.name.eq_ignore_ascii_case("name"))
+                    {
+                        renamed.insert(0, (f.name.clone(), "name".to_string()));
+                    }
+                    changes(&held, &back, &renamed)
+                },
+            );
             // A change is said by a notice naming its field, the export's or the reading's, or by
             // any export notice for one in no field (geometry, the feature count): a notice of
             // geometry names no field to look for, so this half is looser.
