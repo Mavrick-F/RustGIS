@@ -1,6 +1,6 @@
 //! GeoJSON publishing: prove that the source survives a read/write before replacing it.
 
-use super::{Published, refused, source_lock};
+use super::{Published, refuse_link, refused, source_lock};
 use crate::sync::{FileSync, Synced};
 use crate::{Dataset, Result};
 use serde_json::{Value as Json, json};
@@ -19,6 +19,7 @@ use std::path::Path;
 pub fn geojson(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> {
     let _lock = source_lock(path)?;
     let unchanged = || -> Result<()> {
+        refuse_link(path, path)?;
         let changed = synced.files.changed(path)?;
         if changed.is_empty() { Ok(()) } else { Err(refused(path, format!("{} changed since the layer was read", changed.join(", ")))) }
     };
@@ -336,6 +337,55 @@ mod tests {
         let sync = Synced { files: out.files, rows: out.rows };
         rename_owner(&mut ds, "Taylor");
         geojson(&ds, &path, &sync).unwrap();
+    }
+
+    /// A link present at load or introduced after the first fingerprint check stays intact.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_source_is_refused_even_when_introduced_during_preparation() {
+        struct Linked {
+            path: std::path::PathBuf,
+            target: std::path::PathBuf,
+            changed: std::sync::atomic::AtomicBool,
+        }
+        impl Linked {
+            /// Replaces the entry with a link to identical bytes, so fingerprint checks alone pass.
+            fn link(&self) {
+                std::fs::rename(&self.path, &self.target).unwrap();
+                std::os::unix::fs::symlink(&self.target, &self.path).unwrap();
+            }
+        }
+        impl crate::progress::Probe for Linked {
+            /// Changes the source entry without requesting cancellation.
+            fn cancelled(&self) -> bool {
+                false
+            }
+            /// Installs the link when row hashing starts, after the initial file check.
+            fn begin(&self, total: u64) {
+                if total == 1 && !self.changed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    self.link();
+                }
+            }
+            /// Progress is irrelevant to this source-change probe.
+            fn advance(&self, _: u64) {}
+        }
+        for during in [false, true] {
+            let (dir, path, mut ds, sync) = loaded(SOURCE);
+            rename_owner(&mut ds, "Jones");
+            let target = dir.path().join("original.geojson");
+            let probe = std::sync::Arc::new(Linked { path: path.clone(), target: target.clone(), changed: false.into() });
+            if !during {
+                probe.link();
+            }
+            let e = {
+                let _installed = crate::progress::install(during.then_some(probe as std::sync::Arc<dyn crate::progress::Probe>));
+                geojson(&ds, &path, &sync).err().unwrap().to_string()
+            };
+            assert!(e.contains("symbolic link") && e.contains("nothing was written"), "{e}");
+            assert_eq!(std::fs::read_link(&path).unwrap(), target);
+            assert_eq!(std::fs::read_to_string(target).unwrap(), SOURCE);
+            assert!(sync.files.changed(&path).unwrap().is_empty());
+        }
     }
 
     #[test]

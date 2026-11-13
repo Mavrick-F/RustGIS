@@ -57,11 +57,28 @@ fn refused(path: &Path, why: impl std::fmt::Display) -> DataError {
     DataError::Format(format!("{}: {why}; nothing was written", path.display()))
 }
 
+/// Placement replaces a directory entry, so following a linked part while reading is unsafe.
+fn refuse_link(source: &Path, part: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(part) {
+        Ok(m) if m.file_type().is_symlink() => Err(refused(
+            source,
+            format!(
+                "{} is a symbolic link; add the actual source files instead so publishing keeps the link and its target unchanged",
+                part.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Holds an exclusive OS lock on a persistent sidecar through publication. The sidecar is
 /// never unlinked: deleting it could let a third process lock a different inode while another
 /// still holds the old one. Dropping the handle (including on process exit) releases the lock;
 /// contention refuses immediately. This coordinates RustGIS publishers, not other programs.
 fn source_lock(path: &Path) -> Result<std::fs::File> {
+    refuse_link(path, path)?;
     let target = path.canonicalize()?;
     let mut name = std::ffi::OsString::from(".");
     name.push(target.file_name().ok_or_else(|| refused(path, "it has no file name"))?);
@@ -71,13 +88,41 @@ fn source_lock(path: &Path) -> Result<std::fs::File> {
         return Err(refused(path, format!("{} isn't a regular lock file", lock_path.display())));
     }
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
     }
-    let file = options.open(&lock_path).map_err(|e| refused(path, format!("couldn't open {}: {e}", lock_path.display())))?;
+    let opened = match options.open(&lock_path) {
+        Ok(file) => {
+            // The empty sidecar contains no source data. Any account sharing the directory
+            // must be able to lock it, regardless of source groups, ACLs or a private umask.
+            // Unix exclusive locks need only read access; set modes through the open handle.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+            }
+            Ok(file)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            options.create_new(false);
+            let existing = options.open(&lock_path);
+            #[cfg(unix)]
+            let existing = match existing {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // Unix advisory exclusive locks also work on read-only handles.
+                    options.write(false);
+                    options.open(&lock_path)
+                }
+                result => result,
+            };
+            existing
+        }
+        Err(e) => Err(e),
+    };
+    let file = opened.map_err(|e| refused(path, format!("couldn't open {}: {e}", lock_path.display())))?;
     if !file.metadata()?.is_file() {
         return Err(refused(path, "its lock isn't a regular file"));
     }
@@ -157,6 +202,10 @@ impl Original {
 pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> {
     let _lock = source_lock(path)?;
     let unchanged = |when: &str| -> Result<()> {
+        refuse_link(path, path)?;
+        for ext in ["shx", "dbf", "prj"].into_iter().chain(crate::dbf::CPG_SPELLINGS) {
+            refuse_link(path, &path.with_extension(ext))?;
+        }
         let changed = synced.files.changed(path)?;
         if changed.is_empty() {
             return Ok(());
@@ -698,6 +747,34 @@ mod tests {
         assert!(names.iter().all(|n| !n.starts_with('.') || n == ".parcels.shp.rustgis-lock"), "{names:?}");
     }
 
+    /// Reads follow symlinks, but replacement would sever them and leave the target stale.
+    #[cfg(unix)]
+    #[test]
+    fn linked_shapefile_parts_are_refused_without_replacing_the_link_or_target() {
+        for ext in ["shp", "shx", "dbf", "prj", "CPG"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("parcels.shp");
+            written(&parcels(), &path);
+            if ext == "CPG" {
+                std::fs::write(path.with_extension(ext), b"UTF-8").unwrap();
+            }
+            let part = path.with_extension(ext);
+            let target = dir.path().join(format!("original.{ext}"));
+            std::fs::rename(&part, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &part).unwrap();
+            let before = std::fs::read(&target).unwrap();
+            let (mut ds, sync) = read(&path);
+            let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+            rows[0].attrs[0] = Value::Text("Smyth".into());
+            ds.features = rows.into();
+            let e = shapefile(&ds, &path, &sync).err().expect("linked part must be refused").to_string();
+            assert!(e.contains("symbolic link") && e.contains("nothing was written"), "{ext}: {e}");
+            assert_eq!(std::fs::read_link(&part).unwrap(), target);
+            assert_eq!(std::fs::read(&target).unwrap(), before);
+            assert!(sync.files.changed(&path).unwrap().is_empty());
+        }
+    }
+
     /// An independent handle represents a concurrent publisher. Its lock refuses a publish
     /// without touching the source, and is reusable after closing, with no stale-lock cleanup.
     #[test]
@@ -716,6 +793,26 @@ mod tests {
         shapefile(&ds, &path, &sync).unwrap();
         // A second publisher that loaded the old baseline now sees the committed change.
         assert!(shapefile(&ds, &path, &sync).err().unwrap().to_string().contains("changed since the layer was read"));
+    }
+
+    /// A shared source's empty lock is readable across accounts, even under a private umask.
+    /// Its read-only handle still excludes a second publisher on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn shared_source_locks_are_readable_and_can_be_locked_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        written(&parcels(), &path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let held = source_lock(&path).unwrap();
+        let lock_path = dir.path().join(".parcels.shp.rustgis-lock");
+        assert_eq!(std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777, 0o444);
+        drop(held);
+        let held = source_lock(&path).unwrap();
+        assert!(source_lock(&path).err().unwrap().to_string().contains("another RustGIS publisher"));
+        drop(held);
+        source_lock(&path).unwrap();
     }
 
     /// A layer read otherwise than the file reads now (by an older RustGIS, or saved in a
