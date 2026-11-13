@@ -4606,6 +4606,13 @@ impl RustGisApp {
                     }
                     return Ok(Value::Null);
                 }
+                // Add Field and Calculate Field from a standalone table's view act on that table.
+                if p.get("table").is_some_and(|t| !t.is_null()) {
+                    let i = self.session.table_index(p)?;
+                    let id = self.session.project.tables.get(i).map(|t| t.id).ok_or("no such table")?;
+                    self.dialogs.open_on_table(which, &self.session, id)?;
+                    return Ok(Value::Null);
+                }
                 self.dialogs.open(which, &self.session)?;
                 // Rename Map / Rename Layout remember which one (`target`, by name; default the
                 // one in view), so renaming another from the Browser leaves the view alone.

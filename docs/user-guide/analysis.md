@@ -45,6 +45,29 @@ few; undo brings the text back. Use it for dates from CSV, GeoJSON or other file
 text. A field with a domain, subtypes or contingent values, or one a definition query or display
 filter would no longer read as dates (comparing it with a number), is refused.
 
+#### Editing a standalone table
+
+A standalone table opens from its right-click menu in Layers and is edited as a layer is:
+double-click a cell to change it, and use the toolbar to add a row, add a field or calculate a
+field over every row; a column's menu converts its field or deletes it (**Delete Field**). Cells, new rows and Calculate
+Field need editing on (**Edit › Edit**); adding, converting and deleting fields don't, as for a
+layer. Each edit is one undo step.
+
+The `edit.*` commands take the table as `"table"` (its name or id) instead of `"layer"`:
+`edit.setValue`, `edit.addField`, `edit.deleteField`, `edit.convertField`, `edit.calculateField`,
+and `edit.addFeature` with `"attributes"` and no geometry, which adds a row. A value a field can't
+hold whole is said, as for a layer.
+
+A table's rows live in the project, as they were copied in when it was added: edits change the
+project, not the CSV or other file the table came from. **Export Table** (`share.exportTable`)
+writes the edited table to a file. Tables have no selection yet, so rows can't be deleted.
+
+```text
+edit.setValue={"table":"sites","row":0,"field":"street","value":"Rue Cler"}
+edit.addFeature={"table":"sites","attributes":{"id":3,"street":"Quai Branly"}}
+edit.calculateField={"table":"sites","field":"visits","expression":"visits + 1"}
+```
+
 <figure markdown="span">
   ![The attribute table docked under the map: the 14 African countries of more than 30 million people, selected by attributes, highlighted on the map and in the table](https://assets.rustgis.app/images/attribute-table.webp)
   <figcaption>The attribute table, with a selection highlighted on the map and in the table.</figcaption>

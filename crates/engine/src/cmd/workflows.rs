@@ -894,8 +894,8 @@ fn run_script_here(s: &mut Session, p: &Value) -> CmdResult {
     let script = ps(p, "script").ok_or("script is required")?;
     let mut out = Vec::new();
     for (n, id, params) in script_commands(script)? {
-        let spec = s.registry.get(&id).ok_or_else(|| format!("line {n}: unknown command '{id}'"))?;
-        let (enabled, mutates, label) = (spec.enabled, spec.mutates, spec.label);
+        let spec = *s.registry.get(&id).ok_or_else(|| format!("line {n}: unknown command '{id}'"))?;
+        let (mutates, label) = (spec.mutates, spec.label);
         // On a copy of the session ([`ahead_on_copy`]): from a line that may reach outside it,
         // the run here runs the rest.
         #[cfg(not(target_arch = "wasm32"))]
@@ -908,11 +908,14 @@ fn run_script_here(s: &mut Session, p: &Value) -> CmdResult {
         {
             s.active_layer = Some(lid);
         }
-        if let Some(why) = enabled(s) {
+        // And a line naming a standalone table, against that table.
+        let (blocked, table) = s.check_conditions(&spec, &params);
+        if let Some(why) = blocked.unwrap_or_else(|panic| std::panic::resume_unwind(panic)) {
             return Err(format!("line {n}: {id}: {why}"));
         }
-        // As Session::run does: an edit to a layer read in place would be lost at its next read.
-        if let Some(e) = s.streamed_edit(&id, mutates, label, s.active_layer) {
+        // As Session::run does: an edit to a layer read in place would be lost at its next read
+        // (an edit of a table edits no layer).
+        if let Some(e) = s.streamed_edit(&id, mutates, label, if table.is_some() { None } else { s.active_layer }) {
             return Err(format!("line {n}: {e}"));
         }
         let op = s.authorize(&id, &params).map_err(|e| format!("line {n} ({id}): {e}"))?;

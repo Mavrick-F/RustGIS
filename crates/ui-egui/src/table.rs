@@ -1,5 +1,5 @@
 //! The attribute table, docked under the map: sort, filter to the selection, select rows (synced
-//! with the map) and edit values in place.
+//! with the map) and edit values in place, a layer's or a standalone table's.
 
 use std::collections::HashMap;
 
@@ -9,7 +9,7 @@ use rustgis_engine::data::{Dataset, Field, Value as V};
 use serde_json::{Value, json};
 
 use crate::theme::{Tokens, semibold};
-use crate::widgets::small;
+use crate::widgets::{small, small_for};
 use crate::{RustGisApp, icons};
 
 #[derive(Default)]
@@ -164,8 +164,8 @@ pub fn had_focus(st: &TableState, pass: u64) -> bool {
 
 /// A value being typed into a cell.
 struct CellEdit {
-    /// The layer the table showed: shown another (Ctrl+T), the edit is dropped.
-    layer: Option<u32>,
+    /// The layer or table the view showed: shown another (Ctrl+T), the edit is dropped.
+    view: ViewKey,
     /// The feature's id, not its row: rows deleted meanwhile, it still finds its feature (or,
     /// gone, writes nothing).
     fid: u64,
@@ -179,16 +179,23 @@ struct CellEdit {
 }
 
 impl CellEdit {
-    fn new(layer: Option<u32>, fid: u64, col: usize, text: String) -> CellEdit {
-        CellEdit { layer, fid, col, was: text.clone(), text, focus: true }
+    /// An edit of column `col` of feature `fid` in `view`, starting from `text`, taking the focus.
+    fn new(view: ViewKey, fid: u64, col: usize, text: String) -> CellEdit {
+        CellEdit { view, fid, col, was: text.clone(), text, focus: true }
     }
 }
 
+/// The attribute table of the layer (`table_layer`) or standalone table (`table_standalone`)
+/// shown, docked under the map: its rows, toolbar and cell editor. Edits run as commands.
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     let layer_id = app.session.table_layer;
-    // An edit is the layer's it was opened on: the table closed (however) or showing another
-    // layer, it is dropped rather than written later to whatever row has its place.
-    if app.table.editing.as_ref().is_some_and(|e| e.layer != layer_id) {
+    // An edit is the layer's or table's it was opened on: the view closed (however) or showing
+    // another, it is dropped rather than written later to whatever row has its place.
+    let showing = match layer_id.and_then(|id| app.session.map().layer(id)) {
+        Some(l) => Some(ViewKey::Layer(l.instance_id())),
+        None => app.session.table_standalone.map(ViewKey::Table),
+    };
+    if app.table.editing.as_ref().is_some_and(|e| Some(e.view) != showing) {
         app.table.editing = None;
     }
     if layer_id.is_none() && app.session.table_standalone.is_none() {
@@ -284,6 +291,14 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     );
                     ui.add_space(6.0);
                     ui.checkbox(&mut app.table.selected_only, egui::RichText::new(tl!("Selected only")).size(11.5));
+                } else if let ViewKey::Table(id) = key {
+                    // A standalone table: rows and fields, judged as the commands judge them.
+                    let add_row = json!({"table": id});
+                    let why = app.session.why_blocked("edit.addFeature", &add_row);
+                    small_for(ui, app, "new", "", "Add row", "edit.addFeature", add_row, why);
+                    small(ui, app, "field", "", "Add field", "ui.dialog", json!({"name": "addField", "table": id}), false);
+                    small(ui, app, "calculate", "", "Calculate field", "ui.dialog", json!({"name": "calculateField", "table": id}), false);
+                    ui.add_space(6.0);
                 }
                 ui.add(egui::TextEdit::singleline(&mut app.table.filter).hint_text(tl!("Filter rows…")).desired_width(160.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -316,6 +331,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             let mut column_action: Option<(usize, ColumnAction)> = None;
             // A text field to convert to dates ("date") or date-times ("datetime").
             let mut convert: Option<(usize, &str)> = None;
+            // A field to delete.
+            let mut delete_field: Option<usize> = None;
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 let mut tb = TableBuilder::new(ui)
                     .striped(true)
@@ -370,7 +387,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                         show_all = true;
                                         ui.close();
                                     }
-                                    if is_layer && fd.ty == rustgis_engine::data::FieldType::Text {
+                                    if fd.ty == rustgis_engine::data::FieldType::Text {
                                         ui.separator();
                                         if ui.button(tl!("Convert to Date")).clicked() {
                                             convert = Some((i, "date"));
@@ -378,6 +395,15 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                         }
                                         if ui.button(tl!("Convert to Date and Time")).clicked() {
                                             convert = Some((i, "datetime"));
+                                            ui.close();
+                                        }
+                                    }
+                                    // A layer's fields are deleted from Data › Data Design; a
+                                    // table has no other place to delete them.
+                                    if !is_layer {
+                                        ui.separator();
+                                        if ui.button(tl!("Delete Field")).clicked() {
+                                            delete_field = Some(i);
                                             ui.close();
                                         }
                                     }
@@ -429,7 +455,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                         let txt = egui::RichText::new(shown).size(11.5);
                                         let txt = if matches!(v, V::Null) || picture { txt.color(t.text_disabled).italics() } else { txt };
                                         let resp = ui.add(egui::Label::new(txt).sense(Sense::click()).truncate());
-                                        if resp.double_clicked() && is_layer {
+                                        if resp.double_clicked() {
                                             // The cell being typed in is kept first (once: its
                                             // editor may have kept it on losing the focus).
                                             if let Some(e) = app.table.editing.take()
@@ -439,7 +465,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                                 commits.push((e.fid, e.col, e.text, e.was));
                                             }
                                             let text = if matches!(v, V::Null) { String::new() } else { v.to_string() };
-                                            app.table.editing = Some(CellEdit::new(layer_id, oid, c, text));
+                                            app.table.editing = Some(CellEdit::new(key, oid, c, text));
                                         } else if resp.clicked() {
                                             clicked = Some((r, ui.input(|i| i.modifiers.command || i.modifiers.shift)));
                                         }
@@ -476,12 +502,29 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     view.show_all();
                 }
             }
+            // The layer or table the view shows, as the edit commands name it.
+            let target = |mut p: Value| {
+                match key {
+                    ViewKey::Layer(_) => p["layer"] = json!(layer_id),
+                    ViewKey::Table(id) => p["table"] = json!(id),
+                }
+                p
+            };
             if let Some((i, ty)) = convert
                 && let Some(fd) = ds.fields.get(i)
             {
                 // Refused (a streamed layer, a data design on the field): said, unless the command said so.
                 let mark = app.session.notice_mark();
-                if let Err(e) = app.run("edit.convertField", json!({"layer": layer_id, "field": fd.name, "type": ty}))
+                if let Err(e) = app.run("edit.convertField", target(json!({"field": fd.name, "type": ty})))
+                    && app.session.notices_since(mark).is_empty()
+                {
+                    app.session.notify(e, true);
+                }
+            }
+            if let Some(fd) = delete_field.and_then(|i| ds.fields.get(i)) {
+                // Refused (a definition query reading it): said, unless the command said so.
+                let mark = app.session.notice_mark();
+                if let Err(e) = app.run("edit.deleteField", target(json!({"field": fd.name})))
                     && app.session.notices_since(mark).is_empty()
                 {
                     app.session.notify(e, true);
@@ -511,10 +554,13 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 if ends(&app.table.editing, fid, c) {
                     app.table.editing = None;
                 }
-                // Its feature where it is now, in the layer as it is (the table's own Delete runs
-                // after `ds` was read); gone, nothing is written.
-                let live =
-                    layer_id.and_then(|id| app.session.map().layer(id)).and_then(|l| l.dataset.features.iter().position(|f| f.id == fid));
+                // Its feature where it is now, in the layer or table as it is (the table's own Delete
+                // runs after `ds` was read); gone, nothing is written.
+                let rows = match key {
+                    ViewKey::Layer(_) => layer_id.and_then(|id| app.session.map().layer(id)).map(|l| &l.dataset.features),
+                    ViewKey::Table(id) => app.session.project.table(id).map(|t| &t.dataset.features),
+                };
+                let live = rows.and_then(|rows| rows.iter().position(|f| f.id == fid));
                 let (Some(fd), Some(r)) = (ds.fields.get(c), live) else { continue };
                 if text == was {
                     continue;
@@ -531,7 +577,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 // Refused (editing turned off, a domain or rule): said, unless the command said so.
                 let mark = app.session.notice_mark();
-                if let Err(e) = app.run("edit.setValue", json!({"layer": layer_id, "row": r, "field": fd.name, "value": text}))
+                if let Err(e) = app.run("edit.setValue", target(json!({"row": r, "field": fd.name, "value": text})))
                     && app.session.notices_since(mark).is_empty()
                 {
                     app.session.notify(e, true);
@@ -581,6 +627,7 @@ mod tests {
         let col = (0..ds.fields.len()).find(|&c| matches!(ds.value(0, c), V::Text(_))).expect("a text field");
         let num = (0..ds.fields.len()).find(|&c| matches!(ds.value(0, c), V::Int(_) | V::Float(_))).expect("a number field");
         let fid: Vec<u64> = ds.features.iter().map(|f| f.id).collect();
+        let key = ViewKey::Layer(app.session.map().layer(id).unwrap().instance_id());
         let value = |app: &RustGisApp, row: usize| app.session.map().layer(id).unwrap().dataset.value(row, col).to_string();
         let (first, second) = (value(&app, 0), value(&app, 1));
         let number = app.session.map().layer(id).unwrap().dataset.value(0, num).to_string();
@@ -595,7 +642,7 @@ mod tests {
         h.run_steps(4);
         let tool = h.state().session.tool;
         // Opened as a double-click opens it, the text selected by nothing: typing adds to it.
-        h.state_mut().table.editing = Some(CellEdit::new(Some(id), fid[0], col, first.clone()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, first.clone()));
         h.run_steps(2);
         h.event(egui::Event::Text("Zed".into()));
         h.run_steps(2);
@@ -604,7 +651,7 @@ mod tests {
         assert_eq!(value(h.state(), 0), format!("{first}Zed"));
         assert!(h.state().table.editing.is_none(), "the editor closed");
         // Escape: typed, then left as it was, the tool kept.
-        h.state_mut().table.editing = Some(CellEdit::new(Some(id), fid[1], col, second.clone()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[1], col, second.clone()));
         h.run_steps(2);
         h.event(egui::Event::Text("Nope".into()));
         h.run_steps(2);
@@ -615,11 +662,11 @@ mod tests {
         assert_eq!(h.state().session.tool, tool, "Escape left the cell, not the tool");
         // Shown another layer meanwhile (Ctrl+T), an open edit is dropped, not written there;
         // so is one left open when the table closes.
-        h.state_mut().table.editing = Some(CellEdit::new(Some(id + 1000), fid[0], col, String::new()));
+        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Layer(u64::MAX), fid[0], col, String::new()));
         h.run_steps(2);
         assert!(h.state().table.editing.is_none());
         // A number mistyped is refused, not written as null.
-        h.state_mut().table.editing = Some(CellEdit::new(Some(id), fid[0], num, String::new()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], num, String::new()));
         h.run_steps(2);
         h.event(egui::Event::Text("12a".into()));
         h.run_steps(2);
@@ -630,7 +677,7 @@ mod tests {
         // With editing turned off, a value isn't kept, and the table says why.
         h.state_mut().session.map_mut().editing.settings.enabled = false;
         let mark = h.state().session.notice_mark();
-        h.state_mut().table.editing = Some(CellEdit::new(Some(id), fid[0], col, String::new()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new()));
         h.run_steps(2);
         h.event(egui::Event::Text("Off".into()));
         h.run_steps(2);
@@ -639,10 +686,24 @@ mod tests {
         assert_eq!(value(h.state(), 0), format!("{first}Zed"));
         assert!(h.state().session.notices_since(mark).iter().any(|n| n.text.contains("editing is turned off")), "said why");
         h.state_mut().session.map_mut().editing.settings.enabled = true;
-        h.state_mut().table.editing = Some(CellEdit::new(Some(id), fid[0], col, String::new()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new()));
         h.state_mut().session.table_layer = None;
         h.run_steps(2);
         assert!(h.state().table.editing.is_none(), "dropped when the table closed");
+        // A standalone table's cell is edited the same way, its layer's view left alone.
+        h.state_mut().run("layer.addDataText", json!({"fileName": "sites.csv", "text": "id,street\n1,Rue Cler\n"})).unwrap();
+        let table = h.state().session.project.tables[0].id;
+        let tfid = h.state().session.project.tables[0].dataset.features[0].id;
+        h.state_mut().session.table_standalone = Some(table);
+        h.run_steps(2);
+        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Table(table), tfid, 1, "Rue Cler".into()));
+        h.run_steps(2);
+        h.event(egui::Event::Text(" 2".into()));
+        h.run_steps(2);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().session.project.tables[0].dataset.value(0, 1).to_string(), "Rue Cler 2");
+        assert!(h.state().table.editing.is_none(), "the editor closed");
     }
 
     fn fields(names: &[&str]) -> Vec<Field> {

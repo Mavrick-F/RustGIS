@@ -260,6 +260,92 @@ fn table_remove_takes_a_standalone_table_out_of_the_project() {
 }
 
 #[test]
+fn a_standalone_table_is_edited_with_the_edit_commands() {
+    let mut s = world();
+    s.run("layer.addDataText", &json!({"fileName": "sites.csv", "text": "id,street,visits\n1,Champ de Mars,3\n2,Rue Cler,5\n"})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    // No layer active: the table is what the commands are checked against and change.
+    s.active_layer = None;
+    let layers = serde_json::to_value(&s.map().layers).unwrap();
+    let table = |s: &Session| s.project.tables[0].dataset.clone();
+    let cell = |s: &Session, row: usize, field: &str| {
+        let t = table(s);
+        t.value(row, t.field_index(field).unwrap()).clone()
+    };
+    let depth = s.undo_depth();
+    let mark = s.notice_mark();
+    s.run("edit.setValue", &json!({"table": "sites", "row": 1, "field": "street", "value": "Rue Saint-Dominique"})).unwrap();
+    assert_eq!(cell(&s, 1, "street"), rustgis_data::Value::Text("Rue Saint-Dominique".into()));
+    let row = s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"id": 3, "street": "Quai Branly"}})).unwrap();
+    assert_eq!((row["row"].as_u64(), table(&s).features.len()), (Some(2), 3));
+    assert!(table(&s).features[2].geometry.is_none());
+    s.run("edit.addField", &json!({"table": "sites", "name": "opened", "type": "text"})).unwrap();
+    s.run("edit.calculateField", &json!({"table": "sites", "field": "opened", "expression": "'2026-0' || id || '-01'"})).unwrap();
+    let converted = s.run("edit.convertField", &json!({"table": "sites", "field": "opened", "type": "date"})).unwrap();
+    assert_eq!(converted, json!({"converted": 3, "null": 0}));
+    s.run("edit.deleteField", &json!({"table": "sites", "field": "visits"})).unwrap();
+    assert!(table(&s).field_index("visits").is_none() && table(&s).features.iter().all(|f| f.attrs.len() == 3));
+    assert!(s.notices_since(mark).is_empty(), "clean edits say nothing: {:?}", s.notices_since(mark));
+    // An undo step each, and the map's layers untouched.
+    assert_eq!(s.undo_depth(), depth + 6);
+    assert_eq!(serde_json::to_value(&s.map().layers).unwrap(), layers);
+    for _ in 0..6 {
+        s.run("edit.undo", &Value::Null).unwrap();
+    }
+    assert_eq!((cell(&s, 1, "street"), table(&s).features.len()), (rustgis_data::Value::Text("Rue Cler".into()), 2));
+    // A value a field can't hold whole is said, as in a layer.
+    let mark = s.notice_mark();
+    s.run("edit.setValue", &json!({"table": "sites", "row": 0, "field": "visits", "value": "2.7"})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("sites, field 'visits', row 1") && n.text.contains("fraction")));
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"visits": 1.5}})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("sites, field 'visits', row 3") && n.text.contains("fraction")));
+    let mark = s.notice_mark();
+    s.run("edit.calculateField", &json!({"table": "sites", "field": "visits", "expression": "visits / 2"})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("Calculate Field: 'visits'") && n.text.contains("fraction")));
+    // A script's line and a task's step naming the table are checked against it too.
+    s.run(
+        "script.run",
+        &json!({"script": "edit.setValue {\"table\": \"sites\", \"row\": 0, \"field\": \"street\", \"value\": \"Avenue Rapp\"}"}),
+    )
+    .unwrap();
+    assert_eq!(cell(&s, 0, "street"), rustgis_data::Value::Text("Avenue Rapp".into()));
+    let steps =
+        json!([{"title": "Add a field", "command": "edit.addField", "params": {"table": "sites", "name": "checked", "type": "boolean"}}]);
+    s.run("task.new", &json!({"name": "Check sites", "steps": steps})).unwrap();
+    s.run("task.run", &json!({"task": "Check sites"})).unwrap();
+    assert!(table(&s).field_index("checked").is_some());
+    assert_eq!(s.active_layer, None);
+    // Rows change only while editing is on; fields either way, as a layer's.
+    s.run("edit.enable", &json!({"on": false})).unwrap();
+    for (id, p) in [
+        ("edit.setValue", json!({"table": "sites", "row": 0, "field": "street", "value": "x"})),
+        ("edit.addFeature", json!({"table": "sites"})),
+        ("edit.calculateField", json!({"table": "sites", "field": "id", "expression": "1"})),
+    ] {
+        assert!(s.run(id, &p).is_err_and(|e| e.contains("editing is turned off")), "{id}");
+    }
+    s.run("edit.addField", &json!({"table": "sites", "name": "note", "type": "text"})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    // A table has no geometry or templates; a layer and a table at once, or a table that isn't
+    // there, are refused and change nothing.
+    let before = (serde_json::to_value(&s.project.tables).unwrap(), s.undo_depth());
+    for (id, p) in [
+        ("edit.addFeature", json!({"table": "sites", "geometry": {"type": "Point", "coordinates": [2.3, 48.9]}})),
+        ("edit.addFeature", json!({"table": "sites", "template": "Default"})),
+        ("edit.setValue", json!({"table": "sites", "layer": "Cities", "row": 0, "field": "street", "value": "x"})),
+        ("edit.setValue", json!({"table": "nope", "row": 0, "field": "street", "value": "x"})),
+        ("edit.setValue", json!({"table": "sites", "row": 9, "field": "street", "value": "x"})),
+        ("edit.addField", json!({"table": "sites", "name": "street", "type": "text"})),
+        ("edit.deleteField", json!({"table": "sites", "field": "nope"})),
+        ("edit.convertField", json!({"table": "sites", "field": "id", "type": "date"})),
+    ] {
+        assert!(s.run(id, &p).is_err(), "{id} {p}");
+    }
+    assert_eq!((serde_json::to_value(&s.project.tables).unwrap(), s.undo_depth()), before);
+}
+
+#[test]
 fn a_saved_selection_is_read_in_range_in_order_and_once() {
     // A selection edited by hand: a row repeated, out of order, and one past the layer's end.
     let s = world();

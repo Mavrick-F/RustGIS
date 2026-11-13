@@ -23,6 +23,9 @@ pub struct Dialogs {
     pub reload: Option<crate::reloaddata::Form>,
     pub open: Option<&'static str>,
     pub layer: String,
+    /// The standalone table Add Field and Calculate Field act on, by its id, when opened from its
+    /// view; None for the active layer.
+    pub table: Option<u32>,
     /// GeoPackage save/discard targets use IDs because display names can repeat.
     pub gpkg_layer: Option<u32>,
     /// The live instance captured with the map-local ID; Undo can make that ID reusable.
@@ -77,6 +80,23 @@ pub enum CsvSource {
 }
 
 impl Dialogs {
+    /// Opens Add Field or Calculate Field (`which`) on standalone table `id`.
+    pub fn open_on_table(&mut self, which: &str, s: &Session, id: u32) -> Result<(), String> {
+        // The name kept is a `&'static str`, as `open` keeps it.
+        let name: &'static str = match which {
+            "addField" => "addField",
+            "calculateField" => "calculateField",
+            other => return Err(format!("dialog '{other}' doesn't open on a table")),
+        };
+        let fields = &s.project.table(id).ok_or("no such table")?.dataset.fields;
+        *self = Dialogs { open: Some(name), mode: "new", reset_collapse: true, table: Some(id), ..Dialogs::default() };
+        match name {
+            "addField" => self.b = "Double".into(),
+            _ => self.a = fields.last().map(|f| f.name.clone()).unwrap_or_default(),
+        }
+        Ok(())
+    }
+
     /// Opens a dialog on the current selection, capturing the target of CRS changes.
     pub fn open(&mut self, which: &str, s: &Session) -> Result<(), String> {
         let active = s.active_layer.and_then(|id| s.map().layer(id));
@@ -479,10 +499,23 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     }).response.labelled_by(input_label.id);
                     ui.end_row();
                 });
-                close = buttons(app, ui, "Add", |app| app.run("edit.addField", json!({"name": app.dialogs.a, "type": app.dialogs.b})).map(|_| ()));
+                close = buttons(app, ui, "Add", |app| {
+                    let mut p = json!({"name": app.dialogs.a, "type": app.dialogs.b});
+                    if let Some(id) = app.dialogs.table {
+                        p["table"] = json!(id);
+                    }
+                    app.run("edit.addField", p).map(|_| ())
+                });
             }
             "calculateField" => {
-                let fields: Vec<String> = app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| l.dataset.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default();
+                /// The data Calculate Field reads: the table's it was opened on, else the active layer's.
+                fn data(app: &crate::RustGisApp) -> Option<&rustgis_engine::data::Dataset> {
+                    match app.dialogs.table {
+                        Some(id) => app.session.project.table(id).map(|t| &t.dataset),
+                        None => app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| &l.dataset),
+                    }
+                }
+                let fields: Vec<String> = data(app).map(|d| d.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default();
                 ui.horizontal(|ui| {
                     let input_label = ui.label(tl!("Field"));
                     egui::ComboBox::from_id_salt("cf_field").selected_text(app.dialogs.a.clone()).width(220.0).show_ui(ui, |ui| {
@@ -499,13 +532,25 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     .desired_width(f32::INFINITY);
                 ui.add(edit).labelled_by(input_label.id);
                 let text = app.dialogs.text.trim();
-                let reads = app.session.active_layer.and_then(|id| app.session.map().layer(id)).filter(|_| !text.is_empty()).map(|l| rustgis_engine::cmd::edit::check_calculation(text, &l.dataset));
+                let reads = data(app).filter(|_| !text.is_empty()).map(|d| rustgis_engine::cmd::edit::check_calculation(text, d));
                 if let Some(Err(e)) = reads {
                     let t = Tokens::get(ui.ctx());
                     ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", &e)])).small().color(t.red));
                 }
-                ui.label(egui::RichText::new(tl!("Fields, numbers, 'text', + - * / % ^, || to join text, comparisons, CASE and functions such as round(), upper(), if() or scale_linear(). Applies to the selected rows, or every row when none is selected.")).small().weak());
-                close = buttons(app, ui, "Calculate", |app| app.run("edit.calculateField", json!({"field": app.dialogs.a, "expression": app.dialogs.text})).map(|_| ()));
+                // A standalone table has no selection: every row.
+                let help = if app.dialogs.table.is_some() {
+                    tl!("Fields, numbers, 'text', + - * / % ^, || to join text, comparisons, CASE and functions such as round(), upper(), if() or scale_linear(). Applies to every row of the table.")
+                } else {
+                    tl!("Fields, numbers, 'text', + - * / % ^, || to join text, comparisons, CASE and functions such as round(), upper(), if() or scale_linear(). Applies to the selected rows, or every row when none is selected.")
+                };
+                ui.label(egui::RichText::new(help).small().weak());
+                close = buttons(app, ui, "Calculate", |app| {
+                    let mut p = json!({"field": app.dialogs.a, "expression": app.dialogs.text});
+                    if let Some(id) = app.dialogs.table {
+                        p["table"] = json!(id);
+                    }
+                    app.run("edit.calculateField", p).map(|_| ())
+                });
             }
             "saveProject" => close = save_project(app, ui),
             // `a` is the map or layout being renamed; an empty or unchanged name just closes.
