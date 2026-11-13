@@ -835,6 +835,8 @@ pub(super) fn write_strips<W: Write + Seek>(
         }
         pos += zipped.len() as u64;
     }
+    // A cancel that came while the last strip was made stops the write too.
+    crate::progress::check()?;
     fill_tables(out, &head.patches, &places, big, pos, strip_err)
 }
 
@@ -1383,5 +1385,24 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         write_file(&r, 0, &path).unwrap();
         assert!(geotiff::write(&r, 0).is_ok());
+    }
+
+    /// A cancel that comes while the untiled writer makes its last strip stops the write, rather
+    /// than the file being finished as if nothing had happened.
+    #[test]
+    fn a_cancel_during_the_last_strip_stops_the_untiled_write() {
+        use crate::progress::{install, tests::Counted};
+        use std::sync::atomic::Ordering;
+        let probe = std::sync::Arc::new(Counted::default());
+        let _g = install(Some(probe.clone()));
+        let img = Strips { w: 4, h: 3, spp: 1, sample: Sample::Byte, photometric: 1, extra: Vec::new(), classes: false, tags: Vec::new() };
+        let res = write_strips(img, &mut Cursor::new(Vec::new()), |rows, buf| {
+            if rows.end == 3 {
+                probe.cancel.store(true, Ordering::Relaxed);
+            }
+            buf.extend(std::iter::repeat_n(7u8, rows.len() * 4));
+            Ok(())
+        });
+        assert!(matches!(res, Err(DataError::Cancelled)));
     }
 }
