@@ -3743,10 +3743,22 @@ fn parquet_date_units_invalid_values_and_nulls() {
 /// the day plus its positive time, and finer-than-microsecond input is reported rather than cut.
 #[test]
 fn parquet_int96_is_unzoned_and_checks_submicroseconds() {
-    use ::parquet::data_type::{ByteArray, ByteArrayType, Int96, Int96Type};
+    use ::parquet::basic::{LogicalType, Repetition, TimeUnit, Type as Physical};
+    use ::parquet::data_type::{ByteArray, ByteArrayType, Int64Type, Int96, Int96Type};
     use ::parquet::file::{properties::WriterProperties, writer::SerializedFileWriter};
-    let schema =
-        Arc::new(::parquet::schema::parser::parse_message_type("message m { REQUIRED BINARY geometry; OPTIONAL INT96 legacy; }").unwrap());
+    use ::parquet::schema::types::Type;
+    let base = ::parquet::schema::parser::parse_message_type("message m { REQUIRED BINARY geometry; OPTIONAL INT96 legacy; }").unwrap();
+    let mut fields = base.get_fields().to_vec();
+    for (name, utc) in [("clock_local", false), ("clock_utc", true)] {
+        fields.push(Arc::new(
+            Type::primitive_type_builder(name, Physical::INT64)
+                .with_repetition(Repetition::OPTIONAL)
+                .with_logical_type(Some(LogicalType::time(utc, TimeUnit::MICROS)))
+                .build()
+                .unwrap(),
+        ));
+    }
+    let schema = Arc::new(Type::group_type_builder("m").with_fields(fields).build().unwrap());
     let mut bytes = Vec::new();
     let mut w = SerializedFileWriter::new(&mut bytes, schema, Arc::new(WriterProperties::builder().build())).unwrap();
     let mut rg = w.next_row_group().unwrap();
@@ -3762,6 +3774,11 @@ fn parquet_int96_is_unzoned_and_checks_submicroseconds() {
     let mut col = rg.next_column().unwrap().unwrap();
     col.typed::<Int96Type>().write_batch(&[make(86_399_999_999_000, 2_440_587), make(1, 2_440_588)], Some(&[1, 1]), None).unwrap();
     col.close().unwrap();
+    for _ in 0..2 {
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<Int64Type>().write_batch(&[0, 1], Some(&[1, 1]), None).unwrap();
+        col.close().unwrap();
+    }
     rg.close().unwrap();
     w.close().unwrap();
     let src = open_bytes("legacy.parquet", bytes, None).unwrap();
@@ -3769,4 +3786,9 @@ fn parquet_int96_is_unzoned_and_checks_submicroseconds() {
     assert_eq!(batch.features[0].attrs[0].to_string(), "1969-12-31T23:59:59.999999");
     assert!(batch.features[1].attrs[0].is_null());
     assert_eq!(batch.unread_dates, [1]);
+    assert_eq!(batch.features[0].attrs[1].to_string(), "00:00:00");
+    assert_eq!(batch.features[1].attrs[1].to_string(), "00:00:00.000001");
+    assert_eq!(batch.features[0].attrs[2].to_string(), "00:00:00.000000Z");
+    assert_eq!(batch.features[1].attrs[2].to_string(), "00:00:00.000001Z");
+    assert!(batch.features[0].attrs[2] < batch.features[1].attrs[2]);
 }

@@ -590,7 +590,7 @@ impl Layer {
         }
         if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
             let mut fields = self.dataset.fields.clone();
-            if let Err(error) = self.date_fields_from_source(&mut fields, &info.fields) {
+            if let Err(error) = self.date_fields_from_source(&mut fields, &info.fields, info.format) {
                 if let Some(source) = &mut self.source {
                     source.error = Some(error);
                 }
@@ -711,13 +711,19 @@ impl Layer {
     /// with a number) and wouldn't read it as dates, so it keeps working.
     /// A newly supported column (such as INT96) can change attribute positions. Refuse an old
     /// saved schema before changing any field, rather than pairing values with the wrong names.
-    fn date_fields_from_source(&self, fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) -> Result<(), String> {
+    fn date_fields_from_source(
+        &self,
+        fields: &mut [rustgis_data::Field],
+        source: &[rustgis_data::Field],
+        format: &str,
+    ) -> Result<(), String> {
         // Parquet time-only columns were epoch integers before being read as clock text.
         // A saved Integer schema cannot safely interpret that representation change.
-        let integer_became_text = fields
-            .iter()
-            .zip(source)
-            .any(|(saved, fresh)| saved.ty == rustgis_data::FieldType::Integer && fresh.ty == rustgis_data::FieldType::Text);
+        let integer_became_text = format == "GeoParquet"
+            && fields
+                .iter()
+                .zip(source)
+                .any(|(saved, fresh)| saved.ty == rustgis_data::FieldType::Integer && fresh.ty == rustgis_data::FieldType::Text);
         if integer_became_text
             || (source.iter().any(|f| f.ty.is_temporal())
                 && (fields.len() != source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name)))
@@ -794,7 +800,7 @@ impl Layer {
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
             if let Some(info) = copy.info() {
-                self.date_fields_from_source(&mut ds.fields, &info.fields)?;
+                self.date_fields_from_source(&mut ds.fields, &info.fields, info.format)?;
             }
         }
         ds.source = self.dataset.source.clone();
@@ -822,7 +828,7 @@ impl Layer {
         ds.zm_dropped = info.zm_dropped || self.dataset.zm_dropped;
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
-            self.date_fields_from_source(&mut ds.fields, &info.fields)?;
+            self.date_fields_from_source(&mut ds.fields, &info.fields, info.format)?;
         }
         // (A source declaring no geometry type takes its first geometry's when exported, as a
         // whole read does.)
@@ -3198,7 +3204,7 @@ mod tests {
         {
             layer.definition_query = query.map(String::from);
             let mut got = fields.clone();
-            layer.date_fields_from_source(&mut got, &source).unwrap();
+            layer.date_fields_from_source(&mut got, &source, "GeoParquet").unwrap();
             assert_eq!(got[0].ty, ty, "{query:?}");
         }
         // Kept as text, the field holds the dates the source reads, and the filter keeps the rows
@@ -3220,7 +3226,7 @@ mod tests {
             layer.design.rules =
                 vec![design::AttributeRule { name: "Recent".into(), kind, field: String::new(), expression: expression.into() }];
             let mut got = fields.clone();
-            layer.date_fields_from_source(&mut got, &source).unwrap();
+            layer.date_fields_from_source(&mut got, &source, "GeoParquet").unwrap();
             assert_eq!(got[0].ty, FieldType::Text, "{expression}");
         }
         // And a label class's clause.
@@ -3229,7 +3235,7 @@ mod tests {
         class.where_ = Some("issued >= 2026".into());
         layer.labels.classes.push(class);
         let mut got = fields.clone();
-        layer.date_fields_from_source(&mut got, &source).unwrap();
+        layer.date_fields_from_source(&mut got, &source, "GeoParquet").unwrap();
         assert_eq!(got[0].ty, FieldType::Text);
         // Older GeoParquet projects listed epoch days as integers. Both ordinary reads and
         // exports must adopt the native date schema; numeric queries then fail explicitly.
@@ -3237,7 +3243,7 @@ mod tests {
         let mut legacy = Layer::new(2, Dataset::new("legacy", GeometryType::Point, old.clone()));
         legacy.definition_query = Some("issued >= 20000".into());
         let mut upgraded = old;
-        legacy.date_fields_from_source(&mut upgraded, &source).unwrap();
+        legacy.date_fields_from_source(&mut upgraded, &source, "GeoParquet").unwrap();
         assert_eq!(upgraded[0].ty, FieldType::Date);
         let upgraded = Dataset::new("legacy", GeometryType::Point, upgraded);
         assert!(rustgis_data::query::parse_fields("issued >= 20000", &upgraded).is_err());
@@ -3256,11 +3262,11 @@ mod tests {
             vec![Field::new("name", FieldType::DateTime), fields[0].clone(), fields[1].clone()],
         ] {
             let mut saved = fields.clone();
-            let error = layer.date_fields_from_source(&mut saved, &source).unwrap_err();
+            let error = layer.date_fields_from_source(&mut saved, &source, "GeoParquet").unwrap_err();
             assert!(error.contains("Add the data source again"));
             assert_eq!(saved, fields);
             let mut fresh = source.clone();
-            layer.date_fields_from_source(&mut fresh, &source).unwrap();
+            layer.date_fields_from_source(&mut fresh, &source, "GeoParquet").unwrap();
             assert_eq!(fresh, source);
         }
     }
@@ -3271,10 +3277,17 @@ mod tests {
         let source = vec![Field::new("clock", FieldType::Text)];
         let layer = Layer::new(1, Dataset::new("old times", GeometryType::Point, old.clone()));
         let mut fields = old.clone();
-        assert!(layer.date_fields_from_source(&mut fields, &source).unwrap_err().contains("Add the data source again"));
+        assert!(layer.date_fields_from_source(&mut fields, &source, "GeoParquet").unwrap_err().contains("Add the data source again"));
         assert_eq!(fields, old);
+        // Inferred text in other formats can come from empty or mixed columns; this change
+        // does not reinterpret those saved schemas as a Parquet clock migration.
+        for format in ["CSV", "GeoJSON"] {
+            let mut inferred = old.clone();
+            layer.date_fields_from_source(&mut inferred, &source, format).unwrap();
+            assert_eq!(inferred, old);
+        }
         let mut fresh = source.clone();
-        layer.date_fields_from_source(&mut fresh, &source).unwrap();
+        layer.date_fields_from_source(&mut fresh, &source, "GeoParquet").unwrap();
         assert_eq!(fresh, source);
     }
 

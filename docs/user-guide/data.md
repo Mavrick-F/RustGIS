@@ -96,7 +96,7 @@ looks like a date stays text. Invalid dates become empty values with a notice na
 and counting the values; dates cover years 1–9999. Fractional seconds are kept to microseconds.
 Floating-point serial dates in workbooks and FileGDB are rounded to the nearest microsecond,
 with a notice when rounding is needed. Parquet timestamps with finer nonzero precision are
-read as empty with a notice. Times without a day stay text.
+read as empty with a notice. Times without a day stay text; Parquet clocks retain `Z` when declared UTC.
 
 GeoParquet exports use native dates and microsecond timestamps. Zoned date-times are written
 as UTC instants, with a notice when their displayed offsets change; unzoned times stay unzoned.

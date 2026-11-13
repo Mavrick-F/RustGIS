@@ -931,33 +931,36 @@ fn column_kind(t: &parquet::schema::types::Type) -> &'static str {
     }
 }
 
-/// The unit of a time-only column. Such fields stay ISO text, including nanoseconds.
-fn clock_unit(c: &ColumnDescPtr) -> Option<parquet::basic::TimeUnit> {
+/// The unit and UTC adjustment of a time-only column, retained in its ISO text.
+fn clock_kind(c: &ColumnDescPtr) -> Option<(parquet::basic::TimeUnit, bool)> {
     use parquet::basic::TimeUnit;
     match (c.logical_type_ref(), c.converted_type()) {
-        (Some(LogicalType::Time(t)), _) => Some(t.unit),
-        (None, ConvertedType::TIME_MILLIS) => Some(TimeUnit::MILLIS),
-        (None, ConvertedType::TIME_MICROS) => Some(TimeUnit::MICROS),
+        (Some(LogicalType::Time(t)), _) => Some((t.unit, t.is_adjusted_to_u_t_c)),
+        (None, ConvertedType::TIME_MILLIS) => Some((TimeUnit::MILLIS, true)),
+        (None, ConvertedType::TIME_MICROS) => Some((TimeUnit::MICROS, true)),
         _ => None,
     }
 }
 
 /// A time without a day is text rather than a date. Its fractional precision is retained.
-fn clock_value(n: i64, unit: parquet::basic::TimeUnit) -> Value {
+fn clock_value(n: i64, (unit, utc): (parquet::basic::TimeUnit, bool)) -> Value {
     use parquet::basic::TimeUnit;
-    let ns = i128::from(n)
-        * match unit {
-            TimeUnit::MILLIS => 1_000_000,
-            TimeUnit::MICROS => 1000,
-            TimeUnit::NANOS => 1,
-        };
+    let (scale, width): (i128, usize) = match unit {
+        TimeUnit::MILLIS => (1_000_000, 3),
+        TimeUnit::MICROS => (1000, 6),
+        TimeUnit::NANOS => (1, 9),
+    };
+    let ns = i128::from(n) * scale;
     if !(0..86_400_000_000_000).contains(&ns) {
         return Value::Null;
     }
     let seconds = ns / 1_000_000_000;
     let mut text = format!("{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
     let fraction = ns % 1_000_000_000;
-    if fraction != 0 {
+    if utc {
+        // Fixed precision keeps a whole second before its fractions when both carry Z.
+        text.push_str(&format!(".{:0width$}Z", fraction / scale));
+    } else if fraction != 0 {
         text.push('.');
         text.push_str(format!("{fraction:09}").trim_end_matches('0'));
     }
@@ -966,7 +969,7 @@ fn clock_value(n: i64, unit: parquet::basic::TimeUnit) -> Value {
 
 /// A field type for a top-level column; `None` for types not read (binary, fixed-length).
 fn field_type(c: &ColumnDescPtr) -> Option<FieldType> {
-    if clock_unit(c).is_some() {
+    if clock_kind(c).is_some() {
         return Some(FieldType::Text);
     }
     if c.physical_type() == Physical::INT96 {
@@ -1080,7 +1083,7 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Col
     let mut invalid = Vec::new();
     let mut int = |v: Option<i64>| {
         invalid.push(false);
-        if let Some(unit) = clock_unit(&desc) {
+        if let Some(unit) = clock_kind(&desc) {
             return v
                 .map(|n| {
                     let value = clock_value(n, unit);
