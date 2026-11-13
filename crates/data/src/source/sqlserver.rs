@@ -619,14 +619,24 @@ fn fine_times_note(conn: &Conn, from: &str, fine: &[String]) -> Vec<String> {
     );
     let row = conn.query_within(&sql, &[], PROBE_TIMEOUT).ok().flatten().and_then(|rows| rows.into_iter().next());
     let complete = row.as_ref().and_then(|r| int_of(at(r, 0))).is_some_and(|n| n.unsigned_abs() <= FINE_TIMES_SAMPLE);
-    let found: Vec<usize> = (0..fine.len()).map(|i| usize::from(row.as_ref().and_then(|r| int_of(at(r, i + 1))) == Some(1))).collect();
-    fine_times_said(fine, &found, complete)
+    let found: Option<Vec<usize>> = row.map(|r| (0..fine.len()).map(|i| usize::from(int_of(at(&r, i + 1)) == Some(1))).collect());
+    fine_times_said(fine, found.as_deref(), complete)
 }
 
 /// [`fine_times_note`]'s text: `found` counts, for each column of `fine`, whether a row looked at
-/// has a 100-nanosecond digit; `complete` is whether the rows looked at were all of them.
-fn fine_times_said(fine: &[String], found: &[usize], complete: bool) -> Vec<String> {
+/// has a 100-nanosecond digit (`None` when the look failed); `complete` is whether the rows looked
+/// at were all of them.
+fn fine_times_said(fine: &[String], found: Option<&[usize]>, complete: bool) -> Vec<String> {
+    if fine.is_empty() {
+        return Vec::new();
+    }
     let fields: Vec<Field> = fine.iter().map(|c| Field::new(c.clone(), FieldType::DateTime)).collect();
+    let Some(found) = found else {
+        return vec![format!(
+            "date-times in {} may hold 100-nanosecond digits (they couldn't be checked): any are read to the microsecond, the last digit left out",
+            crate::io::named_fields(&fields, &vec![1; fine.len()])
+        )];
+    };
     let has = |i: usize| found.get(i).is_some_and(|&n| n > 0);
     let mut notes = Vec::new();
     if (0..fine.len()).any(has) {
@@ -1037,22 +1047,28 @@ mod tests {
         // whole without any, say nothing; a larger table without any in the rows looked at may.
         let fine = ["seen".to_string(), "logged".to_string()];
         assert_eq!(
-            fine_times_said(&fine, &[0, 1], true),
+            fine_times_said(&fine, Some(&[0, 1]), true),
             ["date-times in 'logged' hold 100-nanosecond digits: they're read to the microsecond, the last digit left out"]
         );
-        assert!(fine_times_said(&fine, &[0, 0], true).is_empty());
-        let notes = fine_times_said(&fine, &[0, 0], false);
+        assert!(fine_times_said(&fine, Some(&[0, 0]), true).is_empty());
+        let notes = fine_times_said(&fine, Some(&[0, 0]), false);
         assert!(notes.len() == 1 && notes[0].starts_with("date-times in 'seen', 'logged' may hold"), "{notes:?}");
         // Columns that have them are named apart from those that may.
-        let notes = fine_times_said(&fine, &[1, 0], false);
+        let notes = fine_times_said(&fine, Some(&[1, 0]), false);
         assert!(
             notes.len() == 2
                 && notes[0].starts_with("date-times in 'seen' hold")
                 && notes[1].starts_with("date-times in 'logged' may hold"),
             "{notes:?}"
         );
-        assert!(fine_times_said(&fine, &[1, 1], false).len() == 1);
-        assert!(fine_times_said(&[], &[], false).is_empty());
+        assert!(fine_times_said(&fine, Some(&[1, 1]), false).len() == 1);
+        // A look that failed says so, naming every column.
+        let notes = fine_times_said(&fine, None, true);
+        assert!(
+            notes.len() == 1 && notes[0].starts_with("date-times in 'seen', 'logged' may hold") && notes[0].contains("couldn't be checked"),
+            "{notes:?}"
+        );
+        assert!(fine_times_said(&[], Some(&[]), false).is_empty() && fine_times_said(&[], None, false).is_empty());
         // A seventh digit of a second is cut; the offset after it stays.
         assert_eq!(to_micros("2026-03-05T14:30:00.1234567+02:00"), "2026-03-05T14:30:00.123456+02:00");
         assert_eq!(to_micros("2026-03-05T14:30:00.1234567"), "2026-03-05T14:30:00.123456");

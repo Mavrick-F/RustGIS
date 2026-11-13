@@ -574,7 +574,7 @@ primary key provides stable feature ids; without one (including views), ids are 
 date-times without a zone. A `datetimeoffset` keeps its offset. RustGIS keeps times to the
 microsecond, so a seventh digit of a second (100 ns) is left out. Looking at up to 100,000 rows,
 the layer names the columns where those rows hold one, and says a larger table's may when they
-hold none. `time` columns stay text.
+hold none (or all of them may, when they couldn't be looked at). `time` columns stay text.
 
 At database compatibility level 100 or lower, streamed `geography` layers filter their whole-table
 read or sample locally instead of sending a viewport polygon to the server. A small view can
