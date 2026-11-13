@@ -11,10 +11,10 @@
 //! Memory: the raster is read in place. A tile is gathered from the bands and compressed on its
 //! own, and only a few tiles a thread are held before they are written, so no second copy of the
 //! pixels is made, and each overview tile is made straight from the full image (a block of
-//! 2ⁿ × 2ⁿ pixels), so no pyramid is kept. The price is
-//! time: every overview level reads the whole full image again, so writing takes about as many
-//! passes over the pixels as there are levels, where building each level from the one before
-//! would take about 1⅓ but hold a second copy.
+//! 2ⁿ × 2ⁿ pixels), so no pyramid is kept. The price is time: every overview level reads the
+//! whole full image again, so writing takes about as many passes over the pixels as there are
+//! levels, where building each level from the one before would take about 1⅓ but hold a second
+//! copy.
 //!
 //! Tiles are compressed with Deflate at its fastest level, after a predictor that makes neighbouring
 //! samples alike: the floating-point one for floats, differences along the row for whole numbers.
@@ -890,7 +890,7 @@ fn in_order<S>(
     if threads > 1 {
         return in_order_parallel(count, threads, err, scratch, make, put);
     }
-    one_by_one(count, scratch, make, put)?;
+    one_by_one(count, err, scratch, make, put)?;
     // A cancel that came while the last piece was made stops the write too.
     crate::progress::check()
 }
@@ -898,6 +898,7 @@ fn in_order<S>(
 /// [`in_order`] on this thread alone: each piece made, then written, before the next.
 fn one_by_one<S>(
     count: usize,
+    err: fn(String) -> DataError,
     scratch: impl Fn() -> S,
     make: impl Fn(&mut S, usize) -> Result<Vec<u8>>,
     mut put: impl FnMut(usize, Vec<u8>) -> Result<()>,
@@ -905,9 +906,23 @@ fn one_by_one<S>(
     let mut s = scratch();
     for k in 0..count {
         crate::progress::step(1)?;
-        put(k, make(&mut s, k)?)?;
+        put(k, caught(&make, &mut s, k, err).0?)?;
     }
     Ok(())
+}
+
+/// Piece `k` from `make`, a panic in it as an error, so the write fails the same way on any number
+/// of threads; and whether it panicked, after which `s` may be half changed.
+fn caught<S>(
+    make: impl Fn(&mut S, usize) -> Result<Vec<u8>>,
+    s: &mut S,
+    k: usize,
+    err: fn(String) -> DataError,
+) -> (Result<Vec<u8>>, bool) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| make(s, k))) {
+        Ok(made) => (made, false),
+        Err(_) => (Err(err("a piece of the image couldn't be made".into())), true),
+    }
 }
 
 /// The pieces a thread of [`in_order`] may make ahead of the one being written: enough that the
@@ -951,22 +966,27 @@ fn in_order_parallel<S>(
         t.next += 1;
         Some(t.next - 1)
     };
-    let stop = || {
-        if let Ok(mut t) = turn.lock() {
-            t.stop = true;
+    /// Stops the threads when dropped, however the writing ends: done, an error, or a panic in
+    /// `put`, which would otherwise leave them waiting for the writer for good, and the scope
+    /// waiting for them.
+    struct Stop<'a>(&'a Mutex<Turn>, &'a Condvar);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut t) = self.0.lock() {
+                t.stop = true;
+            }
+            self.1.notify_all();
         }
-        moved.notify_all();
-    };
+    }
 
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::channel::<(usize, Result<Vec<u8>>)>();
         let work = |tx: mpsc::Sender<(usize, Result<Vec<u8>>)>| {
             let mut s = scratch();
             while let Some(k) = take() {
-                let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| make(&mut s, k)));
-                let panicked = made.is_err();
+                let (made, panicked) = caught(&make, &mut s, k, err);
                 // A thread whose piece panicked stops: its scratch may be half changed.
-                if tx.send((k, made.unwrap_or_else(|_| Err(failed())))).is_err() || panicked {
+                if tx.send((k, made)).is_err() || panicked {
                     break;
                 }
             }
@@ -978,9 +998,11 @@ fn in_order_parallel<S>(
             })
             .count();
         drop(tx);
-        let res = (|| -> Result<()> {
+        // The threads finish the pieces they are making and take no more; the scope waits for them.
+        let _stop = Stop(&turn, &moved);
+        (|| -> Result<()> {
             if started == 0 {
-                return one_by_one(count, &scratch, &make, &mut put);
+                return one_by_one(count, err, &scratch, &make, &mut put);
             }
             // Pieces made before the ones ahead of them, by their index.
             let mut waiting = BTreeMap::new();
@@ -1001,10 +1023,7 @@ fn in_order_parallel<S>(
                 moved.notify_all();
             }
             Ok(())
-        })();
-        // The threads finish the pieces they are making and take no more; the scope waits for them.
-        stop();
-        res
+        })()
     })?;
     // A cancel that came while the last piece was made stops the write too.
     crate::progress::check()
@@ -1609,6 +1628,15 @@ mod tests {
         assert_eq!(n, 9, "the pieces before the failure are written");
         let panics = |_: &mut (), k: usize| if k == 3 { panic!("three") } else { Ok(Vec::new()) };
         let e = in_order_parallel(10, 3, err, || (), panics, |_, _| Ok(()));
+        assert!(e.unwrap_err().to_string().contains("couldn't be made"));
+        // A panic while a piece is written, with the threads waiting for it, is passed on rather
+        // than leaving the write waiting for them.
+        let caught_write = std::panic::catch_unwind(|| {
+            in_order_parallel(40, 2, err, || (), |_, _| Ok(Vec::new()), |k, _| if k == 0 { panic!("write") } else { Ok(()) })
+        });
+        assert!(caught_write.is_err());
+        // On one thread too (the browser, a one-core machine).
+        let e = one_by_one(10, err, || (), panics, |_, _| Ok(()));
         assert!(e.unwrap_err().to_string().contains("couldn't be made"));
     }
 
