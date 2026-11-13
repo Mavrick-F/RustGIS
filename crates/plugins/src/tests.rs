@@ -1830,6 +1830,35 @@ fn cached_blocklist_survives_refused_refreshes() {
     let _ = std::fs::remove_dir_all(&plugins);
 }
 
+/// `state.json` keeps what a newer RustGIS added through a change here, and one that can't be
+/// read is said at start and never written over.
+#[test]
+fn plugin_state_keeps_what_this_version_cannot_read() {
+    let plugins = std::env::temp_dir().join(format!("rustgis-test-plugin-state-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&plugins);
+    let _store = store_lock();
+    crate::store::set_dir(Some(plugins.clone()));
+    std::fs::create_dir_all(&plugins).unwrap();
+    let state = plugins.join("state.json");
+    std::fs::write(&state, r#"{"disabled": [], "folders": [], "pinned": ["kept"]}"#).unwrap();
+    crate::store::install_bytes(&testing::package("state-test", &[])).unwrap();
+    crate::store::set_enabled("state-test", false).unwrap();
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!((&saved["disabled"], &saved["pinned"]), (&json!(["state-test"]), &json!(["kept"])));
+    for unreadable in ["not json", r#"{"disabled": [{"id": "state-test", "until": 2}]}"#] {
+        std::fs::write(&state, unreadable).unwrap();
+        assert!(crate::store::load_installed().iter().any(|e| e.contains("state.json")), "{unreadable}");
+        let e = crate::store::set_enabled("state-test", true).unwrap_err();
+        assert!(e.contains("kept as it is"), "{e}");
+        assert!(crate::store::uninstall("state-test").is_err());
+        assert_eq!(std::fs::read_to_string(&state).unwrap(), unreadable);
+    }
+    std::fs::remove_file(&state).unwrap();
+    assert!(crate::store::load_installed().is_empty());
+    crate::store::uninstall("state-test").unwrap();
+    let _ = std::fs::remove_dir_all(&plugins);
+}
+
 #[test]
 fn process_packages_unpack_safely() {
     use std::io::Write;

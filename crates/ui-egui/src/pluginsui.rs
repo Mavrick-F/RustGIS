@@ -40,6 +40,9 @@ struct Saved {
     data: Option<String>,
     #[serde(default = "yes")]
     enabled: bool,
+    /// Fields a newer RustGIS added, written back as they were.
+    #[serde(flatten)]
+    other: serde_json::Map<String, Value>,
 }
 
 fn yes() -> bool {
@@ -282,23 +285,46 @@ fn keeps_prefs() -> bool {
     cfg!(target_arch = "wasm32")
 }
 
-fn saved(app: &RustGisApp) -> Vec<Saved> {
-    app.services.load_pref.as_ref().and_then(|l| l("plugins_web")).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
-}
-
-fn save(app: &RustGisApp, list: &[Saved]) {
-    if let (Some(s), Ok(text)) = (&app.services.save_pref, serde_json::to_string(list)) {
-        s("plugins_web", &text);
+/// The installed plugins the web app keeps (`plugins_web`): those it can read, and the entries it
+/// can't (from a newer RustGIS, or damaged), kept to be written back as they were. `None` when
+/// the preference isn't a JSON list: it is then never written over. None kept is an empty list.
+fn read_saved(text: Option<&str>) -> Option<(Vec<Saved>, Vec<Value>)> {
+    let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return Some((Vec::new(), Vec::new())) };
+    let Ok(Value::Array(rows)) = serde_json::from_str::<Value>(text) else { return None };
+    let (mut list, mut kept) = (Vec::new(), Vec::new());
+    for row in rows {
+        match serde_json::from_value::<Saved>(row.clone()) {
+            Ok(s) => list.push(s),
+            Err(_) => kept.push(row),
+        }
     }
+    Some((list, kept))
 }
 
+/// The `plugins_web` preference as [`read_saved`] reads it.
+fn saved(app: &RustGisApp) -> Option<(Vec<Saved>, Vec<Value>)> {
+    read_saved(app.services.load_pref.as_ref().and_then(|l| l("plugins_web")).as_deref())
+}
+
+/// The `plugins_web` preference for `list`, with the entries [`read_saved`] couldn't read after it.
+fn saved_text(list: &[Saved], kept: &[Value]) -> String {
+    let mut rows: Vec<Value> = list.iter().filter_map(|s| serde_json::to_value(s).ok()).collect();
+    rows.extend(kept.iter().cloned());
+    Value::Array(rows).to_string()
+}
+
+/// Changes the installed plugins the web app keeps with `f`, writing back the entries it couldn't
+/// read as they were; nothing on the desktop, or when the preference couldn't be read.
 fn update_saved(app: &RustGisApp, f: impl FnOnce(&mut Vec<Saved>)) {
     if !keeps_prefs() {
         return;
     }
-    let mut list = saved(app);
+    // One that can't be read was said at start, and isn't written over.
+    let Some((mut list, kept)) = saved(app) else { return };
     f(&mut list);
-    save(app, &list);
+    if let Some(s) = &app.services.save_pref {
+        s("plugins_web", &saved_text(&list, &kept));
+    }
 }
 
 /// Loads the plugins the web app installed in earlier visits.
@@ -309,7 +335,22 @@ pub fn restore(app: &mut RustGisApp) {
     if let Some(u) = app.services.load_pref.as_ref().and_then(|l| l("plugin_registry")) {
         app.plugins.url = u;
     }
-    restore_list(app, saved(app));
+    let (list, kept) = match saved(app) {
+        Some(read) => read,
+        None => {
+            app.session.warn(tl!(
+                "The plugins installed in this browser couldn't be read (they aren't a JSON list): none is loaded, and plugins installed or removed now aren't remembered."
+            ));
+            (Vec::new(), Vec::new())
+        }
+    };
+    if !kept.is_empty() {
+        app.session.warn(crate::i18n::fmt(
+            "{n} installed plugins couldn't be read (from a newer RustGIS, or damaged): they aren't loaded, and are kept as they were.",
+            &[("n", &kept.len().to_string())],
+        ));
+    }
+    restore_list(app, list);
     // The blocklist, so a pulled plugin isn't loaded again.
     let registry = app.plugins.registry_url();
     let slot = fetch(app, &rp::registry::blocklist_url(&registry), 4 << 20, None);
@@ -483,6 +524,7 @@ fn install_confirmed(app: &mut RustGisApp) {
                     base64::engine::general_purpose::STANDARD.encode(&c.bytes)
                 }),
                 enabled: true,
+                other: serde_json::Map::new(),
             };
             let kept = entry.url.is_some() || entry.data.is_some();
             update_saved(app, |list| {
@@ -1263,6 +1305,7 @@ mod tests {
             url: Some(format!("https://example.invalid/{id}.rgplugin")),
             data: None,
             enabled: true,
+            other: serde_json::Map::new(),
         }
     }
 
@@ -1283,6 +1326,29 @@ mod tests {
         restore_list(app, list);
         poll(app, &egui::Context::default());
         app.session.notices_since(mark).iter().map(|n| (n.text.clone(), n.error)).collect()
+    }
+
+    /// What a newer RustGIS wrote to `plugins_web` survives a change here: entries this version
+    /// can't read and fields it doesn't know are written back as they were; a preference that
+    /// isn't a list isn't read at all.
+    #[test]
+    fn saved_web_plugins_keep_what_this_version_cannot_read() {
+        let text = json!([
+            {"id": "a", "sha256": "0", "url": "https://example.invalid/a.rgplugin", "enabled": true, "channel": "beta"},
+            {"id": "b", "sha256": {"v2": "0"}}
+        ])
+        .to_string();
+        let (mut list, kept) = read_saved(Some(&text)).unwrap();
+        assert_eq!((list.len(), kept.len()), (1, 1));
+        list[0].enabled = false;
+        list.push(record("c", "1"));
+        let again: Value = serde_json::from_str(&saved_text(&list, &kept)).unwrap();
+        assert_eq!(again[0]["channel"], "beta");
+        assert_eq!(again[0]["enabled"], false);
+        assert_eq!(again[1]["id"], "c");
+        assert_eq!(again[2], json!({"id": "b", "sha256": {"v2": "0"}}));
+        assert!(read_saved(Some("{\"plugins\": []}")).is_none());
+        assert_eq!(read_saved(None).map(|(l, k)| (l.len(), k.len())), Some((0, 0)));
     }
 
     /// Plugins the web app couldn't load at start are listed, kept, and told once (#1352).

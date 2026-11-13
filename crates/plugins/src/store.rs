@@ -51,17 +51,38 @@ struct State {
     disabled: Vec<String>,
     #[serde(default)]
     folders: Vec<String>,
+    /// Keys a newer RustGIS added, written back as they were.
+    #[serde(flatten)]
+    other: serde_json::Map<String, serde_json::Value>,
+    /// Why `state.json` couldn't be read, when it couldn't: it is then never written over.
+    #[serde(skip)]
+    unreadable: Option<String>,
 }
 
 fn state_path() -> Option<PathBuf> {
     dir().map(|d| d.join("state.json"))
 }
 
+/// `state.json`: none is no plugin disabled or added from a folder. One that can't be read (or that
+/// a newer RustGIS wrote in a shape this one doesn't know) is said by [`load_installed`] and kept as
+/// it is: [`write_state`] refuses to write over it.
 fn read_state() -> State {
-    state_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    let Some(path) = state_path() else { return State::default() };
+    let read = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
+        Err(e) => Err(e.to_string()),
+        Ok(text) => serde_json::from_str(&text).map_err(|e| e.to_string()),
+    };
+    read.unwrap_or_else(|e| State { unreadable: Some(format!("{}: {e}", path.display())), ..State::default() })
 }
 
+/// Writes `state.json`, refused when [`read_state`] couldn't read the one there.
 fn write_state(st: &State) -> Result<(), String> {
+    if let Some(why) = &st.unreadable {
+        return Err(format!(
+            "{why}; it is kept as it is, so which plugins are disabled or added from folders can't be changed until it is fixed or removed"
+        ));
+    }
     let path = state_path().ok_or("there is no folder for plugins")?;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -94,6 +115,11 @@ pub fn load_installed() -> Vec<String> {
         )),
     }
     let st = read_state();
+    if let Some(why) = &st.unreadable {
+        errors.push(format!(
+            "{why}; it was ignored and is kept as it is, so plugins it disables are on and plugin folders it adds aren't loaded"
+        ));
+    }
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rgplugin"))).collect())
         .unwrap_or_default();

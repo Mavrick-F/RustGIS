@@ -1457,6 +1457,54 @@ fn connections_persist_and_import_once() {
     assert!(empty.session.connections.connections.is_empty(), "an empty saved list must not import again");
 }
 
+/// Saved data sources from a newer RustGIS (#1405): rows, fields and lists this version can't read
+/// are said at start and survive recording a recent source; a preference that can't be read at
+/// all stays byte for byte.
+#[test]
+fn saved_sources_from_a_newer_version_survive_recording_a_recent_one() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("points.geojson");
+    std::fs::write(
+        &file,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}]}"#,
+    )
+    .unwrap();
+    let future = json!({"kind": "gcs", "name": "Bucket", "address": "gs://b/a.tif"});
+    let newer = json!({"favourites": [future.clone()], "recent": [{"kind": "file", "name": "R", "address": "/r.csv", "opened": 3}], "folders": ["/data"]})
+        .to_string();
+    for text in [newer, "[\"not\", \"an object\"]".to_string()] {
+        let store = Arc::new(Mutex::new(HashMap::from([
+            ("data_sources".to_string(), text.clone()),
+            ("connections".to_string(), "{}".to_string()),
+        ])));
+        let (load, save) = (store.clone(), store.clone());
+        let services = rustgis_ui_egui::Services {
+            load_pref: Some(Box::new(move |k| load.lock().unwrap().get(k).cloned())),
+            save_pref: Some(Box::new(move |k, v| {
+                save.lock().unwrap().insert(k.to_string(), v.to_string());
+            })),
+            ..Default::default()
+        };
+        let mut app = RustGisApp::with_sample().with_services(services);
+        app.run("layer.addData", json!({"path": file.display().to_string()})).unwrap();
+        assert!(app.session.sources.recent.iter().any(|r| r.address.ends_with("points.geojson")), "{text}");
+        let said: Vec<_> = app.session.notices_since(0).iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|t| t.contains("saved data source")), "{said:?}");
+        let stored = store.lock().unwrap()["data_sources"].clone();
+        if text.starts_with('[') {
+            assert_eq!(stored, text, "a preference that can't be read stays as it was");
+        } else {
+            let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+            assert_eq!(stored["favourites"], json!([future]));
+            assert_eq!(stored["folders"], json!(["/data"]));
+            assert!(stored["recent"][0]["address"].as_str().unwrap().ends_with("points.geojson"));
+            assert_eq!(stored["recent"][1]["opened"], 3);
+        }
+    }
+}
+
 /// Settings › Start-up › Start With a project (#377): the last one opened or saved, or one picked
 /// once. It opens with its own projection and view, a shell's `blank` still wins, one that no
 /// longer opens leaves the sample with a notice, and after a crash none is opened.

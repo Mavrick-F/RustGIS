@@ -4,8 +4,10 @@
 //! without their passwords, tokens or signatures.
 
 use rustgis_data::source::credentials::{redact_query, secret_key};
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 /// How many recent sources are kept.
 pub const MAX_RECENT: usize = 20;
@@ -43,29 +45,157 @@ pub struct Sources {
     /// Bumped on every change, so the app knows when to keep them.
     #[serde(skip)]
     pub generation: u64,
+    /// What of the preference this version couldn't use, written back as it was.
+    #[serde(skip)]
+    kept: Kept,
+}
+
+/// The three lists, as the preference names them.
+const LISTS: [&str; 3] = ["favourites", "recent", "saved"];
+
+/// What of the saved sources this version couldn't use. A newer RustGIS may add kinds, fields and
+/// lists: they are kept and written back unchanged, so a source noted or kept here never drops
+/// what the newer one wrote.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Kept {
+    /// The whole preference as read, when it couldn't be read at all, and why: it is never
+    /// written over, so what changes in this session isn't kept.
+    whole: Option<(String, String)>,
+    /// Rows of each list that couldn't be read (an unknown kind, an address that isn't one…), or
+    /// that are past the list's limit.
+    rows: BTreeMap<&'static str, Vec<Value>>,
+    /// How many of those rows are past the limit, rather than unreadable.
+    over: usize,
+    /// Fields of read sources this version doesn't know, by list, kind and address.
+    fields: BTreeMap<(&'static str, String, String), Map<String, Value>>,
+    /// Keys beside the three lists this version doesn't know.
+    top: Map<String, Value>,
+    /// Rows and fields that couldn't be read and held a password, key or token: not kept, since
+    /// this version can't strip it from what it doesn't understand.
+    secrets: usize,
+}
+
+impl Kept {
+    /// The entries of `o` without a password, key or token, counting those left out.
+    fn without_secrets(&mut self, mut o: Map<String, Value>) -> Map<String, Value> {
+        let before = o.len();
+        o.retain(|k, v| !holds_secret(&json!({ k.as_str(): v })));
+        self.secrets += before - o.len();
+        o
+    }
+}
+
+/// A saved row: the source, and the fields this version doesn't know.
+#[derive(Deserialize)]
+struct Row {
+    #[serde(flatten)]
+    source: Source,
+    #[serde(flatten)]
+    other: Map<String, Value>,
 }
 
 impl Sources {
     /// Sources read back from the app's preferences: each one checked and cleaned again (the
-    /// preferences are a file anyone could have edited).
+    /// preferences are a file anyone could have edited). What this version can't use is kept, to
+    /// be written back by [`Sources::to_json`] as it was: rows it can't read, fields and lists it
+    /// doesn't know, or the whole preference when it can't be read at all. [`Sources::unread`]
+    /// says what was kept.
     pub fn from_json(text: &str) -> Sources {
-        let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-        // Entry by entry: one that doesn't read is dropped, not the whole list.
-        let read = |k: &str| -> Vec<Source> {
-            v.get(k)
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| serde_json::from_value::<Source>(x.clone()).ok()).filter_map(|x| clean(x).ok()).collect())
-                .unwrap_or_default()
+        let mut s = Sources::default();
+        if text.trim().is_empty() {
+            return s;
+        }
+        let whole = |why: &str| Kept { whole: Some((text.to_string(), why.to_string())), ..Kept::default() };
+        let mut o = match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(o)) => o,
+            _ => {
+                s.kept = whole("they aren't a JSON object");
+                return s;
+            }
         };
-        let mut s = Sources { favourites: read("favourites"), recent: read("recent"), saved: read("saved"), generation: 0 };
-        s.favourites.truncate(MAX_KEPT);
-        s.saved.truncate(MAX_KEPT);
-        s.recent.truncate(MAX_RECENT);
-        // Preferences carry provenance, never authority from an earlier process's login.
-        crate::s3_connections::clear_bindings(
-            s.favourites.iter_mut().chain(&mut s.recent).chain(&mut s.saved).map(|source| &mut source.address),
-        );
+        let mut lists = Vec::with_capacity(LISTS.len());
+        for list in LISTS {
+            match o.remove(list) {
+                None => lists.push(Vec::new()),
+                Some(Value::Array(rows)) => lists.push(rows),
+                Some(_) => {
+                    s.kept = whole("a list of them isn't a JSON array");
+                    return s;
+                }
+            }
+        }
+        s.kept.top = s.kept.without_secrets(o);
+        for (list, rows) in LISTS.into_iter().zip(lists) {
+            let cap = if list == "recent" { MAX_RECENT } else { MAX_KEPT };
+            let mut into = Vec::new();
+            for row in rows {
+                // Entry by entry: one that doesn't read is kept as it was, not the whole list.
+                let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| Some((clean(r.source).ok()?, r.other)));
+                match read {
+                    Some((mut source, other)) if into.len() < cap => {
+                        // Preferences carry provenance, never authority from an earlier process's login.
+                        crate::s3_connections::clear_bindings(std::iter::once(&mut source.address));
+                        let other = s.kept.without_secrets(other);
+                        if !other.is_empty() {
+                            s.kept.fields.insert((list, source.kind.clone(), source.address.clone()), other);
+                        }
+                        into.push(source);
+                    }
+                    _ if holds_secret(&row) => s.kept.secrets += 1,
+                    read => {
+                        s.kept.over += usize::from(read.is_some());
+                        s.kept.rows.entry(list).or_default().push(row);
+                    }
+                }
+            }
+            if let Ok(l) = s.list_mut(list) {
+                *l = into;
+            }
+        }
         s
+    }
+
+    /// What of the preference read by [`Sources::from_json`] isn't used here, one line per kind
+    /// (none when all of it is).
+    pub fn unread(&self) -> Vec<String> {
+        let k = &self.kept;
+        if let Some((_, why)) = &k.whole {
+            return vec![format!(
+                "The saved data sources couldn't be read ({why}): none is listed, and the favourites, recent and saved sources of this session aren't kept over them; fix or remove \"data_sources\" in the preferences file to keep them"
+            )];
+        }
+        let mut said = Vec::new();
+        let rows = k.rows.values().map(Vec::len).sum::<usize>().saturating_sub(k.over);
+        if k.over > 0 {
+            let n = k.over;
+            said.push(format!(
+                "{n} saved data source{} past the lists' limits ({MAX_KEPT} favourites or saved, {MAX_RECENT} recent): not listed, and kept as {} when the sources are saved",
+                if n == 1 { " is" } else { "s are" },
+                if n == 1 { "it was" } else { "they were" }
+            ));
+        }
+        if rows > 0 {
+            said.push(format!(
+                "{rows} saved data source{} couldn't be read (from a newer RustGIS, or damaged): not listed, and kept as {} when the sources are saved",
+                if rows == 1 { "" } else { "s" },
+                if rows == 1 { "it was" } else { "they were" }
+            ));
+        }
+        if !k.fields.is_empty() {
+            let n = k.fields.len();
+            said.push(format!(
+                "{n} saved data source{} settings this version doesn't know (from a newer RustGIS): ignored here, and kept when the sources are saved",
+                if n == 1 { " has" } else { "s have" }
+            ));
+        }
+        if k.secrets > 0 {
+            let n = k.secrets;
+            said.push(format!(
+                "{n} entr{} of the saved data sources couldn't be read and held a password, key or token: dropped, and not saved again",
+                if n == 1 { "y" } else { "ies" }
+            ));
+        }
+        said
     }
 
     /// Takes in the sources kept with the preferences, keeping what this session already has:
@@ -85,11 +215,35 @@ impl Sources {
         join(&mut self.favourites, stored.favourites, MAX_KEPT);
         join(&mut self.saved, stored.saved, MAX_KEPT);
         join(&mut self.recent, stored.recent, MAX_RECENT);
+        self.kept = stored.kept;
         self.generation += 1;
     }
 
+    /// The `data_sources` preference: these sources, with what [`Sources::from_json`] kept
+    /// written back as it was (a preference it couldn't read at all, unchanged).
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        if let Some((text, _)) = &self.kept.whole {
+            return text.clone();
+        }
+        let mut o = self.kept.top.clone();
+        for (list, sources) in LISTS.into_iter().zip([&self.favourites, &self.recent, &self.saved]) {
+            let mut rows: Vec<Value> = sources
+                .iter()
+                .map(|source| {
+                    let mut row = serde_json::to_value(source).unwrap_or(Value::Null);
+                    let key = (list, source.kind.clone(), source.address.clone());
+                    if let (Value::Object(row), Some(other)) = (&mut row, self.kept.fields.get(&key)) {
+                        for (k, v) in other {
+                            row.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                    row
+                })
+                .collect();
+            rows.extend(self.kept.rows.get(list).into_iter().flatten().cloned());
+            o.insert(list.into(), Value::Array(rows));
+        }
+        Value::Object(o).to_string()
     }
 
     /// Notes a source just added (the most recent first, each once).
@@ -98,6 +252,9 @@ impl Sources {
         self.recent.retain(|r| !same(r, &s));
         self.recent.insert(0, s);
         self.recent.truncate(MAX_RECENT);
+        // A source no longer recent takes the fields kept for it along.
+        let recent = &self.recent;
+        self.kept.fields.retain(|(list, kind, address), _| *list != "recent" || recent.iter().any(|r| r.is(kind, address)));
         self.generation += 1;
     }
 
@@ -126,6 +283,9 @@ impl Sources {
         let before = l.len();
         l.retain(|r| !r.is(kind, address));
         let gone = l.len() != before;
+        if let Some(list) = LISTS.into_iter().find(|l| *l == list) {
+            self.kept.fields.remove(&(list, kind.to_string(), address.to_string()));
+        }
         if gone {
             self.generation += 1;
         }
@@ -712,6 +872,68 @@ MIIE
         assert!(s.generation > before);
     }
 
+    /// Rows, fields and lists a newer RustGIS wrote are kept through recording a recent source
+    /// and keeping a favourite here; a preference that can't be read at all is kept byte for
+    /// byte. Clean input says nothing.
+    #[test]
+    fn sources_keep_what_this_version_cannot_read() {
+        let future = json!({"kind": "gcs", "name": "Bucket", "address": "gs://b/a.tif"});
+        let text = json!({
+            "favourites": [{"kind": "file", "name": "A", "address": "/a.gpkg", "pinned": true}, future.clone()],
+            "recent": [{"kind": "file", "name": "R", "address": "/r.csv", "opened": 3}],
+            "saved": [],
+            "folders": ["/data"]
+        })
+        .to_string();
+        let mut s = Sources::default();
+        s.merge(Sources::from_json(&text));
+        assert_eq!(s.unread().len(), 2, "{:?}", s.unread());
+        assert!(s.unread()[0].starts_with("1 saved data source couldn't be read"), "{:?}", s.unread());
+        s.note(Source { kind: "file".into(), address: "/new.csv".into(), ..Source::default() });
+        s.keep("favourites", Source { kind: "file".into(), address: "/b.gpkg".into(), ..Source::default() }).unwrap();
+        let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(saved["folders"], json!(["/data"]));
+        assert_eq!(saved["favourites"][0]["pinned"], true);
+        assert_eq!(saved["favourites"][1]["address"], "/b.gpkg");
+        assert_eq!(saved["favourites"][2], future);
+        assert_eq!(saved["recent"][1]["opened"], 3);
+        // A source that is no longer recent, or that is forgotten, takes its fields along.
+        for i in 0..MAX_RECENT {
+            s.note(Source { kind: "file".into(), address: format!("/{i}.csv"), ..Source::default() });
+        }
+        s.forget("favourites", "file", "/a.gpkg").unwrap();
+        assert!(!s.to_json().contains("opened") && !s.to_json().contains("pinned"));
+        assert!(s.to_json().contains("gs://b/a.tif"));
+
+        for whole in ["[1]", r#"{"favourites": {"a": 1}}"#] {
+            let mut s = Sources::default();
+            s.merge(Sources::from_json(whole));
+            assert!(matches!(s.unread().as_slice(), [one] if one.contains("couldn't be read")), "{whole}");
+            s.note(Source { kind: "file".into(), address: "/new.csv".into(), ..Source::default() });
+            assert_eq!(s.recent.len(), 1, "this session's sources are still listed");
+            assert_eq!(s.to_json(), whole);
+        }
+        // Rows past a list's limit are kept, and said as that.
+        let recent: Vec<Value> = (0..=MAX_RECENT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
+        let s = Sources::from_json(&json!({ "recent": recent }).to_string());
+        assert_eq!(s.recent.len(), MAX_RECENT);
+        assert!(matches!(s.unread().as_slice(), [one] if one.starts_with("1 saved data source is past")), "{:?}", s.unread());
+        assert!(s.to_json().contains(&format!("/{MAX_RECENT}.csv")));
+        // What it can't read and that holds a secret isn't kept: this version can't strip it.
+        let secret = json!({"token": "hidden", "saved": [
+            {"kind": "url", "name": "A", "address": "https://a/x.fgb", "apiKey": "hidden"},
+            {"kind": "gcs", "name": "B", "address": "https://g.example/b?sig=hidden"}
+        ]});
+        let s = Sources::from_json(&secret.to_string());
+        assert!(s.unread().iter().any(|t| t.starts_with("3 entries of the saved data sources")), "{:?}", s.unread());
+        assert!(!s.to_json().contains("hidden"));
+        for clean in
+            ["", r#"{"favourites": [], "recent": [], "saved": []}"#, r#"{"recent": [{"kind": "file", "name": "R", "address": "/r.csv"}]}"#]
+        {
+            assert!(Sources::from_json(clean).unread().is_empty(), "{clean}");
+        }
+    }
+
     #[test]
     fn identity_is_kind_and_address() {
         let mut s = Sources::default();
@@ -930,7 +1152,9 @@ MIIE
         assert_eq!(back.favourites.len(), 1);
         assert_eq!(back.favourites[0].address, "https://h/x.fgb");
         assert!(back.recent.is_empty());
-        assert_eq!(Sources::from_json("not json"), Sources::default());
+        assert_eq!(back.unread().len(), 1, "{:?}", back.unread());
+        let unreadable = Sources::from_json("not json");
+        assert!(unreadable.favourites.is_empty() && unreadable.recent.is_empty() && unreadable.saved.is_empty());
     }
 
     #[test]
