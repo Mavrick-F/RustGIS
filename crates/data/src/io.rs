@@ -1438,8 +1438,10 @@ impl<W: std::io::Write> GeoJsonWriter<W> {
 // ---------------------------------------------------------------------------------------------
 // CSV
 
-const LON_NAMES: &[&str] = &["lon", "lng", "long", "longitude", "x", "lon_dd", "longitude_dd"];
-const LAT_NAMES: &[&str] = &["lat", "latitude", "y", "lat_dd", "latitude_dd"];
+/// Longitude and latitude columns, recognised in any order; CSV export names its coordinate
+/// columns with the first of each that no field has.
+const LON_NAMES: &[&str] = &["longitude", "lon", "lng", "long", "x", "lon_dd", "longitude_dd"];
+const LAT_NAMES: &[&str] = &["latitude", "lat", "y", "lat_dd", "latitude_dd"];
 
 /// Projected coordinate columns, recognised as well as longitude/latitude ones.
 const X_NAMES: &[&str] = &["easting", "point_x", "xcoord", "x_coord"];
@@ -1887,6 +1889,20 @@ fn csv_cell(v: &Value) -> String {
     }
 }
 
+/// The names of a point layer's longitude and latitude columns in CSV: the first of the names
+/// reading takes for each that no field has, ignoring case and the spaces around a name (reading
+/// trims them).
+/// A layer with a field of every such name gets `longitude_1` or `latitude_1`, and reading takes
+/// that field instead ([`CsvLosses::coordinates_note`]).
+fn csv_coordinate_names(fields: &[Field]) -> [String; 2] {
+    let taken = |name: &str| fields.iter().any(|f| f.name.trim().eq_ignore_ascii_case(name));
+    let pick = |base: &str, known: &[&str]| {
+        let name = known.iter().map(|n| n.to_string()).chain((1..).map(|i| format!("{base}_{i}"))).find(|n| !taken(n));
+        name.unwrap_or_default()
+    };
+    [pick("longitude", LON_NAMES), pick("latitude", LAT_NAMES)]
+}
+
 /// A dataset as CSV text: its fields, and a point layer's longitude and latitude ([`CsvWriter`]).
 pub fn to_csv(ds: &Dataset) -> Result<String> {
     let mut w = CsvWriter::new(Vec::new(), &ds.fields, ds.geometry_type)?;
@@ -1895,7 +1911,7 @@ pub fn to_csv(ds: &Dataset) -> Result<String> {
 }
 
 /// Writes CSV a run of features at a time: a header of the fields, and for a point layer
-/// longitude and latitude columns after them.
+/// longitude and latitude columns before them.
 pub(crate) struct CsvWriter<W: std::io::Write> {
     w: csv::Writer<W>,
     point: bool,
@@ -1906,19 +1922,13 @@ impl<W: std::io::Write> CsvWriter<W> {
     pub(crate) fn new(out: W, fields: &[Field], geometry_type: GeometryType) -> Result<Self> {
         let mut w = csv::Writer::from_writer(out);
         let point = geometry_type == GeometryType::Point;
-        let mut head: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+        let mut head = Vec::new();
         if point {
-            // Coordinate columns get names that don't collide with existing fields.
-            for base in ["longitude", "latitude"] {
-                let mut name = base.to_string();
-                let mut i = 1;
-                while head.iter().any(|h| h.eq_ignore_ascii_case(&name)) {
-                    name = format!("{base}_{i}");
-                    i += 1;
-                }
-                head.push(name);
-            }
+            // The coordinate columns come first, so reading takes them rather than a field
+            // named `lat` or `x`.
+            head.extend(csv_coordinate_names(fields));
         }
+        head.extend(fields.iter().map(|f| f.name.clone()));
         w.write_record(&head).map_err(|e| DataError::Format(e.to_string()))?;
         Ok(CsvWriter { w, point })
     }
@@ -1927,12 +1937,13 @@ impl<W: std::io::Write> CsvWriter<W> {
     pub(crate) fn write(&mut self, features: &[crate::Feature]) -> Result<()> {
         for f in features {
             crate::progress::step(1)?;
-            let mut row: Vec<String> = f.attrs.iter().map(csv_cell).collect();
+            let mut row = Vec::with_capacity(f.attrs.len() + 2);
             if self.point {
                 let c = f.geometry.as_ref().and_then(|g| g.label_point());
                 row.push(c.map(|c| c.x.to_string()).unwrap_or_default());
                 row.push(c.map(|c| c.y.to_string()).unwrap_or_default());
             }
+            row.extend(f.attrs.iter().map(csv_cell));
             self.w.write_record(&row).map_err(|e| DataError::Format(e.to_string()))?;
         }
         Ok(())
@@ -2515,8 +2526,42 @@ pub(crate) fn cut(s: &str, max: usize) -> &str {
 /// marks, embeddings, overrides and isolates) in a name or in `target` show as spaces, and a
 /// long name only its first 40 bytes.
 pub fn shapefile_names_note(fields: &[Field], target: &str) -> Option<String> {
-    let renamed: Vec<(&str, String)> =
-        fields.iter().zip(dbf_names(fields)).filter(|(f, n)| f.name != *n).map(|(f, n)| (f.name.as_str(), n)).collect();
+    names_note(fields, dbf_names(fields), target, "a Shapefile (10 bytes at most, unique ignoring case)")
+}
+
+/// The column each field gets in a GeoPackage: its name, unless an earlier field's column or the
+/// id or geometry column has it without regard to case, as SQLite compares column names; then
+/// the name with `_1`, `_2`… added (a later `a` beside `A` becomes `a_1`).
+pub fn geopackage_columns(fields: &[Field]) -> Vec<String> {
+    let (fid, geom) = (free_column_name(fields, "fid"), free_column_name(fields, "geom"));
+    let mut columns: Vec<String> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let taken =
+            |n: &str| columns.iter().any(|c| c.eq_ignore_ascii_case(n)) || n.eq_ignore_ascii_case(&fid) || n.eq_ignore_ascii_case(&geom);
+        let name = (0..).map(|i| if i == 0 { f.name.clone() } else { format!("{}_{i}", f.name) }).find(|n| !taken(n));
+        columns.push(name.unwrap_or_else(|| f.name.clone()));
+    }
+    columns
+}
+
+/// A name no field has, ignoring case (`base`, else `base_1`, `base_2`, …): a GeoPackage's id and
+/// geometry columns.
+pub(crate) fn free_column_name(fields: &[Field], base: &str) -> String {
+    let taken = |n: &str| fields.iter().any(|f| f.name.eq_ignore_ascii_case(n));
+    (0..).map(|i| if i == 0 { base.to_string() } else { format!("{base}_{i}") }).find(|n| !taken(n)).unwrap_or_else(|| base.to_string())
+}
+
+/// What an export to a GeoPackage says when field names differ only in case, which SQLite's
+/// columns can't ([`geopackage_columns`]), or `None` when every name is kept; written as
+/// [`shapefile_names_note`] is.
+pub fn geopackage_names_note(fields: &[Field], target: &str) -> Option<String> {
+    names_note(fields, geopackage_columns(fields), target, "a GeoPackage (unique ignoring case)")
+}
+
+/// One notice of the fields whose names became `names` in `target`, a file of the kind `what`
+/// describes, or `None` when every name is kept.
+fn names_note(fields: &[Field], names: Vec<String>, target: &str, what: &str) -> Option<String> {
+    let renamed: Vec<(&str, String)> = fields.iter().zip(names).filter(|(f, n)| f.name != *n).map(|(f, n)| (f.name.as_str(), n)).collect();
     if renamed.is_empty() {
         return None;
     }
@@ -2524,11 +2569,20 @@ pub fn shapefile_names_note(fields: &[Field], target: &str) -> Option<String> {
     // notice stays one line, reads in the order it is written, and copies no more of a field name
     // than it shows.
     let target: String = target.chars().map(dbf_notice_char).collect();
-    let listed: Vec<String> =
-        renamed.iter().take(5).map(|(old, new)| format!("'{}' → '{}'", dbf_notice_name(old), dbf_notice_name(new))).collect();
+    let listed: Vec<String> = renamed
+        .iter()
+        .take(5)
+        .map(|(old, new)| {
+            let (o, n) = (dbf_notice_name(old), dbf_notice_name(new));
+            // A name made unique keeps its start and gains an ending, which a cut at the end
+            // hides: cut in the middle instead.
+            let (o, n) = if o == n || n.ends_with('…') { (notice_name_ends(old), notice_name_ends(new)) } else { (o, n) };
+            format!("'{o}' → '{n}'")
+        })
+        .collect();
     let more = if renamed.len() > 5 { format!(" and {} more", renamed.len() - 5) } else { String::new() };
     let count = if renamed.len() == 1 { "1 field name was".to_string() } else { format!("{} field names were", renamed.len()) };
-    Some(format!("{target}: {count} changed to fit a Shapefile (10 bytes at most, unique ignoring case): {}{more}", listed.join(", ")))
+    Some(format!("{target}: {count} changed to fit {what}: {}{more}", listed.join(", ")))
 }
 
 /// What an export to `target` says of the date fields it writes as ISO 8601 text, losing the field
@@ -2632,7 +2686,8 @@ pub fn dbf_notice_char(c: char) -> char {
     if c.is_control() || reorders || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c }
 }
 
-/// A bounded field name for a dBase notice, with controls and directional marks flattened.
+/// A field name as a notice shows it: cut after 40 bytes, with controls and directional marks
+/// flattened. [`notice_name_ends`] cuts in the middle instead.
 pub(crate) fn dbf_notice_name(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars().map(dbf_notice_char) {
@@ -2643,6 +2698,29 @@ pub(crate) fn dbf_notice_name(name: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// `name` as a notice shows it, flattened like [`dbf_notice_name`], but cut in the middle: its
+/// first and last 20 bytes, so a name made unique by an ending shows it. Reads no more of the
+/// name than it keeps.
+fn notice_name_ends(name: &str) -> String {
+    let len: usize = name.chars().map(|c| dbf_notice_char(c).len_utf8()).sum();
+    if len <= 40 {
+        return name.chars().map(dbf_notice_char).collect();
+    }
+    let fit = |chars: &mut dyn Iterator<Item = char>| {
+        let mut len = 0;
+        chars
+            .map(dbf_notice_char)
+            .take_while(|c| {
+                len += c.len_utf8();
+                len <= 20
+            })
+            .collect::<Vec<char>>()
+    };
+    let start: String = fit(&mut name.chars()).into_iter().collect();
+    let end: String = fit(&mut name.chars().rev()).into_iter().rev().collect();
+    format!("{start}…{end}")
 }
 
 /// Value losses counted independently for each dBase field, using only rows the writer keeps.
@@ -2818,12 +2896,15 @@ pub struct CsvLosses {
     /// Features whose geometry isn't written: in a line or polygon layer (or one that declares
     /// no type), and in a point layer those with no point to write (an empty multipoint).
     pub unwritten: usize,
+    /// Written with coordinate columns, as a point layer: a streamed export knows this from its
+    /// chunks when the layer declares no type ([`CsvLosses::coordinates_note`]).
+    pub points: bool,
 }
 
 impl CsvLosses {
     /// The losses of `features` in a layer of type `gt`; a streamed export adds up its chunks'.
     pub fn of(features: &[crate::Feature], gt: GeometryType) -> Self {
-        let mut out = Self::default();
+        let mut out = Self { points: gt == GeometryType::Point, ..Self::default() };
         for g in features.iter().filter_map(|f| f.geometry.as_ref()) {
             match (gt, g) {
                 (GeometryType::Point, Geometry::Point(_)) => {}
@@ -2854,6 +2935,31 @@ impl CsvLosses {
         }
         notes
     }
+
+    /// What a CSV export with these losses says when reading the file back wouldn't take its
+    /// coordinate columns: its `fields` have every name reading takes for a longitude or a
+    /// latitude, and reading takes those fields instead. `None` otherwise.
+    pub fn coordinates_note(self, fields: &[Field], target: &str) -> Option<String> {
+        if !self.points {
+            return None;
+        }
+        let header: Vec<String> = csv_coordinate_names(fields).into_iter().chain(fields.iter().map(|f| f.name.clone())).collect();
+        let found = found_xy(&header);
+        if found == Some((0, 1)) {
+            return None;
+        }
+        let name = |i: usize| dbf_notice_name(header.get(i).map_or("", String::as_str));
+        let read = match found {
+            Some((x, y)) => format!("reads columns '{}' and '{}' as the coordinates, which moves the points", name(x), name(y)),
+            None => "reads no coordinates".to_string(),
+        };
+        let target: String = target.chars().map(dbf_notice_char).collect();
+        Some(format!(
+            "{target}: the fields have every name read as a longitude or latitude, so the coordinates are in columns '{}' and '{}'; adding the file back {read} unless those columns are picked",
+            name(0),
+            name(1)
+        ))
+    }
 }
 
 impl std::ops::AddAssign for CsvLosses {
@@ -2861,6 +2967,7 @@ impl std::ops::AddAssign for CsvLosses {
     fn add_assign(&mut self, other: Self) {
         self.as_one_point += other.as_one_point;
         self.unwritten += other.unwritten;
+        self.points |= other.points;
     }
 }
 
@@ -2869,7 +2976,12 @@ impl std::ops::AddAssign for CsvLosses {
 /// none for another format. A streamed export counts CSV's a chunk at a time instead.
 pub fn export_losses_notes(ds: &Dataset, ext: &str, name_field: Option<usize>, target: &str) -> Vec<String> {
     match ext {
-        "csv" => CsvLosses::of(&ds.features, ds.geometry_type).notes(target),
+        "csv" => {
+            let losses = CsvLosses::of(&ds.features, ds.geometry_type);
+            let mut notes = losses.notes(target);
+            notes.extend(losses.coordinates_note(&ds.fields, target));
+            notes
+        }
         "gpx" => gpx_notes(ds, name_field, target),
         _ => Vec::new(),
     }
@@ -4234,14 +4346,14 @@ mod tests {
         ds.push(Some(square), vec![]);
         ds.push(None, vec![]);
         let losses = CsvLosses::of(&ds.features, ds.geometry_type);
-        assert_eq!(losses, CsvLosses { as_one_point: 0, unwritten: 1 });
+        assert_eq!(losses, CsvLosses { as_one_point: 0, unwritten: 1, points: false });
         assert!(losses.notes("t.csv")[0].contains("the geometry of 1 feature wasn't written"));
         assert!(!to_csv(&ds).unwrap().contains("longitude"));
         let points = [crate::Feature { id: 0, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![] }];
-        assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses::default());
+        assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses { points: true, ..CsvLosses::default() });
         // A multipoint without a point in a point layer gets empty coordinate cells.
         let empty = [crate::Feature { id: 1, geometry: Some(Geometry::MultiPoint(vec![])), attrs: vec![] }];
-        assert_eq!(CsvLosses::of(&empty, GeometryType::Point), CsvLosses { as_one_point: 0, unwritten: 1 });
+        assert_eq!(CsvLosses::of(&empty, GeometryType::Point), CsvLosses { as_one_point: 0, unwritten: 1, points: true });
     }
 
     /// GPX leaves out a feature without geometry and a multipoint without a point (no waypoint
@@ -4254,6 +4366,60 @@ mod tests {
         ds.push(None, vec![]);
         assert_eq!(gpx_left_out(&ds), 2);
         assert_eq!(write_bytes(&ds, "gpx").unwrap().1, 2);
+    }
+
+    /// A point layer's fields named like coordinates keep their values when its CSV is read back:
+    /// the coordinate columns come first, so reading takes them, not the fields. (Reading keeps the
+    /// coordinate columns as fields too.)
+    #[test]
+    fn csv_fields_named_like_coordinates_stay_fields() {
+        let names = ["lat", "x", "longitude"];
+        let fields: Vec<Field> = names.iter().map(|n| Field::new(*n, FieldType::Double)).collect();
+        let mut ds = Dataset::new("t", GeometryType::Point, fields);
+        ds.push(Some(Geometry::Point(Coord::new(20.0, 10.0))), vec![Value::Float(1.5), Value::Float(2.5), Value::Float(3.5)]);
+        let out = to_csv(&ds).unwrap();
+        assert_eq!(out.lines().next(), Some("lon,latitude,lat,x,longitude"), "{out}");
+        let (back, _) = read_csv(&out, "t").unwrap();
+        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Coord::new(20.0, 10.0))));
+        for (name, v) in names.iter().zip([1.5, 2.5, 3.5]) {
+            let i = back.field_index(name).unwrap();
+            assert_eq!(back.value(0, i), &Value::Float(v), "{name}");
+        }
+        // A name with spaces around it is the name reading gives it.
+        let mut padded = Dataset::new("t", GeometryType::Point, vec![Field::new(" longitude ", FieldType::Double)]);
+        padded.push(Some(Geometry::Point(Coord::new(20.0, 10.0))), vec![Value::Float(1.5)]);
+        let out = to_csv(&padded).unwrap();
+        assert_eq!(out.lines().next(), Some("lon,latitude, longitude "), "{out}");
+        let (back, _) = read_csv(&out, "t").unwrap();
+        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Coord::new(20.0, 10.0))));
+        assert_eq!(back.value(0, back.field_index("longitude").unwrap()), &Value::Float(1.5));
+    }
+
+    /// A point layer with a field of every longitude name has its longitudes in a column reading
+    /// doesn't take, and its export says so; one with a name left says nothing.
+    #[test]
+    fn csv_coordinates_in_columns_reading_doesnt_take_are_said() {
+        let layer = |names: &[&str]| {
+            let fields: Vec<Field> = names.iter().map(|n| Field::new(*n, FieldType::Integer)).collect();
+            let mut ds = Dataset::new("t", GeometryType::Point, fields);
+            ds.push(Some(Geometry::Point(Coord::new(20.0, 10.0))), names.iter().map(|_| Value::Int(1)).collect());
+            ds
+        };
+        let every = layer(LON_NAMES);
+        let out = to_csv(&every).unwrap();
+        assert!(out.starts_with("longitude_1,latitude,"), "{out}");
+        let notes = export_losses_notes(&every, "csv", None, "t.csv");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(
+            notes[0],
+            "t.csv: the fields have every name read as a longitude or latitude, so the coordinates are in columns 'longitude_1' and 'latitude'; adding the file back reads columns 'longitude' and 'latitude' as the coordinates, which moves the points unless those columns are picked"
+        );
+        // As said: reading takes the field `longitude` (1) for the longitude.
+        let (back, _) = read_csv(&out, "t").unwrap();
+        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Coord::new(1.0, 10.0))));
+        // A name left, or a layer that isn't of points: nothing to say.
+        assert!(export_losses_notes(&layer(&LON_NAMES[1..]), "csv", None, "t.csv").is_empty());
+        assert_eq!(CsvLosses::of(&[], GeometryType::Polyline).coordinates_note(&every.fields, "t.csv"), None);
     }
 
     #[test]
@@ -4283,7 +4449,7 @@ mod tests {
         assert_eq!(ds.geometry_type, GeometryType::Point, "BOM must not hide the lon header");
         let out = to_csv(&ds).unwrap();
         assert!(out.contains("'=SUM(A1)"), "{out}");
-        assert!(out.lines().next().unwrap().contains("longitude_1"), "{out}");
+        assert_eq!(out.lines().next(), Some("lng,latitude,lon,lat,longitude,note"), "{out}");
         let (ds, _) = read_csv("a\nNaN\nx\n", "t").unwrap();
         assert_eq!(ds.fields[0].ty, FieldType::Text);
     }

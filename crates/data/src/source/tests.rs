@@ -1819,6 +1819,37 @@ fn writes_points_lines_kmz_and_zipped_shapefiles() {
     let (back, _) = crate::io::read_path(&d.join("c.gpkg")).unwrap();
     assert_eq!(back.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["A", "a_1"]);
     assert_eq!(back.features[0].attrs, [Value::Int(1), Value::Text("x".into())]);
+    // And the export says so, as the file has it; names kept (an id or geometry column moves
+    // aside for a field) say nothing.
+    assert_eq!(
+        crate::io::geopackage_names_note(&cased.fields, "c.gpkg").as_deref(),
+        Some("c.gpkg: 1 field name was changed to fit a GeoPackage (unique ignoring case): 'a' → 'a_1'")
+    );
+    let kept: Vec<Field> = ["fid", "geom", "a"].iter().map(|n| Field::new(*n, FieldType::Integer)).collect();
+    assert_eq!(crate::io::geopackage_names_note(&kept, "k.gpkg"), None);
+    // A long name shows its start and the ending that makes it unique.
+    let long: Vec<Field> =
+        ["Ab", "ab", "Bb", "bb"].iter().map(|n| Field::new(format!("{n}{}", "x".repeat(50)), FieldType::Integer)).collect();
+    let note = crate::io::geopackage_names_note(&long, "l.gpkg").unwrap();
+    let x = |n| "x".repeat(n);
+    assert!(
+        note.ends_with(&format!(
+            "'ab{}…{}' → 'ab{}…{}_1', 'bb{}…{}' → 'bb{}…{}_1'",
+            x(18),
+            x(20),
+            x(18),
+            x(18),
+            x(18),
+            x(20),
+            x(18),
+            x(18)
+        )),
+        "{note}"
+    );
+    // So does one that fits until it is made unique.
+    let edge: Vec<Field> = ["A".repeat(40), "a".repeat(40)].iter().map(|n| Field::new(n, FieldType::Integer)).collect();
+    let note = crate::io::geopackage_names_note(&edge, "e.gpkg").unwrap();
+    assert!(note.ends_with(&format!("'{}' → '{}…{}_1'", "a".repeat(40), "a".repeat(20), "a".repeat(18))), "{note}");
     // An empty layer writes too.
     let empty = Dataset::new("e", GeometryType::Point, vec![]);
     assert!(crate::io::write_bytes(&empty, "parquet").is_ok());
@@ -3809,4 +3840,32 @@ fn parquet_int96_is_unzoned_and_checks_submicroseconds() {
     assert_eq!(batch.features[0].attrs[2].to_string(), "00:00:00.000000Z");
     assert_eq!(batch.features[1].attrs[2].to_string(), "00:00:00.000001Z");
     assert!(batch.features[0].attrs[2] < batch.features[1].attrs[2]);
+}
+
+/// A feature just below an extent, within the rounding of the Shapefile and GeoJSON indexes'
+/// single-precision boxes, is left out of a read of that extent, as it is in a whole read's
+/// filter and the other formats.
+#[test]
+fn a_feature_just_outside_an_extent_is_left_out_of_its_read() {
+    let d = dir().join("just-outside");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut ds = Dataset::new("edge", GeometryType::Point, vec![]);
+    ds.push(Some(Geometry::Point(Coord::new(0.0, 0.999_999_999))), vec![]);
+    let extent = Some(Extent::new(-1.0, 1.0, 1.0, 2.0));
+    let req = Request { extent, limit: 1000 };
+    let (shp_path, geojson_path) = (d.join("edge.shp"), d.join("edge.geojson"));
+    crate::io::write_path(&ds, &shp_path).unwrap();
+    crate::io::write_path(&ds, &geojson_path).unwrap();
+    let shp = shp::ShpSource::open_path(&shp_path, "edge").unwrap();
+    assert!(shp.read(&req).unwrap().features.is_empty());
+    let mut rows = Vec::new();
+    shp.visit_chunks(extent, 1 << 20, &mut |chunk| {
+        rows.extend(chunk);
+        Ok(())
+    })
+    .unwrap();
+    assert!(rows.is_empty());
+    let geojson = geojson::GeoJsonSource::open_path(&geojson_path, "edge").unwrap();
+    assert!(geojson.read(&req).unwrap().features.is_empty());
+    std::fs::remove_dir_all(&d).unwrap();
 }
