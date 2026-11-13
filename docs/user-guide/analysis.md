@@ -1207,7 +1207,8 @@ them by category only. Find Tools searches them.
 
 RustGIS works with GeoLibre runner 1.x (from 1.0.0, up to but not including 2.0.0). A runner
 outside that range, found or located, is passed over, and the Tools pane says which one and how to
-fix it: install the tools, or locate a runner in that range. A download that fails or is refused
+fix it (also when another runner is used instead; `gp.geolibre` gives it as `passedOver`): install
+the tools, or locate a runner in that range. A download that fails or is refused
 leaves an installed runner as it was.
 
 Field-name parameters (`field`, `*_field`, `fields` and `*_fields`) have a **Fields** menu beside

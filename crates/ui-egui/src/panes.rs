@@ -3207,13 +3207,7 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 .size(11.5)
                 .color(t.text_dim),
             );
-            // A runner was found (or remembered from Locate…) but its version is outside the
-            // range this RustGIS works with: say which and how to fix it, once.
-            let repeated = |note: &str| matches!(&app.gp.last, Some((false, msgs)) if msgs.iter().any(|m| m == note));
-            if let Some(note) = status["unsupported"].as_str().filter(|n| !repeated(n)) {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(note).size(11.0).color(t.red));
-            }
+            geolibre_passed_over(app, ui, t);
             ui.add_space(6.0);
             let progress = app.gp.install.as_ref().and_then(|st| st.lock().ok().map(|s| (s.done, s.total)));
             match progress {
@@ -3274,6 +3268,19 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
         },
     );
+}
+
+/// Why a GeoLibre runner that was found (or remembered from Locate…) isn't used, its version
+/// being outside the range this RustGIS works with: which one and how to fix it, shown on the card
+/// and, while another runner is in use, under the tools' heading. Once: not when a Locate… error
+/// already says it.
+fn geolibre_passed_over(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
+    let Some(note) = rustgis_engine::cmd::gp::geolibre_passed_over() else { return };
+    if matches!(&app.gp.last, Some((false, msgs)) if msgs.contains(&note)) {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(note).size(11.0).color(t.red));
 }
 
 /// Uninstalls the GeoLibre tools (a second press confirms): natively the runner that Install
@@ -3549,6 +3556,7 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 if let Some(e) = &app.gp.uninstall_error {
                     ui.label(egui::RichText::new(e).size(11.0).color(t.red));
                 }
+                geolibre_passed_over(app, ui, t);
                 // As in GeoLibre's Processing menu: category › subcategory › tools
                 // (`GeoLibre › Terrain › Derivatives`; a tool without a subcategory sits
                 // directly in its category).

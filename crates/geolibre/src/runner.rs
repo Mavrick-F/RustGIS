@@ -50,11 +50,13 @@ struct Found {
 static FOUND: Mutex<Found> = Mutex::new(Found { generation: 0, value: None });
 
 /// Why the last runner passed over (found, or chosen with Locate…) wasn't used: its version is
-/// outside the supported range. Cleared when discovery finds a supported runner.
+/// outside the supported range. Kept while another runner is in use; cleared only when a choice
+/// is made (Locate… of a supported runner, or looking again).
 static PASSED_OVER: Mutex<Option<String>> = Mutex::new(None);
 
 /// Why a GeoLibre runner that was found or chosen isn't in use, when its version is outside the
-/// supported range: what was found and how to fix it. `None` when nothing was passed over.
+/// supported range: what was found and how to fix it, also while another runner is in use.
+/// `None` when nothing was passed over.
 pub fn passed_over() -> Option<String> {
     PASSED_OVER.lock().ok().and_then(|p| p.clone())
 }
@@ -64,6 +66,15 @@ fn unsupported_with_fix(what: &str, version: &str) -> Result<(), String> {
     check_supported(what, version).map_err(|e| {
         format!("{e} Install the GeoLibre tools from the Tools pane (or `gp.installGeolibre`), which fetches runner {RELEASE}, or locate a runner in that range.")
     })
+}
+
+/// Records discovery's reason for passing a runner over, if it has one. It only adds: a
+/// remembered Locate… choice refused at startup keeps its reason when discovery then finds a
+/// supported runner. A new choice clears it ([`choose`]).
+fn add_passed_over(note: Option<String>) {
+    if note.is_some() {
+        set_passed_over(note);
+    }
 }
 
 /// Records (or, with `None`, clears) the reason [`passed_over`] gives.
@@ -220,10 +231,8 @@ pub fn find() -> Option<(PathBuf, String)> {
     if found.generation != generation {
         return found.value.clone().flatten();
     }
-    // A supported runner clears an earlier note; finding none keeps one (say, a remembered
-    // Locate… choice refused at startup).
-    if found.value.is_none() && (probed.is_some() || note.is_some()) {
-        set_passed_over(note);
+    if found.value.is_none() {
+        add_passed_over(note);
     }
     found.value.get_or_insert(probed).clone()
 }
@@ -247,7 +256,7 @@ fn first_supported(candidates: Vec<PathBuf>) -> (Option<(PathBuf, String)>, Opti
 
 /// Uses `exe` as the runner (`None`: look in the usual places again). Fails, keeping the
 /// current choice, when `exe` isn't a GeoLibre runner or its version is outside the supported
-/// range (that reason is also kept for [`passed_over`]).
+/// range (that reason is also kept for [`passed_over`]); a choice made clears an earlier reason.
 pub fn choose(exe: Option<PathBuf>) -> Result<Option<(PathBuf, String)>, String> {
     if let Some(p) = &exe {
         let version = version_of(p).ok_or_else(|| format!("{} is not a GeoLibre runner", p.display()))?;
@@ -256,6 +265,7 @@ pub fn choose(exe: Option<PathBuf>) -> Result<Option<(PathBuf, String)>, String>
             return Err(e);
         }
     }
+    set_passed_over(None);
     if let Ok(mut c) = CHOSEN.lock() {
         *c = exe;
     }
@@ -394,13 +404,16 @@ mod tests {
         assert_eq!(found, Some((works.clone(), "geolibre-cli 1.8.0".to_string())));
         let note = note.unwrap();
         assert!(note.contains(&newer.display().to_string()) && note.contains("2.0.0") && note.contains("gp.installGeolibre"), "{note}");
-        assert_eq!(first_supported(vec![other.clone(), works.clone()]), (Some((works, "geolibre-cli 1.8.0".to_string())), None));
+        assert_eq!(first_supported(vec![other.clone(), works.clone()]), (Some((works.clone(), "geolibre-cli 1.8.0".to_string())), None));
         let (found, note) = first_supported(vec![newer.clone()]);
         assert!(found.is_none() && note.is_some());
-        // Locate… refuses it too, keeping the current choice (it changes nothing else).
+        // Locate… refuses it too, keeping the current choice, and the reason stays reported
+        // after discovery, even when it finds a runner to use (#1946 review).
         let before = selected();
         assert!(choose(Some(newer)).is_err_and(|e| e.contains("2.0.0") && e.contains("locate a runner in that range")));
         assert_eq!(selected(), before);
+        add_passed_over(first_supported(vec![works.clone()]).1);
+        assert!(passed_over().is_some_and(|n| n.contains("2.0.0")), "{:?}", passed_over());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
