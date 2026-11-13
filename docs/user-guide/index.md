@@ -419,7 +419,8 @@ The file keeps its code page (its `.cpg` and the language driver in its `.dbf`),
 width, decimals and type where the values still fit, and its `.prj`. A column that can't hold
 an edited value gets one that can, and a notice names it with its old and new form; a field
 deleted or renamed in the layer leaves its column out of the file, and a notice names it too. A layer read in another
-coordinate system than its `.prj` names gets a `.prj` for that system, said too. A shape that wasn't edited is
+coordinate system than its `.prj` names, including one assigned with Define Projection, gets a
+`.prj` for that system, said too. A shape that wasn't edited is
 written with the coordinates the file holds, so a projected file's untouched shapes stay as they
 were to the bit. An edited shape in a projected system is converted from longitude/latitude, as
 RustGIS holds it, and read back: publishing refuses one that would move by more than one part in
