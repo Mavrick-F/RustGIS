@@ -2773,17 +2773,20 @@ fn a_reference_scale_out_of_range_in_a_project_is_left_out_and_said() {
             "{bad}: {notices:?}"
         );
     }
-    // So does a map file or a layer file added on its own.
-    let map = serde_json::to_string(s.map()).unwrap().replace("\"reference_scale\":25000.0", "\"reference_scale\":0");
-    let layer = serde_json::to_string(s.map().layer_by_name("Rivers").unwrap())
-        .unwrap()
-        .replace("\"reference_scale\":25000.0", "\"reference_scale\":0");
+    // So does a map file or a layer file added on its own, and a clean one says nothing.
+    let map = serde_json::to_string(s.map()).unwrap();
+    let layer = serde_json::to_string(s.map().layer_by_name("Rivers").unwrap()).unwrap();
     for (command, text) in [("map.import", map), ("layer.addLayerFile", layer)] {
-        let mut t = world();
-        let mark = t.notices_given();
-        t.run(command, &json!({"text": text})).unwrap();
-        let notices: Vec<String> = t.notices_since(mark).iter().map(|n| n.text.clone()).collect();
-        assert!(notices.iter().any(|n| n.contains("reference scale out of range") && n.contains("'Rivers'")), "{command}: {notices:?}");
+        let said = |text: String| {
+            let mut t = world();
+            let mark = t.notices_given();
+            t.run(command, &json!({"text": text})).unwrap();
+            t.notices_since(mark).iter().map(|n| n.text.clone()).collect::<Vec<String>>()
+        };
+        let clean = said(text.clone());
+        assert!(!clean.iter().any(|n| n.contains("reference scale")), "{command}: {clean:?}");
+        let bad = said(text.replace("\"reference_scale\":25000.0", "\"reference_scale\":0"));
+        assert!(bad.iter().any(|n| n.contains("reference scale out of range") && n.contains("'Rivers'")), "{command}: {bad:?}");
     }
 }
 
