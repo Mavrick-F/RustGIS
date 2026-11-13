@@ -368,7 +368,9 @@ fn an_export_that_changes_a_layer_says_so() {
             let (said, back) = match trip(&ds, ext, &sub) {
                 Ok(trip) => trip,
                 // A refusal says why, but a crash caught by `Session::run` is a bug.
-                Err(e) if e.contains("stopped unexpectedly") => return Err(TestCaseError::fail(format!("{ext}: {e}"))),
+                Err(e) if e.contains("failed unexpectedly") || e.contains("stopped unexpectedly") => {
+                    return Err(TestCaseError::fail(format!("{ext}: {e}")));
+                }
                 Err(_) => continue,
             };
             *written.borrow_mut().entry(ext).or_default() += 1;
@@ -392,7 +394,8 @@ fn an_export_that_changes_a_layer_says_so() {
             }
             let found = back.map_or_else(|e| vec![(format!("not read back: {e}"), None)], |back| changes(&held, &back));
             // A change is said by a notice naming its field, the export's or the reading's, or by
-            // any export notice for one in no field.
+            // any export notice for one in no field (geometry, the feature count): a notice of
+            // geometry names no field to look for, so this half is looser.
             let said_of = |field: &Option<String>| match field {
                 Some(f) => said.export.iter().chain(&said.read).any(|n| n.contains(&format!("'{f}'"))),
                 None => !said.export.is_empty(),
