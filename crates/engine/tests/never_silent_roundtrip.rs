@@ -322,6 +322,22 @@ fn renames(notices: &[String]) -> Vec<(String, String)> {
     out
 }
 
+/// Whether `change`, in `field` if any, is said: by a notice naming the field, the export's or the
+/// reading's, or by any export notice for a change in no field. A notice that renames a field
+/// (`'a' → 'a_1'`) says the rename, not a change in the values of either name.
+fn is_said(change: &str, field: Option<&str>, said: &Said) -> bool {
+    let Some(f) = field else { return !said.export.is_empty() };
+    said.export.iter().chain(&said.read).any(|n| {
+        let mut n = n.clone();
+        if !change.starts_with("field renamed") {
+            for (old, new) in renames(std::slice::from_ref(&n)) {
+                n = n.replace(&format!("'{old}' → '{new}'"), "");
+            }
+        }
+        n.contains(&format!("'{f}'"))
+    })
+}
+
 /// What changed between a layer and the layer read back. Features are matched by content, since
 /// a format may reorder them (FlatGeobuf sorts them along its spatial index); fields by name, and
 /// a format may add its own. `renamed` pairs a field with the column it became.
@@ -452,22 +468,8 @@ fn an_export_that_changes_a_layer_says_so() {
             // A change is said by a notice naming its field, the export's or the reading's, or by
             // any export notice for one in no field (geometry, the feature count): a notice of
             // geometry names no field to look for, so this half is looser.
-            // A notice that renames a field (`'a' → 'a_1'`) says the rename, not a change in its
-            // values.
-            let said_of = |c: &str, field: &Option<String>| match field {
-                Some(f) => said.export.iter().chain(&said.read).any(|n| {
-                    let mut n = n.clone();
-                    if !c.starts_with("field renamed") {
-                        for (old, new) in renames(std::slice::from_ref(&n)) {
-                            n = n.replace(&format!("'{old}' → '{new}'"), "");
-                        }
-                    }
-                    n.contains(&format!("'{f}'"))
-                }),
-                None => !said.export.is_empty(),
-            };
             let silent: Vec<String> =
-                found.into_iter().filter(|(c, field)| !declared(ext, c) && !said_of(c, field)).map(|(c, _)| c).collect();
+                found.into_iter().filter(|(c, field)| !declared(ext, c) && !is_said(c, field.as_deref(), &said)).map(|(c, _)| c).collect();
             if !silent.is_empty() {
                 return Err(TestCaseError::fail(format!(
                     "{ext}: changed without a notice: {silent:?}; said: {:?}, {:?}",
@@ -485,4 +487,15 @@ fn an_export_that_changes_a_layer_says_so() {
     for ext in FORMATS {
         assert!(written.get(ext).is_some_and(|n| *n > 0), "PROPERTY_SEED={seed}: {ext} wrote none of the layers");
     }
+}
+
+#[test]
+fn a_rename_notice_says_the_rename_not_a_change_in_values() {
+    let said = |n: &str| Said { export: vec![n.to_string()], read: Vec::new() };
+    let renamed = said("l.gpkg: 2 field names were changed to fit a GeoPackage: 'name' → 'name_1', 'name_1' → 'name_1_1'");
+    assert!(is_said("field renamed (name_1 → name_1_1)", Some("name_1"), &renamed));
+    assert!(!is_said("number changed (name_1: Int(1) → Int(2))", Some("name_1"), &renamed));
+    let values = said("l.shp: 1 value of 'name_1' was cut to fit");
+    assert!(is_said("number changed (name_1: Int(1) → Int(2))", Some("name_1"), &values));
+    assert!(!is_said("number changed (other: Int(1) → Int(2))", Some("other"), &values));
 }
