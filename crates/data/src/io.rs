@@ -1846,6 +1846,12 @@ fn double_holds(v: &str) -> bool {
         let all: String = mantissa.chars().filter(char::is_ascii_digit).collect();
         all.trim_start_matches('0').trim_end_matches('0').to_string()
     }
+    // A whole number written as one is held only exactly: `12345678901234567000` is a Double's
+    // 17 digits and zeros, but that Double is 12345678901234567168.
+    let whole = v.strip_prefix(['-', '+']).unwrap_or(v);
+    if !whole.is_empty() && whole.bytes().all(|b| b.is_ascii_digit()) {
+        return v.parse::<i128>().is_ok_and(|i| v.parse::<f64>().is_ok_and(|x| x.is_finite() && x as i128 == i));
+    }
     let want = digits(v);
     v.parse::<f64>()
         .is_ok_and(|x| x.is_finite() && (want.is_empty() || want.len() <= 767 && digits(&format!("{x:.*e}", want.len() - 1)) == want))
@@ -4465,6 +4471,8 @@ mod tests {
         assert_eq!((ds.fields[0].ty, ds.value(0, 0)), (FieldType::Double, &Value::Float(0.1)));
         // So is one written out exactly, however many digits that takes.
         assert!(double_holds("0.00000000023283064365386962890625") && !double_holds(&"1".repeat(800)));
+        // A whole number past i64 with trailing zeros is held only if exactly.
+        assert!(!double_holds("12345678901234567000") && double_holds("18446744073709551616"));
         // A whole number beside a decimal: 2^60 is a Double exactly, 10^18 + 100 isn't.
         let (ds, _) = read_csv("a,b\n1152921504606846976,1000000000000000100\n0.5,0.5\n", "t").unwrap();
         assert_eq!((ds.fields[0].ty, ds.fields[1].ty), (FieldType::Double, FieldType::Text));
