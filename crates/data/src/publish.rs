@@ -132,6 +132,13 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     let Some(table) = crate::dbf::raw_table(&original.dbf) else {
         return Err(refused(path, "its .dbf's header doesn't describe its records"));
     };
+    // A record marked deleted still has its shape in the `.shp`; a rewrite would drop both.
+    if table.deleted > 0 {
+        return Err(refused(
+            path,
+            format!("{} of its records are marked deleted, and writing it again would remove them from the file", table.deleted),
+        ));
+    }
     let mut encoding_notes = Vec::new();
     let ldid = original.dbf.get(29).copied().unwrap_or(0);
     let style = DbfStyle {
@@ -156,6 +163,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     let as_held = raw.as_ref().map(|raw| (&as_read, raw));
 
     // 2. The file as read, written again, is the file.
+    crate::progress::begin(as_read.features.len());
     let (again, _, _) = crate::io::shapefile_parts_styled(&*in_file(&as_read, crs, as_held)?, written_crs, Some(&style))?;
     let part = |parts: &[(&str, Vec<u8>)], ext: &str| parts.iter().find(|(e, _)| *e == ext).map(|(_, b)| b.clone()).unwrap_or_default();
     if let Some(why) = same_shapes(&original.shp, &part(&again, "shp"), 0.0) {
@@ -189,11 +197,13 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
         return Err(refused(path, format!("the file couldn't hold the layer as it is: {why}")));
     }
     if !widened.is_empty() {
+        let shown: Vec<&str> = widened.iter().take(5).map(String::as_str).collect();
+        let more = if widened.len() > 5 { format!(" and {} more", widened.len() - 5) } else { String::new() };
         notes.push(format!(
-            "{}: {} given wider columns than the file had, to hold their values: {}",
+            "{}: {} columns other than the file's, to hold their values: {}{more}",
             path.display(),
-            if widened.len() == 1 { "1 field was".to_string() } else { format!("{} fields were", widened.len()) },
-            names_list(&widened)
+            if widened.len() == 1 { "1 field was given".to_string() } else { format!("{} fields were given", widened.len()) },
+            shown.join(", ")
         ));
     }
 
@@ -256,7 +266,8 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
         let mut row = f.clone();
         match held {
             Some(h) => row.geometry = h.geometry.clone(),
-            None => crate::io::project_features(std::slice::from_mut(&mut row), &t, c)?,
+            // Looks at Cancel without counting: the write that follows counts the features.
+            None => crate::io::project_each(std::slice::from_mut(&mut row), &t, c, false)?,
         }
         rows.push(row);
     }
@@ -618,6 +629,23 @@ mod tests {
         assert!(e.contains("reads otherwise now") && e.contains("nothing was written"), "{e}");
     }
 
+    /// A file with records marked deleted is refused: writing it again would drop them, shapes and
+    /// all.
+    #[test]
+    fn a_file_with_deleted_records_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        crate::io::write_path(&parcels(), &path).unwrap();
+        let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        let header = usize::from(u16::from_le_bytes([dbf[8], dbf[9]]));
+        dbf[header] = b'*';
+        std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
+        let (ds, sync) = read(&path);
+        let e = shapefile(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("1 of its records are marked deleted") && e.contains("nothing was written"), "{e}");
+        assert_eq!(std::fs::read(path.with_extension("dbf")).unwrap(), dbf);
+    }
+
     /// A file changed since it was read is never written over.
     #[test]
     fn a_changed_file_is_refused() {
@@ -714,7 +742,8 @@ mod tests {
         ds.features = rows.into();
         let published = shapefile(&ds, &path, &sync).unwrap();
         assert_eq!(published.notes.len(), 1, "{:?}", published.notes);
-        assert!(published.notes[0].contains("1 field was given wider columns") && published.notes[0].contains("'OWNER'"));
+        assert!(published.notes[0].contains("1 field was given columns other than the file's"), "{:?}", published.notes);
+        assert!(published.notes[0].contains("'OWNER' C(5) to C(24)"), "{:?}", published.notes);
         let (back, _) = crate::io::read_path(&path).unwrap();
         assert_eq!(back.features.iter().next().unwrap().attrs[0], Value::Text("Smith and Jones Holdings".into()));
     }

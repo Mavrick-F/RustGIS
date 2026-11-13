@@ -3279,14 +3279,24 @@ fn new_column(ds: &Dataset, k: usize) -> Spec {
     }
 }
 
+impl std::fmt::Display for Spec {
+    /// As a `.dbf` column is described: its type letter, width and, for a number, decimals
+    /// (`N(10,2)`, `C(24)`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ty = char::from(self.ty);
+        if matches!(self.ty, b'N' | b'F') { write!(f, "{ty}({},{})", self.len, self.decimals) } else { write!(f, "{ty}({})", self.len) }
+    }
+}
+
 /// The column field `k` (written as `name`) is written to over a file whose `.dbf` `style`
 /// describes: the file's column of that name where the field's kind and every value still fit
-/// it, so the file keeps its widths and decimals; otherwise a new one ([`new_column`]), and
-/// `true` when the file had a column of that name and kind that was too small for its values.
-fn kept_column(ds: &Dataset, k: usize, name: &str, style: &DbfStyle) -> (Spec, bool) {
+/// it, so the file keeps its widths and decimals; otherwise a new one ([`new_column`]), at least
+/// as wide as the file's, and, when the file had a column of that name and kind that couldn't
+/// hold the values, what changed (`'ACRES' N(10,2) to N(24,9)`).
+fn kept_column(ds: &Dataset, k: usize, name: &str, style: &DbfStyle) -> (Spec, Option<String>) {
     let new = new_column(ds, k);
     let (Some(field), Some(was)) = (ds.fields.get(k), style.columns.iter().find(|c| c.name == name.as_bytes())) else {
-        return (new, false);
+        return (new, None);
     };
     let values = || ds.features.iter().filter_map(|r| r.attrs.get(k)).filter(|v| !v.is_null());
     let ty = was.ty.to_ascii_uppercase();
@@ -3309,22 +3319,26 @@ fn kept_column(ds: &Dataset, k: usize, name: &str, style: &DbfStyle) -> (Spec, b
         (FieldType::Boolean, b'L') | (FieldType::Date, b'D') => true,
         (FieldType::Text | FieldType::DateTime, b'C') => values().all(|v| encoded_len(v) <= usize::from(was.len)),
         // Another kind of field now: a new column, and nothing of the old one to keep.
-        _ => return (new, false),
+        _ => return (new, None),
     };
     if fits {
-        return (kept, false);
+        return (kept, None);
     }
-    // Text wider than the file's column: as wide as its longest value, in the file's code page.
-    if new.ty == b'C' {
-        let longest = values().map(encoded_len).max().unwrap_or(0);
-        return (Spec { len: u8::try_from(longest.clamp(usize::from(was.len), 254)).unwrap_or(254), ..new }, true);
-    }
-    (new, true)
+    let spec = if new.ty == b'C' {
+        // Text wider than the file's column: as wide as its longest value, in the file's code
+        // page, up to the 254 bytes written (a longer value is cut, which publishing refuses).
+        let longest = values().map(encoded_len).max().unwrap_or(0).min(254);
+        Spec { len: u8::try_from(longest).unwrap_or(254), ..new }
+    } else {
+        // A number with more digits or decimals: never narrower than the file's column.
+        Spec { len: new.len.max(was.len), ..new }
+    };
+    (spec, Some(format!("'{}' {kept} to {spec}", dbf_notice_name(&field.name))))
 }
 
 /// As [`shapefile_parts_in`], the `.dbf` written as `style` says when it's given (in the file's
-/// code page, its columns kept where the values fit): also returns the names of the fields whose
-/// column was too small for their values and was made wider.
+/// code page, its columns kept where the values fit): also returns, for each field whose column
+/// couldn't hold its values, how its column changed.
 pub(crate) fn shapefile_parts_styled(
     ds: &Dataset,
     crs: Crs,
@@ -3339,17 +3353,15 @@ pub(crate) fn shapefile_parts_styled(
         Some(style) => TableWriterBuilder::with_encoding(style.encoding.decoder()),
         None => TableWriterBuilder::new(),
     };
-    // Per field: its column (numbers too large for it become null), and the fields whose column
-    // was made wider than the file's.
+    // Per field: its column (numbers too large for it become null), and how the columns that
+    // couldn't hold their values changed.
     let mut specs = Vec::with_capacity(ds.fields.len());
     let mut widened = Vec::new();
-    for (k, (f, n)) in ds.fields.iter().zip(&names).enumerate() {
+    for (k, n) in names.iter().enumerate() {
         let spec = match style {
             Some(style) => {
-                let (spec, wider) = kept_column(ds, k, n, style);
-                if wider {
-                    widened.push(f.name.clone());
-                }
+                let (spec, changed) = kept_column(ds, k, n, style);
+                widened.extend(changed);
                 spec
             }
             None => new_column(ds, k),
@@ -3495,6 +3507,22 @@ pub(crate) fn group_rings(rings: Vec<(Vec<Coord>, bool)>) -> Geometry {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A text column as wide as a `.dbf` allows (255 bytes, a width the writer never uses) with a
+    /// longer value gets a column of the 254 bytes written, not a crash.
+    #[test]
+    fn a_full_width_text_column_with_a_longer_value_is_written_at_254() {
+        let mut ds = Dataset::new("a", GeometryType::Point, vec![Field::new("NOTE", FieldType::Text)]);
+        ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("x".repeat(300))]);
+        let style = DbfStyle {
+            encoding: crate::dbf::DbfEncoding::Utf8,
+            ldid: 0,
+            columns: vec![crate::dbf::Column { name: b"NOTE".to_vec(), ty: b'C', len: 255, decimals: 0 }],
+        };
+        let (spec, changed) = kept_column(&ds, 0, "NOTE", &style);
+        assert_eq!(spec.len, 254);
+        assert_eq!(changed.as_deref(), Some("'NOTE' C(255) to C(254)"));
+    }
 
     /// A Shapefile export of a polygon layer holding a point and a feature without geometry writes
     /// the polygon and counts both left out, the point for its kind; a layer of polygons loses none.

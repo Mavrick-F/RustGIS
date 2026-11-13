@@ -225,6 +225,8 @@ pub(crate) struct Column {
 pub(crate) struct RawTable<'a> {
     pub columns: Vec<Column>,
     pub records: Vec<Vec<&'a [u8]>>,
+    /// The records marked deleted, which aren't among `records`.
+    pub deleted: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -248,10 +250,10 @@ pub(crate) fn raw_table(dbf: &[u8]) -> Option<RawTable<'_>> {
         return None;
     }
     let body = dbf.get(header_len..)?;
-    let mut records = Vec::new();
+    let (mut records, mut deleted) = (Vec::new(), 0);
     for record in body.chunks_exact(record_len).take(count) {
-        // A record marked deleted (`*`) isn't read, so it isn't written either.
         if record.first() == Some(&b'*') {
+            deleted += 1;
             continue;
         }
         let mut at = 1;
@@ -263,7 +265,7 @@ pub(crate) fn raw_table(dbf: &[u8]) -> Option<RawTable<'_>> {
         }
         records.push(values);
     }
-    Some(RawTable { columns, records })
+    Some(RawTable { columns, records, deleted })
 }
 
 /// A date (`D`) field's value, `YYYYMMDD`: `Ok(None)` when it's blank or zeros, as writers leave
