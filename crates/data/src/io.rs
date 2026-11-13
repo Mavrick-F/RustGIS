@@ -1815,8 +1815,8 @@ pub(crate) fn text_type<'a>(vals: impl Iterator<Item = &'a str>) -> FieldType {
             // Identifiers such as ZIP codes keep their leading zeros.
             FieldType::Text
         } else if let Ok(i) = v.parse::<i64>() {
-            // Every whole number up to 2^53 is a Double exactly.
-            whole_past_double |= i.unsigned_abs() > 1 << 53 && !double_holds(v);
+            // A whole number is held when its Double is the same number (in i128: no saturation).
+            whole_past_double |= (i as f64) as i128 != i128::from(i);
             FieldType::Integer
         } else if double_holds(v) {
             FieldType::Double
@@ -4462,6 +4462,9 @@ mod tests {
         // A number written to 17 digits, as `%.17g` writes 0.1, is a Double.
         let (ds, _) = read_csv("v\n0.10000000000000001\n2.5\n", "t").unwrap();
         assert_eq!((ds.fields[0].ty, ds.value(0, 0)), (FieldType::Double, &Value::Float(0.1)));
+        // A whole number beside a decimal: 2^60 is a Double exactly, 10^18 + 100 isn't.
+        let (ds, _) = read_csv("a,b\n1152921504606846976,1000000000000000100\n0.5,0.5\n", "t").unwrap();
+        assert_eq!((ds.fields[0].ty, ds.fields[1].ty), (FieldType::Double, FieldType::Text));
     }
 
     /// CSV export writes numbers as stored (#513): through `Display` a 0.4 m² area in km² was 0.
