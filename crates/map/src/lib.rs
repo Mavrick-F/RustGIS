@@ -712,12 +712,18 @@ impl Layer {
     /// A newly supported column (such as INT96) can change attribute positions. Refuse an old
     /// saved schema before changing any field, rather than pairing values with the wrong names.
     fn date_fields_from_source(&self, fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) -> Result<(), String> {
-        if source.iter().any(|f| f.ty.is_temporal())
-            && (fields.len() != source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name))
+        // Parquet time-only columns were epoch integers before being read as clock text.
+        // A saved Integer schema cannot safely interpret that representation change.
+        let integer_became_text = fields
+            .iter()
+            .zip(source)
+            .any(|(saved, fresh)| saved.ty == rustgis_data::FieldType::Integer && fresh.ty == rustgis_data::FieldType::Text);
+        if integer_became_text
+            || (source.iter().any(|f| f.ty.is_temporal())
+                && (fields.len() != source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name)))
         {
             return Err(
-                "The source exposes date columns that don't match this saved layer's fields. Add the file again to use its current schema."
-                    .into(),
+                "The source's columns don't match this saved layer's fields. Add the data source again to use its current schema.".into()
             );
         }
         let filters: Vec<&str> = self
@@ -3251,12 +3257,25 @@ mod tests {
         ] {
             let mut saved = fields.clone();
             let error = layer.date_fields_from_source(&mut saved, &source).unwrap_err();
-            assert!(error.contains("Add the file again"));
+            assert!(error.contains("Add the data source again"));
             assert_eq!(saved, fields);
             let mut fresh = source.clone();
             layer.date_fields_from_source(&mut fresh, &source).unwrap();
             assert_eq!(fresh, source);
         }
+    }
+
+    #[test]
+    fn time_only_text_refuses_a_saved_epoch_integer_schema() {
+        let old = vec![Field::new("clock", FieldType::Integer)];
+        let source = vec![Field::new("clock", FieldType::Text)];
+        let layer = Layer::new(1, Dataset::new("old times", GeometryType::Point, old.clone()));
+        let mut fields = old.clone();
+        assert!(layer.date_fields_from_source(&mut fields, &source).unwrap_err().contains("Add the data source again"));
+        assert_eq!(fields, old);
+        let mut fresh = source.clone();
+        layer.date_fields_from_source(&mut fresh, &source).unwrap();
+        assert_eq!(fresh, source);
     }
 
     fn points() -> Dataset {

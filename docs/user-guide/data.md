@@ -104,7 +104,8 @@ A column mixing zoned and unzoned times is written as ISO text, with a notice, t
 The writer makes a cancellable pass over timestamp columns before writing to choose that policy.
 If newly available date columns no longer match a saved layer's field positions (for example,
 a formerly unsupported INT96 column), reading or exporting that layer is refused. Add the file
-again to use its current schema; the saved fields are kept unchanged.
+again to use its current schema; the saved fields are kept unchanged. An old integer field that
+now reads as time-only text is refused in the same way.
 FlatGeobuf exports use its native DateTime column type for both dates and date-times. Local
 files are scanned to distinguish date-only columns, date-times and time-only text. Remote
 FlatGeobuf date/time columns stay ISO text with a notice so opening them can keep reading by
