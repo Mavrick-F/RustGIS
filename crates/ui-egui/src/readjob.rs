@@ -303,17 +303,6 @@ fn file_name(path: &str) -> &str {
     std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path)
 }
 
-/// Whether a watched reload has observed its file on the worker. Tests use this boundary to
-/// replace the file after observation, without landing the result or relying on scheduling.
-#[cfg(test)]
-pub(crate) fn file_observed(app: &RustGisApp) -> bool {
-    app.reads
-        .job
-        .as_ref()
-        .and_then(|job| job.seen.as_ref())
-        .is_some_and(|(_, seen)| seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some())
-}
-
 /// Whether a read is under way or waiting.
 fn busy(app: &RustGisApp) -> bool {
     app.reads.job.is_some() || !app.reads.waiting.is_empty()
@@ -599,6 +588,11 @@ impl Reads {
         if let Some(job) = &self.job {
             job.control.cancel();
         }
+    }
+
+    /// Whether the run under way has finished reading on its thread (its answer waits to land).
+    pub fn read_finished_for_tests(&self) -> bool {
+        self.job.as_ref().is_some_and(|job| job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some())
     }
 }
 
@@ -1266,12 +1260,57 @@ mod tests {
         app.run("edit.undo", json!({})).unwrap();
         assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(1.0));
         app.run_by_user("edit.calculateField", p).unwrap();
-        app.run("edit.setValue", json!({"table": "calc", "row": 0, "field": "n", "value": 9})).unwrap();
+        app.session.run("edit.setValue", &json!({"table": "calc", "row": 0, "field": "n", "value": 9})).unwrap();
         let depth = app.session.undo_depth();
         landed(&mut app, 60);
         assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(9.0));
         assert_eq!(app.session.undo_depth(), depth);
         assert!(app.session.notices.iter().any(|n| n.text.contains("table changed")));
+    }
+
+    /// Every table write uses the actual app worker path and lands the same fields, rows and
+    /// notices as synchronous dispatch, as one undo step. Field edits still work with editing off.
+    #[test]
+    fn table_writes_run_off_frame_with_undo_and_notices() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as Attr};
+        let fixture = || {
+            let mut data =
+                Dataset::new("records", GeometryType::None, vec![Field::new("n", FieldType::Integer), Field::new("day", FieldType::Text)]);
+            data.push(None, vec![Attr::Int(1), Attr::Text("2026-01-02".into())]);
+            data.push(None, vec![Attr::Int(2), Attr::Text("bad date".into())]);
+            let mut project = rustgis_engine::Project::default();
+            project.add_table(data);
+            RustGisApp::new(rustgis_engine::Session::new(project))
+        };
+        for (command, p, editing) in [
+            ("edit.setValue", json!({"table": "records", "row": 0, "field": "n", "value": 9.5}), true),
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 3}}), true),
+            ("edit.addField", json!({"table": "records", "name": "extra", "type": "text"}), false),
+            ("edit.deleteField", json!({"table": "records", "field": "day"}), false),
+            ("edit.convertField", json!({"table": "records", "field": "day", "type": "date"}), false),
+            ("edit.calculateField", json!({"table": "records", "field": "n", "expression": "n / 2"}), true),
+        ] {
+            let (mut app, mut expected) = (fixture(), fixture());
+            for app in [&mut app, &mut expected] {
+                app.run("edit.enable", json!({"on": editing})).unwrap();
+            }
+            let before = serde_json::to_value(&app.session.project.tables).unwrap();
+            let depth = app.session.undo_depth();
+            expected.session.run(command, &p).unwrap();
+            app.reads_off_frame = true;
+            assert!(app.run_by_user(command, p).unwrap().get("started").is_some(), "{command}");
+            assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before, "not installed on this frame: {command}");
+            landed(&mut app, 60);
+            assert_eq!(
+                serde_json::to_value(&app.session.project.tables).unwrap(),
+                serde_json::to_value(&expected.session.project.tables).unwrap(),
+                "{command}"
+            );
+            assert_eq!(app.session.notices, expected.session.notices, "{command}");
+            assert_eq!(app.session.undo_depth(), depth + 1, "{command}");
+            app.run("edit.undo", json!({})).unwrap();
+            assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before, "{command}");
+        }
     }
 
     /// Source File State hashes the file on a thread of its own and says what it found once

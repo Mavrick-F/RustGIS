@@ -84,8 +84,11 @@ fn editing_on(s: &Session) -> Result<(), String> {
 
 /// `edit.addFeature`: a feature of the given geometry and attributes (else its template's
 /// defaults) in a layer, selected and checked against the layer's design; or a row of a
-/// standalone table ([`add_row`]).
+/// standalone table ([`add_row`]), on the desktop table worker ([`table_ahead`]).
 pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
+    if let Some(result) = land_table_edit(s, p, "edit.addFeature") {
+        return result;
+    }
     let id = match target(s, p)? {
         Target::Table(i) => return add_row(s, p, i),
         Target::Layer(id) => id,
@@ -490,8 +493,12 @@ fn numeric_loss(input: &Value, v: &Value, ty: FieldType) -> Option<&'static str>
 }
 
 /// `edit.setValue`: one cell of a layer (checked against its design, which may undo it) or of a
-/// standalone table, as its field holds it ([`typed`]), saying what that lost.
+/// standalone table, as its field holds it ([`typed`]), saying what that lost. A table's first
+/// copy of shared rows runs on the desktop table worker ([`table_ahead`]).
 fn set_value(s: &mut Session, p: &Json) -> CmdResult {
+    if let Some(result) = land_table_edit(s, p, "edit.setValue") {
+        return result;
+    }
     let t = target(s, p)?;
     // A row past `usize` (on a 32-bit build) is no row, not a row it wraps round to.
     let row = usize::try_from(p.get("row").and_then(Json::as_u64).ok_or("row is required")?).map_err(|_| "no such row")?;
@@ -558,8 +565,12 @@ fn typed(raw: Json, ty: FieldType) -> Result<Value, String> {
     })
 }
 
-/// Adds an empty field of a type: long, double, text, boolean, date or datetime.
+/// Adds an empty field of a type: long, double, text, boolean, date or datetime. Table rows
+/// are filled on the desktop worker ([`table_ahead`]), with progress and Cancel.
 fn add_field(s: &mut Session, p: &Json) -> CmdResult {
+    if let Some(result) = land_table_edit(s, p, "edit.addField") {
+        return result;
+    }
     let t = target(s, p)?;
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or("name is required")?;
     if !name.chars().all(|c| c.is_alphanumeric() || c == '_') || name.chars().count() > 64 {
@@ -578,7 +589,16 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
     if ds.field_index(name).is_some() {
         return Err(format!("a field named '{name}' already exists"));
     }
-    ds.ensure_field(name, ty);
+    if matches!(t, Target::Table(_)) {
+        ds.fields.push(Field::new(name, ty));
+        rustgis_data::progress::begin(ds.features.len());
+        for row in &mut ds.features {
+            rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
+            row.attrs.push(Value::Null);
+        }
+    } else {
+        ds.ensure_field(name, ty);
+    }
     Ok(Json::Null)
 }
 
@@ -590,8 +610,12 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
 /// would stop reading with it. It runs on the UI thread: it is one parse of the text of a layer
 /// held in memory (a layer read in place is refused, as every `edit.*` command is), measured at
 /// about 60 ms for a million values, with nothing to read or wait for that progress could show.
-/// A standalone table has none of these to refuse it.
+/// A standalone table has none of these to refuse it and converts on the desktop worker
+/// ([`table_ahead`]), with progress and Cancel.
 fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
+    if let Some(result) = land_table_edit(s, p, "edit.convertField") {
+        return result;
+    }
     let t = target(s, p)?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let ty = match ps(p, "type").ok_or("type is required")?.to_ascii_lowercase().as_str() {
@@ -607,7 +631,7 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
             if field.ty != FieldType::Text {
                 return Err(format!("'{name}' is a {} field: only a text field converts to dates", field.ty.label()));
             }
-            (name, to_dates(ds, fi, ty))
+            (name, to_dates(ds, fi, ty)?)
         }
         Target::Layer(id) => convert_layer_field(s, id, fi, ty)?,
     };
@@ -682,14 +706,16 @@ fn convert_layer_field(s: &mut Session, id: u32, fi: usize, ty: FieldType) -> Re
     if let Some(r) = l.design.rules.iter().find(|r| rule_reads(r, &l.dataset) && !rule_reads(r, &schema)) {
         return Err(format!("attribute rule '{}' wouldn't read '{name}' as dates: change or remove it first", r.name));
     }
-    Ok((name, to_dates(&mut l.dataset, fi, ty)))
+    Ok((name, to_dates(&mut l.dataset, fi, ty)?))
 }
 
 /// Makes text field `fi` of `ds` a `ty` (date or date-time) field: how many values became dates,
 /// how many became null, and the first few of those.
-fn to_dates(ds: &mut Dataset, fi: usize, ty: FieldType) -> (usize, usize, Vec<String>) {
+fn to_dates(ds: &mut Dataset, fi: usize, ty: FieldType) -> Result<(usize, usize, Vec<String>), String> {
     let (mut converted, mut nulled, mut examples) = (0usize, 0usize, Vec::new());
+    rustgis_data::progress::begin(ds.features.len());
     for f in &mut ds.features {
+        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
         let Some(v) = f.attrs.get_mut(fi) else { continue };
         let date = match &*v {
             v if v.asks_null() => Value::Null,
@@ -710,20 +736,26 @@ fn to_dates(ds: &mut Dataset, fi: usize, ty: FieldType) -> (usize, usize, Vec<St
     if let Some(f) = ds.fields.get_mut(fi) {
         f.ty = ty;
     }
-    (converted, nulled, examples)
+    Ok((converted, nulled, examples))
 }
 
 /// `edit.deleteField`: removes a field and every reference to it (symbology, labels, the data
 /// design), or refuses while the definition query or a display filter reads it.
-/// A standalone table's field just goes: nothing refers to it.
+/// A standalone table's field just goes: nothing refers to it. Its rows are changed on the
+/// desktop worker ([`table_ahead`]), with progress and Cancel.
 fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
+    if let Some(result) = land_table_edit(s, p, "edit.deleteField") {
+        return result;
+    }
     let t = target(s, p)?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let Target::Layer(id) = t else {
         let ds = data_mut(s, t)?;
         if fi < ds.fields.len() {
             ds.fields.remove(fi);
+            rustgis_data::progress::begin(ds.features.len());
             for f in &mut ds.features {
+                rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
                 if fi < f.attrs.len() {
                     f.attrs.remove(fi);
                 }
@@ -824,25 +856,81 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     Ok(json!({"rulesRemoved": removed_rules}))
 }
 
-/// A table calculation's input and result. Shared input rows let landing detect concurrent edits
-/// without scanning them; the completed rows are swapped in as one ordinary undoable edit.
-struct TableCalculation {
+/// Table writes use one admitted worker path, including the first copy of shared rows. The
+/// handler runs on a session containing only the input table, never the caller's layers or secrets.
+pub(crate) const TABLE_EDITS: &[(&str, &str, fn(&mut Session, &Json) -> CmdResult)] = &[
+    ("edit.setValue", "Edit Attribute", set_value),
+    ("edit.addFeature", "Add Row", add_feature),
+    ("edit.addField", "Add Field", add_field),
+    ("edit.deleteField", "Delete Field", delete_field),
+    ("edit.convertField", "Convert Field", convert_field),
+    ("edit.calculateField", "Calculate Field", calculate_field),
+];
+
+/// The registered command and progress label for a table write. Layer invocations keep their
+/// existing path; the desktop uses this worker only when parameters name a standalone table.
+pub fn table_edit_in_background(command: &str) -> Option<(&'static str, &'static str)> {
+    TABLE_EDITS.iter().find(|(id, ..)| *id == command).map(|(id, name, _)| (*id, *name))
+}
+
+/// One table edit's input and completed result. Shared rows let landing detect concurrent edits
+/// without scanning them. Only fields and rows are installed; unrelated table metadata is kept.
+struct TableEdit {
     opened: u64,
     id: u32,
     input: Dataset,
-    result: Result<(Dataset, Cuts, usize), String>,
+    result: Result<(Dataset, Json, Vec<crate::Notice>), String>,
 }
 
-/// Calculates a standalone table off the desktop frame, including writing its new rows. Layers
-/// retain their existing calculation path, which also applies their editing rules.
-pub(crate) fn calculate_ahead(s: &Session, p: &Json) -> Result<Option<super::reads::ReadWork>, String> {
+/// Prepares a pure table write after admission, with no caller state on the worker except the
+/// table and editing flag. Cancel is checked between rows and before/after the handler. The
+/// shared row storage's first copy and one expression evaluation cannot be interrupted.
+pub(crate) fn table_ahead(s: &Session, command: &str, p: &Json) -> Result<Option<super::reads::ReadWork>, String> {
     let Target::Table(i) = target(s, p)? else { return Ok(None) };
-    let table = s.project.tables.get(i).ok_or("no such table")?;
-    let (opened, id, input, p) = (s.opened, table.id, table.dataset.clone(), p.clone());
-    Ok(Some(super::reads::ahead("Calculate Field", "edit.calculateField".into(), move || {
-        let result = calculate_table(&input, &p);
-        TableCalculation { opened, id, input, result }
+    let &(_, name, handler) = TABLE_EDITS.iter().find(|(id, ..)| *id == command).ok_or("not a table edit")?;
+    let table = s.project.tables.get(i).ok_or("no such table")?.clone();
+    let (opened, id, input, p, editing) = (s.opened, table.id, table.dataset.clone(), p.clone(), s.map().editing.settings.enabled);
+    Ok(Some(super::reads::ahead(name, command.into(), move || {
+        let result = (|| {
+            rustgis_data::progress::begin(0);
+            rustgis_data::progress::check().map_err(|e| e.to_string())?;
+            let mut project = crate::Project::default();
+            project.tables.push(table);
+            let mut copy = Session::new(project);
+            copy.map_mut().editing.settings.enabled = editing;
+            let answer = handler(&mut copy, &p)?;
+            rustgis_data::progress::check().map_err(|e| e.to_string())?;
+            let output = copy.project.tables.into_iter().next().ok_or("no such table")?.dataset;
+            Ok((output, answer, copy.notices))
+        })();
+        TableEdit { opened, id, input, result }
     })))
+}
+
+/// Installs only this command's prepared table edit, rejecting changed input instead of doing
+/// the work on the frame. The ordinary command transaction supplies history and one undo step.
+fn land_table_edit(s: &mut Session, p: &Json, command: &str) -> Option<CmdResult> {
+    let ahead = super::reads::take::<TableEdit>(s, command)?;
+    Some((|| {
+        let Target::Table(i) = target(s, p)? else { return Err("the edit no longer names a table".into()) };
+        let table = s.project.tables.get_mut(i).ok_or("no such table")?;
+        if ahead.opened != s.opened
+            || ahead.id != table.id
+            || !ahead.input.features.shares(&table.dataset.features)
+            || ahead.input.fields != table.dataset.fields
+        {
+            return Err("the table changed while it was edited: run the edit again".into());
+        }
+        let (output, answer, notices) = ahead.result?;
+        (table.dataset.fields, table.dataset.features) = (output.fields, output.features);
+        for notice in notices {
+            match notice.localized {
+                Some(text) => s.notify_text(text, notice.error),
+                None => s.notify(notice.text, notice.error),
+            }
+        }
+        Ok(answer)
+    })())
 }
 
 /// Evaluates and writes a table on its worker, checking Cancel between rows. An expression's
@@ -870,28 +958,16 @@ fn calculate_table(input: &Dataset, p: &Json) -> Result<(Dataset, Cuts, usize), 
 /// refuses changed input instead of recalculating on the frame. Layer edits retain the existing
 /// synchronous path so their editing rules and per-feature undo changes run together.
 fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
+    if let Some(result) = land_table_edit(s, p, "edit.calculateField") {
+        return result;
+    }
     let t = target(s, p)?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let expr = ps(p, "expression").map(str::trim).filter(|e| !e.is_empty()).ok_or("expression is required")?.to_string();
     let Target::Layer(id) = t else {
-        let Target::Table(i) = t else { return Err("no such table".into()) };
         editing_on(s)?;
-        let table = s.project.tables.get(i).ok_or("no such table")?;
-        let (ty, field) = table.dataset.fields.get(fi).map(|f| (f.ty, f.name.clone())).ok_or("no field")?;
-        let (result, cuts, unread) = match super::reads::take::<TableCalculation>(s, "edit.calculateField") {
-            Some(ahead) => {
-                let table = s.project.tables.get(i).ok_or("no such table")?;
-                if ahead.opened != s.opened
-                    || ahead.id != table.id
-                    || !ahead.input.features.shares(&table.dataset.features)
-                    || ahead.input.fields != table.dataset.fields
-                {
-                    return Err("the table changed while its field was calculated: calculate again".into());
-                }
-                ahead.result?
-            }
-            None => calculate_table(data(s, t)?, p)?,
-        };
+        let (ty, field) = data(s, t)?.fields.get(fi).map(|f| (f.ty, f.name.clone())).ok_or("no field")?;
+        let (result, cuts, unread) = calculate_table(data(s, t)?, p)?;
         let n = result.features.len();
         data_mut(s, t)?.features = result.features;
         calculation_notices(s, &field, ty, cuts, unread);

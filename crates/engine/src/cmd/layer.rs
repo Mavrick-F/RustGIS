@@ -12,6 +12,10 @@ use serde_json::{Value, json};
 use super::{b, f, need_feature_layer, need_layer, ps, uint};
 use crate::{CmdResult, CommandSpec as C, Session};
 
+/// The most characters a layer's name has (`layer.rename`, once trimmed): a longer one is refused,
+/// not cut. The Layer Properties pane's name box takes no more.
+pub const MAX_LAYER_NAME: usize = 200;
+
 /// Registers layer commands shared by the UI, CLI and command search.
 pub fn commands() -> Vec<C> {
     vec![
@@ -57,9 +61,15 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layer"?: name|id | [name|id] (default: the active layer; the last of a list becomes the active layer), "mode"?: "replace" (only these; the default) | "toggle" (each in or out of the layer selection; the last one out leaves no active layer) | "extend" (added to it)}"#)
             .view(),
         C::new("layer.rename", "Rename", "Layers", |s, p| {
-            let n = s_req(p, "name")?.trim().chars().take(200).collect::<String>();
+            let n = s_req(p, "name")?.trim().to_string();
             if n.is_empty() {
                 return Err("name is required".into());
+            }
+            // Refused rather than cut, so the name a script or the Rename… dialog gives is never
+            // changed without a word (#1817).
+            let chars = n.chars().count();
+            if chars > MAX_LAYER_NAME {
+                return Err(format!("name is {chars} characters: a layer's name takes at most {MAX_LAYER_NAME}"));
             }
             let id = s.layer_id(p)?;
             let old = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
@@ -97,7 +107,7 @@ pub fn commands() -> Vec<C> {
             legends_follow_layer(s, &old, Some(&n));
             references_follow_layer(s, &old, &n);
             Ok(r)
-        }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?, "name": string}"#)
+        }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?, "name": string (at most 200 characters once trimmed; a longer one is refused)}"#)
         .when(need_layer),
         C::new("layer.visibility", "Visibility", "Layers", |s, p| {
             let ids = layer_ids(s, p)?;
@@ -4255,22 +4265,18 @@ pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, 
             s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n));
         }
         r["bounds"] = json!(info.bounds);
-        // Drawn in place, the tiles are drawn as values (a palette image's by its colour table):
-        // what the header holds beside them (band and class names, wavelengths) comes only with a
-        // window, and is said.
-        let l = &info.layout;
-        let named = l
-            .described
-            .as_ref()
-            .is_some_and(|d| d.bands.iter().any(|b| b.description.is_some() || !b.categories.is_empty() || b.wavelength.is_some()));
-        let mut said: Vec<String> = l.lost.clone();
-        said.extend(l.described.iter().flat_map(|d| d.lost.iter().map(|x| format!("{}: {x}", rustgis_data::raster::pam::GDAL_METADATA))));
-        if named {
-            said.push("drawn in place without its band names, class names or wavelengths: a window (\"bbox\") reads them".into());
+        // A tile layer's own name, as added (and a dated series' file); its header's losses said
+        // now, and not again as the map draws (see `Session::notice_landed_rasters`).
+        let index = r.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok());
+        let mut shown = r.get("name").and_then(Value::as_str).unwrap_or(name).to_string();
+        if let Some(t) = index.and_then(|i| s.map_mut().tiles.get_mut(i)) {
+            shown = cog_tile_where(t, &t.url);
+            let file = crate::render::rustgis_tiles::cog::split(&t.url).0.to_string();
+            if !t.headers_said.contains(&file) {
+                t.headers_said.push(file);
+            }
         }
-        // A tile layer's own name, as added.
-        let shown = r.get("name").and_then(Value::as_str).unwrap_or(name).to_string();
-        for line in said {
+        for line in cog_tile_losses(&info) {
             s.notify(format!("{shown}: {line}"), false);
         }
     } else if probed || why.is_some() || r.get("dated").is_some() {
@@ -4282,6 +4288,43 @@ pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, 
     }
     r["inPlace"] = json!(true);
     Ok(r)
+}
+
+/// Where a cloud-optimised GeoTIFF tile layer's header losses are said: its name, and for a dated
+/// series the file of `address`, one of its dates' (the last part of its path: the host, a login
+/// wrapper, the query and the fragment stay out of what is said).
+pub(crate) fn cog_tile_where(t: &rustgis_map::tiles::TileLayer, address: &str) -> String {
+    if t.time_url.is_none() && t.time_urls.is_empty() {
+        return t.name.clone();
+    }
+    let inner = rustgis_data::login_address::inner(rustgis_data::s3_address::inner(address));
+    let address = inner.split(['?', '#']).next().unwrap_or(inner);
+    // The path after the host (an address without a scheme is a path already); one without a
+    // path names no file.
+    let path = match address.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').map_or("", |(_, path)| path),
+        None => address,
+    };
+    let file: String = path.rsplit(['/', '\\']).next().unwrap_or_default().chars().take(80).collect();
+    if file.is_empty() { t.name.clone() } else { format!("{} ({file})", t.name) }
+}
+
+/// What a cloud-optimised GeoTIFF drawn as a tile layer leaves out of its header, a line each:
+/// drawn in place, its tiles are drawn as values (a palette image's by its colour table), so what
+/// the header holds beside them (band and class names, wavelengths) comes only with a window. Said
+/// as the layer is added, or once its header lands ([`Session::notice_landed_rasters`]).
+pub(crate) fn cog_tile_losses(info: &crate::render::rustgis_tiles::cog::Info) -> Vec<String> {
+    let l = &info.layout;
+    let named = l
+        .described
+        .as_ref()
+        .is_some_and(|d| d.bands.iter().any(|b| b.description.is_some() || !b.categories.is_empty() || b.wavelength.is_some()));
+    let mut said: Vec<String> = l.lost.clone();
+    said.extend(l.described.iter().flat_map(|d| d.lost.iter().map(|x| format!("{}: {x}", rustgis_data::raster::pam::GDAL_METADATA))));
+    if named {
+        said.push("drawn in place without its band names, class names or wavelengths: a window (\"bbox\") reads them".into());
+    }
+    said
 }
 
 /// Adds a cloud-optimised GeoTIFF as a raster layer read in place: its overview held (read now

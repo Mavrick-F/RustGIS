@@ -51,9 +51,9 @@ A standalone table opens from its right-click menu in Layers and is edited as a 
 double-click a cell to change it, and use the toolbar to add a row, add a field or calculate a
 field over every row; a column's menu converts its field or deletes it (**Delete Field**).
 Cells, new rows and Calculate Field need editing on (**Edit › Edit**); adding, converting and
-deleting fields don't, as for a layer. Each edit is one undo step. On the desktop, calculating a
-table's field runs in the background with progress and **Cancel**. If the table changes while
-it runs, the result is refused; calculate again to use the new values.
+deleting fields don't, as for a layer. Each edit is one undo step. On the desktop, table writes
+run in the background with progress or a busy indicator and **Cancel**. If the table changes while an edit runs, its result is refused; run the edit again to use
+the new values.
 
 The `edit.*` commands take the table as `"table"` (its name or id) instead of `"layer"`:
 `edit.setValue`, `edit.addField`, `edit.deleteField`, `edit.convertField`, `edit.calculateField`,

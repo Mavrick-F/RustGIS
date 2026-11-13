@@ -159,7 +159,7 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
             let name = if spec.id == "map.repairTiles" { "Repair Data Source" } else { "Reload Data" };
             (name, work, None)
         }
-        "edit.calculateField" => ("Calculate Field", super::edit::calculate_ahead(s, params)?, None),
+        id if super::edit::table_edit_in_background(id).is_some() => ("Edit Table", super::edit::table_ahead(s, spec.id, params)?, None),
         "topology.validate" => ("Error Inspector", super::design::topology_ahead(s, params), None),
         "source.syncState" => ("Source File State", super::publish::sync_ahead(s, params), None),
         _ => return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service listings, topology and Source File State prepare background work".into()),

@@ -43,6 +43,8 @@ mod extensionsui;
 mod failureui;
 mod fieldlists;
 mod fieldmenu;
+#[cfg(not(target_arch = "wasm32"))]
+mod filedialog;
 mod fill_editor;
 mod geocodeui;
 mod geolibreui;
@@ -158,6 +160,10 @@ fn complete_gp_file(result: Result<Value, String>, id: u64, completed: &Result<V
     visit(&mut result, id, completed)?;
     Ok(result)
 }
+
+/// Another shell's interface around the map ([`RustGisApp::chrome`]): it lays out its own panels
+/// in the window's `Ui` and draws the map with [`RustGisApp::map_view`] in what is left.
+pub type Chrome = fn(&mut RustGisApp, &mut egui::Ui);
 
 /// Files read asynchronously (browser uploads, drops) waiting to be opened: (file name, bytes).
 pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
@@ -1128,6 +1134,10 @@ pub struct RustGisApp {
     /// Add Data and Load All Features read on a thread of their own (the desktop app; see
     /// [`readjob`]). Off, as for tests and the examples, they read as the command runs.
     pub reads_off_frame: bool,
+    /// What another shell draws around the map in place of the ribbon, the panes and the status
+    /// bar (the touch interface, `rustgis-ui-touch`). `None` is the desktop interface. Dialogs
+    /// and the Project menu's page are drawn either way.
+    pub chrome: Option<Chrome>,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1394,6 +1404,7 @@ impl RustGisApp {
             #[cfg(not(target_arch = "wasm32"))]
             reads: readjob::Reads::default(),
             reads_off_frame: false,
+            chrome: None,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1961,10 +1972,14 @@ impl RustGisApp {
             // cannot confirm that this renamed document reached a file.
             self.session.mark_unsaved();
         }
-        self.session.notify(
-            crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)]),
-            false,
-        );
+        // On Android the file is written once the user has chosen its place, and the shell
+        // says then whether it was.
+        let offered = if cfg!(target_os = "android") {
+            crate::i18n::fmt("Choose where to save {name}.", &[("name", &file)])
+        } else {
+            crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)])
+        };
+        self.session.notify(offered, false);
         report.notify(&mut self.session);
         self.ui.web_file = Some(file);
         Ok(())
@@ -1984,7 +1999,12 @@ impl RustGisApp {
                     self.session.notify(e, true);
                     return false;
                 }
-                self.session.notify(crate::i18n::fmt("Download offered: {name}", &[("name", name)]), false);
+                let offered = if cfg!(target_os = "android") {
+                    crate::i18n::fmt("Choose where to save {name}.", &[("name", name)])
+                } else {
+                    crate::i18n::fmt("Download offered: {name}", &[("name", name)])
+                };
+                self.session.notify(offered, false);
                 true
             }
             None => false,
@@ -2339,6 +2359,24 @@ impl RustGisApp {
         readjob::stop(self, std::time::Duration::from_secs(5));
     }
 
+    /// Draws the map into `ui`, with its own controls (zoom, compass, scale bar): for a shell
+    /// that lays out its own interface ([`RustGisApp::chrome`]).
+    pub fn map_view(&mut self, ui: &mut egui::Ui) {
+        mapview::show(self, ui);
+    }
+
+    /// Whether background work is running that the user is shown, with its Cancel: an export, a
+    /// file or a layer being read, a download. A shell that draws its own interface
+    /// ([`RustGisApp::chrome`]) shows [`RustGisApp::background_status`] while it is.
+    pub fn background_busy(&self) -> bool {
+        chrome::background_busy(self)
+    }
+
+    /// Draws that work's progress and Cancel into `ui`, as the desktop's status bar does.
+    pub fn background_status(&mut self, ui: &mut egui::Ui) {
+        chrome::background_status(self, ui);
+    }
+
     /// Whether this shell opens files by path (the desktop app; the web app picks them in the
     /// browser instead).
     pub(crate) fn opens_files(&self) -> bool {
@@ -2452,8 +2490,10 @@ impl RustGisApp {
             if let Some(command) = archive {
                 return readjob::run(self, command, params);
             }
-            if id == "edit.calculateField" && params.get("table").is_some_and(|t| !t.is_null()) {
-                return readjob::run(self, "edit.calculateField", params);
+            if params.get("table").is_some_and(|t| !t.is_null())
+                && let Some((command, _)) = rustgis_engine::cmd::edit::table_edit_in_background(id)
+            {
+                return readjob::run(self, command, params);
             }
             // The topology check's work grows with the layers: on a thread of its own (#1291).
             if id == "topology.validate" {
@@ -3968,7 +4008,7 @@ impl RustGisApp {
             }
             "ui.addFolder" => {
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                if let Some(dir) = crate::filedialog::FileDialog::new().pick_folder() {
                     return self.run("project.addFolder", json!({"path": dir.display().to_string()}));
                 }
                 #[cfg(target_arch = "wasm32")]
@@ -5734,6 +5774,16 @@ impl RustGisApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
+        // A picker Android doesn't have was asked for: said, as the click did nothing.
+        #[cfg(target_os = "android")]
+        for what in filedialog::take_refused() {
+            let text = match what {
+                "choose a folder" => tl!("Choosing a folder isn't available on Android yet."),
+                "save a file" => tl!("Saving to a file of your choice isn't available here on Android yet."),
+                _ => tl!("Choosing a file isn't available here on Android yet."),
+            };
+            self.session.notify(text, false);
+        }
         // Files from the async picker or browser drops.
         let arrived: Vec<(String, Vec<u8>)> = match &self.services.inbox {
             Some(inbox) => std::mem::take(&mut *inbox.lock().unwrap_or_else(|e| e.into_inner())),
@@ -5877,6 +5927,8 @@ impl RustGisApp {
         }
         if self.ui.backstage {
             backstage::show(self, ui);
+        } else if let Some(chrome) = self.chrome {
+            chrome(self, ui);
         } else {
             chrome::header(self, ui);
             ribbon::show(self, ui);

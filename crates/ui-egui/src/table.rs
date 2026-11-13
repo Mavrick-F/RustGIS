@@ -554,10 +554,10 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             if let Some(fd) = delete_field.and_then(|i| ds.fields.get(i)) {
                 // Refused (a definition query reading it): said, unless the command said so.
                 let mark = app.session.notice_mark();
-                if let Err(e) = app.run("edit.deleteField", target(json!({"field": fd.name})))
-                    && app.session.notices_since(mark).is_empty()
-                {
-                    app.session.notify(e, true);
+                match app.run("edit.deleteField", target(json!({"field": fd.name}))) {
+                    Ok(_) => app.table.sort = None,
+                    Err(e) if app.session.notices_since(mark).is_empty() => app.session.notify(e, true),
+                    Err(_) => {}
                 }
             }
             if let Some((r, add)) = clicked
@@ -892,6 +892,34 @@ mod tests {
         prune_views(&mut app);
         assert!(app.table.views.is_empty());
         assert!(app.table.editing.is_none(), "a pending draft must not reach the new project's same-id table");
+    }
+
+    /// Delete Field's real column menu clears the positional sort before a shifted index can
+    /// select another field. The schema changes through ordinary command dispatch.
+    #[test]
+    fn deleting_a_field_from_its_menu_clears_the_sort() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let added =
+            app.run("layer.addDataText", json!({"fileName": "columns.csv", "text": "alpha,beta,gamma,delta\n1,8,3,4\n2,7,4,5\n"})).unwrap();
+        app.session.table_standalone = Some(added["id"].as_u64().unwrap() as u32);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        h.state_mut().table.sort = Some((2, true));
+        h.run_steps(2);
+        assert_eq!(h.state().table.sort, Some((2, true)));
+        h.get_by_label("alpha").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Delete Field").click();
+        h.run_steps(4);
+        assert!(h.state().session.project.tables[0].dataset.field_index("alpha").is_none());
+        assert!(h.state().table.sort.is_none(), "the old index would now sort by delta instead of gamma");
     }
 
     /// Typing into a cell of a reordered table, with a column hidden before it, writes the field
