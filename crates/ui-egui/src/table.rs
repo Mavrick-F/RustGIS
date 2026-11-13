@@ -47,15 +47,16 @@ pub(crate) fn prune_views(app: &mut RustGisApp) {
         app.table.opened = app.session.opened;
     }
     let project = &app.session.project;
-    app.table.views.retain(|key, view| {
-        let fields = match *key {
-            ViewKey::Layer(instance) => {
-                project.maps.iter().flat_map(|m| &m.layers).find(|l| l.instance_id() == instance).map(|l| &l.dataset.fields)
-            }
-            ViewKey::Table(id) => project.table(id).map(|t| &t.dataset.fields),
-        };
-        fields.map(|f| view.repair(f)).is_some()
-    });
+    let fields_for = |key: ViewKey| match key {
+        ViewKey::Layer(instance) => {
+            project.maps.iter().flat_map(|m| &m.layers).find(|l| l.instance_id() == instance).map(|l| &l.dataset.fields)
+        }
+        ViewKey::Table(id) => project.table(id).map(|t| &t.dataset.fields),
+    };
+    app.table.views.retain(|key, view| fields_for(*key).map(|fields| view.repair(fields)).is_some());
+    if app.table.editing.as_ref().is_some_and(|edit| fields_for(edit.view).is_none_or(|fields| fields != &edit.schema)) {
+        app.table.editing = None;
+    }
 }
 
 /// Why a column can't be changed, translated: the edit commands find a field by name, ignoring
@@ -177,6 +178,9 @@ struct CellEdit {
     /// gone, writes nothing).
     fid: u64,
     col: usize,
+    /// The schema this positional column belongs to. A schema change discards the draft before
+    /// the old index can identify another field, including fields with duplicate names.
+    schema: Vec<Field>,
     text: String,
     /// The text it opened with: left as it was, nothing is written (a null stays null).
     was: String,
@@ -186,9 +190,10 @@ struct CellEdit {
 }
 
 impl CellEdit {
-    /// An edit of column `col` of feature `fid` in `view`, starting from `text`, taking the focus.
-    fn new(view: ViewKey, fid: u64, col: usize, text: String) -> CellEdit {
-        CellEdit { view, fid, col, was: text.clone(), text, focus: true }
+    /// An edit of column `col` in its opening schema, starting from `text` and taking focus.
+    /// A later schema change discards it instead of redirecting its positional column.
+    fn new(view: ViewKey, fid: u64, col: usize, text: String, fields: &[Field]) -> CellEdit {
+        CellEdit { view, fid, col, schema: fields.to_vec(), was: text.clone(), text, focus: true }
     }
 }
 
@@ -492,7 +497,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                                 commits.push((e.fid, e.col, e.text, e.was));
                                             }
                                             let text = if matches!(v, V::Null) { String::new() } else { v.to_string() };
-                                            app.table.editing = Some(CellEdit::new(key, oid, c, text));
+                                            app.table.editing = Some(CellEdit::new(key, oid, c, text, &ds.fields));
                                         } else if resp.clicked() {
                                             clicked = Some((r, ui.input(|i| i.modifiers.command || i.modifiers.shift)));
                                         }
@@ -661,6 +666,7 @@ mod tests {
         let value = |app: &RustGisApp, row: usize| app.session.map().layer(id).unwrap().dataset.value(row, col).to_string();
         let (first, second) = (value(&app, 0), value(&app, 1));
         let number = app.session.map().layer(id).unwrap().dataset.value(0, num).to_string();
+        let schema = ds.fields.clone();
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
             |ui, app: &mut RustGisApp| {
                 let ctx = ui.ctx().clone();
@@ -672,7 +678,7 @@ mod tests {
         h.run_steps(4);
         let tool = h.state().session.tool;
         // Opened as a double-click opens it, the text selected by nothing: typing adds to it.
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, first.clone()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, first.clone(), &schema));
         h.run_steps(2);
         h.event(egui::Event::Text("Zed".into()));
         h.run_steps(2);
@@ -681,7 +687,7 @@ mod tests {
         assert_eq!(value(h.state(), 0), format!("{first}Zed"));
         assert!(h.state().table.editing.is_none(), "the editor closed");
         // Escape: typed, then left as it was, the tool kept.
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[1], col, second.clone()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[1], col, second.clone(), &schema));
         h.run_steps(2);
         h.event(egui::Event::Text("Nope".into()));
         h.run_steps(2);
@@ -692,11 +698,11 @@ mod tests {
         assert_eq!(h.state().session.tool, tool, "Escape left the cell, not the tool");
         // Shown another layer meanwhile (Ctrl+T), an open edit is dropped, not written there;
         // so is one left open when the table closes.
-        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Layer(u64::MAX), fid[0], col, String::new()));
+        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Layer(u64::MAX), fid[0], col, String::new(), &schema));
         h.run_steps(2);
         assert!(h.state().table.editing.is_none());
         // A number mistyped is refused, not written as null.
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], num, String::new()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], num, String::new(), &schema));
         h.run_steps(2);
         h.event(egui::Event::Text("12a".into()));
         h.run_steps(2);
@@ -707,7 +713,7 @@ mod tests {
         // With editing turned off, a value isn't kept, and the table says why.
         h.state_mut().session.map_mut().editing.settings.enabled = false;
         let mark = h.state().session.notice_mark();
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new(), &schema));
         h.run_steps(2);
         h.event(egui::Event::Text("Off".into()));
         h.run_steps(2);
@@ -716,7 +722,7 @@ mod tests {
         assert_eq!(value(h.state(), 0), format!("{first}Zed"));
         assert!(h.state().session.notices_since(mark).iter().any(|n| n.text.contains("editing is turned off")), "said why");
         h.state_mut().session.map_mut().editing.settings.enabled = true;
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new()));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new(), &schema));
         h.state_mut().session.table_layer = None;
         h.run_steps(2);
         assert!(h.state().table.editing.is_none(), "dropped when the table closed");
@@ -724,9 +730,10 @@ mod tests {
         h.state_mut().run("layer.addDataText", json!({"fileName": "sites.csv", "text": "id,street\n1,Rue Cler\n"})).unwrap();
         let table = h.state().session.project.tables[0].id;
         let tfid = h.state().session.project.tables[0].dataset.features[0].id;
+        let table_fields = h.state().session.project.tables[0].dataset.fields.clone();
         h.state_mut().session.table_standalone = Some(table);
         h.run_steps(2);
-        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Table(table), tfid, 1, "Rue Cler".into()));
+        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Table(table), tfid, 1, "Rue Cler".into(), &table_fields));
         h.run_steps(2);
         h.event(egui::Event::Text(" 2".into()));
         h.run_steps(2);
@@ -885,13 +892,46 @@ mod tests {
         app.table.views.insert(ViewKey::Table(id), v);
         prune_views(&mut app);
         assert_eq!(app.table.views.get(&ViewKey::Table(id)).map(|v| v.hidden_count(&fs)), Some(1), "kept in its project");
-        app.table.editing = Some(CellEdit::new(ViewKey::Table(id), 1, 0, "old draft".into()));
+        app.table.editing = Some(CellEdit::new(ViewKey::Table(id), 1, 0, "old draft".into(), &fs));
         app.session.run("project.new", &json!({})).unwrap();
         let (again, _) = table(&mut app);
         assert_eq!(again, id, "the new project's table takes the same id");
         prune_views(&mut app);
         assert!(app.table.views.is_empty());
         assert!(app.table.editing.is_none(), "a pending draft must not reach the new project's same-id table");
+    }
+
+    /// An agent can remove an earlier column between frames while a cell owns focus. Enter
+    /// must discard that draft rather than write into the next field at the same raw index.
+    #[test]
+    fn a_cell_draft_cannot_write_another_field_after_schema_changes() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let added = app.run("layer.addDataText", json!({"fileName": "draft.csv", "text": "gone,edited,victim\nA,B,C\n"})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        let id = added["id"].as_u64().unwrap() as u32;
+        app.session.table_standalone = Some(id);
+        let fields = app.session.project.tables[0].dataset.fields.clone();
+        let fid = app.session.project.tables[0].dataset.features[0].id;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Table(id), fid, 1, "B".into(), &fields));
+        h.run_steps(2);
+        h.event(egui::Event::Text(" draft".into()));
+        h.run_steps(2);
+        h.state_mut().session.run("edit.deleteField", &json!({"table": id, "field": "gone"})).unwrap();
+        h.key_press(egui::Key::Enter);
+        h.run_steps(4);
+        let data = &h.state().session.project.tables[0].dataset;
+        assert_eq!(data.value(0, data.field_index("victim").unwrap()).to_string(), "C");
+        assert_eq!(data.value(0, data.field_index("edited").unwrap()).to_string(), "B");
+        assert!(h.state().table.editing.is_none());
     }
 
     /// Delete Field's real column menu clears the positional sort before a shifted index can
