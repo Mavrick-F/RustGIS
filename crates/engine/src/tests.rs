@@ -34459,35 +34459,32 @@ fn postgis_edits_live() {
 /// Dates in a live PostGIS table: `date`, `timestamp` and `timestamptz` read as dates whatever the
 /// database's own `DateStyle` and `TimeZone`, what RustGIS can't hold (`infinity`, a year BC) is
 /// read as empty and said, and saving says which offsets its columns don't keep.
-/// `RUSTGIS_TEST_POSTGIS` names a database where the test may make and drop a table and set the
-/// database's `DateStyle` and `TimeZone` (reset to the server's defaults when it ends).
+/// `RUSTGIS_TEST_POSTGIS` names a database where the test may make and drop a table.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 #[ignore]
 fn postgis_dates_live() {
     use rustgis_data::{FieldType, Value as V};
-    /// Drops the table and resets the database's settings, however the test ends.
-    struct Cleanup(String, String, String);
+    /// Drops the table, however the test ends.
+    struct Cleanup(String, String);
     impl Drop for Cleanup {
         fn drop(&mut self) {
             if let Ok(mut c) = postgres::Client::connect(&self.0, postgres::NoTls) {
-                let _ = c.batch_execute(&format!(
-                    "DROP TABLE IF EXISTS public.{}; ALTER DATABASE \"{}\" RESET DateStyle; ALTER DATABASE \"{}\" RESET TimeZone",
-                    self.1, self.2, self.2
-                ));
+                let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS public.{}", self.1));
             }
         }
     }
     let Ok(url) = std::env::var("RUSTGIS_TEST_POSTGIS") else { return };
-    let url = url.trim_start_matches("postgres:").to_string();
+    // Settings that would give other text, on every connection the test and RustGIS make:
+    // RustGIS's own session doesn't follow them.
+    let url = format!("{} options='-c DateStyle=SQL,DMY -c TimeZone=America/Chicago'", url.trim_start_matches("postgres:"));
     let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let style: String = db.query_one("SHOW DateStyle", &[]).unwrap().get(0);
+    assert_eq!(style, "SQL, DMY");
     let table = format!("rustgis_dates_test_{}", std::process::id());
-    let name: String = db.query_one("SELECT current_database()", &[]).unwrap().get(0);
-    let _cleanup = Cleanup(url.clone(), table.clone(), name.clone());
-    // Settings that would give other text: RustGIS's own session doesn't follow them.
+    let _cleanup = Cleanup(url.clone(), table.clone());
     db.batch_execute(&format!(
-        "ALTER DATABASE \"{name}\" SET DateStyle = 'SQL, DMY'; ALTER DATABASE \"{name}\" SET TimeZone = 'America/Chicago';
-         CREATE TABLE public.{table} (id int PRIMARY KEY, d date, ts timestamp, tz timestamptz, geom geometry(Point, 4326));
+        "CREATE TABLE public.{table} (id int PRIMARY KEY, d date, ts timestamp, tz timestamptz, geom geometry(Point, 4326));
          INSERT INTO public.{table} VALUES
            (1, '2026-03-05', '2026-03-05 14:30:00.25', '2026-03-05 14:30:00+02', ST_SetSRID(ST_MakePoint(1, 1), 4326)),
            (2, 'infinity', '0044-03-15 12:00:00 BC', NULL, ST_SetSRID(ST_MakePoint(2, 2), 4326));"

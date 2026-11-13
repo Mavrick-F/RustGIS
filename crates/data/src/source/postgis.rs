@@ -1174,6 +1174,8 @@ fn text_value(v: &Value) -> Option<String> {
 fn count_offset(saved: &mut Saved, field: usize, column: &str, v: &Value) {
     let t = match v {
         Value::DateTime(t) => Some(*t),
+        // A date is stored at its midnight, without a zone.
+        Value::Date(d) => Some(crate::date::DateTime::from_date(*d)),
         Value::Text(s) => crate::date::DateTime::parse(s),
         _ => None,
     };
@@ -1666,12 +1668,13 @@ mod tests {
             ("timestamp without time zone", at("2026-03-05T14:30:00")),
             ("text", at("2026-03-05T14:30:00+02:00")),
             ("date", Value::parse("2026-03-05", FieldType::Date)),
+            ("timestamp with time zone", Value::parse("2026-03-05", FieldType::Date)),
         ] {
             count_offset(&mut saved, 1, column, &v);
         }
         assert_eq!(
             (saved.utc_dates.as_slice(), saved.zoneless_dates.as_slice(), saved.assumed_utc.as_slice()),
-            (&[0, 1][..], &[0, 2][..], &[0, 1][..])
+            (&[0, 1][..], &[0, 2][..], &[0, 2][..])
         );
         let fields = [Field::new("id", FieldType::Integer), Field::new("seen", FieldType::DateTime)];
         assert_eq!(
@@ -1679,7 +1682,7 @@ mod tests {
             [
                 "wells: 1 date-time was saved in UTC, without its offset (a timestamptz column holds only the moment), in 'seen'",
                 "wells: 2 date-times were saved at the clock time shown, without their offsets (a timestamp column has no time zone), in 'seen'",
-                "wells: 1 date-time without a time zone was saved as UTC (a timestamptz column holds a moment), in 'seen'"
+                "wells: 2 date-times without a time zone were saved as UTC (a timestamptz column holds a moment), in 'seen'"
             ]
         );
         assert!(saved_dates_notes(&fields, &Saved::default(), "wells").is_empty());

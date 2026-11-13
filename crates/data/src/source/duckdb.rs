@@ -43,6 +43,10 @@ const KEEP: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600)
 /// The column added to sort rows into geometry families; never in a result.
 const DIM: &str = "__rustgis_dim";
 
+/// What a converted table is written as: raised when that changes (dates as dates in 2), so a
+/// table converted before is converted again rather than kept as it was.
+const CONVERSION: u32 = 2;
+
 /// A database named by commands: DuckDB files, PostgreSQL connections (also queryable through
 /// DuckDB's `postgres` extension), or live-only MySQL, MariaDB and SQL Server connections.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -480,7 +484,6 @@ fn kept_as_is(ty: &str) -> bool {
             | "VARCHAR"
             | "DATE"
             | "TIMESTAMP"
-            | "TIMESTAMP_S"
             | "TIMESTAMP_MS"
             | "TIMESTAMP WITH TIME ZONE"
     ) || ty.starts_with("DECIMAL(")
@@ -522,6 +525,9 @@ fn select(columns: &[Column], crs: Option<&str>, from: &str) -> Result<(String, 
                 format!("ST_AsText({n}) AS {n}")
             } else if kept_as_is(&c.ty) {
                 n
+            } else if c.ty == "TIMESTAMP_S" {
+                // Parquet has no seconds: an infinite one can't be written as one, but can as microseconds.
+                format!("CAST({n} AS TIMESTAMP) AS {n}")
             } else {
                 format!("CAST({n} AS VARCHAR) AS {n}")
             }
@@ -882,7 +888,12 @@ fn convert_table_in(dir: &Path, database: &Path, table: &Table, crs: Option<&str
     let (wal_len, wal_modified) = stamp(Path::new(&wal)).unwrap_or((0, 0));
     // The cache key, spelled out: kept beside the conversion and checked, so a hash collision
     // can't hand back another table.
-    let key = format!("{}\n{}\n{}\n{crs:?}\n{len}\n{modified}\n{wal_len}\n{wal_modified}", full.display(), table.schema, table.name);
+    let key = format!(
+        "{}\n{}\n{}\n{crs:?}\n{len}\n{modified}\n{wal_len}\n{wal_modified}\nconversion {CONVERSION}",
+        full.display(),
+        table.schema,
+        table.name
+    );
     let tag = format!("{:016x}", fnv1a(key.as_bytes()));
     let keyfile = dir.join(format!("{tag}.key"));
     if let Some(hit) = std::fs::read_to_string(&keyfile).ok().and_then(|s| cached(dir, &key, &s)) {
@@ -1114,6 +1125,7 @@ mod tests {
                 ("g2", "GEOMETRY('EPSG:3857')"),
                 ("t", "TIMESTAMP WITH TIME ZONE"),
                 ("ns", "TIMESTAMP_NS"),
+                ("s", "TIMESTAMP_S"),
                 ("l", "INTEGER[]"),
             ]),
             None,
@@ -1123,6 +1135,7 @@ mod tests {
         assert_eq!(g, "geom");
         assert!(s.contains("(SELECT \"d\", ") && s.contains(", \"t\", ") && s.contains("ST_Force2D(\"geom\") AS \"geom\""), "{s}");
         assert!(s.contains("CAST(\"ns\" AS VARCHAR)") && s.contains("CAST(\"l\" AS VARCHAR)"), "{s}");
+        assert!(s.contains("CAST(\"s\" AS TIMESTAMP) AS \"s\""), "{s}");
         assert!(s.contains(", \"n\",") && s.contains("ST_AsText(\"g2\")"), "{s}");
         // A geometry that says its coordinate system is converted; one given is used.
         let (s, _) = select(&cols(&[("g", "GEOMETRY('EPSG:3857')")]), None, "x").unwrap();
@@ -1196,10 +1209,11 @@ mod tests {
         let open = |p: &Path| crate::source::open_path(p, None).unwrap();
 
         // Mixed geometry, a row without one, a projected column and types written as text.
-        let sql = "SELECT 1 AS id, 'a' AS name, DATE '2020-01-02' AS day, ST_Point(10, 20) AS geom \
-            UNION ALL SELECT 2, 'b', NULL, ST_GeomFromText('LINESTRING(0 0, 1 1)') \
-            UNION ALL SELECT 3, 'c', NULL, ST_GeomFromText('POINT(11 21)') \
-            UNION ALL SELECT 4, 'd', NULL, NULL;";
+        // An infinite time is written, and read as empty with a count.
+        let sql = "SELECT 1 AS id, 'a' AS name, DATE '2020-01-02' AS day, TIMESTAMP_S '2020-01-02 03:04:05' AS seen, ST_Point(10, 20) AS geom \
+            UNION ALL SELECT 2, 'b', NULL, NULL, ST_GeomFromText('LINESTRING(0 0, 1 1)') \
+            UNION ALL SELECT 3, 'c', NULL, TIMESTAMP_S 'infinity', ST_GeomFromText('POINT(11 21)') \
+            UNION ALL SELECT 4, 'd', NULL, NULL, NULL;";
         let out = run_in(&cache, &Query { sql, ..Query::default() }, false).unwrap();
         assert_eq!(out.skipped, 1);
         assert_eq!(out.parts.len(), 2);
@@ -1216,8 +1230,9 @@ mod tests {
         let info = pts.info();
         assert_eq!(info.count, Some(2));
         assert!(info.indexed, "the bbox covering is found");
-        assert_eq!(info.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["id", "name", "day"]);
+        assert_eq!(info.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["id", "name", "day", "seen"]);
         assert_eq!(info.fields[2].ty, crate::FieldType::Date);
+        assert_eq!(info.fields[3].ty, crate::FieldType::DateTime);
         let b = pts.read(&crate::source::Request { extent: Some(rustgis_geom::Extent::new(10.5, 20.5, 12.0, 22.0)), limit: 10 }).unwrap();
         assert_eq!(b.features.len(), 1, "the extent query reads the covering");
         assert_eq!(b.features[0].geometry.as_ref().unwrap().extent(), rustgis_geom::Extent::new(11.0, 21.0, 11.0, 21.0));
@@ -1225,7 +1240,9 @@ mod tests {
         assert_eq!(all_points.features.len(), 2);
         assert!(all_points.features.iter().all(|f| f.geometry.as_ref().unwrap().kind() == crate::GeometryType::Point));
         let days: Vec<String> = all_points.features.iter().map(|f| f.attrs[2].to_string()).collect();
-        assert!(days.contains(&"2020-01-02".to_string()) && all_points.unread_dates.is_empty(), "{days:?}");
+        assert!(days.contains(&"2020-01-02".to_string()), "{days:?}");
+        assert_eq!(all_points.unread_dates.iter().sum::<usize>(), 1);
+        assert_eq!(all_points.unread_dates.get(3), Some(&1));
         // No temporary files are left.
         let names: Vec<String> =
             std::fs::read_dir(&cache).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
