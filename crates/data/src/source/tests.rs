@@ -3700,7 +3700,9 @@ fn flatgeobuf_classifies_local_dates_and_preserves_remote_text() {
         writer.add_column(name, ColumnType::DateTime, |_, c| c.nullable = true);
     }
     for (i, values) in
-        [["2024-02-29", "2026-03-05T14:30:00.123456+02:00", "12:30:00"], ["2026-02-30", "bad", "13:00:00-05:00"]].iter().enumerate()
+        [["2024-02-29", "2026-03-05T14:30:00.123456+02:00", "12:30:00.123456789"], ["2026-02-30", "99:99:99", "13:00:00-05:00"]]
+            .iter()
+            .enumerate()
     {
         writer
             .add_feature_geom(Wkb(wkb::encode(&Geometry::Point(Coord::new(i as f64, 0.0)))), |out| {
@@ -3715,7 +3717,9 @@ fn flatgeobuf_classifies_local_dates_and_preserves_remote_text() {
     let local = open_bytes("dates.fgb", bytes.clone(), None).unwrap();
     assert_eq!(local.info().fields.iter().map(|f| f.ty).collect::<Vec<_>>(), [FieldType::Date, FieldType::DateTime, FieldType::Text]);
     let batch = local.read(&Request::all()).unwrap();
+    // A malformed clock must not force the moment column to Text; real clock fractions stay intact.
     assert_eq!(batch.unread_dates, [1, 1]);
+    assert!(batch.features.iter().any(|f| f.attrs[2].to_string() == "12:30:00.123456789"));
     let (_, report) = materialize(local.as_ref()).unwrap();
     assert!(report.unread_dates.unwrap().contains("2 values"));
     let mut rows = Vec::new();
@@ -3734,6 +3738,27 @@ fn flatgeobuf_classifies_local_dates_and_preserves_remote_text() {
     assert!(remote.info().notes.iter().any(|n| n.contains("3 date/time columns are kept as ISO text")));
     let remote_batch = remote.read(&Request::all()).unwrap();
     assert!(remote_batch.features.iter().any(|f| f.attrs[0] == Value::Text("2026-02-30".into())));
+}
+
+/// A readable size prefix can contain invalid UTF-8 properties. Classification ignores
+/// that row just as whole and streamed reads do, and the read reports the skipped feature.
+#[test]
+fn flatgeobuf_dates_skip_malformed_properties() {
+    let mut ds = Dataset::new("dates", GeometryType::Point, vec![Field::new("day", FieldType::Date)]);
+    for day in ["2001-01-01", "2024-02-29"] {
+        ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::parse(day, FieldType::Date)]);
+    }
+    let mut bytes = fgb::write(&ds).unwrap();
+    let at = bytes.windows(10).position(|s| s == b"2001-01-01").unwrap();
+    bytes[at] = 0xff;
+    let source = open_bytes("dates.fgb", bytes, None).unwrap();
+    assert_eq!(source.info().fields[0].ty, FieldType::Date);
+    let read = source.read(&Request::all()).unwrap();
+    assert_eq!(read.skipped, 1);
+    assert_eq!(read.features.len(), 1);
+    assert_eq!(read.features[0].attrs[0].to_string(), "2024-02-29");
+    let streamed = source.visit_chunks(None, 256, &mut |_| Ok(())).unwrap();
+    assert_eq!(streamed.skipped, 1);
 }
 
 /// Independently authored Arrow columns exercise units, UTC flags, pre-epoch values, nulls,

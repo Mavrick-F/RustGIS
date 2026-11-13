@@ -2442,6 +2442,9 @@ impl RustGisApp {
             if id == "service.add" && params.get("text").and_then(Value::as_str).is_some() {
                 return readjob::run(self, "service.add", params);
             }
+            if id == "layer.repairSource" {
+                return readjob::run(self, "layer.repairSource", params);
+            }
             let archive = match id {
                 "map.reloadTiles" => Some("map.reloadTiles"),
                 "map.repairTiles" => Some("map.repairTiles"),

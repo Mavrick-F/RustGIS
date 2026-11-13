@@ -243,14 +243,18 @@ impl FgbSource {
                 values: vec![Value::Null; self.info.fields.len()],
                 unread_dates: Vec::new(),
             };
-            feature.process_properties(&mut props).map_err(|e| DataError::Format(format!("FlatGeobuf: {e}")))?;
+            // Reads skip a feature with unreadable properties and report it in Batch::skipped.
+            // Such a feature must not influence the inferred date type either.
+            if feature.process_properties(&mut props).is_err() {
+                continue;
+            }
             for &k in columns {
                 if let Some(Value::Text(s)) = props.values.get(k) {
                     let state = if crate::Date::parse(s).is_some() {
                         1
                     } else if crate::DateTime::parse(s).is_some() {
                         2
-                    } else if s.as_bytes().get(2) == Some(&b':') {
+                    } else if is_clock(s) {
                         4
                     } else {
                         0
@@ -731,6 +735,22 @@ fn open_reader<R: Read + Seek>(r: R) -> Result<checked::Reader<R>> {
 
 fn err(e: flatgeobuf::Error) -> DataError {
     DataError::Format(format!("FlatGeobuf: {e}"))
+}
+
+/// Validates a complete ISO clock by supplying a neutral day. The original stays text,
+/// so fractional digits past microseconds are checked as digits but never removed from values.
+fn is_clock(s: &str) -> bool {
+    let s = s.trim();
+    if s.as_bytes().get(2) != Some(&b':') {
+        return false;
+    }
+    let check = if let Some((head, tail)) = s.split_once('.') {
+        let digits = tail.bytes().take_while(|c| c.is_ascii_digit()).count();
+        format!("{head}.{}{}", tail.get(..digits.min(6)).unwrap_or_default(), tail.get(digits..).unwrap_or_default())
+    } else {
+        s.to_string()
+    };
+    crate::DateTime::parse(&format!("2000-01-01T{check}")).is_some()
 }
 
 /// The field type a column is read as; `None` for binary, which RustGIS has no field type for.

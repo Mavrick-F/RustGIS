@@ -830,7 +830,15 @@ impl SourceLayer {
         }
         let named = |e: &str| rustgis_data::diagnostics::message_with_address(path, e);
         if new.handle.is_none() {
-            new.open().map_err(|e| named(&e))?;
+            if path.to_ascii_lowercase().ends_with(".fgb") {
+                // Repair/reload prepare and probe a complete candidate on the caller's worker.
+                // A project-restored source instead uses open()'s asynchronous classification.
+                new.handle = Some(Arc::from(
+                    rustgis_data::source::open_path(std::path::Path::new(path), new.table.as_deref()).map_err(|e| named(&e.to_string()))?,
+                ));
+            } else {
+                new.open().map_err(|e| named(&e))?;
+            }
         }
         // Opening a header alone doesn't establish that its payload is readable. Probe the
         // candidate, never the live source, before the caller commits the replacement.
@@ -1790,6 +1798,11 @@ mod tests {
             assert!(source.is_open(), "{:?}", source.error);
             assert!(!source.same_opening(&copy));
         }
+        // Repair and Reload need a finished, probed candidate before changing the layer.
+        let old = super::SourceLayer { path: Some("missing.fgb".into()), ..Default::default() };
+        let repaired = old.relinked(path.to_str().unwrap(), None).unwrap();
+        assert!(repaired.is_open() && !repaired.is_pending());
+        assert_eq!(repaired.info().unwrap().fields[0].ty, FieldType::Date);
         std::fs::remove_file(path).unwrap();
     }
 

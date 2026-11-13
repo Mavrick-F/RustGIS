@@ -930,4 +930,14 @@ fn filegdb_temporal_fields_keep_days_offsets_and_null_notices() {
     assert_eq!(gdb_datetime(25_569.5, None).to_string(), "1970-01-01T12:00:00");
     assert!(gdb_datetime(25_569.0, Some(i16::MIN)).is_null());
     assert!(gdb_datetime(1e100, None).is_null());
+    // Exercise the reader/report boundary as well as the shared serial helper.
+    for (serial, rounded) in [(45_000.5, false), (45_000.1, true)] {
+        let (t, x) = table(0, &[F::Date("moment", 5)], &[vec![V::Date(Some((serial, None)))]]);
+        let (_, report) = read_table("dates", &t, &x, None).unwrap().unwrap();
+        let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded to the nearest microsecond")).collect();
+        assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
+        if rounded {
+            assert!(notices[0].contains("1 serial date") && notices[0].contains("moment"));
+        }
+    }
 }

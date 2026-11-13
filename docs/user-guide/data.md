@@ -92,7 +92,9 @@ and **Data › Layer Templates** adds empty layers with ready-made schemas to dr
 
 Dates and date-times remain typed when reading Shapefile, GeoPackage, GeoParquet, local
 FlatGeobuf, FileGDB, workbook date cells and GPX timestamps. Ordinary spreadsheet text that
-looks like a date stays text. Invalid dates become empty values with a notice naming the fields
+looks like a date stays text. A workbook column mixing date cells with ordinary text is read
+entirely as text; clean that column in the workbook before using date operations.
+Invalid dates become empty values with a notice naming the fields
 and counting the values; dates cover years 1–9999. Fractional seconds are kept to microseconds.
 Floating-point serial dates in workbooks and FileGDB are rounded to the nearest microsecond,
 with a notice when rounding is needed. Parquet timestamps with finer nonzero precision are

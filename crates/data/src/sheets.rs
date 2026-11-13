@@ -114,9 +114,9 @@ fn grid_unguarded(bytes: &[u8], sheet: Option<&str>) -> Result<Grid> {
         for (k, d) in row.iter().enumerate() {
             if let Data::DateTime(dt) = d {
                 let serial = dt.as_f64() + if is_1904(dt) { DAYS_1900_TO_1904 } else { 0.0 };
-                let adjusted = serial + if serial < 60.0 { 1.0 } else { 0.0 };
+                let adjusted = serial + if (1.0..60.0).contains(&serial) { 1.0 } else { 0.0 };
                 if !dt.is_duration()
-                    && serial >= 1.0
+                    && serial >= 0.0
                     && serial.floor() != 60.0
                     && crate::date::serial_datetime(adjusted, -25_569).is_some_and(|(_, rounded)| rounded)
                     && let Some(n) = rounded_dates.get_mut(k)
@@ -413,7 +413,7 @@ fn check_size(wb: &mut Sheets<Cursor<&[u8]>>, sheet: &str) -> Result<()> {
 }
 
 /// A cell as text: whole numbers without a decimal point, dates as ISO 8601, times of day as
-/// `HH:MM:SS` and durations as `[h]:MM:SS`.
+/// ISO clock text with fractional seconds and durations as `[h]:MM:SS`.
 fn cell(d: &Data) -> String {
     match d {
         Data::Empty | Data::Error(_) => String::new(),
@@ -451,14 +451,15 @@ fn duration(days: f64) -> String {
 }
 
 /// An Excel serial date (days since 1899-12-30) as `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM:SS` when it
-/// has a time of day; a time alone (a serial below 1) as `HH:MM:SS`.
+/// has a time of day; a time alone (a serial below 1) keeps fractional seconds as ISO text.
 fn excel_date(serial: f64, with_time: bool) -> String {
     if !serial.is_finite() || !(0.0..3_000_000.0).contains(&serial) {
         return serial.to_string();
     }
     if serial < 1.0 && with_time {
-        let secs = ((serial * 86_400.0).round() as i64).min(86_399);
-        return format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+        return crate::date::serial_datetime(serial, 0)
+            .and_then(|(t, _)| t.to_string().split_once('T').map(|(_, clock)| clock.to_string()))
+            .unwrap_or_else(|| serial.to_string());
     }
     // Serial 60 is the workbook's fictitious 1900-02-29. Keep that invalid spelling so
     // a typed read reports it instead of silently changing it to a real day.
@@ -555,6 +556,7 @@ mod tests {
         assert_eq!(excel_date(61.0, false), "1900-03-01");
         assert_eq!(excel_date(45_000.999_999_9, true), "2023-03-15T23:59:59.991360", "fractional seconds are kept");
         assert_eq!(excel_date(0.5, true), "12:00:00", "a time of day alone");
+        assert_eq!(excel_date(0.500_001, true), "12:00:00.086400", "clock fractions are kept");
         assert_eq!(excel_date(0.0, true), "00:00:00");
         assert_eq!(duration(1.5), "36:00:00");
         assert_eq!(duration(-0.25), "-6:00:00");
@@ -597,6 +599,31 @@ mod tests {
         assert!(ds.value(1, 0).is_null());
         assert!(report.unread_dates.unwrap().starts_with("1 value"));
         assert_eq!(ds.value(0, 3), &Value::Text("2024-02-29".into()));
+    }
+
+    /// Native numeric date styles reach the public reader's rounding notice, including
+    /// time-only text. Exact half days stay silent; non-dyadic serials report the field/count.
+    #[test]
+    fn workbook_serial_dates_report_rounding_and_keep_clock_fractions() {
+        for (serial, rounded) in [("45000.5", false), ("45000.1", true), ("0.5", false), ("0.500001", false), ("0.123456789", true)] {
+            let cell = format!(r#"<c s="0"><v>{serial}</v></c>"#);
+            let book = xlsx(&[("Dates", &[&["moment"], &[&cell]])]);
+            let mut entries = crate::zip::read(&book).unwrap();
+            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="22"/></cellXfs></styleSheet>"#.to_vec()));
+            let (ds, report) = read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap();
+            let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded to the nearest microsecond")).collect();
+            assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
+            if rounded {
+                assert!(notices[0].contains("1 serial date") && notices[0].contains("moment"));
+            }
+            if serial == "0.500001" {
+                assert_eq!(ds.fields[0].ty, FieldType::Text);
+                assert_eq!(ds.value(0, 0).to_string(), "12:00:00.086400");
+            }
+            if serial == "0.123456789" {
+                assert_eq!(ds.value(0, 0).to_string(), "02:57:46.666570");
+            }
+        }
     }
 
     #[test]
