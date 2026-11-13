@@ -17,10 +17,14 @@ use serde_json::json;
 
 const FORMATS: [&str; 8] = ["geojson", "csv", "fgb", "gpkg", "parquet", "shp", "kml", "gpx"];
 
+/// Formats that hold only features with geometry: an export to one leaves the others out and says
+/// so, and what comes back is compared with the layer without them.
+const GEOMETRY_ONLY: [&str; 4] = ["fgb", "shp", "kml", "gpx"];
+
 /// Changes a format makes without a notice, as (format, the start of a change from [`changes`],
 /// why). Each is what the format can hold or how its reader works, not a loss of a value's
-/// number or text, except trimming and blanks read as null, which are kept here until they are
-/// said.
+/// number or text, except trimming, blanks read as null and (KML, GPX) a field of nulls left out,
+/// which are kept here until they are said (#1907).
 const LIMITS: &[(&str, &str, &str)] = &[
     // CSV holds text: reading trims each cell, types each column from its values (`text_type`)
     // and reads an empty cell as null.
@@ -164,25 +168,33 @@ fn layer() -> impl Strategy<Value = Dataset> {
     })
 }
 
-/// Exports `ds` as `ext` and adds the file back: what the export said, besides naming the file,
-/// and the layer read back, or why there is none. `None` when the export refused the layer, which
-/// isn't silent.
-fn trip(ds: &Dataset, ext: &str, dir: &std::path::Path) -> Option<(Vec<String>, Result<Dataset, String>)> {
+/// What a trip says: the export, besides naming the file, and reading the file back.
+struct Said {
+    export: Vec<String>,
+    read: Vec<String>,
+}
+
+/// Exports `ds` as `ext` and adds the file back: what was said, and the layer read back, or why
+/// there is none. `Err` with why the export refused the layer, which isn't silent.
+fn trip(ds: &Dataset, ext: &str, dir: &std::path::Path) -> Result<(Said, Result<Dataset, String>), String> {
     let path = dir.join(format!("layer.{ext}"));
     let mut s = Session::new(Project::default());
     s.map_mut().add_dataset(ds.clone());
     let mark = s.notice_mark();
-    s.run("share.exportLayer", &json!({"layer": "layer", "path": path})).ok()?;
-    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| !t.starts_with("Exported ")).collect();
+    s.run("share.exportLayer", &json!({"layer": "layer", "path": path}))?;
+    let export: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| !t.starts_with("Exported ")).collect();
     let before: Vec<u32> = s.map().layers.iter().map(|l| l.id).collect();
-    if let Err(e) = s.run("layer.addData", &json!({"path": path})) {
-        return Some((said, Err(e)));
+    let mark = s.notice_mark();
+    let added = s.run("layer.addData", &json!({"path": path}));
+    let said = Said { export, read: s.notices_since(mark).iter().map(|n| n.text.clone()).collect() };
+    if let Err(e) = added {
+        return Ok((said, Err(e)));
     }
     // A format read as several layers (GPX: tracks and their points) gives back the one of the
     // layer's kind.
     let added: Vec<&Dataset> = s.map().layers.iter().filter(|l| !before.contains(&l.id)).map(|l| &l.dataset).collect();
     let back = added.iter().find(|d| d.geometry_type == ds.geometry_type).or(added.first()).map(|d| (*d).clone());
-    Some((said, back.ok_or_else(|| "nothing".to_string())))
+    Ok((said, back.ok_or_else(|| "nothing".to_string())))
 }
 
 /// The value's type, to name a change.
@@ -196,48 +208,55 @@ fn tag(v: &Value) -> &'static str {
     }
 }
 
-/// A value as a number, if it is one.
-fn number(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        _ => None,
-    }
-}
-
 /// How a value changed, if it did; the same number in another type isn't a change. The kinds
 /// name what a format that holds text does to a value, so [`LIMITS`] can allow just that.
 fn value_change(a: &Value, b: &Value) -> Option<String> {
     let same = match (a, b) {
         (Value::Float(x), Value::Float(y)) => x == y || x.is_nan() && y.is_nan(),
-        _ => a == b || number(a).zip(number(b)).is_some_and(|(x, y)| x == y),
+        (Value::Int(x), Value::Int(y)) => x == y,
+        // A whole number in the other type, exactly.
+        (Value::Int(i), Value::Float(f)) | (Value::Float(f), Value::Int(i)) => {
+            (-(2f64.powi(63))..2f64.powi(63)).contains(f) && f.fract() == 0.0 && *f as i64 == *i
+        }
+        _ => a == b,
     };
     if same {
         return None;
     }
-    let reads_as = |t: &str, v: &Value| number(v).is_some_and(|n| t.trim().parse::<f64>().is_ok_and(|m| m == n));
+    // Text that reads as the number exactly.
+    let reads_as = |t: &str, v: &Value| match v {
+        Value::Int(i) => t.trim().parse::<i64>() == Ok(*i),
+        Value::Float(f) => t.trim().parse::<f64>().is_ok_and(|m| m == *f),
+        _ => false,
+    };
     Some(match (a, b) {
         (Value::Text(x), Value::Null) if x.trim().is_empty() => "blank text became null".into(),
         (Value::Text(x), Value::Text(y)) if x.trim() == y.trim() => "text trimmed".into(),
         (Value::Text(x), _) if reads_as(x, b) => "text became a number".into(),
-        (Value::Float(x), Value::Text(_)) if !x.is_finite() => "infinity or NaN became text".into(),
+        (Value::Float(x), Value::Text(y))
+            if !x.is_finite() && y.trim().parse::<f64>().is_ok_and(|m| m == *x || m.is_nan() && x.is_nan()) =>
+        {
+            "infinity or NaN became text".into()
+        }
         (_, Value::Text(y)) if reads_as(y, a) => "number became text".into(),
         (Value::Bool(x), Value::Text(y)) if y == if *x { "True" } else { "False" } => "boolean became text".into(),
+        // Another value, which no limit allows.
         _ if tag(a) == tag(b) => format!("{} changed", tag(a)),
-        _ => format!("{} became {}", tag(a), tag(b)),
+        _ => format!("{} changed to {}", tag(a), tag(b)),
     })
 }
 
-/// A geometry's parts, with coordinates to 1e-7°, each ring from its least point in one direction,
-/// and polygon parts in order: what a format may rearrange without changing the shape.
-fn shape(g: &Geometry) -> Vec<Vec<(i64, i64)>> {
-    let q = |c: &Coord| ((c.x * 1e7).round() as i64, (c.y * 1e7).round() as i64);
+/// A geometry's parts, with exact coordinates, each ring from its least point in one direction, a
+/// polygon's holes and a multipart polygon's parts in order: what a format may rearrange without
+/// changing the shape.
+fn shape(g: &Geometry) -> Vec<Vec<Vec<(u64, u64)>>> {
+    let q = |c: &Coord| (c.x.to_bits(), c.y.to_bits());
     let ring = |r: &[Coord]| {
         let mut r: Vec<_> = r.iter().map(q).collect();
         if r.len() > 1 && r.first() == r.last() {
             r.pop();
         }
-        let start = |r: &[(i64, i64)]| {
+        let start = |r: &[(u64, u64)]| {
             let mut r = r.to_vec();
             let i = r.iter().enumerate().min_by_key(|(_, p)| **p).map_or(0, |(i, _)| i);
             r.rotate_left(i);
@@ -248,31 +267,43 @@ fn shape(g: &Geometry) -> Vec<Vec<(i64, i64)>> {
         forward.min(start(&r))
     };
     match g {
-        Geometry::Point(c) => vec![vec![q(c)]],
-        Geometry::MultiPoint(cs) => cs.iter().map(|c| vec![q(c)]).collect(),
-        Geometry::Line(ls) => ls.iter().map(|l| l.iter().map(q).collect()).collect(),
+        Geometry::Point(c) => vec![vec![vec![q(c)]]],
+        Geometry::MultiPoint(cs) => cs.iter().map(|c| vec![vec![q(c)]]).collect(),
+        Geometry::Line(ls) => ls.iter().map(|l| vec![l.iter().map(q).collect()]).collect(),
         Geometry::Polygon(ps) => {
-            let mut rings: Vec<_> = ps.iter().flatten().map(|r| ring(r)).collect();
-            rings.sort();
-            rings
+            let mut parts: Vec<Vec<_>> = ps
+                .iter()
+                .map(|p| {
+                    let mut rings: Vec<_> = p.iter().map(|r| ring(r)).collect();
+                    if let Some(holes) = rings.get_mut(1..) {
+                        holes.sort();
+                    }
+                    rings
+                })
+                .collect();
+            parts.sort();
+            parts
         }
     }
 }
 
+/// A change, and the field it is in, if any: a notice of it names that field.
+type Change = (String, Option<String>);
+
 /// What changed in one feature: its geometry and the values of the fields in `map`.
-fn feature_changes(x: &Feature, y: &Feature, map: &[(usize, Option<usize>)], fields: &[Field]) -> Vec<String> {
+fn feature_changes(x: &Feature, y: &Feature, map: &[(usize, Option<usize>)], fields: &[Field]) -> Vec<Change> {
     let mut out = Vec::new();
     match (&x.geometry, &y.geometry) {
-        (Some(g), Some(h)) if shape(g) != shape(h) => out.push("geometry changed".to_string()),
-        (Some(_), None) => out.push("geometry dropped".into()),
-        (None, Some(_)) => out.push("geometry made up".into()),
+        (Some(g), Some(h)) if shape(g) != shape(h) => out.push(("geometry changed".to_string(), None)),
+        (Some(_), None) => out.push(("geometry dropped".into(), None)),
+        (None, Some(_)) => out.push(("geometry made up".into(), None)),
         _ => {}
     }
     for &(i, j) in map {
         let (Some(j), Some(f)) = (j, fields.get(i)) else { continue };
         let (a, b) = (x.attrs.get(i).unwrap_or(&Value::Null), y.attrs.get(j).unwrap_or(&Value::Null));
         if let Some(why) = value_change(a, b) {
-            out.push(format!("{why} ({}: {a:?} → {b:?})", f.name));
+            out.push((format!("{why} ({}: {a:?} → {b:?})", f.name), Some(f.name.clone())));
         }
     }
     out
@@ -281,7 +312,7 @@ fn feature_changes(x: &Feature, y: &Feature, map: &[(usize, Option<usize>)], fie
 /// What changed between a layer and the layer read back. Features are matched by content, since
 /// a format may reorder them (FlatGeobuf sorts them along its spatial index); fields by name, and
 /// a format may add its own.
-fn changes(a: &Dataset, b: &Dataset) -> Vec<String> {
+fn changes(a: &Dataset, b: &Dataset) -> Vec<Change> {
     let mut out = Vec::new();
     let mut map = Vec::new();
     for (i, f) in a.fields.iter().enumerate() {
@@ -290,17 +321,18 @@ fn changes(a: &Dataset, b: &Dataset) -> Vec<String> {
         let nulls = if a.features.iter().all(|x| x.attrs.get(i).is_none_or(|v| *v == Value::Null)) { " of nulls" } else { "" };
         let exact = b.fields.iter().position(|g| g.name == f.name);
         let j = exact.or_else(|| b.fields.iter().position(|g| g.name.eq_ignore_ascii_case(&f.name)));
-        match j.and_then(|j| b.fields.get(j)) {
-            None => out.push(format!("field{nulls} missing ({})", f.name)),
-            Some(g) if exact.is_none() => out.push(format!("field renamed ({} → {})", f.name, g.name)),
-            Some(g) if g.ty != f.ty => out.push(format!("field{nulls} type changed {:?} → {:?} ({})", f.ty, g.ty, f.name)),
-            Some(_) => {}
-        }
+        let change = match j.and_then(|j| b.fields.get(j)) {
+            None => Some(format!("field{nulls} missing ({})", f.name)),
+            Some(g) if exact.is_none() => Some(format!("field renamed ({} → {})", f.name, g.name)),
+            Some(g) if g.ty != f.ty => Some(format!("field{nulls} type changed {:?} → {:?} ({})", f.ty, g.ty, f.name)),
+            Some(_) => None,
+        };
+        out.extend(change.map(|c| (c, Some(f.name.clone()))));
         map.push((i, j));
     }
     let (fa, fb) = (a.features.iter().collect::<Vec<_>>(), b.features.iter().collect::<Vec<_>>());
     if fa.len() != fb.len() {
-        out.push(format!("feature count changed ({} → {})", fa.len(), fb.len()));
+        out.push((format!("feature count changed ({} → {})", fa.len(), fb.len()), None));
         return out;
     }
     let mut used = vec![false; fb.len()];
@@ -326,16 +358,51 @@ fn an_export_that_changes_a_layer_says_so() {
     let cases = u32::try_from(env("PROPERTY_CASES", 256)).unwrap_or(256);
     let config = Config { cases, failure_persistence: None, ..Config::default() };
     let mut runner = TestRunner::new_with_rng(config, TestRng::from_seed(RngAlgorithm::ChaCha, &bytes));
+    // Layers each format wrote: one that refuses every layer checks nothing.
+    let written = std::cell::RefCell::new(std::collections::HashMap::<&str, u32>::new());
     let result = runner.run(&layer(), |ds| {
         for ext in FORMATS {
             let sub = dir.join(ext);
             let _ = std::fs::remove_dir_all(&sub);
             std::fs::create_dir_all(&sub).unwrap();
-            let Some((said, back)) = trip(&ds, ext, &sub) else { continue };
-            let found = back.map_or_else(|e| vec![format!("not read back: {e}")], |back| changes(&ds, &back));
-            let silent: Vec<String> = found.into_iter().filter(|c| !declared(ext, c)).collect();
-            if said.is_empty() && !silent.is_empty() {
-                return Err(TestCaseError::fail(format!("{ext}: changed without a notice: {silent:?}")));
+            let (said, back) = match trip(&ds, ext, &sub) {
+                Ok(trip) => trip,
+                // A refusal says why, but a crash caught by `Session::run` is a bug.
+                Err(e) if e.contains("stopped unexpectedly") => return Err(TestCaseError::fail(format!("{ext}: {e}"))),
+                Err(_) => continue,
+            };
+            *written.borrow_mut().entry(ext).or_default() += 1;
+            let mut held = ds.clone();
+            if GEOMETRY_ONLY.contains(&ext) {
+                held.features.retain(|f| f.geometry.is_some());
+                if held.features.len() < ds.features.len() && !said.export.iter().any(|n| n.contains("left out")) {
+                    return Err(TestCaseError::fail(format!(
+                        "{ext}: features without geometry left out without a notice; said: {:?}",
+                        said.export
+                    )));
+                }
+            }
+            // An export that says it wrote NaN and infinity as null holds them as null.
+            if said.export.iter().any(|n| n.contains("aren't finite numbers")) {
+                for v in held.features.iter_mut().flat_map(|f| f.attrs.iter_mut()) {
+                    if matches!(v, Value::Float(x) if !x.is_finite()) {
+                        *v = Value::Null;
+                    }
+                }
+            }
+            let found = back.map_or_else(|e| vec![(format!("not read back: {e}"), None)], |back| changes(&held, &back));
+            // A change is said by a notice naming its field, the export's or the reading's, or by
+            // any export notice for one in no field.
+            let said_of = |field: &Option<String>| match field {
+                Some(f) => said.export.iter().chain(&said.read).any(|n| n.contains(&format!("'{f}'"))),
+                None => !said.export.is_empty(),
+            };
+            let silent: Vec<String> = found.into_iter().filter(|(c, field)| !declared(ext, c) && !said_of(field)).map(|(c, _)| c).collect();
+            if !silent.is_empty() {
+                return Err(TestCaseError::fail(format!(
+                    "{ext}: changed without a notice: {silent:?}; said: {:?}, {:?}",
+                    said.export, said.read
+                )));
             }
         }
         Ok(())
@@ -343,5 +410,9 @@ fn an_export_that_changes_a_layer_says_so() {
     let _ = std::fs::remove_dir_all(&dir);
     if let Err(e) = result {
         panic!("PROPERTY_SEED={seed}: {e}");
+    }
+    let written = written.into_inner();
+    for ext in FORMATS {
+        assert!(written.get(ext).is_some_and(|n| *n > 0), "PROPERTY_SEED={seed}: {ext} wrote none of the layers");
     }
 }
