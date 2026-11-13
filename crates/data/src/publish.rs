@@ -96,29 +96,19 @@ fn source_lock(path: &Path) -> Result<std::fs::File> {
     }
     let opened = match options.open(&lock_path) {
         Ok(file) => {
-            // The empty sidecar contains no source data. Any account sharing the directory
-            // must be able to lock it, regardless of source groups, ACLs or a private umask.
-            // Unix exclusive locks need only read access; set modes through the open handle.
+            // The empty sidecar contains no source data. Accounts sharing the directory need
+            // read/write access regardless of source groups, ACLs or a private umask: NFS
+            // exclusive locks require a writable handle. Set modes through the open handle.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+                file.set_permissions(std::fs::Permissions::from_mode(0o666))?;
             }
             Ok(file)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             options.create_new(false);
-            let existing = options.open(&lock_path);
-            #[cfg(unix)]
-            let existing = match existing {
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    // Unix advisory exclusive locks also work on read-only handles.
-                    options.write(false);
-                    options.open(&lock_path)
-                }
-                result => result,
-            };
-            existing
+            options.open(&lock_path)
         }
         Err(e) => Err(e),
     };
@@ -795,11 +785,12 @@ mod tests {
         assert!(shapefile(&ds, &path, &sync).err().unwrap().to_string().contains("changed since the layer was read"));
     }
 
-    /// A shared source's empty lock is readable across accounts, even under a private umask.
-    /// Its read-only handle still excludes a second publisher on Unix.
+    /// A shared source's empty lock is writable across accounts, even under a private umask.
+    /// Reopening it keeps a writable handle (required by NFS) and excludes a second publisher.
     #[cfg(unix)]
     #[test]
-    fn shared_source_locks_are_readable_and_can_be_locked_read_only() {
+    fn shared_source_locks_are_writable_and_reusable() {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parcels.shp");
@@ -807,9 +798,11 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
         let held = source_lock(&path).unwrap();
         let lock_path = dir.path().join(".parcels.shp.rustgis-lock");
-        assert_eq!(std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777, 0o444);
+        assert_eq!(std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777, 0o666);
         drop(held);
-        let held = source_lock(&path).unwrap();
+        let mut held = source_lock(&path).unwrap();
+        // A zero-byte write checks the descriptor's access mode without storing source data.
+        assert_eq!(held.write(&[]).unwrap(), 0);
         assert!(source_lock(&path).err().unwrap().to_string().contains("another RustGIS publisher"));
         drop(held);
         source_lock(&path).unwrap();
@@ -1021,6 +1014,55 @@ mod tests {
         let columns = crate::dbf::raw_table(&std::fs::read(path.with_extension("dbf")).unwrap()).unwrap().columns;
         assert_eq!(columns[1].ty, b'F');
         assert_eq!(crate::io::read_path(&path).unwrap().0.features.iter().next().unwrap().attrs[1], Value::Float(123456.12345678));
+    }
+
+    /// Converting a text field to a date changes its physical column, which publishing says.
+    #[test]
+    fn a_converted_field_names_its_old_and_new_column_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let mut source = parcels();
+        let mut rows: Vec<_> = source.features.iter().cloned().collect();
+        for row in &mut rows {
+            row.attrs[0] = Value::Text("2025-01-02".into());
+        }
+        source.features = rows.into();
+        let (mut ds, sync) = written(&source, &path);
+        ds.fields[0].ty = FieldType::Date;
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        for row in &mut rows {
+            row.attrs[0] = Value::Date(crate::Date::parse("2025-01-02").unwrap());
+        }
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        assert_eq!(published.notes.len(), 1, "{:?}", published.notes);
+        assert!(published.notes[0].contains("'OWNER' C(10) to D(8)"), "{:?}", published.notes);
+        let bytes = std::fs::read(path.with_extension("dbf")).unwrap();
+        let table = crate::dbf::raw_table(&bytes).unwrap();
+        assert_eq!(table.columns[0].ty, b'D');
+    }
+
+    /// The writer uses UTF-8 name bytes even with a legacy code page: a rewrite is refused
+    /// before the differing name or width can reach the source.
+    #[test]
+    fn a_legacy_non_ascii_column_name_refuses_the_rewrite_without_changing_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        written(&parcels(), &path);
+        std::fs::write(path.with_extension("cpg"), "1252").unwrap();
+        let mut bytes = std::fs::read(path.with_extension("dbf")).unwrap();
+        bytes[32..43].fill(0);
+        bytes[32..37].copy_from_slice(b"Se\xf1or");
+        std::fs::write(path.with_extension("dbf"), &bytes).unwrap();
+        let (mut ds, sync) = read(&path);
+        assert_eq!(ds.fields[0].name, "Señor");
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text("Smyth".into());
+        ds.features = rows.into();
+        let e = shapefile(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("its columns would change") && e.contains("nothing was written"), "{e}");
+        assert_eq!(std::fs::read(path.with_extension("dbf")).unwrap(), bytes);
+        assert!(sync.files.changed(&path).unwrap().is_empty());
     }
 
     /// A widened column is said; a layer in another system gets a `.prj` for it, said too.

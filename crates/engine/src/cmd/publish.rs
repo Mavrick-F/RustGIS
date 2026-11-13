@@ -4,14 +4,14 @@
 use crate::{CmdResult, CommandSpec as C, Session};
 use serde_json::Value;
 
-/// Source commands carry file effects; publish updates the project only in its completion,
-/// after the external write succeeded, while syncState only reports the comparison.
+/// File inspection, and publishing with an explicit edit effect but no automatic undo step:
+/// undo cannot reverse the external write, so its committed sync record follows the file.
 pub fn commands() -> Vec<C> {
     vec![
         C::new("source.syncState", "Source File State", "Data › Data Source", sync_state).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"layer"?: "name|id (default: the active layer): one read whole from a Shapefile or .geojson file"} — whether it has edits its file lacks ("edited"), the file changed since it was read ("sourceChanged"), both ("both") or neither ("inSync"), and which of the file's parts changed"#,
         ),
-        C::new("source.publish", "Publish to Source", "Data › Data Source", |s, p| super::exports::write_here(s, p, "source.publish")).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
+        C::new("source.publish", "Publish to Source", "Data › Data Source", |s, p| super::exports::write_here(s, p, "source.publish")).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files).with(crate::policy::Effect::Edits)).view().params(
             r#"{"layer"?: "name|id (default: the active layer): one read whole from a Shapefile or .geojson file"} — writes the layer's edits back over its source; refused, with nothing written, when the source changed or a rewrite would lose data, metadata or number text. Shapefiles keep their code page, column layout and .prj; GeoJSON keeps its document kind, collection name and feature ids"#,
         ),
     ]
