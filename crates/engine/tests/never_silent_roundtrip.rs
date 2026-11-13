@@ -456,7 +456,12 @@ fn an_export_that_changes_a_layer_says_so() {
             // values.
             let said_of = |c: &str, field: &Option<String>| match field {
                 Some(f) => said.export.iter().chain(&said.read).any(|n| {
-                    let n = if c.starts_with("field renamed") { n.clone() } else { n.replace(&format!("'{f}' → '"), "") };
+                    let mut n = n.clone();
+                    if !c.starts_with("field renamed") {
+                        for (old, new) in renames(std::slice::from_ref(&n)) {
+                            n = n.replace(&format!("'{old}' → '{new}'"), "");
+                        }
+                    }
                     n.contains(&format!("'{f}'"))
                 }),
                 None => !said.export.is_empty(),
