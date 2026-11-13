@@ -1235,6 +1235,34 @@ mod tests {
         assert!(l.is_streamed() && !l.labels.enabled);
     }
 
+    /// The actual app dispatch schedules a table calculation and installs it once with Undo.
+    /// A cell edited while it runs prevents stale results from overwriting the new value.
+    #[test]
+    fn table_calculation_runs_off_frame_and_refuses_changed_input() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName": "calc.csv", "text": "n\n1\n2\n"})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        app.reads_off_frame = true;
+        let p = json!({"table": "calc", "field": "n", "expression": "n / 2"});
+        let depth = app.session.undo_depth();
+        assert_eq!(app.run_by_user("edit.calculateField", p.clone()).unwrap()["started"], "Calculate Field");
+        assert_eq!(app.session.undo_depth(), depth);
+        assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(1.0));
+        landed(&mut app, 60);
+        assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(0.0));
+        assert_eq!(app.session.undo_depth(), depth + 1);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("fraction")));
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(1.0));
+        app.run_by_user("edit.calculateField", p).unwrap();
+        app.run("edit.setValue", json!({"table": "calc", "row": 0, "field": "n", "value": 9})).unwrap();
+        let depth = app.session.undo_depth();
+        landed(&mut app, 60);
+        assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(9.0));
+        assert_eq!(app.session.undo_depth(), depth);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("table changed")));
+    }
+
     /// Source File State hashes the file on a thread of its own and says what it found once
     /// it lands: Command Search shows no answer.
     #[test]

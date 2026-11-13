@@ -2452,6 +2452,9 @@ impl RustGisApp {
             if let Some(command) = archive {
                 return readjob::run(self, command, params);
             }
+            if id == "edit.calculateField" && params.get("table").is_some_and(|t| !t.is_null()) {
+                return readjob::run(self, "edit.calculateField", params);
+            }
             // The topology check's work grows with the layers: on a thread of its own (#1291).
             if id == "topology.validate" {
                 let params = if params.is_null() { json!({}) } else { params };

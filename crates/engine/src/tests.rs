@@ -308,6 +308,29 @@ fn a_standalone_table_is_edited_with_the_edit_commands() {
     assert_eq!(cell(&s, 3, "street"), rustgis_data::Value::Text("Rue Amélie".into()));
     let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
     assert!(said.len() == 1 && said[0].contains("leaves out 1 attribute naming no field: 'stret'"), "{said:?}");
+    // Fields named alike but for case: a key gives the one it names exactly and no other, and a
+    // second key reaching a field already given is said.
+    s.run("layer.addDataText", &json!({"fileName": "twins.csv", "text": "id,Name,name\n1,a,b\n"})).unwrap();
+    let twin = |s: &Session, f: usize| s.project.tables[1].dataset.value(1, f).clone();
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "twins", "attributes": {"name": "lower"}})).unwrap();
+    assert_eq!((twin(&s, 1), twin(&s, 2)), (rustgis_data::Value::Null, rustgis_data::Value::Text("lower".into())));
+    assert!(s.notices_since(mark).is_empty());
+    s.run("edit.undo", &Value::Null).unwrap();
+    let rows = s.project.tables[1].dataset.features.len();
+    let depth = s.undo_depth();
+    let err = s.run("edit.addFeature", &json!({"table": "twins", "attributes": {"Name": "A", "NAME": "B"}})).unwrap_err();
+    assert!(err.contains("matches more than one field"), "{err}");
+    assert_eq!(s.project.tables[1].dataset.features.len(), rows);
+    assert_eq!(s.undo_depth(), depth);
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"street": "A", "STREET": "B"}})).unwrap();
+    assert_eq!(cell(&s, 4, "street"), rustgis_data::Value::Text("A".into()));
+    let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert!(
+        said.len() == 1 && said[0].contains("leaves out 1 attribute naming a field another attribute already gives: 'STREET'"),
+        "{said:?}"
+    );
     let mark = s.notice_mark();
     s.run("edit.calculateField", &json!({"table": "sites", "field": "visits", "expression": "visits / 2"})).unwrap();
     assert!(s.notices_since(mark).iter().any(|n| n.text.contains("Calculate Field: 'visits'") && n.text.contains("fraction")));
@@ -43884,6 +43907,14 @@ fn long_commands_stop_when_cancelled_while_they_run() {
         let control = Control::cancelled_once_started();
         note(command, read.run(&control).map(|_| ()), &control);
     }
+
+    s.run("layer.addDataText", &json!({"fileName": "calc.csv", "text": "n\n1\n2\n"})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    let p = json!({"table": "calc", "field": "n", "expression": "n * 2"});
+    let read = crate::cmd::reads::read_ahead(&mut s, "edit.calculateField", &p).unwrap();
+    assert!(read.reads());
+    let control = Control::cancelled_once_started();
+    note("edit.calculateField", read.run(&control).map(|_| ()), &control);
 
     // Replacement validation can now scan temporal fields as well as probing geometry.
     let mut dates = rustgis_data::Dataset::new(

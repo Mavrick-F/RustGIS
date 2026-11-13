@@ -107,8 +107,7 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     };
     let layer = l.dataset.name.clone();
     let defaults = template.as_ref().map_or(&[][..], |t| &t.defaults[..]);
-    let (attrs, losses) = new_row(&l.dataset.fields, p, defaults)?;
-    let unmatched = unmatched_attributes(&l.dataset.fields, p);
+    let (attrs, losses, left_out) = new_row(&l.dataset.fields, p, defaults)?;
     l.dataset.push(Some(g), attrs);
     l.touch_geometry();
     let row = l.dataset.features.len() - 1;
@@ -117,7 +116,7 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     for (field, key) in losses {
         notify_loss(s, key, &layer, field, row);
     }
-    notify_unmatched(s, &layer, &unmatched);
+    notify_left_out(s, &layer, &left_out);
     Ok(json!({"row": row}))
 }
 
@@ -132,52 +131,83 @@ fn add_row(s: &mut Session, p: &Json, i: usize) -> CmdResult {
     }
     editing_on(s)?;
     let t = data_mut(s, Target::Table(i))?;
-    let (attrs, losses) = new_row(&t.fields, p, &[])?;
-    let unmatched = unmatched_attributes(&t.fields, p);
+    let (attrs, losses, left_out) = new_row(&t.fields, p, &[])?;
     t.push(None, attrs);
     let row = t.features.len().saturating_sub(1);
     let table = t.name.clone();
     for (field, key) in losses {
         notify_loss(s, key, &table, field, row);
     }
-    notify_unmatched(s, &table, &unmatched);
+    notify_left_out(s, &table, &left_out);
     Ok(json!({"row": row}))
 }
 
-/// The keys of `"attributes"` that name no field of `fields`, even ignoring case: their values
-/// are left out of the new row.
-fn unmatched_attributes(fields: &[Field], p: &Json) -> Vec<String> {
-    let Some(given) = p.get("attributes").and_then(Json::as_object) else { return Vec::new() };
-    given.keys().filter(|k| !fields.iter().any(|f| f.name.eq_ignore_ascii_case(k))).cloned().collect()
+/// The given attributes a new row leaves out: those naming no field, and those naming a field
+/// another attribute already gives ([`given_attributes`]).
+#[derive(Default)]
+struct LeftOut {
+    no_field: Vec<String>,
+    taken: Vec<String>,
 }
 
-/// Says, once, which given attributes of a new row in layer or table `name` matched no field.
-fn notify_unmatched(s: &mut Session, name: &str, unmatched: &[String]) {
-    if unmatched.is_empty() {
-        return;
+/// Each field's value in `"attributes"`, by field. A key gives one field: the one named exactly
+/// so, else the only field named so ignoring case (ambiguous keys are refused); the keys named
+/// exactly go first, so `Name` fills `Name` even when `name` comes first. A key naming no field,
+/// or a field another key gives, is left out and said ([`notify_left_out`]).
+fn given_attributes<'a>(fields: &[Field], p: &'a Json) -> Result<(Vec<Option<&'a Json>>, LeftOut), String> {
+    let mut given = vec![None; fields.len()];
+    let mut left = LeftOut::default();
+    let Some(attributes) = p.get("attributes").and_then(Json::as_object) else { return Ok((given, left)) };
+    let exact = |k: &str| fields.iter().position(|f| f.name == k);
+    for (k, v) in attributes.iter().filter(|(k, _)| exact(k).is_some()) {
+        match exact(k).and_then(|i| given.get_mut(i)) {
+            Some(slot @ None) => *slot = Some(v),
+            _ => left.taken.push(k.clone()),
+        }
     }
-    let shown: Vec<String> = unmatched.iter().take(5).map(|k| format!("'{}'", k.chars().take(40).collect::<String>())).collect();
-    let more = if unmatched.len() > 5 { format!(" and {} more", unmatched.len() - 5) } else { String::new() };
-    let n = if unmatched.len() == 1 { "1 attribute".to_string() } else { format!("{} attributes", unmatched.len()) };
-    s.notify(format!("{name}: the new row leaves out {n} naming no field: {}{more}", shown.join(", ")), false);
+    for (k, v) in attributes.iter().filter(|(k, _)| exact(k).is_none()) {
+        let mut matches = fields.iter().enumerate().filter(|(_, f)| f.name.eq_ignore_ascii_case(k));
+        let first = matches.next().map(|(i, _)| i);
+        if matches.next().is_some() {
+            return Err(format!("attribute '{k}' matches more than one field: use an exact field name"));
+        }
+        match first.map(|i| given.get_mut(i)) {
+            None => left.no_field.push(k.clone()),
+            Some(Some(slot @ None)) => *slot = Some(v),
+            Some(_) => left.taken.push(k.clone()),
+        }
+    }
+    Ok((given, left))
+}
+
+/// Says, once per kind, which given attributes a new row in layer or table `name` left out.
+fn notify_left_out(s: &mut Session, name: &str, left: &LeftOut) {
+    for (keys, why) in [(&left.no_field, "naming no field"), (&left.taken, "naming a field another attribute already gives")] {
+        if keys.is_empty() {
+            continue;
+        }
+        let shown: Vec<String> = keys.iter().take(5).map(|k| format!("'{}'", k.chars().take(40).collect::<String>())).collect();
+        let more = if keys.len() > 5 { format!(" and {} more", keys.len() - 5) } else { String::new() };
+        let n = if keys.len() == 1 { "1 attribute".to_string() } else { format!("{} attributes", keys.len()) };
+        s.notify(format!("{name}: the new row leaves out {n} {why}: {}{more}", shown.join(", ")), false);
+    }
 }
 
 /// What writing a value took from it, by field: a notice key ([`notify_loss`]).
 type Losses = Vec<(String, &'static str)>;
 
-/// A new row's values for `fields`: those given (`"attributes"`), else `defaults` (a feature
-/// template's), each as its field holds it, with what that took from each. A value a field can't
-/// hold at all (`soon` in a date field) is refused.
-fn new_row(fields: &[Field], p: &Json, defaults: &[(String, Value)]) -> Result<(Vec<Value>, Losses), String> {
+/// A new row's values for `fields`: those given (`"attributes"`, [`given_attributes`]), else
+/// `defaults` (a feature template's), each as its field holds it, with what that took from each
+/// and the attributes left out. A value a field can't hold at all (`soon` in a date field) is
+/// refused.
+fn new_row(fields: &[Field], p: &Json, defaults: &[(String, Value)]) -> Result<(Vec<Value>, Losses, LeftOut), String> {
     let mut losses = Vec::new();
+    let (given, left_out) = given_attributes(fields, p)?;
     let attrs = fields
         .iter()
-        .map(|f| {
-            // Its name as given, else ignoring case, as fields are found everywhere else.
-            let attributes = p.get("attributes").and_then(Json::as_object);
-            let given = attributes
-                .and_then(|a| a.get(&f.name).or_else(|| a.iter().find(|(k, _)| k.eq_ignore_ascii_case(&f.name)).map(|(_, v)| v)))
-                .map(Value::from_json);
+        .zip(given)
+        .map(|(f, given)| {
+            let given = given.map(Value::from_json);
             let default = defaults.iter().find(|(k, _)| k.eq_ignore_ascii_case(&f.name)).map(|(_, v)| v.clone());
             let value = given.or(default).unwrap_or(Value::Null);
             if non_finite_input(&value, f.ty) {
@@ -205,7 +235,7 @@ fn new_row(fields: &[Field], p: &Json, defaults: &[(String, Value)]) -> Result<(
             Ok(coerced)
         })
         .collect::<Result<Vec<Value>, String>>()?;
-    Ok((attrs, losses))
+    Ok((attrs, losses, left_out))
 }
 
 /// Says what writing a value of `field`, in row `row` of layer or table `name`, took from it.
@@ -794,26 +824,76 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     Ok(json!({"rulesRemoved": removed_rules}))
 }
 
+/// A table calculation's input and result. Shared input rows let landing detect concurrent edits
+/// without scanning them; the completed rows are swapped in as one ordinary undoable edit.
+struct TableCalculation {
+    opened: u64,
+    id: u32,
+    input: Dataset,
+    result: Result<(Dataset, Cuts, usize), String>,
+}
+
+/// Calculates a standalone table off the desktop frame, including writing its new rows. Layers
+/// retain their existing calculation path, which also applies their editing rules.
+pub(crate) fn calculate_ahead(s: &Session, p: &Json) -> Result<Option<super::reads::ReadWork>, String> {
+    let Target::Table(i) = target(s, p)? else { return Ok(None) };
+    let table = s.project.tables.get(i).ok_or("no such table")?;
+    let (opened, id, input, p) = (s.opened, table.id, table.dataset.clone(), p.clone());
+    Ok(Some(super::reads::ahead("Calculate Field", "edit.calculateField".into(), move || {
+        let result = calculate_table(&input, &p);
+        TableCalculation { opened, id, input, result }
+    })))
+}
+
+/// Evaluates and writes a table on its worker, checking Cancel between rows. An expression's
+/// evaluation on one row and the shared row storage's first copy cannot be interrupted;
+/// cancellation never installs partial output.
+fn calculate_table(input: &Dataset, p: &Json) -> Result<(Dataset, Cuts, usize), String> {
+    let fi = input.field_index(ps(p, "field").ok_or("field is required")?).ok_or("no field")?;
+    let ty = input.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
+    let expr = ps(p, "expression").map(str::trim).filter(|e| !e.is_empty()).ok_or("expression is required")?;
+    let calc = Calculation::parse(expr, input)?;
+    let (out, cuts, unread) = evaluate(&calc, input, (0..input.features.len()).collect(), ty)?;
+    let mut result = input.clone();
+    rustgis_data::progress::begin(out.len());
+    for (r, v) in out {
+        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
+        if let Some(c) = result.features.get_mut(r).and_then(|f| f.attrs.get_mut(fi)) {
+            *c = v;
+        }
+    }
+    Ok((result, cuts, unread))
+}
+
 /// Sets a field from an expression, on the selected rows or all of them (all of a standalone
-/// table's). It runs on the UI thread: one evaluation of the expression per row of data already
-/// held in memory (a layer read in place is refused, as every `edit.*` command is), with nothing
-/// to read or wait for, and its result is one undo step taken with the project around it.
+/// table's). Desktop table calculations use the read worker with progress and Cancel; landing
+/// refuses changed input instead of recalculating on the frame. Layer edits retain the existing
+/// synchronous path so their editing rules and per-feature undo changes run together.
 fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
     let t = target(s, p)?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let expr = ps(p, "expression").map(str::trim).filter(|e| !e.is_empty()).ok_or("expression is required")?.to_string();
     let Target::Layer(id) = t else {
+        let Target::Table(i) = t else { return Err("no such table".into()) };
         editing_on(s)?;
-        let ds = data_mut(s, t)?;
-        let (ty, field) = ds.fields.get(fi).map(|f| (f.ty, f.name.clone())).ok_or("no field")?;
-        let calc = Calculation::parse(&expr, ds)?;
-        let (out, cuts, unread) = evaluate(&calc, ds, (0..ds.features.len()).collect(), ty);
-        let n = out.len();
-        for (r, v) in out {
-            if let Some(c) = ds.features.get_mut(r).and_then(|f| f.attrs.get_mut(fi)) {
-                *c = v;
+        let table = s.project.tables.get(i).ok_or("no such table")?;
+        let (ty, field) = table.dataset.fields.get(fi).map(|f| (f.ty, f.name.clone())).ok_or("no field")?;
+        let (result, cuts, unread) = match super::reads::take::<TableCalculation>(s, "edit.calculateField") {
+            Some(ahead) => {
+                let table = s.project.tables.get(i).ok_or("no such table")?;
+                if ahead.opened != s.opened
+                    || ahead.id != table.id
+                    || !ahead.input.features.shares(&table.dataset.features)
+                    || ahead.input.fields != table.dataset.fields
+                {
+                    return Err("the table changed while its field was calculated: calculate again".into());
+                }
+                ahead.result?
             }
-        }
+            None => calculate_table(data(s, t)?, p)?,
+        };
+        let n = result.features.len();
+        data_mut(s, t)?.features = result.features;
         calculation_notices(s, &field, ty, cuts, unread);
         return Ok(json!({"rows": n}));
     };
@@ -822,7 +902,7 @@ fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
     let calc = Calculation::parse(&expr, &l.dataset)?;
     let rows: Vec<usize> = if l.selection.is_empty() { (0..l.dataset.features.len()).collect() } else { l.selection.clone() };
     let n = rows.len();
-    let (out, cuts, unread) = evaluate(&calc, &l.dataset, rows, ty);
+    let (out, cuts, unread) = evaluate(&calc, &l.dataset, rows, ty)?;
     let mut changes = Vec::new();
     for (r, v) in out {
         if let Some(f) = l.dataset.features.get_mut(r) {
@@ -842,10 +922,12 @@ fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
 /// `calc` on `rows` of `ds`, each result as a `ty` field holds it: the rows' new values, the
 /// results a whole-number or date field cut, and how many other results it can't hold (text
 /// that isn't a number or a date), which are null.
-fn evaluate(calc: &Calculation, ds: &Dataset, rows: Vec<usize>, ty: FieldType) -> (Vec<(usize, Value)>, Cuts, usize) {
+fn evaluate(calc: &Calculation, ds: &Dataset, rows: Vec<usize>, ty: FieldType) -> Result<(Vec<(usize, Value)>, Cuts, usize), String> {
     let mut out = Vec::with_capacity(rows.len());
     let (mut cuts, mut unread) = (Cuts::default(), 0usize);
+    rustgis_data::progress::begin(rows.len());
     for r in rows {
+        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
         let v = calc.eval(ds, r);
         let asked_null = v.asks_null();
         let (v, cut) = coerce_cut(v, ty);
@@ -853,7 +935,7 @@ fn evaluate(calc: &Calculation, ds: &Dataset, rows: Vec<usize>, ty: FieldType) -
         cuts.add(cut);
         out.push((r, v));
     }
-    (out, cuts, unread)
+    Ok((out, cuts, unread))
 }
 
 /// Says what Calculate Field's results lost in `field` ([`evaluate`]), even when a calculation

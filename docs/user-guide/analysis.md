@@ -51,13 +51,17 @@ A standalone table opens from its right-click menu in Layers and is edited as a 
 double-click a cell to change it, and use the toolbar to add a row, add a field or calculate a
 field over every row; a column's menu converts its field or deletes it (**Delete Field**).
 Cells, new rows and Calculate Field need editing on (**Edit › Edit**); adding, converting and
-deleting fields don't, as for a layer. Each edit is one undo step.
+deleting fields don't, as for a layer. Each edit is one undo step. On the desktop, calculating a
+table's field runs in the background with progress and **Cancel**. If the table changes while
+it runs, the result is refused; calculate again to use the new values.
 
 The `edit.*` commands take the table as `"table"` (its name or id) instead of `"layer"`:
 `edit.setValue`, `edit.addField`, `edit.deleteField`, `edit.convertField`, `edit.calculateField`,
 and `edit.addFeature` with `"attributes"` and no geometry, which adds a row. As for a layer, a
 notice says when a field can't hold a value whole (a fraction in a whole-number field), and when
-an attribute names no field (names are matched ignoring case).
+an attribute names no field. A new row's attributes match exact field names first, then a unique
+match ignoring case; an ambiguous name is refused. When two keys reach the same field, a notice
+names the key left out.
 
 A table's rows live in the project, as they were copied in when it was added: edits change the
 project, not the CSV or other file the table came from. **Export Table** (`share.exportTable`)

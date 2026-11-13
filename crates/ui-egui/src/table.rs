@@ -43,6 +43,7 @@ pub(crate) fn prune_views(app: &mut RustGisApp) {
     // again at 1, so no view carries over.
     if app.table.opened != app.session.opened {
         app.table.views.clear();
+        app.table.editing = None;
         app.table.opened = app.session.opened;
     }
     let project = &app.session.project;
@@ -884,11 +885,13 @@ mod tests {
         app.table.views.insert(ViewKey::Table(id), v);
         prune_views(&mut app);
         assert_eq!(app.table.views.get(&ViewKey::Table(id)).map(|v| v.hidden_count(&fs)), Some(1), "kept in its project");
+        app.table.editing = Some(CellEdit::new(ViewKey::Table(id), 1, 0, "old draft".into()));
         app.session.run("project.new", &json!({})).unwrap();
         let (again, _) = table(&mut app);
         assert_eq!(again, id, "the new project's table takes the same id");
         prune_views(&mut app);
         assert!(app.table.views.is_empty());
+        assert!(app.table.editing.is_none(), "a pending draft must not reach the new project's same-id table");
     }
 
     /// Typing into a cell of a reordered table, with a column hidden before it, writes the field
