@@ -287,8 +287,9 @@ fn eckert_iv_inverse(x: f64, y: f64) -> Option<(f64, f64)> {
     let v = 2.0 * (eckert_iv_g(c.atan2(a)) / (2.0 * (2.0 + half))).sqrt().min(1.0).asin();
     // The sides meet the pole lines at a tangent, so near a corner a rounding error in y moves
     // the side far in x: a point counts as on the outline when it is within the slack of it in
-    // both x and y.
-    let widest = w * pi * (1.0 + cos_at((a - OUTLINE_SLACK / h).max(0.0))) + OUTLINE_SLACK;
+    // both x and y. From y as given, not clamped: a point past the pole line has used some of
+    // its slack.
+    let widest = w * pi * (1.0 + cos_at((s.abs() - OUTLINE_SLACK / h).clamp(0.0, 1.0))) + OUTLINE_SLACK;
     if x.abs() > widest {
         return None;
     }
@@ -411,9 +412,19 @@ mod tests {
                 let dl = (back.x - lon + 540.0).rem_euclid(360.0) - 180.0;
                 let east = dl.to_radians() * lat.to_radians().cos() * MERCATOR_R;
                 let off = north.hypot(east);
-                assert!(off < 0.02, "{w:?} {lon},{lat}: {back:?}, {off} m off");
+                // About 1 cm here; within a few rounding steps of y of a pole, as another
+                // platform's sine and cosine may round, 5 cm.
+                assert!(off < 0.05, "{w:?} {lon},{lat}: {back:?}, {off} m off");
             }
         }
+        // Past a corner by less than the slack in y but far in x: off the outline.
+        let (pi, w, h) = (
+            std::f64::consts::PI,
+            2.0 / (std::f64::consts::PI * (4.0 + std::f64::consts::PI)).sqrt(),
+            2.0 * (std::f64::consts::PI / (4.0 + std::f64::consts::PI)).sqrt(),
+        );
+        assert!(eckert_iv_inverse(w * pi, h).is_some());
+        assert_eq!(eckert_iv_inverse(w * pi + 3e-5, h + 0.9e-9), None);
     }
 
     /// Against pyproj 3.8.0 (PROJ 9.8.1): 10°E 50°N and 120°W 35°S, on PROJ's unit sphere.
