@@ -293,10 +293,9 @@ fn a_saved_project_opens_as_it_was_saved() {
         let mut changed = Vec::new();
         diff("", &before, &seen(&opened), &mut changed);
         compared.set(compared.get() + usize::from(notices.is_empty()));
-        // The one loss saving says (values that aren't finite numbers, written as null) is in
-        // the layers' values; a notice excuses nothing else.
-        let non_finite = notices.iter().any(|n| n.contains("aren't finite numbers"));
-        changed.retain(|c| !declared(c) && !(non_finite && c.contains("/dataset/features/") && c.ends_with(" → null")));
+        // Values that aren't finite numbers, which saving writes as null and says so, are null in
+        // what the user sees before saving too (`Value`'s `Serialize`): nothing is excused.
+        changed.retain(|c| !declared(c));
         if !changed.is_empty() {
             return Err(TestCaseError::fail(format!("changed, saying {notices:?}: {changed:#?}")));
         }
