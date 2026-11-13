@@ -44,7 +44,53 @@ pub struct FgbSource {
     _workspace: Option<Arc<super::gdal::ReloadWorkspace>>,
 }
 
+/// A header read whose native date schema may still need a complete scan. It cannot read
+/// features until finished, so a frame can schedule that work without publishing a text schema.
+pub struct FgbOpen {
+    source: FgbSource,
+    date_columns: Vec<usize>,
+}
+
+impl FgbOpen {
+    /// Whether completing this local open visits every feature.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn needs_scan(&self) -> bool {
+        !self.date_columns.is_empty() && !matches!(self.source.input, Input::Remote(_))
+    }
+
+    /// Completes the schema, checking cancellation between features of a local date scan.
+    pub fn finish(self) -> Result<FgbSource> {
+        let Self { source: mut src, date_columns } = self;
+        if !date_columns.is_empty() {
+            match &src.input {
+                Input::Remote(_) => src.info.notes.push(format!(
+                    "{} date/time columns are kept as ISO text to read this remote FlatGeobuf by range without scanning every feature",
+                    date_columns.len()
+                )),
+                Input::Path(path) => src.classify_dates(BufReader::new(std::fs::File::open(path)?), &date_columns)?,
+                Input::Bytes(bytes) => src.classify_dates(Cursor::new(bytes.clone()), &date_columns)?,
+            }
+        }
+        if src.info.geometry_type == GeometryType::None {
+            src.info.geometry_type = src.peek_kind();
+        }
+        Ok(src)
+    }
+}
+
 impl FgbSource {
+    /// Reads a local header without classifying date columns; finish it on a worker when needed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_path(path: &Path, name: &str) -> Result<FgbOpen> {
+        Self::prepare(BufReader::new(std::fs::File::open(path)?), Input::Path(path.to_path_buf()), name)
+    }
+
+    /// The same staged open for bytes retained by a project, without copying them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_shared(bytes: super::Shared, name: &str) -> Result<FgbOpen> {
+        Self::prepare(Cursor::new(bytes.clone()), Input::Bytes(bytes), name)
+    }
+
     pub fn open_path(path: &Path, name: &str) -> Result<Self> {
         let f = BufReader::new(std::fs::File::open(path)?);
         Self::new(f, Input::Path(path.to_path_buf()), name)
@@ -81,6 +127,11 @@ impl FgbSource {
     /// Opens a FlatGeobuf from its header: schema, extent, coordinate system, and notes (including
     /// Z or M values, which reading drops).
     fn new<R: Read + Seek>(r: R, input: Input, name: &str) -> Result<Self> {
+        Self::prepare(r, input, name)?.finish()
+    }
+
+    /// Reads only metadata; a caller must finish the native date scan before using the source.
+    fn prepare<R: Read + Seek>(r: R, input: Input, name: &str) -> Result<FgbOpen> {
         let reader = open_reader(r)?;
         let h = reader.header();
         let mut notes = Vec::new();
@@ -165,7 +216,7 @@ impl FgbSource {
         if h.has_z() || h.has_m() {
             info.drop_zm((count > 0).then_some(count));
         }
-        let mut src = FgbSource {
+        let src = FgbSource {
             info,
             input,
             reproject,
@@ -173,25 +224,15 @@ impl FgbSource {
             #[cfg(not(target_arch = "wasm32"))]
             _workspace: None,
         };
-        if !date_columns.is_empty() {
-            match &src.input {
-                Input::Remote(_) => src.info.notes.push(format!(
-                    "{} date/time columns are kept as ISO text to read this remote FlatGeobuf by range without scanning every feature",
-                    date_columns.len()
-                )),
-                Input::Path(path) => src.classify_dates(BufReader::new(std::fs::File::open(path)?), &date_columns)?,
-                Input::Bytes(bytes) => src.classify_dates(Cursor::new(bytes.clone()), &date_columns)?,
-            }
-        }
-        if src.info.geometry_type == GeometryType::None {
-            src.info.geometry_type = src.peek_kind();
-        }
-        Ok(src)
+        Ok(FgbOpen { source: src, date_columns })
     }
 
     /// Classifies local DateTime columns by a complete, cancellable pass. Time-only columns
     /// stay text; all-date columns become Date. Remote sources retain text to keep range reads.
+    /// Checks Cancel after each decoded feature; reading and verifying one encoded feature
+    /// cannot be interrupted midway.
     fn classify_dates<R: Read + Seek>(&mut self, reader: R, columns: &[usize]) -> Result<()> {
+        crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
         let mut states = vec![0u8; self.info.fields.len()];
         let mut iter = open_reader(reader)?.select_all().map_err(err)?;
         while let Some(feature) = iter.next().map_err(err)? {

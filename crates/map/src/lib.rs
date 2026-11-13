@@ -704,30 +704,29 @@ impl Layer {
         self.load_all_counted().map(|(ds, _)| ds)
     }
 
-    /// Gives `fields` (the layer's, as a project saved before RustGIS read a source's date columns
-    /// as dates lists them: text, or GeoParquet epoch integers) the source's date types, so the live layer and its whole reads
-    /// and exports say what the source now gives. A field stays text when the layer's definition
-    /// query, a display filter, an attribute rule or a label class reads it as text (comparing it
-    /// with a number) and wouldn't read it as dates, so it keeps working.
-    /// A newly supported Parquet column (such as INT96) can change attribute positions. Refuse an old
-    /// saved schema before changing any field, rather than pairing values with the wrong names.
+    /// Reconciles source dates with a saved schema before installing any source values.
+    /// Old GeoParquet epoch-integer schemas require re-adding the source: changing the type
+    /// alone cannot preserve saved queries, class keys and calculation rules. Newly exposed
+    /// Parquet columns also require matching positions. Other providers retain name matching.
+    /// Text date fields upgrade only when their saved filters and expressions still read.
     fn date_fields_from_source(
         &self,
         fields: &mut [rustgis_data::Field],
         source: &[rustgis_data::Field],
         format: &str,
     ) -> Result<(), String> {
-        // Parquet time-only columns were epoch integers before being read as clock text.
-        // A saved Integer schema cannot safely interpret that representation change.
-        let integer_became_text = format == "GeoParquet"
-            && fields
-                .iter()
-                .zip(source)
-                .any(|(saved, fresh)| saved.ty == rustgis_data::FieldType::Integer && fresh.ty == rustgis_data::FieldType::Text);
-        if integer_became_text
-            || (format == "GeoParquet"
-                && source.iter().any(|f| f.ty.is_temporal())
-                && (fields.len() != source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name)))
+        // Old Parquet readers exposed epoch integers. Their stored queries, class keys and
+        // calculation rules cannot be migrated by changing a field type alone.
+        if format == "GeoParquet"
+            && fields.iter().zip(source).any(|(saved, fresh)| {
+                saved.ty == rustgis_data::FieldType::Integer && (fresh.ty.is_temporal() || fresh.ty == rustgis_data::FieldType::Text)
+            })
+        {
+            return Err("This saved GeoParquet layer lists dates or times as epoch integers. Add the data source again to use its native date schema; saved fields and settings were kept unchanged.".into());
+        }
+        if format == "GeoParquet"
+            && source.iter().any(|f| f.ty.is_temporal())
+            && (fields.len() != source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name))
         {
             return Err(
                 "The source's columns don't match this saved layer's fields. Add the data source again to use its current schema.".into()
@@ -754,35 +753,10 @@ impl Layer {
                 source.iter().find(|s| s.name == f.name)
             };
             let Some(ty) = source_field.filter(|s| s.ty.is_temporal()).map(|s| s.ty) else { continue };
-            // Earlier GeoParquet readers exposed physical epoch integers. Keeping that field
-            // type would make a native-date export replace dates with nulls. Upgrade it, and
-            // refuse a saved expression that the upgrade would invalidate: display filters
-            // and label clauses otherwise skip parse errors without reporting them.
-            if f.ty == rustgis_data::FieldType::Integer {
-                let before = rustgis_data::Dataset::new("", self.dataset.geometry_type, fields.to_vec());
-                let mut after = before.clone();
-                if let Some(f) = after.fields.get_mut(k) {
-                    f.ty = ty;
-                }
-                if filters
-                    .iter()
-                    .any(|q| rustgis_data::query::parse_fields(q, &before).is_ok() && rustgis_data::query::parse_fields(q, &after).is_err())
-                {
-                    return Err("The source now reads epoch dates as date fields, but a saved filter or expression needs numbers. Update those expressions or add the data source again.".into());
-                }
-                fields.clone_from_slice(&after.fields);
-                continue;
-            }
             if f.ty != rustgis_data::FieldType::Text {
                 continue;
             }
             let before = rustgis_data::Dataset::new("", self.dataset.geometry_type, fields.to_vec());
-            let mut after = before.clone();
-            if let Some(f) = after.fields.get_mut(k) {
-                f.ty = ty;
-            }
-            let reads =
-                |q: &str| rustgis_data::query::parse_fields(q, &before).is_err() || rustgis_data::query::parse_fields(q, &after).is_ok();
             // A calculation rule the expression language doesn't read is the earlier calculator's
             // (`issued + 1`), which only the engine parses: one that names the field keeps it text.
             let name = f.name.to_lowercase();
@@ -793,6 +767,12 @@ impl Layer {
                     // (`Date issued + 1`), and matching too much only keeps the field text.
                     && r.expression.to_lowercase().contains(&name)
             });
+            let mut after = before.clone();
+            if let Some(f) = after.fields.get_mut(k) {
+                f.ty = ty;
+            }
+            let reads =
+                |q: &str| rustgis_data::query::parse_fields(q, &before).is_err() || rustgis_data::query::parse_fields(q, &after).is_ok();
             if !calculates && filters.iter().all(|q| reads(q)) {
                 fields.clone_from_slice(&after.fields);
             }
@@ -3254,29 +3234,27 @@ mod tests {
         let mut got = fields.clone();
         layer.date_fields_from_source(&mut got, &source, "GeoParquet").unwrap();
         assert_eq!(got[0].ty, FieldType::Text);
-        // Older GeoParquet projects listed epoch days as integers. Both ordinary reads and
-        // exports must adopt the native date schema; incompatible saved filters stop the upgrade.
-        let old = vec![Field::new("issued", FieldType::Integer)];
-        let mut legacy = Layer::new(2, Dataset::new("legacy", GeometryType::Point, old.clone()));
-        legacy.definition_query = Some("issued >= 20000".into());
-        let mut upgraded = old;
-        assert!(legacy.date_fields_from_source(&mut upgraded, &source, "GeoParquet").unwrap_err().contains("saved filter or expression"));
-        assert_eq!(upgraded[0].ty, FieldType::Integer);
-        legacy.definition_query = None;
-        legacy.display_filters = vec![effects::DisplayFilter {
-            name: "old epoch filter".into(),
-            min_scale: None,
-            max_scale: None,
-            where_: "issued >= 20000".into(),
-        }];
-        assert!(legacy.date_fields_from_source(&mut upgraded, &source, "GeoParquet").is_err());
-        assert_eq!(upgraded[0].ty, FieldType::Integer);
-        legacy.display_filters[0].where_ = "issued >= '2026-01-01'".into();
-        legacy.date_fields_from_source(&mut upgraded, &source, "GeoParquet").unwrap();
-        assert_eq!(upgraded[0].ty, FieldType::Date);
-        let upgraded = Dataset::new("legacy", GeometryType::Point, upgraded);
-        assert!(rustgis_data::query::parse_fields("issued >= 20000", &upgraded).is_err());
-        assert!(rustgis_data::query::parse_fields("issued >= '2026-01-01'", &upgraded).is_ok());
+        // Old epoch schemas need explicit reconciliation: even a filter valid for two
+        // proposed dates cannot account for saved class keys or legacy calculation rules.
+        let old = vec![Field::new("starts_on", FieldType::Integer), Field::new("ends_on", FieldType::Integer)];
+        let source = [Field::new("starts_on", FieldType::Date), Field::new("ends_on", FieldType::Date)];
+        let mut legacy = Layer::new(2, Dataset::new("old epochs", GeometryType::Point, old.clone()));
+        legacy.definition_query = Some("starts_on <= ends_on".into());
+        legacy.dataset.push(None, vec![Value::Int(20000), Value::Int(20001)]);
+        legacy.renderer =
+            Renderer::unique(&legacy.dataset, &[], "starts_on", Ramp::Ember, Symbol::default_for(GeometryType::Point, 0)).unwrap();
+        for query in [None, Some("starts_on <= ends_on")] {
+            legacy.definition_query = query.map(String::from);
+            let mut kept = old.clone();
+            let error = legacy.date_fields_from_source(&mut kept, &source, "GeoParquet").unwrap_err();
+            assert!(error.contains("Add the data source again"));
+            assert_eq!(kept, old);
+            assert_eq!(legacy.renderer.field(), Some("starts_on"));
+        }
+        // Current native-date schemas need no migration, including date-to-date comparisons.
+        let mut current = source.to_vec();
+        legacy.date_fields_from_source(&mut current, &source, "GeoParquet").unwrap();
+        assert!(rustgis_data::query::parse_fields("starts_on <= ends_on", &Dataset::new("", GeometryType::Point, current)).is_ok());
     }
 
     /// Previously omitted INT96 fields can now be present between saved columns, or after them.

@@ -105,12 +105,13 @@ The writer makes a cancellable pass over timestamp columns before writing to cho
 a streamed export reads its source twice.
 If newly available date columns no longer match a saved layer's field positions (for example,
 a formerly unsupported INT96 column), reading or exporting that layer is refused. Add the file
-again to use its current schema; the saved fields are kept unchanged. An epoch-integer date field
-with a saved numeric filter or expression is also refused: update it to compare ISO dates or
-add the source again. An old integer field that
+again to use its current schema; the saved fields are kept unchanged. Saved GeoParquet layers that still list dates as epoch integers are also refused: add the source
+again. Their saved fields, filters and styles are kept unchanged rather than partially migrated. An old integer field that
 now reads as time-only text is refused in the same way.
 FlatGeobuf exports use its native DateTime column type for both dates and date-times. Local
-files are scanned to distinguish date-only columns, date-times and time-only text. Remote
+files are scanned to distinguish date-only columns, date-times and time-only text. Reopening
+a saved desktop layer runs that scan off the window thread, with progress and Cancel in the
+status bar. Remote
 FlatGeobuf date/time columns stay ISO text with a notice so opening them can keep reading by
 range without downloading every feature.
 
