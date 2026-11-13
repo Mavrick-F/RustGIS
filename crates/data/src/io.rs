@@ -2531,8 +2531,9 @@ fn names_note(fields: &[Field], names: Vec<String>, target: &str, what: &str) ->
         .take(5)
         .map(|(old, new)| {
             let (o, n) = (dbf_notice_name(old), dbf_notice_name(new));
-            // A long name made unique keeps its start and gains an ending: show both.
-            let (o, n) = if o == n { (notice_name_ends(old), notice_name_ends(new)) } else { (o, n) };
+            // A name made unique keeps its start and gains an ending, which a cut at the end
+            // hides: cut in the middle instead.
+            let (o, n) = if o == n || n.ends_with('…') { (notice_name_ends(old), notice_name_ends(new)) } else { (o, n) };
             format!("'{o}' → '{n}'")
         })
         .collect();
@@ -2567,7 +2568,8 @@ pub(crate) fn dbf_notice_char(c: char) -> char {
     if c.is_control() || reorders || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c }
 }
 
-/// A bounded field name for a dBase notice, with controls and directional marks flattened.
+/// A field name as a notice shows it: cut after 40 bytes, with controls and directional marks
+/// flattened. [`notice_name_ends`] cuts in the middle instead.
 pub(crate) fn dbf_notice_name(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars().map(dbf_notice_char) {
@@ -2580,24 +2582,26 @@ pub(crate) fn dbf_notice_name(name: &str) -> String {
     out
 }
 
-/// `name` as a notice shows it, like [`dbf_notice_name`] but keeping its first and last 20 bytes
-/// around the cut, for names whose first 40 bytes match.
+/// `name` as a notice shows it, flattened like [`dbf_notice_name`], but cut in the middle: its
+/// first and last 20 bytes, so a name made unique by an ending shows it. Reads no more of the
+/// name than it keeps.
 fn notice_name_ends(name: &str) -> String {
-    let chars: Vec<char> = name.chars().map(dbf_notice_char).collect();
-    if chars.iter().map(|c| c.len_utf8()).sum::<usize>() <= 40 {
-        return chars.into_iter().collect();
+    let len: usize = name.chars().map(|c| dbf_notice_char(c).len_utf8()).sum();
+    if len <= 40 {
+        return name.chars().map(dbf_notice_char).collect();
     }
-    let fit = |cs: &mut dyn Iterator<Item = &char>| {
+    let fit = |chars: &mut dyn Iterator<Item = char>| {
         let mut len = 0;
-        cs.take_while(|c| {
-            len += c.len_utf8();
-            len <= 20
-        })
-        .count()
+        chars
+            .map(dbf_notice_char)
+            .take_while(|c| {
+                len += c.len_utf8();
+                len <= 20
+            })
+            .collect::<Vec<char>>()
     };
-    let (head, tail) = (fit(&mut chars.iter()), fit(&mut chars.iter().rev()));
-    let start: String = chars[..head].iter().collect();
-    let end: String = chars[chars.len() - tail..].iter().collect();
+    let start: String = fit(&mut name.chars()).into_iter().collect();
+    let end: String = fit(&mut name.chars().rev()).into_iter().rev().collect();
     format!("{start}…{end}")
 }
 
