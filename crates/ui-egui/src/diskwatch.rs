@@ -1373,6 +1373,13 @@ mod tests {
         // second's read was prepared before the first replaced the source, so the engine refuses
         // it when it lands (nothing is discarded).
         app.run("ui.reloadData", json!({"layer": id})).unwrap();
+        // The worker observes the file after spawning, not when run() returns. Wait for that
+        // observation so the later replacement really is newer than this reload's baseline.
+        let observed_by = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !crate::readjob::file_observed(&app) {
+            assert!(std::time::Instant::now() < observed_by, "the reload never observed its file");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         replace(3);
         app.run("ui.reloadData", json!({"layer": id})).unwrap();
         let land_all = |app: &mut RustGisApp| {

@@ -303,6 +303,17 @@ fn file_name(path: &str) -> &str {
     std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path)
 }
 
+/// Whether a watched reload has observed its file on the worker. Tests use this boundary to
+/// replace the file after observation, without landing the result or relying on scheduling.
+#[cfg(test)]
+pub(crate) fn file_observed(app: &RustGisApp) -> bool {
+    app.reads
+        .job
+        .as_ref()
+        .and_then(|job| job.seen.as_ref())
+        .is_some_and(|(_, seen)| seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some())
+}
+
 /// Whether a read is under way or waiting.
 fn busy(app: &RustGisApp) -> bool {
     app.reads.job.is_some() || !app.reads.waiting.is_empty()
