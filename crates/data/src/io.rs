@@ -1804,16 +1804,20 @@ fn out_of_lonlat(g: &Geometry) -> bool {
 }
 
 /// The type of a column of text values: Integer or Double when every non-empty value is one,
-/// otherwise (or with no values) Text.
+/// otherwise (or with no values) Text. A number with more digits than a Double holds, such as a
+/// 20-digit identifier, keeps its column Text, so no digit is rounded away.
 pub(crate) fn text_type<'a>(vals: impl Iterator<Item = &'a str>) -> FieldType {
     let mut ty: Option<FieldType> = None;
+    // A whole number a Double can't hold: fine in an Integer column, not in a Double one.
+    let mut whole_past_double = false;
     for v in vals.map(str::trim).filter(|s| !s.is_empty()) {
         let t = if has_leading_zero(v) {
             // Identifiers such as ZIP codes keep their leading zeros.
             FieldType::Text
         } else if v.parse::<i64>().is_ok() {
+            whole_past_double |= !double_holds(v);
             FieldType::Integer
-        } else if v.parse::<f64>().is_ok_and(f64::is_finite) {
+        } else if double_holds(v) {
             FieldType::Double
         } else {
             FieldType::Text
@@ -1823,7 +1827,24 @@ pub(crate) fn text_type<'a>(vals: impl Iterator<Item = &'a str>) -> FieldType {
             Some(prev) => widen(prev, Some(t)),
         });
     }
-    ty.unwrap_or(FieldType::Text)
+    match ty {
+        Some(FieldType::Double) if whole_past_double => FieldType::Text,
+        ty => ty.unwrap_or(FieldType::Text),
+    }
+}
+
+/// Whether a number's text reads as a finite Double with the same significant digits, so the
+/// Double is the number written: `1.50`, `0.1` and `1e300` are; `12345678901234567891` and
+/// `0.12345678901234567891` aren't.
+fn double_holds(v: &str) -> bool {
+    /// The digits of a number's mantissa without leading or trailing zeros.
+    fn digits(s: &str) -> String {
+        let mantissa = s.split(['e', 'E']).next().unwrap_or_default();
+        let all: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+        all.trim_start_matches('0').trim_end_matches('0').to_string()
+    }
+    // `{:e}` writes the shortest digits that read back as the same Double.
+    v.parse::<f64>().is_ok_and(|x| x.is_finite() && digits(v) == digits(&format!("{x:e}")))
 }
 
 /// Types a dataset's Text columns from their values (see [`text_type`]), for readers whose
@@ -4423,6 +4444,18 @@ mod tests {
         assert_eq!(back.value(0, 2), &Value::Text("-abc".into()));
         assert_eq!(back.value(1, 2), &Value::Text("=x".into()));
         assert_eq!(to_csv(&back).unwrap(), once, "export/import is stable");
+    }
+
+    #[test]
+    fn csv_digits_a_number_cannot_hold_stay_text() {
+        let text = "id,share,mixed,n,x\n12345678901234567891,0.12345678901234567891,9007199254740993,7,1.50\n2,0.5,1.5,8,1e300\n";
+        let (ds, _) = read_csv(text, "t").unwrap();
+        let types: Vec<FieldType> = ds.fields.iter().map(|f| f.ty).collect();
+        assert_eq!(types, [FieldType::Text, FieldType::Text, FieldType::Text, FieldType::Integer, FieldType::Double]);
+        assert_eq!(ds.value(0, 0), &Value::Text("12345678901234567891".into()));
+        assert_eq!(ds.value(0, 1), &Value::Text("0.12345678901234567891".into()));
+        assert_eq!(ds.value(0, 2), &Value::Text("9007199254740993".into()), "a whole number past 2^53 in a decimal column");
+        assert_eq!(ds.value(1, 4), &Value::Float(1e300));
     }
 
     /// CSV export writes numbers as stored (#513): through `Display` a 0.4 m² area in km² was 0.
