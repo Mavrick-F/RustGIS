@@ -265,6 +265,7 @@ impl FeatureSource for ShpSource {
         true
     }
     /// Visits located shapes in a spatial request; geometry-less rows belong only to whole reads.
+    /// Counts scanned records and checks Cancel before filtering them.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let encoding = self.encoding.decoder();
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
@@ -284,7 +285,9 @@ impl FeatureSource for ShpSource {
         // their directory or the complete feature collection in memory.
         // Every record id fits u32. This format bound visits them all while keeping SQLite's
         // LIMIT within its signed integer range on 64-bit hosts.
+        crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
         let (matched, complete) = self.index.visit_complete(bounds, |i, place| {
+            crate::progress::step(1)?;
             if u64::from(place.len) > MAX_RECORD {
                 skipped += 1;
                 return Ok(());

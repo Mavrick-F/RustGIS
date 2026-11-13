@@ -335,14 +335,21 @@ impl FeatureSource for GpkgMemSource {
     }
 
     /// Keeps rows without geometry in whole reads; they have no location to match an extent.
+    /// Counts scanned records and checks Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         // A whole read knows its count; an extent, bounded natively or not, is matched as it goes.
         let mut sample = if req.extent.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
         let (mut skipped, mut unread_dates) = (0, Vec::new());
+        let mut failed = None;
+        crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
         self.db
             .rows(&self.table, |rowid, r| {
+                if let Err(e) = crate::progress::step(1) {
+                    failed = Some(e);
+                    return ControlFlow::Break(());
+                }
                 let blob = match r.get(self.geom_col) {
                     Some(Val::Blob(b)) if !super::gpkg_blob::is_whole_empty_blob(b) => b,
                     // A row without geometry (NULL, or an empty one) is kept in a whole read; it
@@ -385,6 +392,9 @@ impl FeatureSource for GpkgMemSource {
                 ControlFlow::Continue(())
             })
             .map_err(err)?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
         Ok(Batch { matched: sample.seen(), complete: sample.complete(), features: sample.items, skipped, unread_dates })
     }
 
@@ -393,7 +403,8 @@ impl FeatureSource for GpkgMemSource {
         true
     }
 
-    /// A scan in table order, keeping and skipping the rows a whole read does.
+    /// A scan in table order, keeping and skipping the rows a whole read does, with progress
+    /// and a Cancel check between records.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         let req = Request { extent, limit: usize::MAX };
@@ -401,8 +412,13 @@ impl FeatureSource for GpkgMemSource {
         let mut out = Batch { complete: true, ..Batch::default() };
         // The visitor's error, which stops the scan.
         let mut failed = None;
+        crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
         self.db
             .rows(&self.table, |rowid, r| {
+                if let Err(e) = crate::progress::step(1) {
+                    failed = Some(e);
+                    return ControlFlow::Break(());
+                }
                 let geometry = match r.get(self.geom_col) {
                     Some(Val::Blob(b)) if !super::gpkg_blob::is_whole_empty_blob(b) => {
                         let Some((envelope, body)) = super::gpkg_blob::split_blob(b) else {

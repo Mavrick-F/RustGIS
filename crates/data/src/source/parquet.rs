@@ -419,6 +419,21 @@ impl FeatureSource for ParquetSource {
         // Without native bounds every group may contain view matches. Scan within the budget,
         // or refuse explicitly: thinning groups first could discard all of a nonempty view.
         let unbounded = req.extent.is_some() && native.is_none();
+        if unbounded {
+            // Every selected group must be scanned before sampling its view matches.
+            for &g in &groups {
+                let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
+                if declared > self.group_rows as u64 {
+                    return Err(DataError::Format(format!(
+                        "GeoParquet: row group {g} has {declared} rows, more than the {} read from one",
+                        self.group_rows
+                    )));
+                }
+                if declared > rows_in(g) as u64 {
+                    return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
+                }
+            }
+        }
         if let Some(file) = &self.remote {
             // Far more rows than the read takes: a sample of row groups evenly spread over them
             // (the read samples their rows), so what is fetched stays near what is shown. No more
@@ -555,6 +570,8 @@ impl FeatureSource for ParquetSource {
     /// read of the same extent. The taken rows of one row group are decoded together before
     /// they are chunked, so the peak is a row group's columns plus a chunk. Null geometry is
     /// retained without an extent filter, keeping its row and attributes in whole exports.
+    /// Checks Cancel between groups and scanned rows; each group's column decoding finishes
+    /// before the next check.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         if self.remote.is_some() {
@@ -565,7 +582,9 @@ impl FeatureSource for ParquetSource {
         let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let mut out = Batch { complete: true, ..Batch::default() };
         let mut base = 0u64;
+        crate::progress::begin(usize::try_from(md.file_metadata().num_rows()).unwrap_or(0));
         for g in 0..md.num_row_groups() {
+            crate::progress::check()?;
             // From the declared row counts, as a read numbers them.
             let start = base;
             let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
@@ -608,6 +627,7 @@ impl FeatureSource for ParquetSource {
                 return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
             }
             for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
+                crate::progress::step(1)?;
                 let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
                     Some(bytes) => {
                         let Some(geometry) = wkb::decode(bytes).and_then(|geom| self.reproject.geometry(geom)) else {

@@ -4133,15 +4133,35 @@ fn a_view_its_system_cant_bound_reads_what_is_in_view() {
                     assert!(g.extent().intersects(&view), "{ext}: feature {} is outside the view", f.id);
                 }
             }
-            if matches!(ext, "shp" | "fgb" | "parquet" | "geojson") {
+            {
                 // Cancel while scanning, not before the read starts; the view needs a complete scan.
                 let probe = crate::progress::tests::Counted::cancelling_after(3);
                 let _guard = crate::progress::install(Some(probe.clone()));
                 assert!(matches!(source.read(&Request { extent: Some(view), limit: 10 }), Err(DataError::Cancelled)), "{ext}");
                 assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 3, "{ext}");
             }
+            if source.visits_chunks() {
+                let probe = crate::progress::tests::Counted::cancelling_after(3);
+                let _guard = crate::progress::install(Some(probe.clone()));
+                assert!(matches!(source.visit_chunks(Some(view), 1 << 20, &mut |_| Ok(())), Err(DataError::Cancelled)));
+                assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 3);
+            }
         }
     }
+}
+
+/// A view match after the row cap must not disappear from an unbounded GeoParquet read.
+#[test]
+fn unbounded_parquet_view_refuses_a_capped_group() {
+    let p = dir().join("capped-view.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    ds.push(Some(Geometry::Point(Coord::new(-81.0, 40.0))), vec![Value::Int(0)]);
+    ds.push(Some(Geometry::Point(Coord::new(-81.0, 0.0))), vec![Value::Int(1)]);
+    write_unbounded_view_fixture(&ds, &p);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_group_rows(1);
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+    let error = source.read(&req).unwrap_err().to_string();
+    assert!(error.contains("more than the 1 read from one"), "{error}");
 }
 
 /// Writes the projected reader fixture, including formats whose public writer accepts only WGS 84.

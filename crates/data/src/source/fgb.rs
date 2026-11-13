@@ -354,7 +354,8 @@ impl FgbSource {
 
     /// Visits the features a complete [`FgbSource::read_with`] of `extent` gives, in the same
     /// order and with the same ids, a chunk at a time. An extent read through the index holds
-    /// the feature numbers it finds (8 bytes each) for the ids, as a read does.
+    /// the feature numbers it finds (8 bytes each) for the ids, as a read does. Counts candidates
+    /// and checks Cancel before filtering, including candidates the view does not keep.
     fn visit_with<R: Read + Seek>(
         &self,
         open: &impl Fn() -> Result<R>,
@@ -382,7 +383,9 @@ impl FgbSource {
         }
         let mut out = Batch { complete: true, ..Batch::default() };
         let mut n = 0u64;
+        crate::progress::begin(iter.features_count().unwrap_or(0));
         while let Some(f) = iter.next().map_err(err)? {
+            crate::progress::step(1)?;
             n += 1;
             let id = numbers.as_ref().and_then(|v| v.get(usize::try_from(n - 1).unwrap_or(usize::MAX)).copied()).unwrap_or(n);
             let geometry = f.to_wkb(CoordDimensions::xy()).ok().as_deref().and_then(wkb::decode).and_then(|g| self.reproject.geometry(g));

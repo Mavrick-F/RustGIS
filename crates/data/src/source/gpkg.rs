@@ -432,6 +432,7 @@ impl FeatureSource for GpkgSource {
     }
 
     /// Samples native-envelope matches, or decoded view matches when the native box is refused.
+    /// Scans count records and check Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
@@ -487,7 +488,9 @@ impl FeatureSource for GpkgSource {
                 // A whole read knows its count; an extent, bounded natively or not, is matched as it goes.
                 let mut sample =
                     if req.extent.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
+                crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
                 while let Some(r) = rows.next().map_err(err)? {
+                    crate::progress::step(1)?;
                     // With an extent, the envelope in the geometry's header says whether the row
                     // matches before anything is decoded; without an envelope, only the decoded
                     // geometry can, so the match is counted after it.
@@ -529,7 +532,8 @@ impl FeatureSource for GpkgSource {
     /// map's reads of the layer go on, and the source's connection isn't held while the visitor
     /// runs; another program writing to the file waits for the scan to end, as for any reader
     /// (outside WAL mode). A file put in place of the one opened is refused (where the system
-    /// says files' identities); a file removed fails as missing.
+    /// says files' identities); a file removed fails as missing. Counts scanned records and checks
+    /// Cancel between them.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         let Some((path, id)) = &self.file else { return Err(DataError::Format("GeoPackage: no file to read".into())) };
@@ -550,7 +554,9 @@ impl FeatureSource for GpkgSource {
         let mut st = conn.prepare(&sql).map_err(err)?;
         let mut rows = st.query([]).map_err(err)?;
         let mut out = Batch { complete: true, ..Batch::default() };
+        crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
         while let Some(r) = rows.next().map_err(err)? {
+            crate::progress::step(1)?;
             match self.feature(r, native.as_ref(), &req, &mut out.unread_dates).map_err(err)? {
                 Row::Feature(f) => {
                     out.matched += 1;

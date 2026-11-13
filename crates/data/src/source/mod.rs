@@ -843,9 +843,18 @@ impl Reproject {
         }
     }
 
+    /// A database's query box: refuse an unbounded view before any whole-table sampling.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn database_extent(&self, e: &Extent) -> Result<Extent> {
+        self.extent_from_lonlat(e)
+            .filter(|n| !n.is_empty() && [n.min_x, n.min_y, n.max_x, n.max_y].iter().all(|v| v.is_finite()))
+            .ok_or_else(unbounded_database_view)
+    }
+
     /// A longitude/latitude extent in native coordinates, or `None` when the system refuses a
     /// place on its edge (one it can't bring back, #1925): the edge's other places no longer bound
-    /// what's inside it, so a read filters nothing rather than leave features out.
+    /// what's inside it. Local reads scan and filter geometry; database reads refuse explicitly
+    /// rather than sample the whole table before filtering.
     pub(crate) fn extent_from_lonlat(&self, e: &Extent) -> Option<Extent> {
         match &self.t {
             None => Some(*e),
@@ -862,6 +871,12 @@ impl Reproject {
             }
         }
     }
+}
+
+/// A refused database view must not become a whole-table sample before local filtering.
+#[cfg(not(target_arch = "wasm32"))]
+fn unbounded_database_view() -> DataError {
+    DataError::Format("the requested view can't be bounded in the database's coordinate system; choose a smaller view".into())
 }
 
 /// A GeoPackage table's `gpkg_spatial_ref_sys` row: organization, its code, and its WKT
