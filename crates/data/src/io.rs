@@ -1850,7 +1850,10 @@ fn double_holds(v: &str) -> bool {
     // 17 digits and zeros, but that Double is 12345678901234567168.
     let whole = v.strip_prefix(['-', '+']).unwrap_or(v);
     if !whole.is_empty() && whole.bytes().all(|b| b.is_ascii_digit()) {
-        return v.parse::<i128>().is_ok_and(|i| v.parse::<f64>().is_ok_and(|x| x.is_finite() && x as i128 == i));
+        // A whole Double's exact digits, written out (no finite Double has more than 309).
+        let digits = whole.trim_start_matches('0');
+        let digits = if digits.is_empty() { "0" } else { digits };
+        return digits.len() <= 309 && v.parse::<f64>().is_ok_and(|x| x.is_finite() && format!("{:.0}", x.abs()) == digits);
     }
     let want = digits(v);
     v.parse::<f64>()
@@ -4473,6 +4476,9 @@ mod tests {
         assert!(double_holds("0.00000000023283064365386962890625") && !double_holds(&"1".repeat(800)));
         // A whole number past i64 with trailing zeros is held only if exactly.
         assert!(!double_holds("12345678901234567000") && double_holds("18446744073709551616"));
+        // At any size, with no saturation: i128::MAX isn't one, 2^200 is.
+        assert!(!double_holds("170141183460469231731687303715884105727"));
+        assert!(double_holds("1606938044258990275541962092341162602522202993782792835301376"));
         // A whole number beside a decimal: 2^60 is a Double exactly, 10^18 + 100 isn't.
         let (ds, _) = read_csv("a,b\n1152921504606846976,1000000000000000100\n0.5,0.5\n", "t").unwrap();
         assert_eq!((ds.fields[0].ty, ds.fields[1].ty), (FieldType::Double, FieldType::Text));
