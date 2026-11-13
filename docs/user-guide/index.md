@@ -425,11 +425,16 @@ were to the bit. An edited shape in a projected system is converted from longitu
 RustGIS holds it, and read back: publishing refuses one that would move by more than one part in
 10¹¹ of its coordinates (a tenth of a millimetre at ten thousand kilometres).
 
+Publishing refuses symbolic links in any source part: add the actual source files instead.
+This keeps each link and its target unchanged.
+
 The new parts are written beside the old ones, with the old parts' file permissions, checked,
 and then renamed into place, the `.shp` last. An OS lock prevents two RustGIS processes from
 publishing the same source at once; a competing publish refuses immediately. The empty
 `.filename.shp.rustgis-lock` sidecar stays beside the source for reuse; the OS releases its lock
-when the publisher finishes or exits. Other programs do not follow this locking protocol. If one fails to land, the old parts are put back;
+when the publisher finishes or exits. On Unix, this empty file is readable across accounts,
+so users sharing the source can lock it without write access to the sidecar. Other programs do
+not follow this locking protocol. If one fails to land, the old parts are put back;
 should putting one back fail too, the message names the temporary file that holds it, beside the
 Shapefile, so it can be renamed back by hand. Sidecars RustGIS doesn't write, such as `.shp.xml`
 metadata, are left alone. The spatial indexes that would no longer match (`.qix`, `.sbn`, `.sbx`)
