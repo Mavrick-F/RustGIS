@@ -710,7 +710,8 @@ impl WorldProjection {
 
 /// How far (degrees of latitude, or of longitude scaled to the ground) a place taken into a
 /// projection may come back from where it was: about 11 m on each axis, 16 m at most. Inside their
-/// areas of use places come back within a centimetre, except at Robinson's table rows, whose pieces
+/// areas of use places come back within a centimetre, except within a ten-thousandth of a degree of
+/// a pole in the authalic-latitude systems (0.2 m) and at Robinson's table rows, whose pieces
 /// overlap by up to 2.5 m.
 const COMES_BACK_DEG: f64 = 1e-4;
 
@@ -737,7 +738,9 @@ fn robinson_edge(native: &proj4rs::Proj, geo: &proj4rs::Proj, wgs84: &proj4rs::P
     // x grows in proportion to the longitude along a parallel: the edge is twice as far as halfway.
     let mut x_half = (centre.0 + side / 2.0, centre.1, 0.0);
     transform(geo, native, &mut x_half).ok()?;
-    if (c.x - x0).abs() > 2.0 * (x_half.0 - x0).abs() * (1.0 + 1e-6) {
+    // On the edge from both sides: a point inside the map refused for another reason isn't moved.
+    let (dx, edge_dx) = ((c.x - x0).abs(), 2.0 * (x_half.0 - x0).abs());
+    if dx > edge_dx * (1.0 + 1e-6) || dx < edge_dx * (1.0 - 1e-6) {
         return None;
     }
     let mut edge = (centre.0 + side, centre.1, 0.0);

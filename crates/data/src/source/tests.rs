@@ -4073,3 +4073,89 @@ fn database_date_text_reads_as_dates_and_counts_the_rest() {
     }
     assert_eq!(unread, [0, 7]);
 }
+
+/// A read of a view whose box the layer's system can't bound (#1925) still matches the view: a
+/// UTM zone 17 layer with 200 points in view, 2000 in the zone outside it and a row without
+/// geometry, read with a limit of 10, gives a sample of the points in view and not the row. Sampling
+/// the whole layer before testing the view would keep about one.
+#[test]
+fn a_view_its_system_cant_bound_reads_what_is_in_view() {
+    let d = dir().join("unbounded-view");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    for i in 0..2200 {
+        let (lat, k) = if i < 200 { (0.0, 25.0 * f64::from(i) / 200.0) } else { (40.0, 40.0 * f64::from(i - 200) / 2000.0) };
+        let lon = -84.0 + 6.0 * f64::from(i % 37) / 37.0;
+        ds.push(Some(Geometry::Point(Coord::new(lon, lat + k))), vec![Value::Int(i64::from(i))]);
+    }
+    ds.push(None, vec![Value::Int(-1)]);
+    let view = Extent::new(-120.0, -30.0, 10.0, 30.0);
+    let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new());
+    assert!(r.extent_from_lonlat(&view).is_none(), "the view's edge is refused");
+    for ext in ["shp", "fgb", "gpkg", "parquet", "geojson"] {
+        let p = d.join(format!("pts.{ext}"));
+        write_unbounded_view_fixture(&ds, &p);
+        let source = open_path(&p, None).unwrap();
+        let mut sources: Vec<&dyn FeatureSource> = vec![source.as_ref()];
+        let memory = if ext == "gpkg" {
+            let bytes = Shared(std::sync::Arc::new(std::fs::read(&p).unwrap()));
+            Some(gpkg_mem::GpkgMemSource::open_shared(bytes, None).unwrap())
+        } else {
+            None
+        };
+        if let Some(memory) = &memory {
+            sources.push(memory);
+        }
+        for source in sources {
+            for limit in [10, 2201] {
+                let read = source.read(&Request { extent: Some(view), limit }).unwrap();
+                if limit == 10 {
+                    // Adaptive sampling keeps between half the limit and the limit.
+                    assert!((5..=10).contains(&read.features.len()), "{ext}: {} features", read.features.len());
+                } else {
+                    // A full view read excludes the null-geometry row and all out-of-view points.
+                    assert_eq!(read.features.len(), 200, "{ext}");
+                    assert!(read.complete, "{ext}");
+                }
+                for f in &read.features {
+                    let g = f.geometry.as_ref().unwrap_or_else(|| panic!("{ext}: feature {} has no geometry", f.id));
+                    assert!(g.extent().intersects(&view), "{ext}: feature {} is outside the view", f.id);
+                }
+            }
+        }
+    }
+}
+
+/// Writes the projected reader fixture, including formats whose public writer accepts only WGS 84.
+fn write_unbounded_view_fixture(ds: &Dataset, path: &Path) {
+    let crs = Crs::from_epsg(32617).unwrap();
+    match path.extension().and_then(|s| s.to_str()).unwrap() {
+        "geojson" => {
+            let projected = crate::io::project(ds, crs).unwrap();
+            let mut json = crate::io::to_geojson(&projected);
+            json["crs"] = serde_json::json!({"type": "name", "properties": {"name": "EPSG:32617"}});
+            std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
+        }
+        "parquet" => {
+            use arrow_array::{BinaryArray, RecordBatch};
+            use arrow_schema::{DataType, Field as AField, Schema};
+            let projected = crate::io::project(ds, crs).unwrap();
+            let wkbs: Vec<_> = projected.features.iter().map(|f| f.geometry.as_ref().map(wkb::encode)).collect();
+            let geometry = BinaryArray::from(wkbs.iter().map(|w| w.as_deref()).collect::<Vec<_>>());
+            let schema = Arc::new(Schema::new(vec![AField::new("geometry", DataType::Binary, true)]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(geometry)]).unwrap();
+            let geo = serde_json::json!({"version": "1.0.0", "primary_column": "geometry", "columns": {"geometry": {
+                "encoding": "WKB", "geometry_types": ["Point"], "crs": {"type": "ProjectedCRS", "id": {"authority": "EPSG", "code": 32617}}
+            }}});
+            let props = ::parquet::file::properties::WriterProperties::builder()
+                .set_key_value_metadata(Some(vec![::parquet::file::metadata::KeyValue::new("geo".into(), geo.to_string())]))
+                .build();
+            let mut writer = ::parquet::arrow::ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        _ => {
+            crate::io::write_path_in(ds, path, crs).unwrap();
+        }
+    }
+}

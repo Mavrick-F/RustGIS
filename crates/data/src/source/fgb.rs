@@ -305,7 +305,8 @@ impl FgbSource {
             return self.read_with(open, req, true);
         }
         // Without an index, an extent is tested on each feature: sample the matches as they come.
-        let late = native.is_some() && indexed.is_none();
+        // That includes one the file's system couldn't bound (`native` is `None`).
+        let late = req.extent.is_some() && indexed.is_none();
         let matched = iter.features_count().map(|n| n as u64).or(self.info.count).unwrap_or(0);
         let mut sample = if late || matched == 0 { Sampler::new(limit) } else { Sampler::with_total(limit, matched) };
         let mut out = Batch::default();

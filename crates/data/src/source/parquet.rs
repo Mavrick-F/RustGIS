@@ -458,7 +458,8 @@ impl FeatureSource for ParquetSource {
             groups.iter().zip(&keep).map(|(&g, k)| k.as_ref().map(|k| k.iter().filter(|&&b| b).count()).unwrap_or(rows_in(g)) as u64).sum();
         // Without a covering, or with nullable inferred bounds, test geometry before sampling
         // for the whole request. Otherwise the match count is known, and every `step`-th is read.
-        let late = native.is_some() && groups.iter().any(|&g| self.needs_geometry_filter(md, g));
+        // An extent the file's system couldn't bound (`native` is `None`) is tested on every row.
+        let late = req.extent.is_some() && (native.is_none() || groups.iter().any(|&g| self.needs_geometry_filter(md, g)));
         let mut sample = if late { Sampler::new(limit) } else { Sampler::with_total(limit, matched) };
         // The rows of each group the sample takes, decided before anything else is read.
         let takes: Vec<Vec<bool>> = groups

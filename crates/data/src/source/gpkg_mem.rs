@@ -338,7 +338,8 @@ impl FeatureSource for GpkgMemSource {
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
-        let mut sample = if native.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
+        // A whole read knows its count; an extent, bounded natively or not, is matched as it goes.
+        let mut sample = if req.extent.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
         let (mut skipped, mut unread_dates) = (0, Vec::new());
         self.db
             .rows(&self.table, |rowid, r| {
@@ -347,7 +348,7 @@ impl FeatureSource for GpkgMemSource {
                     // A row without geometry (NULL, or an empty one) is kept in a whole read; it
                     // has no place to match an extent.
                     Some(Val::Null | Val::Blob(_)) | None => {
-                        if native.is_none() && sample.wants() {
+                        if req.extent.is_none() && sample.wants() {
                             sample.keep(Feature { id: rowid as u64, geometry: None, attrs: self.attrs(r, &mut unread_dates) });
                         }
                         return ControlFlow::Continue(());
@@ -368,7 +369,7 @@ impl FeatureSource for GpkgMemSource {
                 {
                     return ControlFlow::Continue(());
                 }
-                let known = native.is_none() || envelope.is_some();
+                let known = req.extent.is_none() || (native.is_some() && envelope.is_some());
                 if known && !sample.wants() {
                     return ControlFlow::Continue(());
                 }
@@ -423,7 +424,7 @@ impl FeatureSource for GpkgMemSource {
                         Some(geometry)
                     }
                     // Without geometry (NULL, or an empty one): kept unless an extent is asked for.
-                    Some(Val::Null | Val::Blob(_)) | None if native.is_none() => None,
+                    Some(Val::Null | Val::Blob(_)) | None if req.extent.is_none() => None,
                     Some(Val::Null | Val::Blob(_)) | None => return ControlFlow::Continue(()),
                     Some(_) => {
                         out.skipped += 1;

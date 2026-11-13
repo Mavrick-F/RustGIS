@@ -431,6 +431,7 @@ impl FeatureSource for GpkgSource {
         &self.info
     }
 
+    /// Samples native-envelope matches, or decoded view matches when the native box is refused.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
@@ -483,8 +484,9 @@ impl FeatureSource for GpkgSource {
                 let sql = format!("SELECT {} FROM {}", self.select_list(), quote(&self.table));
                 let mut st = conn.prepare(&sql).map_err(err)?;
                 let mut rows = st.query([]).map_err(err)?;
+                // A whole read knows its count; an extent, bounded natively or not, is matched as it goes.
                 let mut sample =
-                    if native.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
+                    if req.extent.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
                 while let Some(r) = rows.next().map_err(err)? {
                     // With an extent, the envelope in the geometry's header says whether the row
                     // matches before anything is decoded; without an envelope, only the decoded
@@ -498,7 +500,7 @@ impl FeatureSource for GpkgSource {
                     {
                         continue;
                     }
-                    let known = native.is_none() || envelope.is_some();
+                    let known = req.extent.is_none() || (native.is_some() && envelope.is_some());
                     if known && !sample.wants() {
                         continue;
                     }
