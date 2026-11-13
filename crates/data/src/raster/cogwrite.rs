@@ -769,7 +769,8 @@ const STRIP_BYTES: u64 = 1 << 20;
 /// start): its directory and tags, then its strips, each made by `rows` (which appends the
 /// samples of a range of rows, interleaved and little-endian), run through the predictor and
 /// compressed with Deflate before the next is made. Classic TIFF when the file can't pass 4 GiB,
-/// BigTIFF otherwise. A cancelled run stops it within a strip.
+/// BigTIFF otherwise. It counts the strips as its progress, and a cancelled run stops it within a
+/// strip.
 pub(super) fn write_strips<W: Write + Seek>(
     img: Strips,
     out: &mut W,
@@ -820,8 +821,9 @@ pub(super) fn write_strips<W: Write + Seek>(
     let effort = if img.classes { DEFLATE_CLASSES } else { DEFLATE_FAST };
     let mut places = vec![Vec::with_capacity(strips)];
     let (mut raw, mut row) = (Vec::new(), Vec::new());
+    crate::progress::begin(strips);
     for y in (0..img.h as usize).step_by(per_strip as usize) {
-        crate::progress::check()?;
+        crate::progress::step(1)?;
         raw.clear();
         rows(y..(y + per_strip as usize).min(img.h as usize), &mut raw)?;
         predict_rows(&mut raw, line, spp, img.sample, predictor, &mut row);
@@ -1367,7 +1369,7 @@ mod tests {
     }
 
     /// A cancelled GeoTIFF or COG write stops with [`DataError::Cancelled`], the COG leaving no
-    /// file; without a probe both are written.
+    /// file; without a probe both are written, and the GeoTIFF writer counts its strips.
     #[test]
     fn a_cancelled_raster_write_stops() {
         use crate::progress::{install, tests::Counted};
@@ -1378,10 +1380,18 @@ mod tests {
         {
             let _g = install(Some(Counted::cancelling_after(2)));
             assert!(matches!(write_file(&r, 0, &path), Err(DataError::Cancelled)));
-            // Cancelled before it starts: the GeoTIFF writer counts nothing.
+            // Cancelled before its first strip.
             let _g = install(Some(Counted::cancelling_after(0)));
             assert!(matches!(geotiff::write(&r, 0), Err(DataError::Cancelled)));
         }
+        // The GeoTIFF writer counts its strips: 1100 rows of 4400 bytes, 238 to a strip.
+        let counted = std::sync::Arc::new(Counted::default());
+        {
+            let _g = install(Some(counted.clone()));
+            assert!(geotiff::write(&r, 0).is_ok());
+        }
+        use std::sync::atomic::Ordering;
+        assert_eq!((counted.done.load(Ordering::Relaxed), counted.total.load(Ordering::Relaxed)), (5, 5));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         write_file(&r, 0, &path).unwrap();
         assert!(geotiff::write(&r, 0).is_ok());
