@@ -161,6 +161,28 @@ mod native {
             Ok(FileSync { files })
         }
 
+        /// The files of the source at `path` as just written: each of `written` (a path and
+        /// the bytes written to it) by those bytes, so a write made since by someone else isn't
+        /// taken for this one; any other part as it is on the disk.
+        pub fn of_written(path: &Path, written: &[(PathBuf, Vec<u8>)]) -> Result<FileSync> {
+            use sha2::Digest;
+            let mut files = Vec::new();
+            for (name, p) in parts(path) {
+                let stamp = match written.iter().find(|(w, _)| *w == p) {
+                    Some((_, bytes)) => Some(FileStamp {
+                        len: bytes.len() as u64,
+                        sha256: sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect(),
+                    }),
+                    None => match len(&p)? {
+                        None => None,
+                        Some(len) => Some(FileStamp { len, sha256: sha256(&p)? }),
+                    },
+                };
+                files.push((name, stamp));
+            }
+            Ok(FileSync { files })
+        }
+
         /// Runs `read`, which reads the source at `path`, and returns with its result the files
         /// as they were just before it ran (`None` when a part couldn't be read). Hashed before
         /// the read, the record can only be older than what was read: a write while it ran, or

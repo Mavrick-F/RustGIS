@@ -397,6 +397,41 @@ can't check it.
 On the desktop, make the layer active and choose **Source File State** in Command Search; what it
 found shows in the status bar. CLI and Python: `source.syncState` with `{"layer":"parcels"}`.
 
+### Publish to source
+
+`source.publish` writes a layer's edits back over the Shapefile it was read from, so the file
+that other people and programs read holds them. A Shapefile can't change one row in place, so
+the whole file is written again, and RustGIS first makes sure that only the edits change. It
+refuses, with nothing written, when:
+
+- the file changed since the layer was read (`source.syncState` would say `sourceChanged` or
+  `both`): writing would overwrite that change;
+- the file, read and written again, wouldn't be the same file: shapes with Z or M values, records
+  without a shape, multipatches, text with spaces before it, columns of a type RustGIS doesn't
+  write (memo, binary). The message names what would change and where;
+- the file can't hold the layer as it is: a feature without a shape, a field name longer than 10
+  bytes, text in characters the file's code page lacks.
+
+The file keeps its code page (its `.cpg` and the language driver in its `.dbf`), each column's
+width, decimals and type where the values still fit, and its `.prj`. A column too narrow for an
+edited value is made wider, and a notice says which. A layer read in another coordinate system
+than its `.prj` names gets a `.prj` for that system, said too. The new parts are written beside
+the old ones, checked, and then renamed into place, the `.shp` last; if any fails, the old parts
+are put back. Sidecars RustGIS doesn't write, such as `.shp.xml` metadata, are left alone; the
+spatial indexes that would no longer match (`.qix`, `.sbn`, `.sbx`) are removed. In a projected
+coordinate system, RustGIS holds the shapes in longitude/latitude, so unedited shapes go through
+that conversion and back: they may move by one part in 10¹¹ of their coordinates at most (a tenth
+of a millimetre at ten thousand kilometres), and anything more is refused.
+
+Once published, the layer reads `inSync`, and the project has a change to save (its record of
+the file). Undo doesn't change the file: undoing an edit made before publishing shows the layer
+as `edited` again. A layer with no edits writes nothing. GeoJSON and layers read in place can't
+be published yet.
+
+On the desktop, make the layer active and choose **Publish to Source** in Command Search; it runs
+in the background, with progress and Cancel in the status bar. CLI and Python: `source.publish`
+with `{"layer":"parcels"}`.
+
 ## Keyboard shortcuts
 
 | Keys | Action |

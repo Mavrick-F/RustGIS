@@ -44,6 +44,7 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str, Start)] = &[
     ("share.exportMap", "Export Map", super::share::map_work),
     ("layout.export", "Export Layout", super::layout::export_work),
     ("report.export", "Export Report", super::report::export_work),
+    ("source.publish", "Publish to Source", super::publish::publish_work),
 ];
 
 /// `command` and what it is called, when the app writes its file on another thread (see

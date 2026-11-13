@@ -2462,6 +2462,12 @@ impl RustGisApp {
             if id == "source.syncState" {
                 return readjob::run_then(self, "source.syncState", params, Some(sync_state_said));
             }
+            // Publishing hashes, reads and writes the whole file: on a thread of its own, with
+            // progress and Cancel, as an export is.
+            if id == "source.publish" {
+                let params = if params.is_null() { json!({}) } else { params };
+                return exportjob::start(self, "source.publish", params);
+            }
             // Converting the labels of a layer read in place reads all of its source first, on a
             // thread of its own, whoever asks (a click, the assistant).
             if id == "labels.convert"

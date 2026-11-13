@@ -2433,6 +2433,7 @@ impl Session {
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
+        self.keep_synced(&cur);
         self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
         self.touch_all_geometry();
         true
@@ -2457,6 +2458,7 @@ impl Session {
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
+        self.keep_synced(&cur);
         self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
         self.touch_all_geometry();
         true
@@ -2473,6 +2475,18 @@ impl Session {
         }
         // Zarr layers that follow the slider read the step it is back at.
         cmd::zarr::follow_time(self);
+    }
+
+    /// After undo or redo swaps the project: each layer keeps the record of its file it had
+    /// (`synced`), as undo doesn't change the file. A layer published since keeps the record of
+    /// what was written, so undoing an edit made before shows it as an edit the file holds.
+    fn keep_synced(&mut self, before: &Project) {
+        for l in self.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            let old = before.maps.iter().flat_map(|m| &m.layers).find(|o| o.instance_id() == l.instance_id());
+            if let Some(old) = old.filter(|o| o.dataset.source == l.dataset.source) {
+                l.synced = old.synced.clone();
+            }
+        }
     }
 
     /// After undo or redo swaps the project: the tile layer picked in the Layers pane stays the one

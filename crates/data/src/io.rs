@@ -603,78 +603,8 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
         "shp" => {
             crate::progress::begin(ds.features.len());
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
-            // Every part is written to a temporary file first and renamed into place only once all
-            // are written, the .shp last, so a failed write leaves the old Shapefile whole.
-            let mut written: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-            let staged = parts.iter().try_for_each(|(e, bytes)| {
-                // The .shp keeps the name given (`Roads.SHP` stays so); the others take its stem.
-                let target = if *e == "shp" { path.to_path_buf() } else { path.with_extension(e) };
-                let tmp = temp_beside(&target)?;
-                let result = write_new(&tmp, bytes);
-                if result.is_ok() {
-                    written.push((tmp, target));
-                }
-                result
-            });
-            // A cancel before the parts land leaves the old Shapefile as it was.
-            if let Err(e) = staged.map_err(DataError::from).and_then(|()| crate::progress::check()) {
-                for (tmp, _) in &written {
-                    let _ = std::fs::remove_file(tmp);
-                }
-                return Err(e);
-            }
-            written.sort_by_key(|(_, target)| target == path);
-            // The old parts are moved aside first and put back if any new part fails to land, so
-            // the old Shapefile stays a matching set.
-            let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-            let mut placed: Vec<std::path::PathBuf> = Vec::new();
-            let mut result = Ok(());
-            for (tmp, target) in &written {
-                // A cancel before the last part lands rolls back like a failed rename.
-                if crate::progress::check().is_err() {
-                    result = Err(std::io::Error::other(DataError::Cancelled));
-                    break;
-                }
-                if target.exists() {
-                    // Any failure here rolls back like a failed rename.
-                    let bak = match temp_beside(target) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            result = Err(e);
-                            break;
-                        }
-                    };
-                    if let Err(e) = std::fs::rename(target, &bak) {
-                        result = Err(e);
-                        break;
-                    }
-                    backups.push((bak, target.clone()));
-                }
-                if let Err(e) = std::fs::rename(tmp, target) {
-                    result = Err(e);
-                    break;
-                }
-                placed.push(target.clone());
-            }
-            if let Err(e) = result {
-                for p in &placed {
-                    let _ = std::fs::remove_file(p);
-                }
-                for (bak, target) in &backups {
-                    let _ = std::fs::rename(bak, target);
-                }
-                for (tmp, _) in &written {
-                    let _ = std::fs::remove_file(tmp);
-                }
-                return Err(e.into());
-            }
-            for (bak, _) in &backups {
-                let _ = std::fs::remove_file(bak);
-            }
-            // A spatial index left from an older file of the same name would no longer match.
-            for stale in ["qix", "sbn", "sbx"] {
-                let _ = std::fs::remove_file(path.with_extension(stale));
-            }
+            let parts: Vec<(std::path::PathBuf, Vec<u8>)> = parts.into_iter().map(|(e, bytes)| (shapefile_part(path, e), bytes)).collect();
+            place_shapefile(path, &stage_shapefile(&parts)?)?;
             Ok((left_out, None))
         }
         _ if crs != Crs::LonLat && !PROJECTED_FORMATS.contains(&ext.as_str()) => {
@@ -686,6 +616,106 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             Ok((left_out, None))
         }
     }
+}
+
+/// The path of the part with extension `ext` of the Shapefile at `path`: the `.shp` keeps the
+/// name given (`Roads.SHP` stays so); the others take its stem.
+pub(crate) fn shapefile_part(path: &Path, ext: &str) -> std::path::PathBuf {
+    if ext == "shp" { path.to_path_buf() } else { path.with_extension(ext) }
+}
+
+/// Writes each of a Shapefile's parts (its path and bytes) to a temporary file beside it, synced
+/// to the disk; returns each temporary file with the part it becomes. Nothing is left behind
+/// when one fails or the run is cancelled (see [`place_shapefile`]).
+pub(crate) fn stage_shapefile(parts: &[(std::path::PathBuf, Vec<u8>)]) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+    let mut written: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let staged = parts.iter().try_for_each(|(target, bytes)| {
+        let tmp = temp_beside(target)?;
+        let result = write_new(&tmp, bytes);
+        if result.is_ok() {
+            written.push((tmp, target.clone()));
+        }
+        result
+    });
+    // A cancel before the parts land leaves the old Shapefile as it was.
+    if let Err(e) = staged.map_err(DataError::from).and_then(|()| crate::progress::check()) {
+        unstage(&written);
+        return Err(e);
+    }
+    Ok(written)
+}
+
+/// Removes the temporary files [`stage_shapefile`] wrote.
+pub(crate) fn unstage(staged: &[(std::path::PathBuf, std::path::PathBuf)]) {
+    for (tmp, _) in staged {
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
+/// Renames each staged part of the Shapefile at `path` ([`stage_shapefile`]) into place, the
+/// `.shp` last, so a failed write leaves the old Shapefile whole: each old part is moved aside
+/// first and put back if any new part fails to land, and a Cancel before the last part lands
+/// rolls back the same way. Once all have landed, the old parts and the spatial indexes that
+/// would no longer match (`.qix`, `.sbn`, `.sbx`) are removed.
+pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::path::PathBuf)]) -> Result<()> {
+    let mut written: Vec<&(std::path::PathBuf, std::path::PathBuf)> = staged.iter().collect();
+    written.sort_by_key(|(_, target)| target == path);
+    let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let mut placed: Vec<std::path::PathBuf> = Vec::new();
+    let mut result = Ok(());
+    for (tmp, target) in written {
+        // A cancel before the last part lands rolls back like a failed rename.
+        if crate::progress::check().is_err() {
+            result = Err(std::io::Error::other(DataError::Cancelled));
+            break;
+        }
+        if target.exists() {
+            // Any failure here rolls back like a failed rename.
+            let bak = match temp_beside(target) {
+                Ok(b) => b,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            if let Err(e) = std::fs::rename(target, &bak) {
+                result = Err(e);
+                break;
+            }
+            backups.push((bak, target.clone()));
+        }
+        if let Err(e) = std::fs::rename(tmp, target) {
+            result = Err(e);
+            break;
+        }
+        placed.push(target.clone());
+    }
+    if let Err(e) = result {
+        for p in &placed {
+            let _ = std::fs::remove_file(p);
+        }
+        // An old part that can't be put back is named, so it isn't lost under its temporary name.
+        let mut kept = Vec::new();
+        for (bak, target) in &backups {
+            if std::fs::rename(bak, target).is_err() {
+                kept.push(format!("{} is kept as {}", target.display(), bak.display()));
+            }
+        }
+        unstage(staged);
+        let e = DataError::from(e);
+        if kept.is_empty() {
+            return Err(e);
+        }
+        return Err(DataError::Format(format!("{e}; putting the old file back failed: {}", kept.join(", "))));
+    }
+    for (bak, _) in &backups {
+        let _ = std::fs::remove_file(bak);
+    }
+    // A spatial index left from an older file of the same name would no longer match.
+    for stale in ["qix", "sbn", "sbx"] {
+        let _ = std::fs::remove_file(path.with_extension(stale));
+    }
+    Ok(())
 }
 
 /// A new temporary name beside `path`, unique per call, so concurrent writes to the same target
@@ -2320,17 +2350,17 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
 }
 
 /// The files of a Shapefile, read into memory.
-struct ShapefileParts {
-    shp: Vec<u8>,
-    shx: Option<Vec<u8>>,
-    dbf: Vec<u8>,
-    prj: Option<String>,
-    cpg: Option<Vec<u8>>,
+pub(crate) struct ShapefileParts {
+    pub shp: Vec<u8>,
+    pub shx: Option<Vec<u8>>,
+    pub dbf: Vec<u8>,
+    pub prj: Option<String>,
+    pub cpg: Option<Vec<u8>>,
 }
 
 /// Decodes attributes and shapes together, tracking geometry lost during CRS conversion so
 /// a later projection definition cannot silently repair an incomplete layer.
-fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
+pub(crate) fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
     use shapefile::Shape;
     use shapefile::dbase::FieldValue;
     use std::io::Cursor;
@@ -2339,6 +2369,7 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
     let encoding = crate::dbf::encoding(parts.cpg.as_deref(), parts.dbf.get(29).copied().unwrap_or(0), &mut encoding_notes);
     crate::dbf::readable_header_date(&mut parts.dbf);
     let date_columns = crate::dbf::dates_as_text(&mut parts.dbf);
+    crate::dbf::floats_as_numeric(&mut parts.dbf);
     let dbf = shapefile::dbase::ReaderBuilder::new()
         .with_encoding(encoding.decoder())
         .build(Cursor::new(parts.dbf))
@@ -2549,7 +2580,7 @@ fn integral_numeric_to_integer(ds: &mut Dataset) {
 }
 
 /// WGS 84 as ESRI WKT, for a Shapefile's `.prj`.
-const WGS84_PRJ: &str = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+pub(crate) const WGS84_PRJ: &str = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
 
 /// The longest prefix of `s` that fits in `max` bytes, cut at a character boundary.
 pub(crate) fn cut(s: &str, max: usize) -> &str {
@@ -3209,40 +3240,137 @@ pub fn shapefile_parts(ds: &Dataset) -> Result<(Vec<(&'static str, Vec<u8>)>, us
 /// As [`shapefile_parts`], for a dataset whose geometry is in `crs`'s coordinates: the `.prj`
 /// says `crs`, and is left out for a system WKT can't describe.
 pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, Vec<u8>)>, usize)> {
+    shapefile_parts_styled(ds, crs, None).map(|(parts, left_out, _)| (parts, left_out))
+}
+
+/// What a Shapefile written over the one a layer was read from keeps of that file's `.dbf`
+/// (#1385): its code page (the encoding its text is written in, and the language driver byte
+/// its header names), and each column's width, decimals and type (`F` stays `F`) where the
+/// layer's field of that name still fits it.
+pub(crate) struct DbfStyle {
+    pub encoding: crate::dbf::DbfEncoding,
+    pub ldid: u8,
+    pub columns: Vec<crate::dbf::Column>,
+}
+
+/// The `.dbf` column a field is written to: its type letter, width and decimals.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Spec {
+    ty: u8,
+    len: u8,
+    decimals: u8,
+}
+
+/// The column field `k` of `ds` is written to as a new file has it: numbers in 18 digits
+/// (integers) or 24 characters with as many decimals as fit, text as wide as its longest value.
+fn new_column(ds: &Dataset, k: usize) -> Spec {
+    let Some(f) = ds.fields.get(k) else { return Spec { ty: b'C', len: 1, decimals: 0 } };
+    match f.ty {
+        // 18 digits: GDAL reads a wider field as a real number.
+        FieldType::Integer => Spec { ty: b'N', len: 18, decimals: 0 },
+        FieldType::Double => Spec { ty: b'N', len: 24, decimals: u8::try_from(dbf_decimals(ds, k)).unwrap_or(15) },
+        FieldType::Boolean => Spec { ty: b'L', len: 1, decimals: 0 },
+        FieldType::Date => Spec { ty: b'D', len: 8, decimals: 0 },
+        // A `.dbf` has no date-time field that other programs read, so they're ISO text.
+        FieldType::Text | FieldType::DateTime => {
+            let longest = ds.features.iter().filter_map(|r| r.attrs.get(k)).map(|v| v.to_string().len()).max().unwrap_or(0);
+            Spec { ty: b'C', len: u8::try_from(longest.clamp(1, 254)).unwrap_or(254), decimals: 0 }
+        }
+    }
+}
+
+/// The column field `k` (written as `name`) is written to over a file whose `.dbf` `style`
+/// describes: the file's column of that name where the field's kind and every value still fit
+/// it, so the file keeps its widths and decimals; otherwise a new one ([`new_column`]), and
+/// `true` when the file had a column of that name and kind that was too small for its values.
+fn kept_column(ds: &Dataset, k: usize, name: &str, style: &DbfStyle) -> (Spec, bool) {
+    let new = new_column(ds, k);
+    let (Some(field), Some(was)) = (ds.fields.get(k), style.columns.iter().find(|c| c.name == name.as_bytes())) else {
+        return (new, false);
+    };
+    let values = || ds.features.iter().filter_map(|r| r.attrs.get(k)).filter(|v| !v.is_null());
+    let ty = was.ty.to_ascii_uppercase();
+    let kept = Spec { ty, len: was.len, decimals: was.decimals };
+    let encoding = style.encoding.decoder();
+    // Bytes of a value's text in the file's code page.
+    let encoded_len = |v: &Value| {
+        use shapefile::dbase::encoding::Encoding;
+        let text = v.to_string();
+        encoding.encode(&text).map_or(text.len(), |b| b.len())
+    };
+    let fits = match (field.ty, ty) {
+        (FieldType::Integer | FieldType::Double, b'N' | b'F') => values().all(|v| {
+            let d = usize::from(was.decimals);
+            dbf_number(v, field.ty, d).is_some_and(|x| {
+                let text = format!("{x:.d$}");
+                text.len() <= usize::from(was.len) && text.parse::<f64>().ok() == v.as_f64()
+            })
+        }),
+        (FieldType::Boolean, b'L') | (FieldType::Date, b'D') => true,
+        (FieldType::Text | FieldType::DateTime, b'C') => values().all(|v| encoded_len(v) <= usize::from(was.len)),
+        // Another kind of field now: a new column, and nothing of the old one to keep.
+        _ => return (new, false),
+    };
+    if fits {
+        return (kept, false);
+    }
+    // Text wider than the file's column: as wide as its longest value, in the file's code page.
+    if new.ty == b'C' {
+        let longest = values().map(encoded_len).max().unwrap_or(0);
+        return (Spec { len: u8::try_from(longest.clamp(usize::from(was.len), 254)).unwrap_or(254), ..new }, true);
+    }
+    (new, true)
+}
+
+/// As [`shapefile_parts_in`], the `.dbf` written as `style` says when it's given (in the file's
+/// code page, its columns kept where the values fit): also returns the names of the fields whose
+/// column was too small for their values and was made wider.
+pub(crate) fn shapefile_parts_styled(
+    ds: &Dataset,
+    crs: Crs,
+    style: Option<&DbfStyle>,
+) -> Result<(Vec<(&'static str, Vec<u8>)>, usize, Vec<String>)> {
     use shapefile::dbase::{FieldName, FieldValue, Record, TableWriterBuilder};
     use std::io::Cursor;
     let fmt = |e: shapefile::Error| DataError::Format(format!("Shapefile: {e}"));
     let names = dbf_names(&ds.fields);
     let dbf_name = |n: &str| FieldName::try_from(n).map_err(|e| DataError::Format(format!("Shapefile: field {n}: {e}")));
-    let mut table = TableWriterBuilder::new();
-    // Per field: decimals of a Double field (numbers too large for 24 characters become null).
-    let mut decimals = vec![0usize; ds.fields.len()];
+    let mut table = match style {
+        Some(style) => TableWriterBuilder::with_encoding(style.encoding.decoder()),
+        None => TableWriterBuilder::new(),
+    };
+    // Per field: its column (numbers too large for it become null), and the fields whose column
+    // was made wider than the file's.
+    let mut specs = Vec::with_capacity(ds.fields.len());
+    let mut widened = Vec::new();
     for (k, (f, n)) in ds.fields.iter().zip(&names).enumerate() {
-        table = match f.ty {
-            // 18 digits: GDAL reads a wider field as a real number.
-            FieldType::Integer => table.add_numeric_field(dbf_name(n)?, 18, 0),
-            FieldType::Double => {
-                let d = dbf_decimals(ds, k);
-                if let Some(slot) = decimals.get_mut(k) {
-                    *slot = d;
+        let spec = match style {
+            Some(style) => {
+                let (spec, wider) = kept_column(ds, k, n, style);
+                if wider {
+                    widened.push(f.name.clone());
                 }
-                table.add_numeric_field(dbf_name(n)?, 24, u8::try_from(d).unwrap_or(15))
+                spec
             }
-            FieldType::Boolean => table.add_logical_field(dbf_name(n)?),
-            FieldType::Date => table.add_date_field(dbf_name(n)?),
-            // A `.dbf` has no date-time field that other programs read, so they're ISO text.
-            FieldType::Text | FieldType::DateTime => {
-                let longest = ds.features.iter().filter_map(|r| r.attrs.get(k)).map(|v| v.to_string().len()).max().unwrap_or(0);
-                table.add_character_field(dbf_name(n)?, u8::try_from(longest.clamp(1, 254)).unwrap_or(254))
-            }
+            None => new_column(ds, k),
         };
+        table = match spec.ty {
+            // A float column is written as a numeric one (both hold the number as text) and
+            // marked `F` again below: `dbase` writes an `F` column's number as an `f32`.
+            b'N' | b'F' => table.add_numeric_field(dbf_name(n)?, spec.len, spec.decimals),
+            b'L' => table.add_logical_field(dbf_name(n)?),
+            b'D' => table.add_date_field(dbf_name(n)?),
+            _ => table.add_character_field(dbf_name(n)?, spec.len),
+        };
+        specs.push(spec);
     }
     let record = |r: &crate::Feature| -> Record {
         let mut rec = Record::default();
         for (k, (f, n)) in ds.fields.iter().zip(&names).enumerate() {
             let v = r.attrs.get(k).unwrap_or(&Value::Null);
+            let decimals = specs.get(k).map_or(0, |s| usize::from(s.decimals));
             let value = match f.ty {
-                FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals.get(k).copied().unwrap_or(0))),
+                FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals)),
                 FieldType::Boolean => FieldValue::Logical(dbf_boolean(v)),
                 FieldType::Date => FieldValue::Date(dbf_date(v).and_then(|d| {
                     let (y, m, d) = d.ymd();
@@ -3326,10 +3454,25 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
         }
     }
     let prj = if crs == Crs::LonLat { Some(WGS84_PRJ.to_string()) } else { crate::raster::wkt::to_wkt(crs) };
-    let mut parts = vec![("shp", shp.into_inner()), ("shx", shx.into_inner()), ("dbf", dbf.into_inner())];
+    let mut dbf = dbf.into_inner();
+    if let Some(style) = style {
+        // The file's language driver, whatever `dbase` takes the encoding for, and its float
+        // columns marked `F` again.
+        if let Some(b) = dbf.get_mut(29) {
+            *b = style.ldid;
+        }
+        for (k, spec) in specs.iter().enumerate() {
+            if spec.ty == b'F'
+                && let Some(b) = dbf.get_mut(32 + k * 32 + 11)
+            {
+                *b = b'F';
+            }
+        }
+    }
+    let mut parts = vec![("shp", shp.into_inner()), ("shx", shx.into_inner()), ("dbf", dbf)];
     parts.extend(prj.map(|p| ("prj", p.into_bytes())));
     parts.push(("cpg", b"UTF-8".to_vec()));
-    Ok((parts, left_out))
+    Ok((parts, left_out, widened))
 }
 
 fn is_outer<P>(r: &shapefile::PolygonRing<P>) -> bool {

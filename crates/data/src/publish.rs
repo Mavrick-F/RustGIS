@@ -1,0 +1,758 @@
+//! Writing a layer kept in the project back over the Shapefile it was read from (#1385), so that
+//! the file shows its edits and keeps everything else it held.
+//!
+//! A Shapefile can't change one row in place: the whole file is written again. That is only
+//! safe when nothing but the edits changes, so [`shapefile`] proves it before it touches the
+//! file, and refuses, saying why, when it can't:
+//!
+//! 1. The file is as it was when the layer was read ([`FileSync::changed`]): a change made since
+//!    would be overwritten. And it reads now as the layer was read: rows that weren't edited are
+//!    written as the file holds them, not as an older read held them.
+//! 2. The file as it was read, written again the same way, holds what the file holds: the same
+//!    shapes (no Z or M values dropped, none left out), the same columns and the same values,
+//!    compared as the bytes the `.dbf` holds, not as read (text a read trims, a code page's
+//!    characters). Whatever a read and write of the file loses shows here, before the edits.
+//! 3. The layer, written, reads back as the layer: every value and shape the edits made fits.
+//!
+//! A shape that wasn't edited is written with the coordinates the file holds, not converted to
+//! longitude/latitude and back, so a projected file's shapes stay as they were to the bit.
+//!
+//! Only then are the new parts written beside the old ones, checked again against the bytes
+//! meant, and renamed into place, the `.shp` last; any failure puts the old parts back
+//! ([`crate::io::place_shapefile`]). The file keeps its code page, column widths, decimals,
+//! `.prj` and `.cpg` where the edits allow; sidecars RustGIS doesn't write (`.shp.xml`) are left.
+
+use crate::dbf::{Column, RawTable};
+use crate::io::{DbfStyle, ShapefileParts};
+use crate::raster::Crs;
+use crate::sync::{FileSync, Synced};
+use crate::{DataError, Dataset, Feature, FieldType, Geometry, Result, Value};
+use std::path::{Path, PathBuf};
+
+/// How far an edited shape may read back from where the layer has it, relative to the size of its
+/// coordinates, in a file in another system than longitude/latitude: the layer's shape is
+/// projected to the file's system and read back through the inverse, which isn't exact to the
+/// last bit (a few parts in 10¹³ measured, in a state plane system in feet). One part in 10¹¹ is
+/// a tenth of a millimetre at ten thousand kilometres; anything more is refused.
+const PROJECTED_TOLERANCE: f64 = 1e-11;
+
+/// A layer written back over its Shapefile: the files as they were written, to record as the
+/// layer's new sync point, the features written, and what it says (fields given wider columns,
+/// a `.prj` that now says another system).
+pub struct Published {
+    pub files: FileSync,
+    pub features: usize,
+    pub notes: Vec<String>,
+}
+
+/// A refusal: nothing was written.
+fn refused(path: &Path, why: impl std::fmt::Display) -> DataError {
+    DataError::Format(format!("{}: {why}; nothing was written", path.display()))
+}
+
+/// The Shapefile at `path`'s parts as they are, read into memory, with its `.cpg`'s path.
+struct Original {
+    shp: Vec<u8>,
+    shx: Option<Vec<u8>>,
+    dbf: Vec<u8>,
+    prj: Option<Vec<u8>>,
+    cpg: Option<(PathBuf, Vec<u8>)>,
+}
+
+/// Reads the file at `p`, `None` when it isn't there; refuses one past what a reader takes.
+fn read_part(p: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::metadata(p) {
+        Ok(m) if m.len() > crate::io::MAX_BYTES => Err(DataError::Format(format!("{} is too large to read", p.display()))),
+        Ok(_) => Ok(Some(std::fs::read(p)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+impl Original {
+    /// Reads the parts of the Shapefile at `path`: its `.shp` and `.dbf` must be there; its
+    /// `.shx`, `.prj` and `.cpg` (in whichever case it is spelled) may be.
+    fn read(path: &Path) -> Result<Original> {
+        let missing = |ext: &str| refused(path, format!("its .{ext} isn't there"));
+        let shp = read_part(path)?.ok_or_else(|| missing("shp"))?;
+        let dbf = read_part(&path.with_extension("dbf"))?.ok_or_else(|| missing("dbf"))?;
+        let shx = read_part(&path.with_extension("shx"))?;
+        let prj = read_part(&path.with_extension("prj"))?;
+        let mut cpg = None;
+        for ext in crate::dbf::CPG_SPELLINGS {
+            let p = path.with_extension(ext);
+            if let Some(bytes) = read_part(&p)? {
+                cpg = Some((p, bytes));
+                break;
+            }
+        }
+        Ok(Original { shp, shx, dbf, prj, cpg })
+    }
+
+    /// Its parts as the reader takes them.
+    fn parts(&self) -> ShapefileParts {
+        ShapefileParts {
+            shp: self.shp.clone(),
+            shx: self.shx.clone(),
+            dbf: self.dbf.clone(),
+            prj: self.prj.as_ref().and_then(|p| String::from_utf8(p.clone()).ok()),
+            cpg: self.cpg.as_ref().map(|(_, b)| b.clone()),
+        }
+    }
+
+    /// The coordinate system its `.prj` names, as the reader takes it (`None` for none, one it
+    /// can't read, or longitude/latitude).
+    fn crs(&self) -> Option<Crs> {
+        let text = std::str::from_utf8(self.prj.as_deref()?).ok()?;
+        crate::raster::wkt::read_wkt(text).ok().map(|(c, _)| c).filter(|c| *c != Crs::LonLat)
+    }
+}
+
+/// Writes `ds`, read whole from the Shapefile at `path` when it and its files were as `synced`
+/// records, back over that Shapefile: see the module's documentation for what it checks first
+/// and what it keeps. Its work grows with the file: it is hashed twice, read twice, written in
+/// memory twice and read back, the hashing and writing counting progress, and it stops once the
+/// run is cancelled (before the last part is placed, which puts the old file back). Reading the
+/// file into memory and back are single steps without a check.
+pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> {
+    let unchanged = |when: &str| -> Result<()> {
+        let changed = synced.files.changed(path)?;
+        if changed.is_empty() {
+            return Ok(());
+        }
+        Err(refused(path, format!("{} changed {when}, and writing the layer would overwrite that", changed.join(", "))))
+    };
+    unchanged("since the layer was read")?;
+    let original = Original::read(path)?;
+    let crs = ds.crs.filter(|c| *c != Crs::LonLat);
+    let written_crs = crs.unwrap_or(Crs::LonLat);
+    let mut notes = Vec::new();
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+
+    let Some(table) = crate::dbf::raw_table(&original.dbf) else {
+        return Err(refused(path, "its .dbf's header doesn't describe its records"));
+    };
+    let mut encoding_notes = Vec::new();
+    let ldid = original.dbf.get(29).copied().unwrap_or(0);
+    let style = DbfStyle {
+        encoding: crate::dbf::encoding(original.cpg.as_ref().map(|(_, b)| b.as_slice()), ldid, &mut encoding_notes),
+        ldid,
+        columns: table.columns.clone(),
+    };
+
+    // 1. It reads as the layer was read: in the layer's system, and in the file's own
+    // coordinates (the system taken for longitude/latitude, which converts nothing).
+    let (as_read, _) = crate::io::read_shapefile_parts(original.parts(), &name, crs)?;
+    if crate::sync::rows_digest(&as_read)? != synced.rows {
+        return Err(refused(
+            path,
+            "it reads otherwise now than when the layer was read (RustGIS reads it more fully since), so rows that weren't edited could change: add the file again to read it as it is",
+        ));
+    }
+    let raw = match crs {
+        Some(_) => Some(crate::io::read_shapefile_parts(original.parts(), &name, Some(Crs::LonLat))?.0),
+        None => None,
+    };
+    let as_held = raw.as_ref().map(|raw| (&as_read, raw));
+
+    // 2. The file as read, written again, is the file.
+    let (again, _, _) = crate::io::shapefile_parts_styled(&*in_file(&as_read, crs, as_held)?, written_crs, Some(&style))?;
+    let part = |parts: &[(&str, Vec<u8>)], ext: &str| parts.iter().find(|(e, _)| *e == ext).map(|(_, b)| b.clone()).unwrap_or_default();
+    if let Some(why) = same_shapes(&original.shp, &part(&again, "shp"), 0.0) {
+        return Err(refused(path, format!("written again, its shapes wouldn't be the same: {why}")));
+    }
+    if let Some(why) = same_table(&table, &part(&again, "dbf")) {
+        return Err(refused(path, format!("written again, its table wouldn't be the same: {why}")));
+    }
+
+    // 3. The layer, written, reads back as the layer.
+    if let Some(note) = crate::io::shapefile_names_note(&ds.fields, &name) {
+        return Err(refused(path, note));
+    }
+    crate::progress::begin(ds.features.len());
+    let (mut parts, left_out, widened) = crate::io::shapefile_parts_styled(&*in_file(ds, crs, as_held)?, written_crs, Some(&style))?;
+    if left_out > 0 {
+        return Err(refused(
+            path,
+            format!("{left_out} of the layer's features have no shape a Shapefile of its kind holds (none, or one of another kind)"),
+        ));
+    }
+    let back = ShapefileParts {
+        shp: part(&parts, "shp"),
+        shx: Some(part(&parts, "shx")),
+        dbf: part(&parts, "dbf"),
+        prj: None,
+        cpg: original.cpg.as_ref().map(|(_, b)| b.clone()),
+    };
+    let (read_back, _) = crate::io::read_shapefile_parts(back, &name, crs)?;
+    if let Some(why) = same_rows(ds, &read_back, if crs.is_some() { PROJECTED_TOLERANCE } else { 0.0 }) {
+        return Err(refused(path, format!("the file couldn't hold the layer as it is: {why}")));
+    }
+    if !widened.is_empty() {
+        notes.push(format!(
+            "{}: {} given wider columns than the file had, to hold their values: {}",
+            path.display(),
+            if widened.len() == 1 { "1 field was".to_string() } else { format!("{} fields were", widened.len()) },
+            names_list(&widened)
+        ));
+    }
+
+    // The `.prj` and `.cpg` as the file had them, unless the layer is in another system.
+    parts.retain(|(e, _)| !matches!(*e, "prj" | "cpg"));
+    if crs == original.crs() {
+        if let Some(prj) = &original.prj {
+            parts.push(("prj", prj.clone()));
+        }
+    } else {
+        let Some(prj) = (match crs {
+            None => Some(crate::io::WGS84_PRJ.to_string()),
+            Some(c) => crate::raster::wkt::to_wkt(c),
+        }) else {
+            return Err(refused(path, format!("the layer is in {}, which a .prj can't describe", written_crs.label())));
+        };
+        notes.push(format!("{}: its .prj now says {}, the system the layer is in", path.display(), written_crs.label()));
+        parts.push(("prj", prj.into_bytes()));
+    }
+    let mut targets: Vec<(PathBuf, Vec<u8>)> = parts.into_iter().map(|(e, bytes)| (crate::io::shapefile_part(path, e), bytes)).collect();
+    if let Some((cpg, bytes)) = &original.cpg {
+        targets.push((cpg.clone(), bytes.clone()));
+    }
+    // The record of the files as they will be, made before any is placed: once they are, the
+    // publish has happened, whatever comes after.
+    let files = FileSync::of_written(path, &targets)?;
+
+    // Written beside the old parts, checked, and placed.
+    let staged = crate::io::stage_shapefile(&targets)?;
+    let checked = (|| -> Result<()> {
+        for ((tmp, _), (_, bytes)) in staged.iter().zip(&targets) {
+            if std::fs::read(tmp)? != *bytes {
+                return Err(refused(path, format!("{} didn't read back as written", tmp.display())));
+            }
+        }
+        unchanged("while the layer was written")
+    })();
+    if let Err(e) = checked {
+        crate::io::unstage(&staged);
+        return Err(e);
+    }
+    crate::io::place_shapefile(path, &staged)?;
+    Ok(Published { files, features: ds.features.len(), notes })
+}
+
+/// `ds` in the file's coordinate system `crs` (`None`: longitude/latitude, as it is held). Given
+/// the file as read and in its own coordinates (`as_held`, the same rows), a feature whose shape
+/// is the one read takes the file's coordinates as they are; any other is projected.
+fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Dataset)>) -> Result<std::borrow::Cow<'a, Dataset>> {
+    let Some(c) = crs else { return Ok(std::borrow::Cow::Borrowed(ds)) };
+    let t = c.transformer().map_err(DataError::Format)?;
+    let (read, raw): (Vec<&Feature>, Vec<&Feature>) = match as_held {
+        Some((read, raw)) => (read.features.iter().collect(), raw.features.iter().collect()),
+        None => (Vec::new(), Vec::new()),
+    };
+    let at: std::collections::HashMap<u64, usize> = read.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+    let mut rows = Vec::with_capacity(ds.features.len());
+    for f in ds.features.iter() {
+        let held = at.get(&f.id).and_then(|&i| read.get(i).filter(|r| r.geometry == f.geometry).and(raw.get(i)));
+        let mut row = f.clone();
+        match held {
+            Some(h) => row.geometry = h.geometry.clone(),
+            None => crate::io::project_features(std::slice::from_mut(&mut row), &t, c)?,
+        }
+        rows.push(row);
+    }
+    let mut out = ds.clone();
+    out.features = rows.into();
+    Ok(std::borrow::Cow::Owned(out))
+}
+
+/// The first few names, quoted, and how many more.
+fn names_list(names: &[String]) -> String {
+    let shown: Vec<String> = names.iter().take(5).map(|n| format!("'{}'", crate::io::dbf_notice_name(n))).collect();
+    let more = if names.len() > 5 { format!(" and {} more", names.len() - 5) } else { String::new() };
+    format!("{}{more}", shown.join(", "))
+}
+
+/// A value's bytes for a notice: decoded loosely, quoted, cut after 40 bytes, control characters as
+/// spaces.
+fn shown(bytes: &[u8]) -> String {
+    format!("'{}'", crate::io::dbf_notice_name(&String::from_utf8_lossy(bytes)))
+}
+
+/// A shape as the file holds it: its kind, and its coordinates part by part.
+fn shape_parts(shape: &shapefile::Shape) -> (&'static str, Vec<Vec<(f64, f64)>>) {
+    use shapefile::Shape;
+    let xy = |ps: &[shapefile::Point]| ps.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>();
+    let xym = |ps: &[shapefile::PointM]| ps.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>();
+    let xyz = |ps: &[shapefile::PointZ]| ps.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>();
+    match shape {
+        Shape::NullShape => ("no shape", Vec::new()),
+        Shape::Point(p) => ("Point", vec![vec![(p.x, p.y)]]),
+        Shape::PointM(p) => ("PointM", vec![vec![(p.x, p.y)]]),
+        Shape::PointZ(p) => ("PointZ", vec![vec![(p.x, p.y)]]),
+        Shape::Multipoint(m) => ("Multipoint", vec![xy(m.points())]),
+        Shape::MultipointM(m) => ("MultipointM", vec![xym(m.points())]),
+        Shape::MultipointZ(m) => ("MultipointZ", vec![xyz(m.points())]),
+        Shape::Polyline(l) => ("Polyline", l.parts().iter().map(|p| xy(p)).collect()),
+        Shape::PolylineM(l) => ("PolylineM", l.parts().iter().map(|p| xym(p)).collect()),
+        Shape::PolylineZ(l) => ("PolylineZ", l.parts().iter().map(|p| xyz(p)).collect()),
+        Shape::Polygon(p) => ("Polygon", p.rings().iter().map(|r| xy(r.points())).collect()),
+        Shape::PolygonM(p) => ("PolygonM", p.rings().iter().map(|r| xym(r.points())).collect()),
+        Shape::PolygonZ(p) => ("PolygonZ", p.rings().iter().map(|r| xyz(r.points())).collect()),
+        Shape::Multipatch(_) => ("Multipatch", Vec::new()),
+    }
+}
+
+/// Whether `a` and `b` are within `tolerance` of each other, relative to their size.
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    a == b || (a - b).abs() <= tolerance * a.abs().max(b.abs()).max(1.0)
+}
+
+/// Whether two lists of parts hold the same coordinates, within `tolerance`.
+fn same_coords(a: &[Vec<(f64, f64)>], b: &[Vec<(f64, f64)>], tolerance: f64) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(p, q)| p.len() == q.len() && p.iter().zip(q).all(|(s, t)| near(s.0, t.0, tolerance) && near(s.1, t.1, tolerance)))
+}
+
+/// Why the shapes of `.shp` file `b` aren't those of `a`, or `None` when they are: one shape for
+/// each, of the same kind, with the same coordinates within `tolerance`. Counts each kind of
+/// difference and names the first shape of it.
+fn same_shapes(a: &[u8], b: &[u8], tolerance: f64) -> Option<String> {
+    let read = |bytes: &[u8]| -> std::result::Result<Vec<shapefile::Shape>, String> {
+        let mut reader = shapefile::ShapeReader::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+        reader.iter_shapes().collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    };
+    let (a, b) = match (read(a), read(b)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return Some(format!("its shapes couldn't be read ({e})")),
+    };
+    let (a, b): (Vec<_>, Vec<_>) = (a.iter().map(shape_parts).collect(), b.iter().map(shape_parts).collect());
+    // Each kind of shape a read leaves out, with the first record holding one.
+    let mut out = Vec::new();
+    for kind in ["no shape", "Multipatch"] {
+        let held: Vec<usize> = a.iter().enumerate().filter(|(_, (k, _))| *k == kind).map(|(i, _)| i + 1).collect();
+        if let Some(first) = held.first() {
+            let what = if kind == "no shape" { "have no shape" } else { "are multipatches" };
+            out.push(format!("{} records {what}, which RustGIS leaves out (the first, record {first})", held.len()));
+        }
+    }
+    if !out.is_empty() {
+        return Some(out.join("; "));
+    }
+    if a.len() != b.len() {
+        return Some(format!("{} shapes would be {}", a.len(), b.len()));
+    }
+    let kinds: Vec<usize> = a.iter().zip(&b).enumerate().filter(|(_, (s, t))| s.0 != t.0).map(|(i, _)| i).collect();
+    if let Some(&first) = kinds.first() {
+        let (was, now) = (a.get(first).map_or("", |s| s.0), b.get(first).map_or("", |s| s.0));
+        let zm = if was.ends_with('Z') || was.ends_with('M') { ", as RustGIS doesn't keep Z or M values" } else { "" };
+        return Some(format!("{} shapes would change kind{zm} (the first, record {}: {was} to {now})", kinds.len(), first + 1));
+    }
+    let moved: Vec<usize> =
+        a.iter().zip(&b).enumerate().filter(|(_, (s, t))| !same_coords(&s.1, &t.1, tolerance)).map(|(i, _)| i).collect();
+    moved.first().map(|first| format!("{} shapes would change (the first, record {})", moved.len(), first + 1))
+}
+
+/// A `.dbf` value as a value, for comparing what two files hold: text without the spaces or NULs
+/// that pad it, a number as the number it says, a date or yes/no without the forms of empty.
+#[derive(PartialEq)]
+enum Cell<'a> {
+    Bytes(&'a [u8]),
+    Number(f64),
+    Empty,
+}
+
+/// What value `bytes` of a column of type `ty` holds ([`Cell`]).
+fn cell(ty: u8, bytes: &[u8]) -> Cell<'_> {
+    let padding = |b: &u8| *b == b' ' || *b == 0;
+    let end = bytes.iter().rposition(|b| !padding(b)).map_or(0, |i| i + 1);
+    let right = bytes.get(..end).unwrap_or_default();
+    let trimmed = right.get(right.iter().position(|b| !padding(b)).unwrap_or(right.len())..).unwrap_or_default();
+    match ty.to_ascii_uppercase() {
+        b'C' => {
+            if right.is_empty() {
+                Cell::Empty
+            } else {
+                Cell::Bytes(right)
+            }
+        }
+        b'N' | b'F' => {
+            if trimmed.is_empty() || trimmed.iter().all(|b| *b == b'*') {
+                return Cell::Empty;
+            }
+            match std::str::from_utf8(trimmed).ok().and_then(|t| t.parse::<f64>().ok()) {
+                Some(x) => Cell::Number(x),
+                None => Cell::Bytes(trimmed),
+            }
+        }
+        b'L' => match trimmed.first().map(u8::to_ascii_uppercase) {
+            Some(b'T' | b'Y' | b'1') => Cell::Bytes(b"T"),
+            Some(b'F' | b'N' | b'0') => Cell::Bytes(b"F"),
+            _ => Cell::Empty,
+        },
+        b'D' if trimmed.is_empty() || trimmed == b"00000000" => Cell::Empty,
+        _ => Cell::Bytes(trimmed),
+    }
+}
+
+/// A column described for a notice: its name, type, width and decimals (`N(10,2)`).
+fn column(c: &Column) -> String {
+    let name = String::from_utf8_lossy(&c.name);
+    let ty = char::from(c.ty);
+    if matches!(c.ty.to_ascii_uppercase(), b'N' | b'F') {
+        format!("'{}' {ty}({},{})", crate::io::dbf_notice_name(&name), c.len, c.decimals)
+    } else {
+        format!("'{}' {ty}({})", crate::io::dbf_notice_name(&name), c.len)
+    }
+}
+
+/// Why the `.dbf` `b` doesn't hold what `a` holds, or `None` when it does: the same columns
+/// (names, types, widths, decimals) and, record by record, the same values ([`cell`]). Counts the
+/// values that differ and names the first.
+fn same_table(a: &RawTable, b: &[u8]) -> Option<String> {
+    let Some(b) = crate::dbf::raw_table(b) else { return Some("its .dbf couldn't be written".into()) };
+    if a.columns.len() != b.columns.len() {
+        return Some(format!("it has {} columns and would have {}", a.columns.len(), b.columns.len()));
+    }
+    let changed: Vec<String> = a
+        .columns
+        .iter()
+        .zip(&b.columns)
+        .filter(|(s, t)| s.name != t.name || !s.ty.eq_ignore_ascii_case(&t.ty) || s.len != t.len || s.decimals != t.decimals)
+        .map(|(s, t)| format!("{} would be {}", column(s), column(t)))
+        .collect();
+    if !changed.is_empty() {
+        return Some(format!("its columns would change: {}", changed.join(", ")));
+    }
+    if a.records.len() != b.records.len() {
+        return Some(format!("{} records would be {}", a.records.len(), b.records.len()));
+    }
+    let mut first = None;
+    let mut count = 0usize;
+    for (row, (r, s)) in a.records.iter().zip(&b.records).enumerate() {
+        for (c, (x, y)) in a.columns.iter().zip(r.iter().zip(s)) {
+            if cell(c.ty, x) != cell(c.ty, y) {
+                count += 1;
+                first.get_or_insert((row, c, *x, *y));
+            }
+        }
+    }
+    first.map(|(row, c, x, y)| {
+        format!(
+            "{count} values would change (the first, record {} of '{}': {} would be {})",
+            row + 1,
+            crate::io::dbf_notice_name(&String::from_utf8_lossy(&c.name)),
+            shown(x),
+            shown(y)
+        )
+    })
+}
+
+/// Whether two values of a field of type `ty` are the same once written to a `.dbf` and read:
+/// numbers by their value (a whole number reads back as an integer), empty text and no value
+/// alike (a `.dbf` can't tell them apart), a date-time by its text.
+fn same_value(ty: FieldType, a: &Value, b: &Value) -> bool {
+    let text = |v: &Value| match v {
+        Value::Null => String::new(),
+        v => v.to_string(),
+    };
+    match (a, b) {
+        _ if a == b => true,
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => a.as_f64() == b.as_f64(),
+        _ if matches!(ty, FieldType::Text | FieldType::DateTime) => text(a) == text(b),
+        _ => false,
+    }
+}
+
+/// A geometry as its parts of coordinates: a point is a part of one, each polygon ring closed
+/// and turned to run the same way whichever way it was drawn (a Shapefile orders a ring's
+/// vertices by whether it is a hole).
+fn geometry_parts(g: Option<&Geometry>) -> Vec<Vec<(f64, f64)>> {
+    let xy = |cs: &[crate::Coord]| cs.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>();
+    match g {
+        None => Vec::new(),
+        Some(Geometry::Point(c)) => vec![vec![(c.x, c.y)]],
+        Some(Geometry::MultiPoint(cs)) => cs.iter().map(|c| vec![(c.x, c.y)]).collect(),
+        Some(Geometry::Line(parts)) => parts.iter().map(|p| xy(p)).collect(),
+        Some(Geometry::Polygon(polys)) => polys
+            .iter()
+            .flatten()
+            .map(|r| {
+                let mut ring = xy(r);
+                if ring.first() != ring.last() {
+                    ring.extend(ring.first().copied());
+                }
+                // Twice the signed area: positive runs anticlockwise.
+                let area: f64 = ring.windows(2).map(|w| w.first().zip(w.get(1)).map_or(0.0, |(p, q)| p.0 * q.1 - q.0 * p.1)).sum();
+                if area < 0.0 {
+                    ring.reverse();
+                }
+                ring
+            })
+            .collect(),
+    }
+}
+
+/// Why `back`, the layer `ds` written to a Shapefile and read again, isn't `ds`, or `None` when
+/// it is: the same fields, features, values ([`same_value`]) and shapes within `tolerance`.
+/// Counts the values and shapes that differ and names the first of each.
+fn same_rows(ds: &Dataset, back: &Dataset, tolerance: f64) -> Option<String> {
+    let names = |d: &Dataset| d.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+    if names(ds) != names(back) {
+        return Some(format!("its fields would read back as {}", names_list(&names(back))));
+    }
+    if ds.features.len() != back.features.len() {
+        return Some(format!("its {} features would read back as {}", ds.features.len(), back.features.len()));
+    }
+    let (mut values, mut first_value, mut shapes, mut first_shape) = (0usize, None, 0usize, None);
+    for (k, (f, g)) in ds.features.iter().zip(back.features.iter()).enumerate() {
+        for (field, (a, b)) in ds.fields.iter().zip(f.attrs.iter().zip(&g.attrs)) {
+            if !same_value(field.ty, a, b) {
+                values += 1;
+                first_value.get_or_insert((k, field.name.clone(), a.clone(), b.clone()));
+            }
+        }
+        // Points are compared as parts of one point each, so a point and a multipoint of one agree.
+        let (p, q) = (geometry_parts(f.geometry.as_ref()), geometry_parts(g.geometry.as_ref()));
+        if !same_coords(&p, &q, tolerance) {
+            shapes += 1;
+            first_shape.get_or_insert(k);
+        }
+    }
+    let mut out = Vec::new();
+    if let Some((k, name, a, b)) = first_value {
+        let show = |v: &Value| if v.is_null() { "empty".to_string() } else { shown(v.to_string().as_bytes()) };
+        out.push(format!(
+            "{values} values would read back otherwise (the first, feature {} of '{}': {} as {})",
+            k + 1,
+            crate::io::dbf_notice_name(&name),
+            show(&a),
+            show(&b)
+        ));
+    }
+    if let Some(k) = first_shape {
+        out.push(format!("{shapes} shapes would read back otherwise (the first, feature {})", k + 1));
+    }
+    (!out.is_empty()).then(|| out.join("; "))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::{Coord, Field, GeometryType};
+
+    /// A small polygon layer of parcels with an owner, an area with decimals and a count.
+    fn parcels() -> Dataset {
+        let mut ds = Dataset::new(
+            "parcels",
+            GeometryType::Polygon,
+            vec![Field::new("OWNER", FieldType::Text), Field::new("ACRES", FieldType::Double), Field::new("UNITS", FieldType::Integer)],
+        );
+        let square = |x: f64| {
+            Geometry::Polygon(vec![vec![vec![
+                Coord::new(x, 35.0),
+                Coord::new(x, 35.1),
+                Coord::new(x + 0.1, 35.1),
+                Coord::new(x + 0.1, 35.0),
+                Coord::new(x, 35.0),
+            ]]])
+        };
+        ds.push(Some(square(-90.0)), vec![Value::Text("Smith".into()), Value::Float(1.25), Value::Int(2)]);
+        ds.push(Some(square(-89.8)), vec![Value::Text("Jones".into()), Value::Float(0.5), Value::Int(1)]);
+        ds
+    }
+
+    /// Writes `ds` as a Shapefile at `path` and reads it back with its sync record.
+    fn written(ds: &Dataset, path: &Path) -> (Dataset, Synced) {
+        crate::io::write_path(ds, path).unwrap();
+        read(path)
+    }
+
+    /// Reads the Shapefile at `path` with its sync record, as Add Data does.
+    fn read(path: &Path) -> (Dataset, Synced) {
+        let (read, files) = FileSync::around(path, || crate::io::read_path(path).unwrap()).unwrap();
+        let rows = crate::sync::rows_digest(&read.0).unwrap();
+        (read.0, Synced { files: files.unwrap(), rows })
+    }
+
+    /// An edit is written back: the file reads as the layer, keeps its columns and `.prj`, and
+    /// its new record matches the files as they are.
+    #[test]
+    fn an_edit_is_written_back_and_the_file_keeps_its_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (mut ds, sync) = written(&parcels(), &path);
+        let prj = std::fs::read(path.with_extension("prj")).unwrap();
+        let columns = crate::dbf::raw_table(&std::fs::read(path.with_extension("dbf")).unwrap()).unwrap().columns;
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text("Smyth".into());
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        assert!(published.notes.is_empty(), "{:?}", published.notes);
+        let (back, _) = crate::io::read_path(&path).unwrap();
+        assert_eq!(back.features.iter().next().unwrap().attrs[0], Value::Text("Smyth".into()));
+        assert_eq!(std::fs::read(path.with_extension("prj")).unwrap(), prj);
+        assert_eq!(crate::dbf::raw_table(&std::fs::read(path.with_extension("dbf")).unwrap()).unwrap().columns, columns);
+        assert!(published.files.changed(&path).unwrap().is_empty());
+        // Nothing left beside it.
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert!(names.iter().all(|n| !n.starts_with('.')), "{names:?}");
+    }
+
+    /// A layer read otherwise than the file reads now (by an older RustGIS, or saved in a
+    /// project that couldn't hold a value) is refused: its unedited rows aren't the file's.
+    #[test]
+    fn a_layer_read_otherwise_than_the_file_reads_now_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (ds, mut sync) = written(&parcels(), &path);
+        // As an older read had it: one value otherwise.
+        let mut older = ds.clone();
+        let mut rows: Vec<_> = older.features.iter().cloned().collect();
+        rows[0].attrs[1] = Value::Float(1.2);
+        older.features = rows.into();
+        sync.rows = crate::sync::rows_digest(&older).unwrap();
+        let e = shapefile(&older, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("reads otherwise now") && e.contains("nothing was written"), "{e}");
+    }
+
+    /// A file changed since it was read is never written over.
+    #[test]
+    fn a_changed_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (ds, sync) = written(&parcels(), &path);
+        let other = Dataset { features: ds.features.iter().take(1).cloned().collect::<Vec<_>>().into(), ..ds.clone() };
+        crate::io::write_path(&other, &path).unwrap();
+        let before = std::fs::read(path.with_extension("dbf")).unwrap();
+        let e = shapefile(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("changed since the layer was read") && e.contains("nothing was written"), "{e}");
+        assert_eq!(std::fs::read(path.with_extension("dbf")).unwrap(), before);
+    }
+
+    /// Text in a code page is written back in it, with the file's language driver; a character
+    /// the code page can't hold is refused rather than written as something else.
+    #[test]
+    fn a_code_page_is_kept_and_what_it_cant_hold_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        crate::io::write_path(&parcels(), &path).unwrap();
+        // The same file in Windows-1252: its `.cpg` says so.
+        std::fs::write(path.with_extension("cpg"), "1252").unwrap();
+        let (mut ds, sync) = read(&path);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text("Muñoz".into());
+        ds.features = rows.clone().into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        // The record of what was published, as the layer takes it.
+        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&ds).unwrap() };
+        let dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        assert!(dbf.windows(5).any(|w| w == b"Mu\xf1oz"), "written in Windows-1252");
+        assert_eq!(std::fs::read(path.with_extension("cpg")).unwrap(), b"1252");
+        assert_eq!(crate::io::read_path(&path).unwrap().0.features.iter().next().unwrap().attrs[0], Value::Text("Muñoz".into()));
+        // A character Windows-1252 doesn't have.
+        rows[1].attrs[0] = Value::Text("Łukasz".into());
+        ds.features = rows.into();
+        let e = shapefile(&ds, &path, &synced).err().unwrap().to_string();
+        assert!(e.contains("couldn't hold the layer") && e.contains("Łukasz"), "{e}");
+        assert_eq!(std::fs::read(path.with_extension("dbf")).unwrap(), dbf);
+    }
+
+    /// What a read loses is refused before the edits are: text a read trims, a feature without a
+    /// shape, a number too precise for the column.
+    #[test]
+    fn what_a_read_loses_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        crate::io::write_path(&parcels(), &path).unwrap();
+        // The first owner with a space before it, as another program may have written it.
+        let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        let at = dbf.windows(5).position(|w| w == b"Smith").unwrap();
+        dbf.splice(at..at + 5, *b" Smit");
+        std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
+        let (ds, sync) = read(&path);
+        let e = shapefile(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("table wouldn't be the same") && e.contains("' Smit'"), "{e}");
+    }
+
+    /// A float (`F`) column reads every digit its text holds, not the seven of an `f32`, and is
+    /// written back as an `F` column with its width and decimals.
+    #[test]
+    fn a_float_column_keeps_its_digits_and_its_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let mut ds = parcels();
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[1] = Value::Float(123456.12345678);
+        ds.features = rows.into();
+        crate::io::write_path(&ds, &path).unwrap();
+        // ACRES, the second column, made a float column as other programs write one.
+        let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        dbf[32 + 32 + 11] = b'F';
+        std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
+        let (mut ds, sync) = read(&path);
+        assert_eq!(ds.features.iter().next().unwrap().attrs[1], Value::Float(123456.12345678));
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[1].attrs[0] = Value::Text("Jonas".into());
+        ds.features = rows.into();
+        shapefile(&ds, &path, &sync).unwrap();
+        let columns = crate::dbf::raw_table(&std::fs::read(path.with_extension("dbf")).unwrap()).unwrap().columns;
+        assert_eq!(columns[1].ty, b'F');
+        assert_eq!(crate::io::read_path(&path).unwrap().0.features.iter().next().unwrap().attrs[1], Value::Float(123456.12345678));
+    }
+
+    /// A widened column is said; a layer in another system gets a `.prj` for it, said too.
+    #[test]
+    fn a_wider_value_widens_its_column_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (mut ds, sync) = written(&parcels(), &path);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text("Smith and Jones Holdings".into());
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        assert_eq!(published.notes.len(), 1, "{:?}", published.notes);
+        assert!(published.notes[0].contains("1 field was given wider columns") && published.notes[0].contains("'OWNER'"));
+        let (back, _) = crate::io::read_path(&path).unwrap();
+        assert_eq!(back.features.iter().next().unwrap().attrs[0], Value::Text("Smith and Jones Holdings".into()));
+    }
+
+    /// A projected file's unedited shapes stay where they were, to the tolerance.
+    #[test]
+    fn a_projected_file_keeps_its_unedited_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        // UTM in metres, and a state plane system in US feet.
+        for code in ["EPSG:32616", "EPSG:2274"] {
+            let crs = Crs::parse(code).unwrap();
+            let mut ds = parcels();
+            ds.crs = Some(crs);
+            crate::io::write_path_in(&ds, &path, crs).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let (mut ds, sync) = read(&path);
+            let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+            rows[1].attrs[2] = Value::Int(3);
+            ds.features = rows.into();
+            shapefile(&ds, &path, &sync).unwrap();
+            // Every shape as it was, to the bit: none was edited.
+            assert!(same_shapes(&before, &std::fs::read(&path).unwrap(), 0.0).is_none(), "{code}");
+            // A shape moved is projected; the others stay as they were.
+            let (mut ds, sync) = read(&path);
+            let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+            if let Some(Geometry::Polygon(polys)) = &mut rows[1].geometry {
+                polys[0][0][1].y += 0.01;
+            }
+            ds.features = rows.into();
+            shapefile(&ds, &path, &sync).unwrap();
+            let shapes = |b: &[u8]| -> Vec<_> {
+                let mut r = shapefile::ShapeReader::new(std::io::Cursor::new(b.to_vec())).unwrap();
+                r.iter_shapes().map(|s| shape_parts(&s.unwrap()).1).collect()
+            };
+            let (was, now) = (shapes(&before), shapes(&std::fs::read(&path).unwrap()));
+            assert_eq!(was[0], now[0], "{code}");
+            assert_ne!(was[1], now[1], "{code}");
+        }
+    }
+}
