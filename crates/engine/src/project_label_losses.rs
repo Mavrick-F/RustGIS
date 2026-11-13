@@ -309,12 +309,15 @@ pub(super) fn notices_for_maps(text: &str, project: &Project, maps_only: bool) -
 }
 
 /// The same audit for a map file read on its own; unreadable label settings give no notice
-/// (the map itself was read, so its labels were too). Diagram notices only with `diagrams`
-/// (an import that takes the layers' diagrams).
+/// (the map itself was read, so its labels were too). Diagram and reference scale notices only
+/// with `diagrams` (an import that takes the layers whole, not only their styles).
 pub(crate) fn map_notices(text: &str, map: &rustgis_map::Map, diagrams: bool) -> Vec<String> {
     // The layers' own state still says whether a diagram is hidden when the audit can't read them.
     let Ok(raw) = serde_json::from_str::<Map>(text) else { return only(hidden(map.layers.iter()), diagrams) };
     let mut notices = count(raw.layers.iter(), map.layers.iter().map(|l| &l.labels), &map.name, "the map file");
+    if diagrams {
+        notices.extend(refused_reference_scales(raw.layers.iter()));
+    }
     notices.extend(hidden(map.layers.iter()));
     only(notices, diagrams)
 }
@@ -323,6 +326,9 @@ pub(crate) fn map_notices(text: &str, map: &rustgis_map::Map, diagrams: bool) ->
 pub(crate) fn layer_notices(text: &str, layer: &rustgis_map::Layer, diagrams: bool) -> Vec<String> {
     let Ok(raw) = serde_json::from_str::<Layer>(text) else { return only(hidden(std::iter::once(layer)), diagrams) };
     let mut notices = count(std::iter::once(&raw), std::iter::once(&layer.labels), &layer.name, "the layer file");
+    if diagrams {
+        notices.extend(refused_reference_scales(std::iter::once(&raw)));
+    }
     notices.extend(hidden(std::iter::once(layer)));
     only(notices, diagrams)
 }
