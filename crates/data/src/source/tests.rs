@@ -3605,7 +3605,15 @@ fn native_file_dates_preserve_zone_policy_and_fractional_seconds() {
             ],
         );
     }
-    let bytes = parquet::write(&ds).unwrap();
+    let bytes = {
+        use std::sync::atomic::Ordering;
+        let progress = Arc::new(crate::progress::tests::Counted::default());
+        let _guard = crate::progress::install(Some(progress.clone()));
+        crate::progress::begin(ds.features.len());
+        let bytes = parquet::write(&ds).unwrap();
+        assert_eq!(progress.done.load(Ordering::Relaxed), ds.features.len() as u64, "the layout pass must not count written rows");
+        bytes
+    };
     let arrow = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone())).unwrap();
     assert_eq!(arrow.schema().field_with_name("day").unwrap().data_type(), &DataType::Date32);
     assert_eq!(arrow.schema().field_with_name("local").unwrap().data_type(), &DataType::Timestamp(TimeUnit::Microsecond, None));
@@ -3638,6 +3646,16 @@ fn native_file_dates_preserve_zone_policy_and_fractional_seconds() {
     assert!(note.contains("1 value couldn't be written"));
     let (bad, _) = crate::io::read_bytes("bad.parquet", &parquet::write(&ds).unwrap()).unwrap();
     assert!(bad.features[0].attrs[0].is_null());
+    // Date fields accept the same unzoned midnight text as stored-value conversion;
+    // non-midnight times and zoned midnight still cannot be narrowed to a calendar date.
+    for (text, valid) in [("2026-03-05T00:00:00", true), ("2026-03-05T00:00:01", false), ("2026-03-05T00:00:00Z", false)] {
+        ds.features[0].attrs[0] = Value::Text(text.into());
+        let (read, _) = crate::io::read_bytes("midnight.parquet", &parquet::write(&ds).unwrap()).unwrap();
+        assert_eq!(read.features[0].attrs[0].is_null(), !valid, "{text}");
+        if valid {
+            assert_eq!(read.features[0].attrs[0], Value::parse("2026-03-05", FieldType::Date));
+        }
+    }
 }
 
 /// FlatGeobuf has a shared DateTime wire type. Local classification sees the whole column;

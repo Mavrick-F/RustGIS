@@ -709,7 +709,7 @@ impl Layer {
     /// and exports say what the source now gives. A field stays text when the layer's definition
     /// query, a display filter, an attribute rule or a label class reads it as text (comparing it
     /// with a number) and wouldn't read it as dates, so it keeps working.
-    /// A newly supported column (such as INT96) can change attribute positions. Refuse an old
+    /// A newly supported Parquet column (such as INT96) can change attribute positions. Refuse an old
     /// saved schema before changing any field, rather than pairing values with the wrong names.
     fn date_fields_from_source(
         &self,
@@ -725,7 +725,8 @@ impl Layer {
                 .zip(source)
                 .any(|(saved, fresh)| saved.ty == rustgis_data::FieldType::Integer && fresh.ty == rustgis_data::FieldType::Text);
         if integer_became_text
-            || (source.iter().any(|f| f.ty.is_temporal())
+            || (format == "GeoParquet"
+                && source.iter().any(|f| f.ty.is_temporal())
                 && (fields.len() != source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name)))
         {
             return Err(
@@ -746,14 +747,30 @@ impl Layer {
             .collect();
         for k in 0..fields.len() {
             let Some(f) = fields.get(k) else { continue };
-            let Some(ty) = source.get(k).filter(|s| s.ty.is_temporal()).map(|s| s.ty) else { continue };
+            let source_field = if format == "GeoParquet" {
+                source.get(k)
+            } else {
+                // Other formats keep their existing name-based date upgrade behavior.
+                source.iter().find(|s| s.name == f.name)
+            };
+            let Some(ty) = source_field.filter(|s| s.ty.is_temporal()).map(|s| s.ty) else { continue };
             // Earlier GeoParquet readers exposed physical epoch integers. Keeping that field
             // type would make a native-date export replace dates with nulls. Upgrade it, and
-            // let an old numeric filter report its type error rather than silently miscompare.
+            // refuse a saved expression that the upgrade would invalidate: display filters
+            // and label clauses otherwise skip parse errors without reporting them.
             if f.ty == rustgis_data::FieldType::Integer {
-                if let Some(f) = fields.get_mut(k) {
+                let before = rustgis_data::Dataset::new("", self.dataset.geometry_type, fields.to_vec());
+                let mut after = before.clone();
+                if let Some(f) = after.fields.get_mut(k) {
                     f.ty = ty;
                 }
+                if filters
+                    .iter()
+                    .any(|q| rustgis_data::query::parse_fields(q, &before).is_ok() && rustgis_data::query::parse_fields(q, &after).is_err())
+                {
+                    return Err("The source now reads epoch dates as date fields, but a saved filter or expression needs numbers. Update those expressions or add the data source again.".into());
+                }
+                fields.clone_from_slice(&after.fields);
                 continue;
             }
             if f.ty != rustgis_data::FieldType::Text {
@@ -3238,11 +3255,23 @@ mod tests {
         layer.date_fields_from_source(&mut got, &source, "GeoParquet").unwrap();
         assert_eq!(got[0].ty, FieldType::Text);
         // Older GeoParquet projects listed epoch days as integers. Both ordinary reads and
-        // exports must adopt the native date schema; numeric queries then fail explicitly.
+        // exports must adopt the native date schema; incompatible saved filters stop the upgrade.
         let old = vec![Field::new("issued", FieldType::Integer)];
         let mut legacy = Layer::new(2, Dataset::new("legacy", GeometryType::Point, old.clone()));
         legacy.definition_query = Some("issued >= 20000".into());
         let mut upgraded = old;
+        assert!(legacy.date_fields_from_source(&mut upgraded, &source, "GeoParquet").unwrap_err().contains("saved filter or expression"));
+        assert_eq!(upgraded[0].ty, FieldType::Integer);
+        legacy.definition_query = None;
+        legacy.display_filters = vec![effects::DisplayFilter {
+            name: "old epoch filter".into(),
+            min_scale: None,
+            max_scale: None,
+            where_: "issued >= 20000".into(),
+        }];
+        assert!(legacy.date_fields_from_source(&mut upgraded, &source, "GeoParquet").is_err());
+        assert_eq!(upgraded[0].ty, FieldType::Integer);
+        legacy.display_filters[0].where_ = "issued >= '2026-01-01'".into();
         legacy.date_fields_from_source(&mut upgraded, &source, "GeoParquet").unwrap();
         assert_eq!(upgraded[0].ty, FieldType::Date);
         let upgraded = Dataset::new("legacy", GeometryType::Point, upgraded);
@@ -3289,6 +3318,25 @@ mod tests {
         let mut fresh = source.clone();
         layer.date_fields_from_source(&mut fresh, &source, "GeoParquet").unwrap();
         assert_eq!(fresh, source);
+    }
+
+    /// Parquet's newly exposed columns need positional validation; other providers retain
+    /// their name-based date upgrades when an unrelated source column is added or removed.
+    #[test]
+    fn non_parquet_date_upgrades_keep_name_matching_for_changed_schemas() {
+        let old = vec![Field::new("issued", FieldType::Text), Field::new("name", FieldType::Text)];
+        let layer = Layer::new(1, Dataset::new("permits", GeometryType::Point, old.clone()));
+        for source in [
+            vec![Field::new("extra", FieldType::Integer), Field::new("issued", FieldType::Date), old[1].clone()],
+            vec![Field::new("issued", FieldType::Date)],
+        ] {
+            for format in ["GeoPackage", "Shapefile", "CSV"] {
+                let mut fields = old.clone();
+                layer.date_fields_from_source(&mut fields, &source, format).unwrap();
+                assert_eq!(fields[0].ty, FieldType::Date);
+                assert_eq!(fields[1], old[1]);
+            }
+        }
     }
 
     fn points() -> Dataset {

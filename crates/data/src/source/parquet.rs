@@ -1443,7 +1443,7 @@ fn date_cell(v: &Value) -> Option<crate::Date> {
     match v {
         Value::Date(d) => Some(*d),
         Value::DateTime(t) if t.is_date() => Some(t.date()),
-        Value::Text(s) => crate::Date::parse(s),
+        Value::Text(s) => crate::DateTime::parse(s).filter(|t| t.is_date()).map(|t| t.date()),
         _ => None,
     }
 }
@@ -1510,6 +1510,8 @@ pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<String> {
 /// `WRITE_GROUP_ROWS` rows, so only one run is held (a run's last group can be smaller, and a
 /// streamed export's groups end with its chunks); the geometry types and bounding box the `geo`
 /// metadata gives are gathered as the rows go and written with the footer.
+/// Timestamp columns require replaying the feed before writing, to select one Parquet timezone
+/// flag per column without buffering the source. That pass checks Cancel but counts no writes.
 pub(crate) fn write_features<W: std::io::Write + Send>(
     geometry_type: GeometryType,
     fields: &[Field],
@@ -1527,7 +1529,7 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
     if fields.iter().any(|f| f.ty == FieldType::DateTime) {
         feed(&mut |rows| {
             for chunk in rows.chunks(BATCH) {
-                crate::progress::step(chunk.len())?;
+                crate::progress::check()?;
                 layout.add(fields, chunk);
             }
             Ok(())
