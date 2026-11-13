@@ -4,12 +4,14 @@
 use crate::{CmdResult, CommandSpec as C, Session};
 use serde_json::Value;
 
+/// File inspection, and publishing with an explicit edit effect but no automatic undo step:
+/// undo cannot reverse the external write, so its committed sync record follows the file.
 pub fn commands() -> Vec<C> {
     vec![
         C::new("source.syncState", "Source File State", "Data › Data Source", sync_state).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"layer"?: "name|id (default: the active layer): one read whole from a Shapefile or .geojson file"} — whether it has edits its file lacks ("edited"), the file changed since it was read ("sourceChanged"), both ("both") or neither ("inSync"), and which of the file's parts changed"#,
         ),
-        C::new("source.publish", "Publish to Source", "Data › Data Source", |s, p| super::exports::write_here(s, p, "source.publish")).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
+        C::new("source.publish", "Publish to Source", "Data › Data Source", |s, p| super::exports::write_here(s, p, "source.publish")).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files).with(crate::policy::Effect::Edits)).view().params(
             r#"{"layer"?: "name|id (default: the active layer): one read whole from a Shapefile"} — writes the layer's edits back over the Shapefile it was read from, keeping its code page, columns and .prj; refused, with nothing written, when the file changed since it was read or can't hold the layer as it is (Z or M values, features without shapes, text its code page lacks)"#,
         ),
     ]

@@ -44743,7 +44743,10 @@ fn a_layer_publishes_its_edits_to_its_shapefile() {
     assert_eq!(dbf(), before, "nothing to write");
     s.run("edit.setValue", &json!({"layer": id, "row": 0, "field": "name", "value": "Renamed"})).unwrap();
     s.mark_saved();
+    let undo_before_publish = s.undo_depth();
     let out = s.run("source.publish", &json!({"layer": id})).unwrap();
+    assert_eq!(s.undo_depth(), undo_before_publish, "publishing cannot be undone separately from the edits");
+    assert!(s.log.entries().any(|e| e.command == "source.publish" && e.ok));
     assert_eq!(out["published"], true);
     assert!(s.dirty(), "the layer's new record is a change to save");
     let (read, _) = rustgis_data::io::read_path(&path).unwrap();

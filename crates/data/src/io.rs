@@ -3353,7 +3353,7 @@ impl std::fmt::Display for Spec {
 /// The column field `k` (written as `name`) is written to over a file whose `.dbf` `style`
 /// describes: the file's column of that name where the field's kind and every value still fit
 /// it, so the file keeps its widths and decimals; otherwise a new one ([`new_column`]), at least
-/// as wide as the file's, and, when the file had a column of that name and kind that couldn't
+/// as wide as the file's, and, when a column of that name changes kind or can't
 /// hold the values, what changed (`'ACRES' N(10,2) to N(24,9)`).
 fn kept_column(ds: &Dataset, k: usize, name: &str, style: &DbfStyle) -> (Spec, Option<String>) {
     let new = new_column(ds, k);
@@ -3380,8 +3380,8 @@ fn kept_column(ds: &Dataset, k: usize, name: &str, style: &DbfStyle) -> (Spec, O
         }),
         (FieldType::Boolean, b'L') | (FieldType::Date, b'D') => true,
         (FieldType::Text | FieldType::DateTime, b'C') => values().all(|v| encoded_len(v) <= usize::from(was.len)),
-        // Another kind of field now: a new column, and nothing of the old one to keep.
-        _ => return (new, None),
+        // Another kind of field now: say how its physical column changes too.
+        _ => return (new, Some(format!("'{}' {kept} to {new}", dbf_notice_name(&field.name)))),
     };
     if fits {
         return (kept, None);

@@ -86,7 +86,8 @@ pub struct CommandSpec {
     pub shortcut: &'static str,
     /// Parameter description for scripts and agents.
     pub params: &'static str,
-    /// Whether it changes the project (and so takes an undo snapshot).
+    /// Whether it takes an automatic project-edit transaction (undo snapshot and dirty marking).
+    /// Changes committed without that transaction declare `Effect::Edits` explicitly.
     pub mutates: bool,
     /// `None` = enabled; `Some(reason)` = disabled.
     pub enabled: fn(&Session) -> Option<&'static str>,
@@ -109,6 +110,12 @@ impl CommandSpec {
     /// the description is not a `{"key": …}` object (nothing to check against).
     pub fn param_keys(&self) -> Option<Vec<&'static str>> {
         param_keys(self.params)
+    }
+
+    /// Whether it can change the project, including external commits that update metadata
+    /// without an automatic undo snapshot. Logging and command discovery use this contract.
+    pub const fn changes_project(&self) -> bool {
+        self.mutates || self.effects.contains(policy::Effect::Edits)
     }
 
     /// Whether the parameter description includes a required top-level input.
@@ -163,7 +170,8 @@ impl CommandSpec {
         self.params = p;
         self
     }
-    /// Doesn't change the project (no undo snapshot, not dirtying).
+    /// Suppresses automatic undo snapshots and dirty marking. Usually read-only; a command
+    /// committing external changes can update metadata itself and declares `Effect::Edits`.
     pub const fn view(mut self) -> Self {
         self.mutates = false;
         self
