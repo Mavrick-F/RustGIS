@@ -52,8 +52,9 @@ double-click a cell to change it, and use the toolbar to add a row, add a field 
 field over every row; a column's menu converts its field or deletes it (**Delete Field**).
 Cells, new rows and Calculate Field need editing on (**Edit › Edit**); adding, converting and
 deleting fields don't, as for a layer. Each edit is one undo step. On the desktop, table writes
-run in the background with progress or a busy indicator and **Cancel**. If the table changes while an edit runs, its result is refused; run the edit again to use
-the new values.
+run in the background with progress or a busy indicator and **Cancel**. Queued edits run in
+order, each using the preceding edit's result. If the table changes independently while an edit
+runs, its result is refused; run the edit again to use the new values.
 
 The `edit.*` commands take the table as `"table"` (its name or id) instead of `"layer"`:
 `edit.setValue`, `edit.addField`, `edit.deleteField`, `edit.convertField`, `edit.calculateField`,

@@ -156,11 +156,16 @@ struct LeftOut {
 /// Each field's value in `"attributes"`, by field. A key gives one field: the one named exactly
 /// so, else the only field named so ignoring case (ambiguous keys are refused); the keys named
 /// exactly go first, so `Name` fills `Name` even when `name` comes first. A key naming no field,
-/// or a field another key gives, is left out and said ([`notify_left_out`]).
+/// or a field another key gives, is left out and said ([`notify_left_out`]). Non-object values
+/// other than null are refused before any row is inserted.
 fn given_attributes<'a>(fields: &[Field], p: &'a Json) -> Result<(Vec<Option<&'a Json>>, LeftOut), String> {
     let mut given = vec![None; fields.len()];
     let mut left = LeftOut::default();
-    let Some(attributes) = p.get("attributes").and_then(Json::as_object) else { return Ok((given, left)) };
+    let attributes = match p.get("attributes") {
+        None | Some(Json::Null) => return Ok((given, left)),
+        Some(Json::Object(attributes)) => attributes,
+        Some(_) => return Err("attributes is an object of field names and values".into()),
+    };
     let exact = |k: &str| fields.iter().position(|f| f.name == k);
     for (k, v) in attributes.iter().filter(|(k, _)| exact(k).is_some()) {
         match exact(k).and_then(|i| given.get_mut(i)) {

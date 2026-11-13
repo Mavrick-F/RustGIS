@@ -300,6 +300,17 @@ fn a_standalone_table_is_edited_with_the_edit_commands() {
     let mark = s.notice_mark();
     s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"visits": 1.5}})).unwrap();
     assert!(s.notices_since(mark).iter().any(|n| n.text.contains("sites, field 'visits', row 3") && n.text.contains("fraction")));
+    // Supplied attributes must be an object; null remains an optional blank row.
+    let before = (serde_json::to_value(&s.project.tables).unwrap(), s.undo_depth());
+    for attributes in [json!("street=Quai Branly"), json!([]), json!(7), json!(true)] {
+        let err = s.run("edit.addFeature", &json!({"table": "sites", "attributes": attributes})).unwrap_err();
+        assert!(err.contains("attributes is an object"), "{err}");
+        assert_eq!((serde_json::to_value(&s.project.tables).unwrap(), s.undo_depth()), before);
+    }
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "sites", "attributes": null})).unwrap();
+    assert!(s.notices_since(mark).is_empty());
+    s.run("edit.undo", &Value::Null).unwrap();
     // A row past the 32-bit range is no row, on every build.
     assert!(s.run("edit.setValue", &json!({"table": "sites", "row": 4_294_967_296u64, "field": "street", "value": "x"})).is_err());
     // A name in another case finds its field; one naming no field is said, not dropped quietly.

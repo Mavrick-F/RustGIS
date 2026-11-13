@@ -366,6 +366,10 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
     let Some(ahead) = asked.ahead.take() else {
         return complete_here(app, asked, p, Err(tl!("This read was already started").to_string()));
     };
+    let ahead = match ahead.refresh_table_input(&app.session) {
+        Ok(ahead) => ahead,
+        Err(why) => return complete_here(app, asked, p, Err(why)),
+    };
     let name = ahead.name;
     let reload = matches!(asked.command, "layer.reloadData" | "map.reloadTiles");
     let control = Control::stoppable();
@@ -1266,6 +1270,82 @@ mod tests {
         assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(9.0));
         assert_eq!(app.session.undo_depth(), depth);
         assert!(app.session.notices.iter().any(|n| n.text.contains("table changed")));
+    }
+
+    /// Waiting writes consume their predecessor's output, with one undo step per command.
+    #[test]
+    fn queued_table_writes_land_in_order() {
+        let fixture = || {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+            app.run("edit.enable", json!({"on": true})).unwrap();
+            app
+        };
+        let (mut app, mut expected) = (fixture(), fixture());
+        app.reads_off_frame = true;
+        let before = serde_json::to_value(&app.session.project.tables).unwrap();
+        let depth = app.session.undo_depth();
+        let commands = [
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 3}})),
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 4}})),
+            ("edit.setValue", json!({"table": "records", "row": 3, "field": "n", "value": 9})),
+            ("edit.addField", json!({"table": "records", "name": "extra", "type": "long"})),
+            ("edit.calculateField", json!({"table": "records", "field": "extra", "expression": "n + 1"})),
+        ];
+        for (i, (command, p)) in commands.iter().enumerate() {
+            expected.session.run(command, p).unwrap();
+            let answer = app.run_by_user(command, p.clone()).unwrap();
+            if i == 0 {
+                assert!(answer.get("started").is_some());
+            } else {
+                assert_eq!(answer["waiting"], i);
+            }
+        }
+        landed(&mut app, 60);
+        assert_eq!(
+            serde_json::to_value(&app.session.project.tables).unwrap(),
+            serde_json::to_value(&expected.session.project.tables).unwrap()
+        );
+        assert_eq!(app.session.undo_depth(), depth + commands.len());
+        assert!(app.session.notices.is_empty(), "{:?}", app.session.notices);
+        for _ in commands {
+            app.run("edit.undo", Value::Null).unwrap();
+        }
+        assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before);
+        // Refreshing input must not retarget a waiting command to a replacement with its name.
+        let p = json!({"table": "records", "attributes": {"n": 3}});
+        app.run_by_user("edit.addFeature", p.clone()).unwrap();
+        app.run_by_user("edit.addFeature", p).unwrap();
+        app.session.run("table.remove", &json!({"table": "records"})).unwrap();
+        app.session.run("layer.addDataText", &json!({"fileName": "records.csv", "text": "n\n7\n"})).unwrap();
+        let replacement = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
+        landed(&mut app, 60);
+        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), replacement);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("table changed while the edit was waiting")));
+    }
+
+    /// Landing rechecks the current editing setting before installing any queued row edit.
+    #[test]
+    fn table_row_writes_are_refused_if_editing_is_turned_off_before_landing() {
+        for (command, p) in [
+            ("edit.setValue", json!({"table": "records", "row": 0, "field": "n", "value": 9})),
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 3}})),
+            ("edit.calculateField", json!({"table": "records", "field": "n", "expression": "n + 1"})),
+        ] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+            app.run("edit.enable", json!({"on": true})).unwrap();
+            app.reads_off_frame = true;
+            let before = serde_json::to_value(&app.session.project.tables).unwrap();
+            assert!(app.run_by_user(command, p).unwrap().get("started").is_some(), "{command}");
+            app.run("edit.enable", json!({"on": false})).unwrap();
+            let depth = app.session.undo_depth();
+            let mark = app.session.notice_mark();
+            landed(&mut app, 60);
+            assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before, "{command}");
+            assert_eq!(app.session.undo_depth(), depth, "{command}");
+            assert!(app.session.notices_since(mark).iter().any(|n| n.text.contains("editing is turned off")), "{command}");
+        }
     }
 
     /// Every table write uses the actual app worker path and lands the same fields, rows and

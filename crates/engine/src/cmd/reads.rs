@@ -44,6 +44,8 @@ pub struct ReadAhead {
     owner: Continuation,
     source: Option<rustgis_map::source::SourceLayer>,
     work: Option<ReadWork>,
+    /// A table write retains its admitted project and table identity across queue waits.
+    table: Option<(u64, u32)>,
 }
 
 impl ReadAhead {
@@ -59,11 +61,25 @@ impl ReadAhead {
         self.work.is_some()
     }
 
+    /// Refreshes a table write's input immediately before its worker starts, so queued writes
+    /// see earlier writes' output. The admitted operation, owner and table identity stay fixed;
+    /// landing still rejects changes made while the worker runs. Other reads keep their input.
+    pub fn refresh_table_input(mut self, s: &Session) -> Result<Self, String> {
+        let Some((opened, table)) = self.table else { return Ok(self) };
+        self.owner.check()?;
+        let CommandOp::Registered { spec, params } = self.op.op() else { return Err("not a registered read command".into()) };
+        if s.opened != opened || s.named_table(spec, params) != Some(table) {
+            return Err("the table changed while the edit was waiting: run the edit again".into());
+        }
+        self.work = super::edit::table_ahead(s, spec.id, params)?;
+        Ok(self)
+    }
+
     /// Reads, blocking until it's done; `control` stops it and counts its progress (see
     /// [`rustgis_analysis::control`]). A read that fails gives its failure to the command, which
     /// says it as it would have; only a cancelled run (or a bug in a reader) is an error here.
     pub fn run(self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> Result<Read, String> {
-        let ReadAhead { name, op, owner, source, work } = self;
+        let ReadAhead { name, op, owner, source, work, table: _ } = self;
         owner.check()?;
         let current = owner.clone();
         let still = std::sync::Arc::new(move || current.check().is_ok());
@@ -165,7 +181,8 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
         _ => return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service listings, topology and Source File State prepare background work".into()),
     };
     let name = work.as_ref().map_or(name, |work| work.name);
-    Ok(ReadAhead { name, op, owner, source, work })
+    let table = super::edit::table_edit_in_background(spec.id).and_then(|_| s.named_table(spec, params)).map(|id| (s.opened, id));
+    Ok(ReadAhead { name, op, owner, source, work, table })
 }
 
 /// Consumes a completed read under its initiating owner, with ordinary command history and undo.
