@@ -34637,7 +34637,9 @@ fn data_interop_reads_the_whole_source() {
     s.map_mut().layer_mut(id).unwrap().dataset.features.clear();
     for format in ["geojson", "csv", "kml", "gpx", "wkt"] {
         let path = fixture.dir.join(format!("{format}.txt"));
+        let mark = s.notice_mark();
         let answer = s.run("data.convert", &json!({"layer": id, "format": format, "path": path, "nameField": "lanes"})).unwrap();
+        assert_eq!(s.notices_since(mark).iter().filter(|n| n.text == format!("Exported {}", path.display())).count(), 1, "{format}");
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(answer["bytes"].as_u64(), Some(text.len() as u64));
         let count = match format {
@@ -34688,7 +34690,11 @@ fn data_interop_reports_non_finite_numbers() {
     let id = s.run("layer.addData", &json!({"path": fixture.path(), "stream": true})).unwrap()["layer"].clone();
     let mark = s.notice_mark();
     s.run("data.convert", &json!({"layer": id, "format": "geojson", "path": fixture.dir.join("clean.json")})).unwrap();
-    assert!(s.notices_since(mark).is_empty(), "{:?}", s.notices_since(mark));
+    assert_eq!(
+        s.notices_since(mark).iter().map(|n| n.text.as_str()).collect::<Vec<_>>(),
+        [format!("Exported {}", fixture.dir.join("clean.json").display())],
+        "a clean conversion reports completion without loss notices"
+    );
 }
 
 /// Date parsing can empty a value outside the loaded view. Both source-read paths report
@@ -40104,10 +40110,8 @@ fn exports_run_on_another_thread() {
         // The session's log has it as it has the export run here.
         let there_params = logged(&s).map(|(c, p, ok)| (c, unpathed_json(&p, &there), ok));
         assert_eq!(there_params, logged_here.map(|(c, p, ok)| (c, unpathed_json(&p, &here), ok)), "{command} {file}");
-        if !said_here.is_empty() {
-            let filed = s.diagnostics.records().last().map(|r| r.source.clone());
-            assert_eq!(filed.as_deref(), Some(command), "the history files what it said under the command");
-        }
+        let filed = s.diagnostics.records().last().map(|r| r.source.clone());
+        assert_eq!(filed.as_deref(), Some(command), "the history files what it said under the command");
         assert_eq!(said(&s, mark, &there), said_here, "{command} {file}");
         // The path as it appears in JSON: on Windows its backslashes are escaped there.
         let unpathed = |v: &Value, path: &str| {

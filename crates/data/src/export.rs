@@ -91,10 +91,11 @@ fn write_chunks_to(
     write_chunks_as(src, layer, path, crs, gpkg, bytes, &ext)
 }
 
-/// Writes a source in the explicitly chosen format, regardless of the destination's extension.
-/// Used by Data Interop, whose format parameter is independent of its path.
+/// Writes a source in the explicitly chosen format (ignoring case), regardless of the destination's
+/// extension. Used by Data Interop, whose format parameter is independent of its path.
 pub fn write_source_as_in(src: &dyn FeatureSource, layer: &Dataset, path: &Path, crs: Crs, format: &str) -> Result<Exported> {
-    write_chunks_as(src, layer, path, crs, &GpkgTable::default(), CHUNK_BYTES, format).map(|(e, _)| e)
+    let format = format.to_ascii_lowercase();
+    write_chunks_as(src, layer, path, crs, &GpkgTable::default(), CHUNK_BYTES, &format).map(|(e, _)| e)
 }
 
 /// Shared chunk writer for extension-based exports and explicit-format conversion.

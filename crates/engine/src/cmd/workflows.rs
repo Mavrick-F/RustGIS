@@ -1631,7 +1631,7 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
     Ok(Box::new(move || {
         let format = conversion_format(&params)?;
         let chunks = if layer.is_streamed() && matches!(format, "geojson" | "csv") { layer.chunk_export()? } else { None };
-        let (notes, null_numbers) = if let Some((source, ds)) = chunks {
+        let (mut notes, null_numbers) = if let Some((source, ds)) = chunks {
             let result = rustgis_data::export::write_source_as_in(
                 source.as_ref(),
                 &ds,
@@ -1669,6 +1669,7 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             (notes, rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, format))
         };
         let bytes = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();
+        notes.push(format!("Exported {path}"));
         let target = path.clone();
         let then = (null_numbers > 0).then(|| {
             Box::new(move |s: &mut Session, _: &mut Value| {
