@@ -281,7 +281,8 @@ impl FgbSource {
         Ok(())
     }
 
-    /// Reads a request; `scan` ignores the index.
+    /// Reads a request; `scan` ignores the index. A full geometry scan for a spatial request
+    /// counts features and checks Cancel between them.
     fn read_with<R: Read + Seek>(&self, open: &impl Fn() -> Result<R>, req: &Request, scan: bool) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let reader = open_reader(open()?)?;
@@ -311,7 +312,13 @@ impl FgbSource {
         let mut sample = if late || matched == 0 { Sampler::new(limit) } else { Sampler::with_total(limit, matched) };
         let mut out = Batch::default();
         let mut n = 0u64;
+        if late {
+            crate::progress::begin(usize::try_from(matched).unwrap_or(0));
+        }
         while let Some(f) = iter.next().map_err(err)? {
+            if late {
+                crate::progress::step(1)?;
+            }
             n += 1;
             let id = numbers.as_ref().and_then(|v| v.get(usize::try_from(n - 1).unwrap_or(usize::MAX)).copied()).unwrap_or(n);
             // A cheap skip when the sample won't take this feature (the extent isn't tested yet).
@@ -587,7 +594,8 @@ impl FgbSource {
     }
 
     /// A request on a file by its web address: the index search, then the features the sample
-    /// takes, fetched together before any is read; the others are passed over unread.
+    /// takes, fetched together before any is read; the others are passed over unread. An unbounded
+    /// spatial read scans every candidate within the budget, counting features and checking Cancel.
     fn read_remote(&self, f: &Arc<Remote>, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
@@ -668,7 +676,13 @@ impl FgbSource {
         let mut out = Batch::default();
         let mut sample = Sampler::new(limit);
         let mut k = 0usize;
+        if late {
+            crate::progress::begin(n);
+        }
         while let Some(feat) = iter.next().map_err(err)? {
+            if late {
+                crate::progress::step(1)?;
+            }
             let this = k;
             k += 1;
             if !taken(this, step) {

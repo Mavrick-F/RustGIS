@@ -256,7 +256,8 @@ impl FeatureSource for GeoJsonSource {
         self.unreadable + self.failed.len()
     }
 
-    /// Reads a bounded sample; when native bounds are refused, filters geometry before sampling.
+    /// Reads a bounded sample; when native bounds are refused, filters geometry before sampling,
+    /// counting records and checking Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         // Counted first, then sampled, unless the native box is refused: no list of every match.
@@ -271,7 +272,13 @@ impl FeatureSource for GeoJsonSource {
         let mut buf = Vec::new();
         let mut features = Vec::with_capacity(matched.div_ceil(step).min(limit));
         let mut skipped = 0;
+        if late {
+            crate::progress::begin(matched);
+        }
         for i in self.matches(extent).step_by(step).take(if late { usize::MAX } else { limit }) {
+            if late {
+                crate::progress::step(1)?;
+            }
             let Some(place) = self.places.get(i as usize) else { continue };
             let Some(json) = read_place(&mut f, &mut pos, &mut buf, place) else {
                 skipped += 1;

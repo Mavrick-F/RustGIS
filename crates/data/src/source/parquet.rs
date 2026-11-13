@@ -389,6 +389,7 @@ impl FeatureSource for ParquetSource {
     }
 
     /// Keeps rows with null geometry in whole reads; they have no location to match an extent.
+    /// Unbounded spatial scans count rows and check Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let md = self.reader.metadata();
@@ -426,7 +427,8 @@ impl FeatureSource for ParquetSource {
             if rows > (limit as u64).saturating_mul(8) && !groups.is_empty() && !self.exact && !unbounded {
                 thinned = usize::try_from(rows.div_ceil((limit as u64).saturating_mul(4).max(1))).unwrap_or(usize::MAX).max(2);
             }
-            let cols: Vec<usize> = self.covering.map(|c| c.to_vec()).unwrap_or_default();
+            // A read without native bounds never fetches the covering columns.
+            let cols: Vec<usize> = if native.is_some() { self.covering.map(|c| c.to_vec()).unwrap_or_default() } else { Vec::new() };
             let all: Vec<usize> = cols.iter().copied().chain([self.geom_col]).chain(self.field_cols.iter().copied()).collect();
             let cost: u64 = groups.iter().step_by(thinned).map(|&g| chunks_size(md, g, &all)).sum();
             if cost > remote::READ_BUDGET && unbounded {
@@ -492,7 +494,13 @@ impl FeatureSource for ParquetSource {
             starts.push(first_row);
             first_row = first_row.saturating_add(u64::try_from(md.row_group(g).num_rows()).unwrap_or(0));
         }
+        if unbounded {
+            crate::progress::begin(usize::try_from(matched).unwrap_or(0));
+        }
         for (&g, take) in groups.iter().zip(&takes) {
+            if unbounded {
+                crate::progress::check()?;
+            }
             if !take.iter().any(|&t| t) {
                 continue;
             }
@@ -508,6 +516,9 @@ impl FeatureSource for ParquetSource {
             let base = starts.get(g).copied().unwrap_or(0);
             // The columns hold the taken rows only, in order: the k-th is row `r`.
             for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
+                if unbounded {
+                    crate::progress::step(1)?;
+                }
                 // Null geometry is valid; malformed non-null WKB is skipped and counted.
                 let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
                     Some(bytes) => {

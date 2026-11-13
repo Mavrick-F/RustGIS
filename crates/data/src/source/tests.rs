@@ -4133,6 +4133,13 @@ fn a_view_its_system_cant_bound_reads_what_is_in_view() {
                     assert!(g.extent().intersects(&view), "{ext}: feature {} is outside the view", f.id);
                 }
             }
+            if matches!(ext, "shp" | "fgb" | "parquet" | "geojson") {
+                // Cancel while scanning, not before the read starts; the view needs a complete scan.
+                let probe = crate::progress::tests::Counted::cancelling_after(3);
+                let _guard = crate::progress::install(Some(probe.clone()));
+                assert!(matches!(source.read(&Request { extent: Some(view), limit: 10 }), Err(DataError::Cancelled)), "{ext}");
+                assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 3, "{ext}");
+            }
         }
     }
 }

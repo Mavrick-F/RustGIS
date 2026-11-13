@@ -170,6 +170,7 @@ impl FeatureSource for ShpSource {
     }
 
     /// Samples indexed records, falling back to geometry matches when the native view is refused.
+    /// The fallback counts records and checks Cancel before reading each one.
     fn read(&self, req: &Request) -> Result<Batch> {
         let encoding = self.encoding.decoder();
         let limit = clamp_limit(req.limit);
@@ -188,7 +189,13 @@ impl FeatureSource for ShpSource {
         // by: every record is visited, tested, and the matches sampled as they come.
         let late = req.extent.is_some() && bounds.is_none();
         let mut sample = super::Sampler::new(limit);
+        if late {
+            crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
+        }
         let mut each = |i: u32, place: Place| {
+            if late {
+                crate::progress::step(1)?;
+            }
             if u64::from(place.len) > MAX_RECORD {
                 skipped += 1;
                 return Ok(());
