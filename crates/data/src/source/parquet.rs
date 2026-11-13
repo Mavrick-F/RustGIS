@@ -33,6 +33,9 @@ const BATCH: usize = 8192;
 /// Most rows read from one row group (fewer in the browser, whose memory is smaller).
 const MAX_GROUP_ROWS: usize = if cfg!(target_arch = "wasm32") { 1 << 21 } else { 1 << 24 };
 
+/// Conservative decoded-column budget for one group scanned without native view bounds.
+const MAX_SCAN_BYTES: u64 = if cfg!(target_arch = "wasm32") { 64 << 20 } else { 256 << 20 };
+
 /// A GeoParquet file.
 pub struct ParquetSource {
     info: SourceInfo,
@@ -53,6 +56,8 @@ pub struct ParquetSource {
     exact: bool,
     /// The most rows read from one row group: `MAX_GROUP_ROWS`, lowered by tests.
     group_rows: usize,
+    /// Decoded-column budget for an unbounded spatial scan; lowered by tests.
+    scan_bytes: u64,
     /// Declared after `reader`: Windows must close its file before removing the workspace.
     #[cfg(not(target_arch = "wasm32"))]
     _workspace: Option<Arc<super::duckdb::ReloadWorkspace>>,
@@ -297,6 +302,7 @@ impl ParquetSource {
             remote,
             exact: false,
             group_rows: MAX_GROUP_ROWS,
+            scan_bytes: MAX_SCAN_BYTES,
             #[cfg(not(target_arch = "wasm32"))]
             _workspace: None,
         };
@@ -340,6 +346,13 @@ impl ParquetSource {
         self
     }
 
+    /// A lower decoded-column budget, for tests without large allocations.
+    #[cfg(test)]
+    pub(crate) fn with_scan_bytes(mut self, bytes: u64) -> Self {
+        self.scan_bytes = bytes;
+        self
+    }
+
     /// The rows of row group `g` read. Row counts come from the file: bounded by what the
     /// geometry column chunk holds, and by a cap, so a crafted count can't size a huge allocation.
     fn rows_in(&self, md: &ParquetMetaData, g: usize) -> usize {
@@ -347,6 +360,33 @@ impl ParquetSource {
         let rows = usize::try_from(rg.num_rows()).unwrap_or(0);
         let values = rg.columns().get(self.geom_col).and_then(|c| usize::try_from(c.num_values()).ok()).unwrap_or(0);
         rows.min(values).min(self.group_rows)
+    }
+
+    /// Refuses an unbounded view before allocating a group's decoded columns. Metadata sizes
+    /// include encoded dictionaries/prefixes, not their expansion into owned values: allow each
+    /// binary row the entire column payload, then six copies for decoding, UTF-8 replacement and
+    /// conversion. Add 128 bytes per row/column for value slots, flags and temporary vectors.
+    /// This deliberately conservative estimate may refuse groups that a streaming reader could
+    /// handle; smaller row groups avoid that refusal. Saturation and invalid sizes fail closed.
+    fn check_scan_bytes(&self, md: &ParquetMetaData, g: usize) -> Result<()> {
+        let group = md.row_group(g);
+        let rows = u64::try_from(group.num_rows()).unwrap_or(u64::MAX);
+        let mut bytes = rows.saturating_mul(2);
+        for c in [self.geom_col].into_iter().chain(self.field_cols.iter().copied()) {
+            let Some(column) = group.columns().get(c) else {
+                return Err(DataError::Format(format!("GeoParquet: row group {g} has a missing column")));
+            };
+            let encoded = u64::try_from(column.uncompressed_size()).unwrap_or(u64::MAX);
+            let expansion = if column.column_descr().physical_type() == Physical::BYTE_ARRAY { rows.max(1) } else { 1 };
+            bytes = bytes.saturating_add(encoded.saturating_mul(expansion).saturating_mul(6)).saturating_add(rows.saturating_mul(128));
+        }
+        if bytes > self.scan_bytes {
+            return Err(DataError::Format(format!(
+                "GeoParquet: row group {g} exceeds the {} byte decoded-column budget for an unbounded view; choose a smaller view or rewrite the file with smaller row groups",
+                self.scan_bytes
+            )));
+        }
+        Ok(())
     }
 
     /// Whether inferred bounds may omit or count rows that only their geometry can test.
@@ -389,7 +429,8 @@ impl FeatureSource for ParquetSource {
     }
 
     /// Keeps rows with null geometry in whole reads; they have no location to match an extent.
-    /// Unbounded spatial scans count rows and check Cancel between them.
+    /// Unbounded spatial scans refuse groups over the decoded-column budget before decoding,
+    /// count rows and check Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let md = self.reader.metadata();
@@ -422,6 +463,7 @@ impl FeatureSource for ParquetSource {
         if unbounded {
             // Every selected group must be scanned before sampling its view matches.
             for &g in &groups {
+                self.check_scan_bytes(md, g)?;
                 let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
                 if declared > self.group_rows as u64 {
                     return Err(DataError::Format(format!(
@@ -571,7 +613,7 @@ impl FeatureSource for ParquetSource {
     /// they are chunked, so the peak is a row group's columns plus a chunk. Null geometry is
     /// retained without an extent filter, keeping its row and attributes in whole exports.
     /// Checks Cancel between groups and scanned rows; each group's column decoding finishes
-    /// before the next check.
+    /// before the next check. An unbounded view also checks the decoded-column budget first.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         if self.remote.is_some() {
@@ -602,6 +644,9 @@ impl FeatureSource for ParquetSource {
             // A read takes at most `MAX_GROUP_ROWS` of a row group, and no more than its geometry
             // column holds. A traversal promises every row, so a group it can't read whole is an
             // error, not a quietly shorter export; it is refused before this group is read.
+            if extent.is_some() && native.is_none() {
+                self.check_scan_bytes(md, g)?;
+            }
             let readable = self.rows_in(md, g);
             if declared > self.group_rows as u64 {
                 return Err(DataError::Format(format!(

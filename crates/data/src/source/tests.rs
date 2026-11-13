@@ -4164,6 +4164,29 @@ fn unbounded_parquet_view_refuses_a_capped_group() {
     assert!(error.contains("more than the 1 read from one"), "{error}");
 }
 
+/// Repeated text can expand from a small dictionary into one owned string per scanned row.
+#[test]
+fn unbounded_parquet_view_refuses_decoded_columns_over_budget() {
+    let p = dir().join("decoded-view.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("label", FieldType::Text)]);
+    for _ in 0..20 {
+        ds.push(Some(Geometry::Point(Coord::new(-81.0, 0.0))), vec![Value::Text("x".repeat(1024))]);
+    }
+    write_unbounded_view_fixture(&ds, &p);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_scan_bytes(16 << 10);
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 1 };
+    let error = source.read(&req).unwrap_err().to_string();
+    assert!(error.contains("decoded-column budget"), "{error}");
+    let error = source.visit_chunks(req.extent, 4096, &mut |_| Ok(())).unwrap_err().to_string();
+    assert!(error.contains("decoded-column budget"), "{error}");
+    let clean = Request { extent: Some(Extent::new(-84.0, -1.0, -78.0, 1.0)), limit: 1 };
+    assert_eq!(source.read(&clean).unwrap().features.len(), 1);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+    let batch = source.read(&req).unwrap();
+    assert_eq!(batch.matched, 20);
+    assert_eq!(batch.features[0].attrs[0], Value::Text("x".repeat(1024)));
+}
+
 /// Writes the projected reader fixture, including formats whose public writer accepts only WGS 84.
 fn write_unbounded_view_fixture(ds: &Dataset, path: &Path) {
     let crs = Crs::from_epsg(32617).unwrap();
@@ -4175,7 +4198,7 @@ fn write_unbounded_view_fixture(ds: &Dataset, path: &Path) {
             std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
         }
         "parquet" => {
-            use arrow_array::{BinaryArray, Float64Array, RecordBatch, StructArray};
+            use arrow_array::{BinaryArray, Float64Array, RecordBatch, StringArray, StructArray};
             use arrow_schema::{DataType, Field as AField, Schema};
             let projected = crate::io::project(ds, crs).unwrap();
             let wkbs: Vec<_> = projected.features.iter().map(|f| f.geometry.as_ref().map(wkb::encode)).collect();
@@ -4191,11 +4214,25 @@ fn write_unbounded_view_fixture(ds: &Dataset, path: &Path) {
                 vec![coord(|e| e.min_x), coord(|e| e.min_y), coord(|e| e.max_x), coord(|e| e.max_y)],
                 None,
             );
-            let schema = Arc::new(Schema::new(vec![
+            let mut fields = vec![
                 AField::new("geometry", DataType::Binary, true),
                 AField::new("bbox", DataType::Struct(bbox_fields.iter().cloned().collect()), false),
-            ]));
-            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(geometry), Arc::new(bbox)]).unwrap();
+            ];
+            let mut columns: Vec<arrow_array::ArrayRef> = vec![Arc::new(geometry), Arc::new(bbox)];
+            for (i, field) in ds.fields.iter().enumerate().filter(|(_, f)| f.ty == FieldType::Text) {
+                fields.push(AField::new(&field.name, DataType::Utf8, true));
+                columns.push(Arc::new(StringArray::from(
+                    ds.features
+                        .iter()
+                        .map(|f| match f.attrs.get(i) {
+                            Some(Value::Text(s)) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+            }
+            let schema = Arc::new(Schema::new(fields));
+            let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
             let geo = serde_json::json!({"version": "1.1.0", "primary_column": "geometry", "columns": {"geometry": {
                 "encoding": "WKB", "geometry_types": ["Point"], "crs": {"type": "ProjectedCRS", "id": {"authority": "EPSG", "code": 32617}},
                 "covering": {"bbox": {"xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"], "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"]}}
