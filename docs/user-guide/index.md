@@ -407,21 +407,28 @@ refuses, with nothing written, when:
 - the file changed since the layer was read (`source.syncState` would say `sourceChanged` or
   `both`): writing would overwrite that change;
 - the file, read and written again, wouldn't be the same file: shapes with Z or M values, records
-  without a shape, multipatches, text with spaces before it, columns of a type RustGIS doesn't
-  write (memo, binary). The message names what would change and where;
+  without a shape, multipatches, records marked deleted, text with spaces before it, numbers with
+  more digits than RustGIS holds exactly, columns of a type RustGIS doesn't write (memo, binary),
+  text in a code page RustGIS can't write. The message names what would change and where;
 - the file can't hold the layer as it is: a feature without a shape, a field name longer than 10
   bytes, text in characters the file's code page lacks.
 
 The file keeps its code page (its `.cpg` and the language driver in its `.dbf`), each column's
 width, decimals and type where the values still fit, and its `.prj`. A column too narrow for an
 edited value is made wider, and a notice says which. A layer read in another coordinate system
-than its `.prj` names gets a `.prj` for that system, said too. The new parts are written beside
-the old ones, checked, and then renamed into place, the `.shp` last; if any fails, the old parts
-are put back. Sidecars RustGIS doesn't write, such as `.shp.xml` metadata, are left alone; the
-spatial indexes that would no longer match (`.qix`, `.sbn`, `.sbx`) are removed. In a projected
-coordinate system, RustGIS holds the shapes in longitude/latitude, so unedited shapes go through
-that conversion and back: they may move by one part in 10¹¹ of their coordinates at most (a tenth
-of a millimetre at ten thousand kilometres), and anything more is refused.
+than its `.prj` names gets a `.prj` for that system, said too. A shape that wasn't edited is
+written with the coordinates the file holds, so a projected file's untouched shapes stay as they
+were to the bit. An edited shape in a projected system is converted from longitude/latitude, as
+RustGIS holds it, and read back: publishing refuses one that would move by more than one part in
+10¹¹ of its coordinates (a tenth of a millimetre at ten thousand kilometres).
+
+The new parts are written beside the old ones, with the old parts' file permissions, checked,
+and then renamed into place, the `.shp` last. If one fails to land, the old parts are put back;
+should putting one back fail too, the message names the temporary file that holds it, beside the
+Shapefile, so it can be renamed back by hand. Sidecars RustGIS doesn't write, such as `.shp.xml`
+metadata, are left alone. The spatial indexes that would no longer match (`.qix`, `.sbn`, `.sbx`)
+are removed where they can be; one that can't be (held open by another program) is left, and
+should be deleted before that program uses the file.
 
 Once published, the layer reads `inSync`, and the project has a change to save (its record of
 the file). Undo doesn't change the file: undoing an edit made before publishing shows the layer

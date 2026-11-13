@@ -1926,9 +1926,11 @@ fn read_synced(path: &str, read: impl FnOnce() -> WholeRead) -> WholeRead {
         ds.source = Some(full.display().to_string());
     }
     report.synced = match files {
-        Some(files) => {
-            Some(rustgis_data::sync::Synced { files, rows: rustgis_data::sync::rows_digest(&ds).map_err(|e| format!("{path}: {e}"))? })
-        }
+        Some(files) => Some(rustgis_data::sync::Synced {
+            files,
+            rows: rustgis_data::sync::rows_digest(&ds).map_err(|e| format!("{path}: {e}"))?,
+            read: None,
+        }),
         None => {
             report.messages.push(format!(
                 "{path}: a part of it couldn't be read to record it, so RustGIS can't tell later whether the file changed since; add it again to compare it"

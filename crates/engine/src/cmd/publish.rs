@@ -79,7 +79,8 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 });
             }
             let published = rustgis_data::publish::shapefile(&dataset, std::path::Path::new(&path), &synced).map_err(|e| e.to_string())?;
-            let new = rustgis_data::sync::Synced { files: published.files, rows };
+            let read = (published.rows != rows).then_some(published.rows);
+            let new = rustgis_data::sync::Synced { files: published.files, rows, read };
             let (said, written_path) = (path.clone(), Some(path.clone()));
             let then: Then = Box::new(move |s: &mut Session, _: &mut Value| {
                 // The record follows the file: the layer read from it takes the record of what

@@ -36,11 +36,13 @@ use std::path::{Path, PathBuf};
 /// a tenth of a millimetre at ten thousand kilometres; anything more is refused.
 const PROJECTED_TOLERANCE: f64 = 1e-11;
 
-/// A layer written back over its Shapefile: the files as they were written, to record as the
-/// layer's new sync point, the features written, and what it says (fields given wider columns,
-/// a `.prj` that now says another system).
+/// A layer written back over its Shapefile: the files as they were written and the
+/// [`crate::sync::rows_digest`] of the file as it reads now, to record as the layer's new sync
+/// point, the features written, and what it says (fields given other columns, a `.prj` that now
+/// says another system).
 pub struct Published {
     pub files: FileSync,
+    pub rows: u64,
     pub features: usize,
     pub notes: Vec<String>,
 }
@@ -146,11 +148,16 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
         ldid,
         columns: table.columns.clone(),
     };
+    // A code page RustGIS can't write (one it reads as UTF-8 for want of a decoder): edited text
+    // would be written in UTF-8 under the file's language driver.
+    if let Some(note) = encoding_notes.first() {
+        return Err(refused(path, format!("{note}, so its text can't be written in its own code page")));
+    }
 
     // 1. It reads as the layer was read: in the layer's system, and in the file's own
     // coordinates (the system taken for longitude/latitude, which converts nothing).
     let (as_read, _) = crate::io::read_shapefile_parts(original.parts(), &name, crs)?;
-    if crate::sync::rows_digest(&as_read)? != synced.rows {
+    if crate::sync::rows_digest(&as_read)? != synced.file_rows() {
         return Err(refused(
             path,
             "it reads otherwise now than when the layer was read (RustGIS reads it more fully since), so rows that weren't edited could change: add the file again to read it as it is",
@@ -196,6 +203,8 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     if let Some(why) = same_rows(ds, &read_back, if crs.is_some() { PROJECTED_TOLERANCE } else { 0.0 }) {
         return Err(refused(path, format!("the file couldn't hold the layer as it is: {why}")));
     }
+    // The file as the next publish will read it.
+    let rows = crate::sync::rows_digest(&read_back)?;
     if !widened.is_empty() {
         let shown: Vec<&str> = widened.iter().take(5).map(String::as_str).collect();
         let more = if widened.len() > 5 { format!(" and {} more", widened.len() - 5) } else { String::new() };
@@ -246,7 +255,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
         return Err(e);
     }
     crate::io::place_shapefile(path, &staged)?;
-    Ok(Published { files, features: ds.features.len(), notes })
+    Ok(Published { files, rows, features: ds.features.len(), notes })
 }
 
 /// `ds` in the file's coordinate system `crs` (`None`: longitude/latitude, as it is held). Given
@@ -366,12 +375,34 @@ fn same_shapes(a: &[u8], b: &[u8], tolerance: f64) -> Option<String> {
 }
 
 /// A `.dbf` value as a value, for comparing what two files hold: text without the spaces or NULs
-/// that pad it, a number as the number it says, a date or yes/no without the forms of empty.
+/// that pad it, a number as the decimal it says exactly (no `f64`, which can't tell
+/// 9007199254740993 from 9007199254740992), a date or yes/no without the forms of empty.
 #[derive(PartialEq)]
 enum Cell<'a> {
     Bytes(&'a [u8]),
-    Number(f64),
+    /// Negative, the whole digits without leading zeros, the decimals without trailing zeros.
+    Number(bool, &'a [u8], &'a [u8]),
     Empty,
+}
+
+/// A number's text as its sign, whole digits and decimals with the zeros that don't count left
+/// off (`-003.50` is `-3.5`; `-0` is `0`), or `None` when it isn't plain decimal digits.
+fn decimal(text: &[u8]) -> Option<(bool, &[u8], &[u8])> {
+    let (negative, digits) = match text.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        Some((b'+', rest)) => (false, rest),
+        _ => (false, text),
+    };
+    let (whole, decimals) = match digits.iter().position(|b| *b == b'.') {
+        Some(at) => (digits.get(..at)?, digits.get(at + 1..)?),
+        None => (digits, &b""[..]),
+    };
+    if whole.is_empty() && decimals.is_empty() || !whole.iter().chain(decimals).all(u8::is_ascii_digit) {
+        return None;
+    }
+    let whole = whole.get(whole.iter().position(|b| *b != b'0').unwrap_or(whole.len())..)?;
+    let decimals = decimals.get(..decimals.iter().rposition(|b| *b != b'0').map_or(0, |i| i + 1))?;
+    Some((negative && !(whole.is_empty() && decimals.is_empty()), whole, decimals))
 }
 
 /// What value `bytes` of a column of type `ty` holds ([`Cell`]).
@@ -392,8 +423,8 @@ fn cell(ty: u8, bytes: &[u8]) -> Cell<'_> {
             if trimmed.is_empty() || trimmed.iter().all(|b| *b == b'*') {
                 return Cell::Empty;
             }
-            match std::str::from_utf8(trimmed).ok().and_then(|t| t.parse::<f64>().ok()) {
-                Some(x) => Cell::Number(x),
+            match decimal(trimmed) {
+                Some((negative, whole, decimals)) => Cell::Number(negative, whole, decimals),
                 None => Cell::Bytes(trimmed),
             }
         }
@@ -585,7 +616,7 @@ mod tests {
     fn read(path: &Path) -> (Dataset, Synced) {
         let (read, files) = FileSync::around(path, || crate::io::read_path(path).unwrap()).unwrap();
         let rows = crate::sync::rows_digest(&read.0).unwrap();
-        (read.0, Synced { files: files.unwrap(), rows })
+        (read.0, Synced { files: files.unwrap(), rows, read: None })
     }
 
     /// An edit is written back: the file reads as the layer, keeps its columns and `.prj`, and
@@ -627,6 +658,68 @@ mod tests {
         sync.rows = crate::sync::rows_digest(&older).unwrap();
         let e = shapefile(&older, &path, &sync).err().unwrap().to_string();
         assert!(e.contains("reads otherwise now") && e.contains("nothing was written"), "{e}");
+    }
+
+    /// A number past what an `f64` holds exactly, in a column that wasn't edited, is refused
+    /// rather than written back rounded.
+    #[test]
+    fn a_number_an_f64_rounds_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        crate::io::write_path(&parcels(), &path).unwrap();
+        // UNITS, an N(18,0) column, holding 2⁵³ + 1 in the first record.
+        let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        let table = crate::dbf::raw_table(&dbf).unwrap();
+        let header = usize::from(u16::from_le_bytes([dbf[8], dbf[9]]));
+        let at = header + 1 + usize::from(table.columns[0].len) + usize::from(table.columns[1].len);
+        dbf[at..at + 18].copy_from_slice(b"  9007199254740993");
+        std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
+        let (mut ds, sync) = read(&path);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[1].attrs[0] = Value::Text("Jonas".into());
+        ds.features = rows.into();
+        let e = shapefile(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("table wouldn't be the same") && e.contains("9007199254740993"), "{e}");
+        // Written the same in other forms, a number is the same.
+        assert!(cell(b'N', b"  003.50") == cell(b'N', b"3.5"));
+        assert!(cell(b'N', b"-0.00") == cell(b'N', b"0"));
+        assert!(cell(b'N', b"9007199254740993") != cell(b'N', b"9007199254740992"));
+    }
+
+    /// A code page RustGIS reads as UTF-8 for want of a decoder (DOS French Canadian, by its
+    /// language driver) is refused: edited text would be written in another code page.
+    #[test]
+    fn a_code_page_rustgis_cant_write_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        crate::io::write_path(&parcels(), &path).unwrap();
+        std::fs::remove_file(path.with_extension("cpg")).unwrap();
+        let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        dbf[29] = 0x6C;
+        std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
+        let (ds, sync) = read(&path);
+        let e = shapefile(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("code page 863") && e.contains("nothing was written"), "{e}");
+    }
+
+    /// Once published, a layer the file holds otherwise than the layer does (an empty text reads
+    /// back as no value) publishes again: its record holds the file as it reads.
+    #[test]
+    fn a_layer_the_file_reads_otherwise_publishes_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (mut ds, sync) = written(&parcels(), &path);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text(String::new());
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        let rows_now = crate::sync::rows_digest(&ds).unwrap();
+        assert_ne!(published.rows, rows_now, "the file reads the empty text as no value");
+        let synced = Synced { files: published.files, rows: rows_now, read: Some(published.rows) };
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[1].attrs[0] = Value::Text("Jonas".into());
+        ds.features = rows.into();
+        shapefile(&ds, &path, &synced).unwrap();
     }
 
     /// A file with records marked deleted is refused: writing it again would drop them, shapes and
@@ -675,7 +768,7 @@ mod tests {
         ds.features = rows.clone().into();
         let published = shapefile(&ds, &path, &sync).unwrap();
         // The record of what was published, as the layer takes it.
-        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&ds).unwrap() };
+        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&ds).unwrap(), read: Some(published.rows) };
         let dbf = std::fs::read(path.with_extension("dbf")).unwrap();
         assert!(dbf.windows(5).any(|w| w == b"Mu\xf1oz"), "written in Windows-1252");
         assert_eq!(std::fs::read(path.with_extension("cpg")).unwrap(), b"1252");

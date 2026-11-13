@@ -631,7 +631,7 @@ pub(crate) fn stage_shapefile(parts: &[(std::path::PathBuf, Vec<u8>)]) -> Result
     let mut written: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     let staged = parts.iter().try_for_each(|(target, bytes)| {
         let tmp = temp_beside(target)?;
-        let result = write_new(&tmp, bytes);
+        let result = write_new_like(&tmp, target, bytes);
         if result.is_ok() {
             written.push((tmp, target.clone()));
         }
@@ -734,8 +734,35 @@ pub(crate) fn temp_beside(path: &Path) -> std::io::Result<std::path::PathBuf> {
 
 /// Writes and syncs a new file (`create_new`, so an existing file or symlink is never followed);
 /// removes it on failure.
+#[cfg(test)]
 fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_new_with(path, |w| w.write_all(bytes))
+}
+
+/// [`write_new`], the new file taking the mode of the file at `like` (on Unix, when there is one)
+/// before any content is written: a private part (`0600`) stays private once the new file
+/// replaces it, and its content is never readable by others meanwhile. A mode that can't be set
+/// is an error, rather than a part made readable.
+fn write_new_like(path: &Path, like: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mode = match std::fs::symlink_metadata(like) {
+        Ok(old) if !old.file_type().is_symlink() => Some(old.permissions()),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    #[cfg(not(unix))]
+    let _ = like;
+    write_new_with(path, |w| {
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(path)?.permissions().mode() != mode.mode() {
+                std::fs::set_permissions(path, mode)?;
+            }
+        }
+        w.write_all(bytes)
+    })
 }
 
 /// [`write_new`] with the content written by `write`, through a buffer, as it goes.
@@ -2582,6 +2609,30 @@ fn integral_numeric_to_integer(ds: &mut Dataset) {
 /// WGS 84 as ESRI WKT, for a Shapefile's `.prj`.
 pub(crate) const WGS84_PRJ: &str = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
 
+/// The longest prefix of `s` whose text takes at most `max` bytes in `encoding`, cut at a
+/// character boundary: what a `.dbf` in that code page holds of it.
+fn cut_encoded<'a>(s: &'a str, max: usize, encoding: &crate::dbf::DbfEncoding) -> &'a str {
+    use shapefile::dbase::encoding::Encoding;
+    let encoder = encoding.decoder();
+    let fits = |t: &str| encoder.encode(t).map_or(t.len(), |b| b.len()) <= max;
+    if fits(s) {
+        return s;
+    }
+    // The longest prefix that fits: a character takes at least one byte, so it is within `max`
+    // characters, and a shorter prefix never takes more bytes.
+    let ends: Vec<usize> = s.char_indices().map(|(i, _)| i).skip(1).take(max).chain([s.len()]).collect();
+    let (mut lo, mut hi) = (0usize, ends.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if ends.get(mid - 1).is_some_and(|&e| fits(s.get(..e).unwrap_or(""))) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo.checked_sub(1).and_then(|i| ends.get(i)).and_then(|&e| s.get(..e)).unwrap_or("")
+}
+
 /// The longest prefix of `s` that fits in `max` bytes, cut at a character boundary.
 pub(crate) fn cut(s: &str, max: usize) -> &str {
     let mut end = s.len().min(max);
@@ -3388,9 +3439,10 @@ pub(crate) fn shapefile_parts_styled(
                     let (y, m, d) = d.ymd();
                     shapefile::dbase::Date::new(u32::try_from(d).ok()?, u32::try_from(m).ok()?, u32::try_from(y).ok()?).ok()
                 })),
-                FieldType::Text | FieldType::DateTime => {
-                    FieldValue::Character((!v.is_null()).then(|| cut(&v.to_string(), 254).to_string()))
-                }
+                FieldType::Text | FieldType::DateTime => FieldValue::Character((!v.is_null()).then(|| match style {
+                    Some(style) => cut_encoded(&v.to_string(), 254, &style.encoding).to_string(),
+                    None => cut(&v.to_string(), 254).to_string(),
+                })),
             };
             rec.insert(n.clone(), value);
         }
@@ -3507,6 +3559,17 @@ pub(crate) fn group_rings(rings: Vec<(Vec<Coord>, bool)>) -> Geometry {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Text is cut to what its code page holds in the bytes given, at a character boundary.
+    #[test]
+    fn text_is_cut_to_its_code_page_bytes() {
+        let cp1252 = crate::dbf::DbfEncoding::Standard(encoding_rs::WINDOWS_1252);
+        let e = "é".repeat(300);
+        assert_eq!(cut_encoded(&e, 254, &cp1252).chars().count(), 254);
+        assert_eq!(cut_encoded(&e, 254, &crate::dbf::DbfEncoding::Utf8).chars().count(), 127);
+        assert_eq!(cut_encoded("short", 254, &cp1252), "short");
+        assert_eq!(cut_encoded("ab", 0, &cp1252), "");
+    }
 
     /// A text column as wide as a `.dbf` allows (255 bytes, a width the writer never uses) with a
     /// longer value gets a column of the 254 bytes written, not a crash.
