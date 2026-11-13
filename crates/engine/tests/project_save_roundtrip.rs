@@ -295,7 +295,8 @@ fn a_saved_project_opens_as_it_was_saved() {
         compared.set(compared.get() + usize::from(notices.is_empty()));
         // The one loss saving says (values that aren't finite numbers, written as null) is in
         // the layers' values; a notice excuses nothing else.
-        changed.retain(|c| !declared(c) && (notices.is_empty() || !c.contains("/dataset/features/")));
+        let non_finite = notices.iter().any(|n| n.contains("aren't finite numbers"));
+        changed.retain(|c| !declared(c) && !(non_finite && c.contains("/dataset/features/") && c.ends_with(" → null")));
         if !changed.is_empty() {
             return Err(TestCaseError::fail(format!("changed, saying {notices:?}: {changed:#?}")));
         }
@@ -345,7 +346,8 @@ fn a_project_from_a_newer_rustgis_opens_only_when_this_version_can_keep_it() {
         std::fs::write(&newer, file.to_string()).unwrap();
         let mut a = Session::new(Project::new("Other"));
         a.run("project.open", &json!({"path": clean})).map_err(TestCaseError::fail)?;
-        let mut b = Session::new(Project::new("Other"));
+        // Refused, it leaves the project open as it was, layers, groups and layouts too.
+        let (mut b, _) = build(&names, &steps);
         let before = seen(&b);
         let open = b.run("project.open", &json!({"path": newer}));
         let count = if open.is_ok() { &opened } else { &refused };
