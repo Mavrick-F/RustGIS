@@ -591,9 +591,13 @@ impl FgbSource {
     fn read_remote(&self, f: &Arc<Remote>, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        let late = req.extent.is_some() && native.is_none();
         let native = native.unwrap_or(Extent::new(f64::MIN, f64::MIN, f64::MAX, f64::MAX));
         let (index, features) = self.sections(f)?;
         let hits = self.remote_search(f, index, &native)?;
+        if late && hits.thin > 1 {
+            return Err(remote::view_budget());
+        }
         let n = hits.items.len();
         // Each hit's bytes: to the next feature when that follows it, else a guess.
         let size = |k: usize| -> u64 {
@@ -604,13 +608,20 @@ impl FgbSource {
         };
         // A sample: runs of consecutive features, every `step`-th run (fewer when their bytes
         // would be more than a read may fetch).
-        let mut step = usize::try_from(stride(n as u64, limit)).unwrap_or(usize::MAX).max(1);
+        // A refused native view must match geometry before any feature is sampled away.
+        let mut step = if late { 1 } else { usize::try_from(stride(n as u64, limit)).unwrap_or(usize::MAX).max(1) };
         // Runs short enough for the sample to be spread over many places.
         let run = (limit / 256).clamp(1, RUN);
         let taken = |k: usize, step: usize| step == 1 || (k / run).is_multiple_of(step);
         loop {
             let bytes: u64 = (0..n).filter(|&k| taken(k, step)).map(size).sum();
-            if bytes <= FEATURE_BUDGET || step >= n.max(1) {
+            if bytes <= FEATURE_BUDGET {
+                break;
+            }
+            if late {
+                return Err(remote::view_budget());
+            }
+            if step >= n.max(1) {
                 break;
             }
             step = step.saturating_mul(2);
@@ -655,6 +666,7 @@ impl FgbSource {
             return Err(DataError::Format("FlatGeobuf: the index search found a different set of features".into()));
         }
         let mut out = Batch::default();
+        let mut sample = Sampler::new(limit);
         let mut k = 0usize;
         while let Some(feat) = iter.next().map_err(err)? {
             let this = k;
@@ -669,7 +681,7 @@ impl FgbSource {
                 out.skipped += 1;
                 continue;
             };
-            if !in_request(&geometry, req) {
+            if !in_request(&geometry, req) || (late && !sample.wants()) {
                 continue;
             }
             let mut props = Props {
@@ -683,13 +695,24 @@ impl FgbSource {
                 continue;
             }
             super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
-            out.features.push(Feature { id, geometry: Some(geometry), attrs: props.values });
-            if out.features.len() >= limit {
-                break;
+            let feature = Feature { id, geometry: Some(geometry), attrs: props.values };
+            if late {
+                sample.keep(feature);
+            } else {
+                out.features.push(feature);
+                if out.features.len() >= limit {
+                    break;
+                }
             }
         }
-        out.matched = (n as u64).saturating_mul(hits.thin);
-        out.complete = step == 1 && hits.thin == 1;
+        if late {
+            out.matched = sample.seen();
+            out.complete = sample.complete();
+            out.features = sample.items;
+        } else {
+            out.matched = (n as u64).saturating_mul(hits.thin);
+            out.complete = step == 1 && hits.thin == 1;
+        }
         Ok(out)
     }
 }

@@ -415,17 +415,23 @@ impl FeatureSource for ParquetSource {
             _ => true,
         };
         let mut thinned = 1usize;
+        // Without native bounds every group may contain view matches. Scan within the budget,
+        // or refuse explicitly: thinning groups first could discard all of a nonempty view.
+        let unbounded = req.extent.is_some() && native.is_none();
         if let Some(file) = &self.remote {
             // Far more rows than the read takes: a sample of row groups evenly spread over them
             // (the read samples their rows), so what is fetched stays near what is shown. No more
             // bytes than a read may fetch.
             let rows: u64 = groups.iter().map(|&g| rows_in(g) as u64).sum();
-            if rows > (limit as u64).saturating_mul(8) && !groups.is_empty() && !self.exact {
+            if rows > (limit as u64).saturating_mul(8) && !groups.is_empty() && !self.exact && !unbounded {
                 thinned = usize::try_from(rows.div_ceil((limit as u64).saturating_mul(4).max(1))).unwrap_or(usize::MAX).max(2);
             }
             let cols: Vec<usize> = self.covering.map(|c| c.to_vec()).unwrap_or_default();
             let all: Vec<usize> = cols.iter().copied().chain([self.geom_col]).chain(self.field_cols.iter().copied()).collect();
             let cost: u64 = groups.iter().step_by(thinned).map(|&g| chunks_size(md, g, &all)).sum();
+            if cost > remote::READ_BUDGET && unbounded {
+                return Err(remote::view_budget());
+            }
             if cost > remote::READ_BUDGET && self.exact {
                 return Err(DataError::Format(format!(
                     "GeoParquet: the extent needs {} MB of the file, more than one read takes",
