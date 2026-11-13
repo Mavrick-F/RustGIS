@@ -2706,6 +2706,11 @@ impl RustGisApp {
         {
             return None;
         }
+        // An edit of a standalone table acts on the table, not the active layer: a step naming
+        // both would be refused when it runs again.
+        if id.starts_with("edit.") && params.get("table").is_some_and(|t| !t.is_null()) {
+            return None;
+        }
         let spec = self.session.registry.get(id).filter(|c| c.mutates && params.get("layer").is_none_or(Value::is_null)).copied()?;
         if !spec.param_keys().is_some_and(|k| k.contains(&"layer")) {
             return None;

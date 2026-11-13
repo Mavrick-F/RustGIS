@@ -23,9 +23,10 @@ pub struct Dialogs {
     pub reload: Option<crate::reloaddata::Form>,
     pub open: Option<&'static str>,
     pub layer: String,
-    /// The standalone table Add Field and Calculate Field act on, by its id, when opened from its
-    /// view; None for the active layer.
-    pub table: Option<u32>,
+    /// The standalone table Add Field and Calculate Field act on, when opened from its view: the
+    /// project it is in ([`Session::opened`]) and its id, which another project may give again;
+    /// None for the active layer.
+    pub table: Option<(u64, u32)>,
     /// GeoPackage save/discard targets use IDs because display names can repeat.
     pub gpkg_layer: Option<u32>,
     /// The live instance captured with the map-local ID; Undo can make that ID reusable.
@@ -89,12 +90,27 @@ impl Dialogs {
             other => return Err(format!("dialog '{other}' doesn't open on a table")),
         };
         let fields = &s.project.table(id).ok_or("no such table")?.dataset.fields;
-        *self = Dialogs { open: Some(name), mode: "new", reset_collapse: true, table: Some(id), ..Dialogs::default() };
+        *self = Dialogs { open: Some(name), mode: "new", reset_collapse: true, table: Some((s.opened, id)), ..Dialogs::default() };
         match name {
             "addField" => self.b = "Double".into(),
             _ => self.a = fields.last().map(|f| f.name.clone()).unwrap_or_default(),
         }
         Ok(())
+    }
+
+    /// The standalone table the dialog acts on, as `"table"` names it in `p`; refused once another
+    /// project is open, whose table of that id is another table.
+    fn on_table(&self, s: &Session, mut p: Value) -> Result<Value, String> {
+        match self.table {
+            Some((opened, _)) if opened != s.opened => {
+                Err(tl!("Another project is open now: open the dialog again from its table.").into())
+            }
+            Some((_, id)) => {
+                p["table"] = json!(id);
+                Ok(p)
+            }
+            None => Ok(p),
+        }
     }
 
     /// Opens a dialog on the current selection, capturing the target of CRS changes.
@@ -500,10 +516,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     ui.end_row();
                 });
                 close = buttons(app, ui, "Add", |app| {
-                    let mut p = json!({"name": app.dialogs.a, "type": app.dialogs.b});
-                    if let Some(id) = app.dialogs.table {
-                        p["table"] = json!(id);
-                    }
+                    let p = app.dialogs.on_table(&app.session, json!({"name": app.dialogs.a, "type": app.dialogs.b}))?;
                     app.run("edit.addField", p).map(|_| ())
                 });
             }
@@ -511,7 +524,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 /// The data Calculate Field reads: the table's it was opened on, else the active layer's.
                 fn data(app: &crate::RustGisApp) -> Option<&rustgis_engine::data::Dataset> {
                     match app.dialogs.table {
-                        Some(id) => app.session.project.table(id).map(|t| &t.dataset),
+                        Some((opened, id)) => app.session.project.table(id).filter(|_| opened == app.session.opened).map(|t| &t.dataset),
                         None => app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| &l.dataset),
                     }
                 }
@@ -545,10 +558,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 };
                 ui.label(egui::RichText::new(help).small().weak());
                 close = buttons(app, ui, "Calculate", |app| {
-                    let mut p = json!({"field": app.dialogs.a, "expression": app.dialogs.text});
-                    if let Some(id) = app.dialogs.table {
-                        p["table"] = json!(id);
-                    }
+                    let p = app.dialogs.on_table(&app.session, json!({"field": app.dialogs.a, "expression": app.dialogs.text}))?;
                     app.run("edit.calculateField", p).map(|_| ())
                 });
             }
@@ -2419,6 +2429,23 @@ fn crs_details(ui: &mut egui::Ui, chosen: &str, current: &str, t: &Tokens) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A field dialog opened on a standalone table acts on that table, and on no other once
+    /// another project is open: table ids start again in each project.
+    #[test]
+    fn a_table_dialog_refuses_another_project() {
+        let mut app = RustGisApp::with_sample();
+        let csv = json!({"fileName": "sites.csv", "text": "id,street\n1,Rue Cler\n"});
+        app.run("layer.addDataText", csv.clone()).unwrap();
+        let id = app.session.project.tables[0].id;
+        app.run("ui.dialog", json!({"name": "addField", "table": id})).unwrap();
+        let p = app.dialogs.on_table(&app.session, json!({"name": "note"})).unwrap();
+        assert_eq!(p["table"], json!(id));
+        app.run("project.new", json!({})).unwrap();
+        app.run("layer.addDataText", csv).unwrap();
+        assert_eq!(app.session.project.tables[0].id, id, "the new project's table has the same id");
+        assert!(app.dialogs.on_table(&app.session, json!({"name": "note"})).is_err());
+    }
 
     /// The app in a harness, its fonts installed on the first pass (the dialog draws on the next).
     fn app_harness(app: RustGisApp) -> egui_kittest::Harness<'static, RustGisApp> {

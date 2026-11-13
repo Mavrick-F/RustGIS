@@ -300,6 +300,14 @@ fn a_standalone_table_is_edited_with_the_edit_commands() {
     let mark = s.notice_mark();
     s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"visits": 1.5}})).unwrap();
     assert!(s.notices_since(mark).iter().any(|n| n.text.contains("sites, field 'visits', row 3") && n.text.contains("fraction")));
+    // A row past the 32-bit range is no row, on every build.
+    assert!(s.run("edit.setValue", &json!({"table": "sites", "row": 4_294_967_296u64, "field": "street", "value": "x"})).is_err());
+    // A name in another case finds its field; one naming no field is said, not dropped quietly.
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"STREET": "Rue Amélie", "stret": "x"}})).unwrap();
+    assert_eq!(cell(&s, 3, "street"), rustgis_data::Value::Text("Rue Amélie".into()));
+    let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert!(said.len() == 1 && said[0].contains("leaves out 1 attribute naming no field: 'stret'"), "{said:?}");
     let mark = s.notice_mark();
     s.run("edit.calculateField", &json!({"table": "sites", "field": "visits", "expression": "visits / 2"})).unwrap();
     assert!(s.notices_since(mark).iter().any(|n| n.text.contains("Calculate Field: 'visits'") && n.text.contains("fraction")));

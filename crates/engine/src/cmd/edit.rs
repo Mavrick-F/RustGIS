@@ -70,9 +70,12 @@ fn data_mut(s: &mut Session, t: Target) -> Result<&mut Dataset, String> {
     }
 }
 
-/// Field `name`'s index in the data of `t`.
+/// Field `name`'s index in the data of `t`: the field of exactly that name, else the first
+/// matching it ignoring case. A source can hold names that differ only in case (PostGIS columns),
+/// and the one named exactly is the one meant.
 fn field_of(s: &Session, t: Target, name: &str) -> Result<usize, String> {
-    data(s, t)?.field_index(name).ok_or_else(|| format!("no field named '{name}'"))
+    let ds = data(s, t)?;
+    ds.fields.iter().position(|f| f.name == name).or_else(|| ds.field_index(name)).ok_or_else(|| format!("no field named '{name}'"))
 }
 
 /// A table's rows change only while editing is on, as a layer's features do
@@ -107,6 +110,7 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     let layer = l.dataset.name.clone();
     let defaults = template.as_ref().map_or(&[][..], |t| &t.defaults[..]);
     let (attrs, losses) = new_row(&l.dataset.fields, p, defaults)?;
+    let unmatched = unmatched_attributes(&l.dataset.fields, p);
     l.dataset.push(Some(g), attrs);
     l.touch_geometry();
     let row = l.dataset.features.len() - 1;
@@ -115,6 +119,7 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     for (field, key) in losses {
         notify_loss(s, key, &layer, field, row);
     }
+    notify_unmatched(s, &layer, &unmatched);
     Ok(json!({"row": row}))
 }
 
@@ -130,13 +135,33 @@ fn add_row(s: &mut Session, p: &Json, i: usize) -> CmdResult {
     editing_on(s)?;
     let t = data_mut(s, Target::Table(i))?;
     let (attrs, losses) = new_row(&t.fields, p, &[])?;
+    let unmatched = unmatched_attributes(&t.fields, p);
     t.push(None, attrs);
     let row = t.features.len().saturating_sub(1);
     let table = t.name.clone();
     for (field, key) in losses {
         notify_loss(s, key, &table, field, row);
     }
+    notify_unmatched(s, &table, &unmatched);
     Ok(json!({"row": row}))
+}
+
+/// The keys of `"attributes"` that name no field of `fields`, even ignoring case: their values
+/// are left out of the new row.
+fn unmatched_attributes(fields: &[Field], p: &Json) -> Vec<String> {
+    let Some(given) = p.get("attributes").and_then(Json::as_object) else { return Vec::new() };
+    given.keys().filter(|k| !fields.iter().any(|f| f.name.eq_ignore_ascii_case(k))).cloned().collect()
+}
+
+/// Says, once, which given attributes of a new row in layer or table `name` matched no field.
+fn notify_unmatched(s: &mut Session, name: &str, unmatched: &[String]) {
+    if unmatched.is_empty() {
+        return;
+    }
+    let shown: Vec<String> = unmatched.iter().take(5).map(|k| format!("'{}'", k.chars().take(40).collect::<String>())).collect();
+    let more = if unmatched.len() > 5 { format!(" and {} more", unmatched.len() - 5) } else { String::new() };
+    let n = if unmatched.len() == 1 { "1 attribute".to_string() } else { format!("{} attributes", unmatched.len()) };
+    s.notify(format!("{name}: the new row leaves out {n} naming no field: {}{more}", shown.join(", ")), false);
 }
 
 /// What writing a value took from it, by field: a notice key ([`notify_loss`]).
@@ -150,7 +175,11 @@ fn new_row(fields: &[Field], p: &Json, defaults: &[(String, Value)]) -> Result<(
     let attrs = fields
         .iter()
         .map(|f| {
-            let given = p.get("attributes").and_then(|a| a.get(&f.name)).map(Value::from_json);
+            // Its name as given, else ignoring case, as fields are found everywhere else.
+            let attributes = p.get("attributes").and_then(Json::as_object);
+            let given = attributes
+                .and_then(|a| a.get(&f.name).or_else(|| a.iter().find(|(k, _)| k.eq_ignore_ascii_case(&f.name)).map(|(_, v)| v)))
+                .map(Value::from_json);
             let default = defaults.iter().find(|(k, _)| k.eq_ignore_ascii_case(&f.name)).map(|(_, v)| v.clone());
             let value = given.or(default).unwrap_or(Value::Null);
             if non_finite_input(&value, f.ty) {
@@ -436,7 +465,8 @@ fn numeric_loss(input: &Value, v: &Value, ty: FieldType) -> Option<&'static str>
 /// standalone table, as its field holds it ([`typed`]), saying what that lost.
 fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     let t = target(s, p)?;
-    let row = p.get("row").and_then(Json::as_u64).ok_or("row is required")? as usize;
+    // A row past `usize` (on a 32-bit build) is no row, not a row it wraps round to.
+    let row = usize::try_from(p.get("row").and_then(Json::as_u64).ok_or("row is required")?).map_err(|_| "no such row")?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let raw = p.get("value").cloned().unwrap_or(Json::Null);
     let input = Value::from_json(&raw);
@@ -767,7 +797,9 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
 }
 
 /// Sets a field from an expression, on the selected rows or all of them (all of a standalone
-/// table's).
+/// table's). It runs on the UI thread: one evaluation of the expression per row of data already
+/// held in memory (a layer read in place is refused, as every `edit.*` command is), with nothing
+/// to read or wait for, and its result is one undo step taken with the project around it.
 fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
     let t = target(s, p)?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
