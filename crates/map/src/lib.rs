@@ -590,7 +590,12 @@ impl Layer {
         }
         if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
             let mut fields = self.dataset.fields.clone();
-            self.date_fields_from_source(&mut fields, &info.fields);
+            if let Err(error) = self.date_fields_from_source(&mut fields, &info.fields) {
+                if let Some(source) = &mut self.source {
+                    source.error = Some(error);
+                }
+                return false;
+            }
             self.dataset.fields = fields;
         }
         // An opened source's dropped Z or M values, for a project saved without the mark. Added to,
@@ -700,11 +705,21 @@ impl Layer {
     }
 
     /// Gives `fields` (the layer's, as a project saved before RustGIS read a source's date columns
-    /// as dates lists them: text) the source's date types, so the live layer and its whole reads
+    /// as dates lists them: text, or GeoParquet epoch integers) the source's date types, so the live layer and its whole reads
     /// and exports say what the source now gives. A field stays text when the layer's definition
     /// query, a display filter, an attribute rule or a label class reads it as text (comparing it
     /// with a number) and wouldn't read it as dates, so it keeps working.
-    fn date_fields_from_source(&self, fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) {
+    /// A newly supported column (such as INT96) can change attribute positions. Refuse an old
+    /// saved schema before changing any field, rather than pairing values with the wrong names.
+    fn date_fields_from_source(&self, fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) -> Result<(), String> {
+        if source.iter().any(|f| f.ty.is_temporal())
+            && (fields.len() != source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name))
+        {
+            return Err(
+                "The source exposes date columns that don't match this saved layer's fields. Add the file again to use its current schema."
+                    .into(),
+            );
+        }
         let filters: Vec<&str> = self
             .definition_query
             .iter()
@@ -719,7 +734,16 @@ impl Layer {
             .collect();
         for k in 0..fields.len() {
             let Some(f) = fields.get(k) else { continue };
-            let Some(ty) = source.iter().find(|s| s.name == f.name && s.ty.is_temporal()).map(|s| s.ty) else { continue };
+            let Some(ty) = source.get(k).filter(|s| s.ty.is_temporal()).map(|s| s.ty) else { continue };
+            // Earlier GeoParquet readers exposed physical epoch integers. Keeping that field
+            // type would make a native-date export replace dates with nulls. Upgrade it, and
+            // let an old numeric filter report its type error rather than silently miscompare.
+            if f.ty == rustgis_data::FieldType::Integer {
+                if let Some(f) = fields.get_mut(k) {
+                    f.ty = ty;
+                }
+                continue;
+            }
             if f.ty != rustgis_data::FieldType::Text {
                 continue;
             }
@@ -744,6 +768,7 @@ impl Layer {
                 fields.clone_from_slice(&after.fields);
             }
         }
+        Ok(())
     }
 
     /// [`Layer::load_all`], with what of the source couldn't be read.
@@ -763,7 +788,7 @@ impl Layer {
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
             if let Some(info) = copy.info() {
-                self.date_fields_from_source(&mut ds.fields, &info.fields);
+                self.date_fields_from_source(&mut ds.fields, &info.fields)?;
             }
         }
         ds.source = self.dataset.source.clone();
@@ -791,7 +816,7 @@ impl Layer {
         ds.zm_dropped = info.zm_dropped || self.dataset.zm_dropped;
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
-            self.date_fields_from_source(&mut ds.fields, &info.fields);
+            self.date_fields_from_source(&mut ds.fields, &info.fields)?;
         }
         // (A source declaring no geometry type takes its first geometry's when exported, as a
         // whole read does.)
@@ -3167,7 +3192,7 @@ mod tests {
         {
             layer.definition_query = query.map(String::from);
             let mut got = fields.clone();
-            layer.date_fields_from_source(&mut got, &source);
+            layer.date_fields_from_source(&mut got, &source).unwrap();
             assert_eq!(got[0].ty, ty, "{query:?}");
         }
         // Kept as text, the field holds the dates the source reads, and the filter keeps the rows
@@ -3189,7 +3214,7 @@ mod tests {
             layer.design.rules =
                 vec![design::AttributeRule { name: "Recent".into(), kind, field: String::new(), expression: expression.into() }];
             let mut got = fields.clone();
-            layer.date_fields_from_source(&mut got, &source);
+            layer.date_fields_from_source(&mut got, &source).unwrap();
             assert_eq!(got[0].ty, FieldType::Text, "{expression}");
         }
         // And a label class's clause.
@@ -3198,8 +3223,40 @@ mod tests {
         class.where_ = Some("issued >= 2026".into());
         layer.labels.classes.push(class);
         let mut got = fields.clone();
-        layer.date_fields_from_source(&mut got, &source);
+        layer.date_fields_from_source(&mut got, &source).unwrap();
         assert_eq!(got[0].ty, FieldType::Text);
+        // Older GeoParquet projects listed epoch days as integers. Both ordinary reads and
+        // exports must adopt the native date schema; numeric queries then fail explicitly.
+        let old = vec![Field::new("issued", FieldType::Integer)];
+        let mut legacy = Layer::new(2, Dataset::new("legacy", GeometryType::Point, old.clone()));
+        legacy.definition_query = Some("issued >= 20000".into());
+        let mut upgraded = old;
+        legacy.date_fields_from_source(&mut upgraded, &source).unwrap();
+        assert_eq!(upgraded[0].ty, FieldType::Date);
+        let upgraded = Dataset::new("legacy", GeometryType::Point, upgraded);
+        assert!(rustgis_data::query::parse_fields("issued >= 20000", &upgraded).is_err());
+        assert!(rustgis_data::query::parse_fields("issued >= '2026-01-01'", &upgraded).is_ok());
+    }
+
+    /// Previously omitted INT96 fields can now be present between saved columns, or after them.
+    /// Refusal keeps the saved schema intact and prevents shifted or silently omitted values.
+    #[test]
+    fn newly_read_date_columns_refuse_stale_saved_field_positions() {
+        let fields = vec![Field::new("name", FieldType::Text), Field::new("population", FieldType::Integer)];
+        let layer = Layer::new(1, Dataset::new("old", GeometryType::Point, fields.clone()));
+        for source in [
+            vec![fields[0].clone(), Field::new("legacy_time", FieldType::DateTime), fields[1].clone()],
+            vec![fields[0].clone(), fields[1].clone(), Field::new("legacy_time", FieldType::DateTime)],
+            vec![Field::new("name", FieldType::DateTime), fields[0].clone(), fields[1].clone()],
+        ] {
+            let mut saved = fields.clone();
+            let error = layer.date_fields_from_source(&mut saved, &source).unwrap_err();
+            assert!(error.contains("Add the file again"));
+            assert_eq!(saved, fields);
+            let mut fresh = source.clone();
+            layer.date_fields_from_source(&mut fresh, &source).unwrap();
+            assert_eq!(fresh, source);
+        }
     }
 
     fn points() -> Dataset {
