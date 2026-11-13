@@ -57,6 +57,12 @@ pub(crate) fn prune_views(app: &mut RustGisApp) {
     });
 }
 
+/// Why a column can't be changed, translated: the edit commands find a field by name, ignoring
+/// case, and an earlier field has this one's name but for case.
+fn shadowed() -> &'static str {
+    tl!("An earlier field has this name but for case, and edits by name reach that one: this column can't be changed here.")
+}
+
 /// What a column's right-click menu asked for.
 #[derive(Clone, Copy)]
 enum ColumnAction {
@@ -333,6 +339,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             let mut convert: Option<(usize, &str)> = None;
             // A field to delete.
             let mut delete_field: Option<usize> = None;
+            // A cell double-clicked in a column whose name finds another field.
+            let mut by_other_name = false;
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 let mut tb = TableBuilder::new(ui)
                     .striped(true)
@@ -387,13 +395,24 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                         show_all = true;
                                         ui.close();
                                     }
+                                    // The edit commands find a field by name, ignoring case: a
+                                    // column whose name finds another one isn't changed by name.
+                                    let named = ds.field_index(&fd.name) == Some(i);
                                     if fd.ty == rustgis_engine::data::FieldType::Text {
                                         ui.separator();
-                                        if ui.button(tl!("Convert to Date")).clicked() {
+                                        if ui
+                                            .add_enabled(named, egui::Button::new(tl!("Convert to Date")))
+                                            .on_disabled_hover_text(shadowed())
+                                            .clicked()
+                                        {
                                             convert = Some((i, "date"));
                                             ui.close();
                                         }
-                                        if ui.button(tl!("Convert to Date and Time")).clicked() {
+                                        if ui
+                                            .add_enabled(named, egui::Button::new(tl!("Convert to Date and Time")))
+                                            .on_disabled_hover_text(shadowed())
+                                            .clicked()
+                                        {
                                             convert = Some((i, "datetime"));
                                             ui.close();
                                         }
@@ -402,7 +421,11 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                     // table has no other place to delete them.
                                     if !is_layer {
                                         ui.separator();
-                                        if ui.button(tl!("Delete Field")).clicked() {
+                                        if ui
+                                            .add_enabled(named, egui::Button::new(tl!("Delete Field")))
+                                            .on_disabled_hover_text(shadowed())
+                                            .clicked()
+                                        {
                                             delete_field = Some(i);
                                             ui.close();
                                         }
@@ -455,7 +478,10 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                         let txt = egui::RichText::new(shown).size(11.5);
                                         let txt = if matches!(v, V::Null) || picture { txt.color(t.text_disabled).italics() } else { txt };
                                         let resp = ui.add(egui::Label::new(txt).sense(Sense::click()).truncate());
-                                        if resp.double_clicked() {
+                                        if resp.double_clicked() && ds.fields.get(c).is_some_and(|f| ds.field_index(&f.name) != Some(c)) {
+                                            // Its value would be written to the field its name finds.
+                                            by_other_name = true;
+                                        } else if resp.double_clicked() {
                                             // The cell being typed in is kept first (once: its
                                             // editor may have kept it on losing the focus).
                                             if let Some(e) = app.table.editing.take()
@@ -520,6 +546,9 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 {
                     app.session.notify(e, true);
                 }
+            }
+            if by_other_name {
+                app.session.notify(shadowed().to_string(), true);
             }
             if let Some(fd) = delete_field.and_then(|i| ds.fields.get(i)) {
                 // Refused (a definition query reading it): said, unless the command said so.

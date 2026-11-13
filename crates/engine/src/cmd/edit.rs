@@ -70,12 +70,10 @@ fn data_mut(s: &mut Session, t: Target) -> Result<&mut Dataset, String> {
     }
 }
 
-/// Field `name`'s index in the data of `t`: the field of exactly that name, else the first
-/// matching it ignoring case. A source can hold names that differ only in case (PostGIS columns),
-/// and the one named exactly is the one meant.
+/// Field `name`'s index in the data of `t`: the first matching it ignoring case, as expressions
+/// and queries find fields.
 fn field_of(s: &Session, t: Target, name: &str) -> Result<usize, String> {
-    let ds = data(s, t)?;
-    ds.fields.iter().position(|f| f.name == name).or_else(|| ds.field_index(name)).ok_or_else(|| format!("no field named '{name}'"))
+    data(s, t)?.field_index(name).ok_or_else(|| format!("no field named '{name}'"))
 }
 
 /// A table's rows change only while editing is on, as a layer's features do
