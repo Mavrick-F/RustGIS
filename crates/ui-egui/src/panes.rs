@@ -3207,6 +3207,13 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 .size(11.5)
                 .color(t.text_dim),
             );
+            // A runner was found (or remembered from Locate…) but its version is outside the
+            // range this RustGIS works with: say which and how to fix it, once.
+            let repeated = |note: &str| matches!(&app.gp.last, Some((false, msgs)) if msgs.iter().any(|m| m == note));
+            if let Some(note) = status["unsupported"].as_str().filter(|n| !repeated(n)) {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(note).size(11.0).color(t.red));
+            }
             ui.add_space(6.0);
             let progress = app.gp.install.as_ref().and_then(|st| st.lock().ok().map(|s| (s.done, s.total)));
             match progress {

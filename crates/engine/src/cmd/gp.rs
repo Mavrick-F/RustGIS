@@ -92,11 +92,16 @@ pub fn is_geolibre_tool(spec: &rustgis_analysis::ToolSpec) -> bool {
 }
 
 /// Whether the GeoLibre tools are available. Natively: the runner in use, its version and tool
-/// count. In the browser (`web`): whether the WASI runner's tools have been loaded.
+/// count; without one, why a runner found or chosen isn't used (`unsupported`: its version is
+/// outside the range this RustGIS works with). In the browser (`web`): whether the WASI
+/// runner's tools have been loaded.
 pub fn geolibre_status() -> Value {
     #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
     {
         let found = rustgis_geolibre::runner::selected();
+        // Only without a runner in use, so the status a run was approved against doesn't change
+        // while that runner stays.
+        let unsupported = if found.is_none() { rustgis_geolibre::runner::passed_over() } else { None };
         json!({
             "supported": true,
             "web": false,
@@ -106,7 +111,8 @@ pub fn geolibre_status() -> Value {
             "path": found.as_ref().map(|(p, _)| p.display().to_string()),
             "version": found.map(|(_, v)| v),
             "tools": geolibre_tools().len(),
-            "download": rustgis_geolibre::runner::DOWNLOAD_URL,
+            "download": rustgis_geolibre::runner::download_url(),
+            "unsupported": unsupported,
         })
     }
     #[cfg(all(feature = "geolibre", target_arch = "wasm32"))]
@@ -118,9 +124,9 @@ pub fn geolibre_status() -> Value {
     json!({"supported": false, "available": false})
 }
 
-/// Downloads and installs the latest GeoLibre runner for this platform; returns the program's
-/// path. `progress` gets the bytes received and the expected total. Blocks: the app calls it
-/// from a background thread, then picks the runner with `gp.setGeolibre`. Native only.
+/// Downloads and installs the pinned GeoLibre runner release for this platform; returns the
+/// program's path. `progress` gets the bytes received and the expected total. Blocks: the app
+/// calls it from a background thread, then picks the runner with `gp.setGeolibre`. Native only.
 pub fn install_geolibre(progress: &dyn Fn(u64, Option<u64>)) -> Result<String, String> {
     #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
     {
