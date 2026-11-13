@@ -1640,10 +1640,11 @@ pub fn written_bands(r: &Raster, band: usize) -> Vec<usize> {
 
 /// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
 /// when they are 8-bit, else 32-bit floats, alpha kept), so it reads back in colour; otherwise
-/// `band` (0-based) as 32-bit floats. `band` is for rasters that aren't colour ones: a colour
-/// raster always writes its colour bands, as its 8-bit form did before. The strips go through
-/// the predictors and Deflate effort of the COG writer ([`super::cogwrite::write_strips`]). A
-/// cancelled run stops it (with [`DataError::Cancelled`]) within a strip.
+/// `band` (0-based), as bytes when it is an 8-bit band of whole bytes, else as 32-bit floats.
+/// `band` is for rasters that aren't colour ones: a colour raster always writes its colour bands,
+/// as its 8-bit form did before. The strips go through the predictors and Deflate effort of the
+/// COG writer ([`super::cogwrite::write_strips`]). A cancelled run stops it (with
+/// [`DataError::Cancelled`]) within a strip.
 pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
     encode(r, band, false)
 }
@@ -1806,7 +1807,22 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
         }
     } else {
         let b = r.bands.get(band).ok_or_else(|| err(format!("the raster has no band {}", band + 1)))?;
-        put(image(&[band], Sample::Float, Vec::new())?, &b.data, f32::to_le_bytes, &mut out)?;
+        // An 8-bit band is written as bytes when every value is a whole byte and an empty cell is
+        // only where no-data can mark it (as the multiband samples above); otherwise as floats.
+        let byte = |v: &f32| if r.is_valid(*v) { v.fract() == 0.0 && (0.0..=255.0).contains(v) } else { r.nodata.is_some() };
+        if r.data_type == "UInt8" && fits_bytes(r, band) && b.data.iter().all(byte) {
+            let nodata = r.nodata.map_or(0, |d| d as u8);
+            let mut data = super::room(b.data.len(), w as usize, h as usize)?;
+            for (i, v) in b.data.iter().enumerate() {
+                if i % (1 << 20) == 0 {
+                    crate::progress::check()?;
+                }
+                data.push(if r.is_valid(*v) { *v as u8 } else { nodata });
+            }
+            put(image(&[band], Sample::Byte, Vec::new())?, &data, u8::to_le_bytes, &mut out)?;
+        } else {
+            put(image(&[band], Sample::Float, Vec::new())?, &b.data, f32::to_le_bytes, &mut out)?;
+        }
     }
     Ok(out.into_inner())
 }
@@ -1913,6 +1929,22 @@ mod tests {
         assert_eq!(back.value(0, 2, 1), Some(7.0));
         assert_eq!(back.value(0, 1, 1), None);
         assert_eq!(back.data_type, "Float32");
+    }
+
+    /// A grey 8-bit band is written as bytes, its no-data cells as the no-data value; without a
+    /// no-data value to mark an empty cell, or with a fraction, it stays floats.
+    #[test]
+    fn grey_bytes_round_trip_as_bytes() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 3.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let byte = |cells: Vec<f32>, nodata| {
+            let r = Raster::new("g", 3, 1, vec![cells], gt, Crs::LonLat, nodata, ColorHint::Gray, "UInt8").unwrap();
+            read(std::io::Cursor::new(write(&r, 0).unwrap()), "back").unwrap()
+        };
+        let back = byte(vec![1.0, 0.0, 255.0], Some(0.0));
+        assert_eq!((back.data_type.as_str(), back.nodata), ("UInt8", Some(0.0)));
+        assert_eq!((back.value(0, 0, 0), back.value(0, 1, 0), back.value(0, 2, 0)), (Some(1.0), None, Some(255.0)));
+        assert_eq!(byte(vec![1.0, f32::NAN, 2.0], None).data_type, "Float32");
+        assert_eq!(byte(vec![1.0, 2.5, 2.0], Some(0.0)).data_type, "Float32");
     }
 
     #[test]

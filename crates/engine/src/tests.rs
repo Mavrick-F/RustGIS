@@ -10064,9 +10064,9 @@ fn layouts_compose_export_and_round_trip() {
     let pdf = std::fs::read(&pdf_path).unwrap();
     let count = format!("/Count {pages}");
     assert!(pdf.windows(count.len()).any(|w| w == count.as_bytes()), "one PDF page per series page");
-    // Kept as vectors: its text in outline fonts, no page a picture, and nothing too large.
+    // Kept as vectors: its text in its fonts (#1815), no page a picture, and nothing too large.
     let has = |needle: &[u8]| pdf.windows(needle.len()).any(|w| w == needle);
-    assert!(has(b"/Subtype /Type3") && has(b"/ToUnicode") && has(b"/Contents"));
+    assert!(has(b"/Subtype /Type0") && has(b"/ToUnicode") && has(b"/Contents"));
     assert!(!has(b"/Im0 Do"), "no page is one picture");
     assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("as pictures, not vectors")));
     assert_eq!(s.project.layouts[0].series.as_ref().unwrap().page, 1, "the shown page is restored");
@@ -11447,6 +11447,58 @@ fn a_scan_warped_onto_its_points_is_placed_for_real() {
     t.run("project.openText", &json!({"text": text})).unwrap();
     let again = t.map().layer_by_name("plate").unwrap().raster.as_ref().unwrap().data.clone().unwrap();
     assert!(again.georeferenced && again.transform == out.transform, "{:?} vs {:?}", again.transform, out.transform);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A hillshade is made as bytes, 1–255 with 0 for no data, so it is exported as 8-bit samples (a
+/// GeoTIFF and a COG); it is still drawn as a grey stretch, even of a plane with a single shade,
+/// which as whole numbers would otherwise be drawn as classes. A chain ending in one is the same.
+#[test]
+fn hillshade_is_made_and_written_as_bytes() {
+    use base64::Engine;
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let mut s = world();
+    s.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
+    let gt = GeoTransform { origin_x: 10.0, origin_y: 45.04, pixel_width: 0.001, pixel_height: -0.001 };
+    let plane = Raster::new("plane", 10, 10, vec![vec![50.0; 100]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    let plane = base64::engine::general_purpose::STANDARD.encode(geotiff::write(&plane, 0).unwrap());
+    s.run("layer.addDataBytes", &json!({"fileName": "plane.tif", "data": plane})).unwrap();
+    let shade = |s: &mut Session, cmd: &str, p: Value| {
+        let r = s.run(cmd, &p).unwrap_or_else(|e| panic!("{cmd} {p}: {e}"));
+        let l = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().raster.clone().unwrap();
+        let d = l.data.clone().unwrap();
+        assert_eq!((d.data_type.as_str(), d.nodata), ("UInt8", Some(0.0)), "{cmd} {p}");
+        assert!(matches!(l.style.renderer, rustgis_map::RasterRenderer::Stretch { .. }), "{cmd} {p}: {:?}", l.style.renderer);
+        (s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().name.clone(), d)
+    };
+    let (hill, d) = shade(&mut s, "raster.function", json!({"layer": "dem", "function": "hillshade"}));
+    let st = &d.bands[0].stats;
+    assert!(st.min >= 1.0 && st.max <= 255.0 && st.count == 1600, "{st:?}");
+    let (_, flat) = shade(&mut s, "raster.function", json!({"layer": "plane", "function": "hillshade"}));
+    assert_eq!(flat.bands[0].stats.categories.as_ref().map(Vec::len), Some(1));
+    let steps = json!([{"function": "bandMath", "expression": "b1 * 2"}, {"function": "hillshade"}]);
+    shade(&mut s, "raster.functionChain", json!({"layer": "dem", "steps": steps}));
+    // A step after a hillshade reads its no-data, and makes floats again.
+    let r = s
+        .run(
+            "raster.functionChain",
+            &json!({"layer": "dem", "steps": [{"function": "hillshade"}, {"function": "threshold", "value": 128}]}),
+        )
+        .unwrap();
+    let after = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().raster.clone().unwrap().data.unwrap();
+    assert_eq!((after.data_type.as_str(), after.bands[0].stats.count), ("Float32", 1600));
+    let dir = std::env::temp_dir().join(format!("rustgis-hillshade-bytes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for cog in [false, true] {
+        let tif = dir.join(format!("hill-{cog}.tif"));
+        s.run("share.exportRaster", &json!({"layer": hill, "path": tif.display().to_string(), "cog": cog})).unwrap();
+        let back = rustgis_data::raster::read_path(&tif).unwrap();
+        assert_eq!(
+            (back.data_type.as_str(), back.nodata, back.bands[0].data.as_slice()),
+            ("UInt8", Some(0.0), d.bands[0].data.as_slice()),
+            "cog: {cog}"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -34689,13 +34741,13 @@ fn geopackage_past_the_count_limit_streams_exports_and_reads_whole() {
     let output = fixture.dir.join("whole.csv");
     let exported = s.run("share.exportLayer", &json!({"layer": id, "path": output})).unwrap();
     assert_eq!(exported["features"].as_u64(), Some(count as u64));
-    // A header, then every row once and in order (the first column is the road's name).
+    // A header, then every row once and in order (the road's name after its coordinates).
     let mut lines = std::io::BufRead::lines(std::io::BufReader::new(std::fs::File::open(&output).unwrap()));
-    assert!(lines.next().unwrap().unwrap().starts_with("name,"));
+    assert!(lines.next().unwrap().unwrap().starts_with("longitude,latitude,name"));
     let mut rows = 0;
     for (k, line) in lines.enumerate() {
         let line = line.unwrap();
-        assert!(line.starts_with(&format!("road {},", k + 1)), "row {k}: {line}");
+        assert_eq!(line.split(',').nth(2), Some(format!("road {}", k + 1).as_str()), "row {k}: {line}");
         rows += 1;
     }
     assert_eq!(rows, count, "every row");
@@ -38761,6 +38813,35 @@ fn must_be_covered_by_says_which_polygons_it_left_out_at_a_pole() {
     }
 }
 
+/// The faces a PDF sets in outlines though fonts were asked for (#1815) are said in one notice:
+/// none, nothing said; one face, singular; more, plural; past ten, the first ten and how many more.
+#[test]
+fn a_pdf_says_which_faces_it_sets_in_outlines() {
+    let mut s = Session::new(Project::default());
+    let faces = |n: usize| -> Vec<rustgis_render::pdf::Outlined> {
+        (1..=n).map(|i| rustgis_render::pdf::Outlined { face: format!("Face {i}"), why: "its licence forbids embedding".into() }).collect()
+    };
+    let said = |s: &mut Session, n: usize| {
+        let mark = s.notice_mark();
+        crate::cmd::layout::outlined_notice(s, &faces(n));
+        s.notices_since(mark).iter().map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    assert!(said(&mut s, 0).is_empty(), "every face embedded, nothing said");
+    let lead = "The PDF sets the text of";
+    let tail = "as outlines, not as text a vector editor can edit:";
+    assert_eq!(said(&mut s, 1), [format!("{lead} 1 face {tail} Face 1 (its licence forbids embedding)")]);
+    let two = said(&mut s, 2);
+    assert_eq!(two.len(), 1, "one notice");
+    assert!(
+        two[0].starts_with(&format!("{lead} 2 faces {tail} Face 1 (")) && two[0].ends_with(", Face 2 (its licence forbids embedding)"),
+        "{two:?}"
+    );
+    let eleven = said(&mut s, 11);
+    assert_eq!(eleven.len(), 1, "one notice");
+    assert!(eleven[0].starts_with(&format!("{lead} 11 faces {tail}")), "{eleven:?}");
+    assert!(eleven[0].contains("Face 10 (") && !eleven[0].contains("Face 11") && eleven[0].ends_with(", and 1 more"), "{eleven:?}");
+}
+
 #[test]
 fn a_pdf_says_which_frames_and_pages_it_draws_as_pictures() {
     let mut s = Session::new(Project::default());
@@ -38784,6 +38865,65 @@ fn a_pdf_says_which_frames_and_pages_it_draws_as_pictures() {
     assert!(
         s.notices_since(mark)[0].text.ends_with("(page 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 and 5 more)")
     );
+}
+
+/// A layout's PDF sets its text in its faces, embedded as subsets (#1815): a layout text and a
+/// map's labels come out as Type 0 fonts over CID fonts, their text read back through each font's
+/// map; `"pdf": {"text": "outlines"}` keeps the Type 3 outlines, and anything else is refused.
+#[test]
+fn a_layout_pdf_sets_its_text_in_its_fonts() {
+    let mut s = world();
+    s.run("labels.field", &json!({"layer": "Countries", "field": "name"})).unwrap();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    s.run("layout.addElement", &json!({"kind": "text", "text": "Ocupação do solo"})).unwrap();
+    let path = std::env::temp_dir().join(format!("rustgis-fonts-{}.pdf", std::process::id()));
+    // Removed however the test ends.
+    struct Removed(std::path::PathBuf);
+    impl Drop for Removed {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _removed = Removed(path.clone());
+    let export = |s: &mut Session, p: Value| {
+        let mark = s.notice_mark();
+        let mut p = p;
+        p["path"] = json!(path);
+        p["dpi"] = json!(72);
+        s.run("layout.export", &p).map(|_| {
+            let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+            (String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned(), said)
+        })
+    };
+    let (pdf, said) = export(&mut s, json!({})).unwrap();
+    assert!(pdf.contains("/Subtype /Type0") && pdf.contains("/Encoding /Identity-H"), "{said:?}");
+    assert!(pdf.contains("/Subtype /CIDFontType2") || pdf.contains("/Subtype /CIDFontType0"));
+    assert!(!pdf.contains("/Subtype /Type3"), "every face embedded: {said:?}");
+    assert!(!said.iter().any(|t| t.contains("as outlines")), "{said:?}");
+    // The text read back: the title's and the labels' characters are in the fonts' maps.
+    let raw = std::fs::read(&path).unwrap();
+    let maps: String = raw
+        .windows(8)
+        .enumerate()
+        .filter(|(_, w)| w == b"\nstream\n")
+        .filter_map(|(i, _)| miniz_oxide::inflate::decompress_to_vec_zlib(&raw[i + 8..]).ok())
+        .map(|d| String::from_utf8_lossy(&d).into_owned())
+        .filter(|d| d.contains("<0000> <FFFF>"))
+        .collect();
+    for ch in ['O', 'ç', 'ã'] {
+        assert!(maps.contains(&format!("> <{:04X}>", ch as u32)), "{ch}");
+    }
+    let (outlines, said) = export(&mut s, json!({"pdf": {"text": "outlines"}})).unwrap();
+    assert!(outlines.contains("/Subtype /Type3") && !outlines.contains("/Type0"), "{said:?}");
+    export(&mut s, json!({"pdf": {"text": "fonts"}})).unwrap();
+    assert!(std::fs::read(&path).unwrap() == raw, "\"fonts\" is the default, byte for byte");
+    for bad in
+        [json!({"pdf": {"text": "curves"}}), json!({"pdf": "outlines"}), json!({"pdf": {"text": 1}}), json!({"pdf": {"txt": "outlines"}})]
+    {
+        let err = export(&mut s, bad.clone()).unwrap_err();
+        let said = ["\"fonts\" or \"outlines\"", "fonts\"|\"outlines", "pdf has no key \"txt\": its keys are layers, text"];
+        assert!(said.iter().any(|s| err.contains(s)), "{bad}: {err}");
+    }
 }
 
 /// A layout's PDF has layers (#1815): each element an optional content group named after it,

@@ -1182,7 +1182,8 @@ exporting it (`layer.addData`, `share.exportRaster`) give the full size as `over
 and the MCP server see it too. A GeoTIFF read in place that is added before its overview is in
 (the desktop app, the browser) answers `"reading": true`, sized by its header when that is in, and
 with `null` for its size and bands until then.
-`share.exportRaster` writes an untiled GeoTIFF, in strips of rows; with `"cog": true` it writes a
+`share.exportRaster` writes an untiled GeoTIFF, in strips of rows, with an 8-bit grey band (a
+hillshade, say) as bytes and another single band as 32-bit floats; with `"cog": true` it writes a
 cloud-optimised one: 512-pixel tiles, overviews (each half the size of the last, down to one tile),
 and every directory ahead of the tiles, so a reader fetches the header once and then only the tiles
 it needs. Both compress with Deflate after a predictor: the floating-point one for decimal values,

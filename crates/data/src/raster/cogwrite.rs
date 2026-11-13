@@ -1191,7 +1191,7 @@ mod tests {
     /// The untiled writer's strips take the same predictors: floats (NaN, negative and very large
     /// values) the floating-point one, RGB bytes differences, every band of `write_all`'s float
     /// samples (colour, alpha and one more) the floating-point one, and a band of a few classes
-    /// none. Each image runs over more than one strip, and every value of every band reads back
+    /// none, though it is written as floats. Each image runs over more than one strip, and every value of every band reads back
     /// exactly.
     #[test]
     fn untiled_strips_read_back_exactly_through_their_predictor() {
@@ -1209,7 +1209,7 @@ mod tests {
             (geotiff::write(&utm(w, h, vec![floats(0)], ColorHint::Gray, "Float32", None), 0).unwrap(), 3, 1),
             (geotiff::write(&utm(w, h, (0..3).map(bytes).collect(), ColorHint::Rgb { alpha: false }, "UInt8", None), 0).unwrap(), 2, 3),
             (geotiff::write_all(&utm(w, h, five, ColorHint::Rgb { alpha: true }, "Float32", None)).unwrap(), 3, 5),
-            (geotiff::write(&utm(w, h, vec![classes()], ColorHint::Gray, "UInt8", None), 0).unwrap(), 1, 1),
+            (geotiff::write(&utm(w, h, vec![classes()], ColorHint::Gray, "Float32", None), 0).unwrap(), 1, 1),
         ];
         for (i, (file, predictor, bands)) in cases.into_iter().enumerate() {
             let mut dec = Decoder::new(Cursor::new(file.as_slice())).unwrap();
