@@ -68,12 +68,15 @@ fn unsupported_with_fix(what: &str, version: &str) -> Result<(), String> {
     })
 }
 
-/// Records discovery's reason for passing a runner over, if it has one. It only adds: a
-/// remembered Locate… choice refused at startup keeps its reason when discovery then finds a
-/// supported runner. A new choice clears it ([`choose`]).
+/// Records discovery's reason for passing a runner over, if it has one and no reason is kept
+/// yet: a Locate… choice refused (say, the remembered one at startup) keeps its reason when
+/// discovery then passes over another runner or finds a supported one. Only a choice replaces or
+/// clears it ([`choose`]).
 fn add_passed_over(note: Option<String>) {
-    if note.is_some() {
-        set_passed_over(note);
+    if let Ok(mut p) = PASSED_OVER.lock()
+        && p.is_none()
+    {
+        *p = note;
     }
 }
 
@@ -407,13 +410,16 @@ mod tests {
         assert_eq!(first_supported(vec![other.clone(), works.clone()]), (Some((works.clone(), "geolibre-cli 1.8.0".to_string())), None));
         let (found, note) = first_supported(vec![newer.clone()]);
         assert!(found.is_none() && note.is_some());
-        // Locate… refuses it too, keeping the current choice, and the reason stays reported
-        // after discovery, even when it finds a runner to use (#1946 review).
+        // Locate… refuses it too, keeping the current choice, and its reason stays reported after
+        // discovery, both when that finds a runner to use and when it passes over another one.
         let before = selected();
-        assert!(choose(Some(newer)).is_err_and(|e| e.contains("2.0.0") && e.contains("locate a runner in that range")));
+        assert!(choose(Some(newer.clone())).is_err_and(|e| e.contains("2.0.0") && e.contains("locate a runner in that range")));
         assert_eq!(selected(), before);
+        let older = fake("older", "geolibre-cli 0.11.0");
         add_passed_over(first_supported(vec![works.clone()]).1);
-        assert!(passed_over().is_some_and(|n| n.contains("2.0.0")), "{:?}", passed_over());
+        add_passed_over(first_supported(vec![older.clone(), works.clone()]).1);
+        let kept = passed_over().unwrap_or_default();
+        assert!(kept.contains(&newer.display().to_string()) && !kept.contains(&older.display().to_string()), "{kept}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
