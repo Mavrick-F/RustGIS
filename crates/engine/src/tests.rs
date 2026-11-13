@@ -2747,6 +2747,50 @@ fn a_reference_scale_is_set_kept_and_undone() {
 }
 
 #[test]
+fn a_reference_scale_out_of_range_in_a_project_is_left_out_and_said() {
+    let mut s = world();
+    s.run("layer.referenceScale", &json!({"layer": "Rivers", "scale": 25000})).unwrap();
+    let text = serde_json::to_string(&s.project).unwrap();
+    let said = |text: &str| {
+        let mut t = Session::new(Project::default());
+        let mark = t.notices_given();
+        t.run("project.openText", &json!({"text": text})).unwrap();
+        let notices: Vec<String> = t.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        (t.map().layer_by_name("Rivers").unwrap().reference_scale, notices)
+    };
+    // One the command takes opens as saved, with nothing to say.
+    let (kept, notices) = said(&text);
+    assert_eq!(kept, Some(25000.0));
+    assert!(!notices.iter().any(|n| n.contains("reference scale")), "{notices:?}");
+    // One it would refuse is left out, and the notice names the layer.
+    for bad in ["1e39", "-5", "0"] {
+        let edited = text.replace("\"reference_scale\":25000.0", &format!("\"reference_scale\":{bad}"));
+        assert_ne!(edited, text);
+        let (kept, notices) = said(&edited);
+        assert_eq!(kept, None, "{bad}");
+        assert!(
+            notices.iter().any(|n| n.contains("1 layer(s) with a reference scale out of range") && n.contains("'Rivers'")),
+            "{bad}: {notices:?}"
+        );
+    }
+    // So does a map file or a layer file added on its own, and a clean one says nothing.
+    let map = serde_json::to_string(s.map()).unwrap();
+    let layer = serde_json::to_string(s.map().layer_by_name("Rivers").unwrap()).unwrap();
+    for (command, text) in [("map.import", map), ("layer.addLayerFile", layer)] {
+        let said = |text: String| {
+            let mut t = world();
+            let mark = t.notices_given();
+            t.run(command, &json!({"text": text})).unwrap();
+            t.notices_since(mark).iter().map(|n| n.text.clone()).collect::<Vec<String>>()
+        };
+        let clean = said(text.clone());
+        assert!(!clean.iter().any(|n| n.contains("reference scale")), "{command}: {clean:?}");
+        let bad = said(text.replace("\"reference_scale\":25000.0", "\"reference_scale\":0"));
+        assert!(bad.iter().any(|n| n.contains("reference scale out of range") && n.contains("'Rivers'")), "{command}: {bad:?}");
+    }
+}
+
+#[test]
 fn rivers_are_labelled_along_their_lines_in_italics() {
     let mut s = world();
     s.run("labels.field", &json!({"layer": "Rivers", "field": "name"})).unwrap();
@@ -20324,7 +20368,7 @@ fn dropped_z_values_are_said_on_import_and_export() {
         assert!(said(&s, mark), "stream {stream}: {:?}", s.notices_since(mark));
         assert!(std::fs::read_to_string(&out).unwrap().contains("[1.0,2.0]"));
         let mark = s.notice_mark();
-        s.run("data.convert", &json!({"layer": id, "format": "wkt"})).unwrap();
+        s.run("data.convert", &json!({"layer": id, "format": "wkt", "path": dir.join(format!("converted-{stream}.csv"))})).unwrap();
         assert!(said(&s, mark), "stream {stream}");
     }
     let mut s = world();
@@ -34676,6 +34720,133 @@ impl Drop for GpkgRegressionFixture {
     }
 }
 
+/// Conversion reads the source even when the current view contains no features; the explicit
+/// format wins over the filename. Text-only conversion must not return a partial view.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn data_interop_reads_the_whole_source() {
+    let fixture = GpkgRegressionFixture::new("interop");
+    let mut s = Session::new(Project::default());
+    let loaded = s.run("layer.addData", &json!({"path": fixture.path(), "stream": true})).unwrap();
+    let id = loaded["layer"].as_u64().unwrap() as u32;
+    assert!(s.map().layer(id).unwrap().is_streamed());
+    s.map_mut().layer_mut(id).unwrap().dataset.features.clear();
+    for format in ["geojson", "csv", "kml", "gpx", "wkt"] {
+        let path = fixture.dir.join(format!("{format}.txt"));
+        let mark = s.notice_mark();
+        let answer = s.run("data.convert", &json!({"layer": id, "format": format, "path": path, "nameField": "lanes"})).unwrap();
+        assert_eq!(s.notices_since(mark).iter().filter(|n| n.text == format!("Exported {}", path.display())).count(), 1, "{format}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(answer["bytes"].as_u64(), Some(text.len() as u64));
+        let count = match format {
+            "geojson" => serde_json::from_str::<Value>(&text).unwrap()["features"].as_array().unwrap().len(),
+            "kml" => {
+                assert!(text.contains("<name>2</name>"));
+                text.matches("<Placemark>").count()
+            }
+            "gpx" => {
+                assert!(text.contains("<name>2</name>"));
+                text.matches("<wpt ").count()
+            }
+            _ => text.lines().count() - 1,
+        };
+        assert_eq!(count, 3, "{format}: conversion lost source features");
+    }
+    let error = s.run("data.convert", &json!({"layer": id, "format": "geojson"})).unwrap_err();
+    assert!(error.contains("path"), "{error}");
+}
+
+/// A non-finite REAL survives source reading but becomes JSON null: both whole and chunked
+/// conversion report the count after success, and a clean conversion gives no such notice.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn data_interop_reports_non_finite_numbers() {
+    let fixture = GpkgRegressionFixture::new("interop-numbers");
+    let db = rusqlite::Connection::open(fixture.path()).unwrap();
+    db.execute_batch("ALTER TABLE roads ADD COLUMN reading REAL; UPDATE roads SET reading = 1e999 WHERE fid IN (1, 2);").unwrap();
+    for stream in [false, true] {
+        let mut s = Session::new(Project::default());
+        let id = s.run("layer.addData", &json!({"path": fixture.path(), "stream": stream})).unwrap()["layer"].clone();
+        let mark = s.notice_mark();
+        let path = fixture.dir.join(format!("numbers-{stream}.json"));
+        s.run("data.convert", &json!({"layer": id, "format": "geojson", "path": path})).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(text.matches("\"reading\":null").count(), 3);
+        let notes: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("aren't finite numbers")).collect();
+        assert_eq!(notes.len(), 1, "stream {stream}: {:?}", s.notices_since(mark));
+        assert!(notes[0].text.contains("2 attribute value(s)"), "{}", notes[0].text);
+        if !stream {
+            let mark = s.notice_mark();
+            s.run("data.convert", &json!({"layer": id, "format": "geojson"})).unwrap();
+            assert!(s.notices_since(mark).iter().any(|n| n.text.contains("2 attribute value(s)")));
+        }
+    }
+    db.execute_batch("UPDATE roads SET reading = 1.5;").unwrap();
+    let mut s = Session::new(Project::default());
+    let id = s.run("layer.addData", &json!({"path": fixture.path(), "stream": true})).unwrap()["layer"].clone();
+    let mark = s.notice_mark();
+    s.run("data.convert", &json!({"layer": id, "format": "geojson", "path": fixture.dir.join("clean.json")})).unwrap();
+    assert_eq!(
+        s.notices_since(mark).iter().map(|n| n.text.as_str()).collect::<Vec<_>>(),
+        [format!("Exported {}", fixture.dir.join("clean.json").display())],
+        "a clean conversion reports completion without loss notices"
+    );
+}
+
+/// Date parsing can empty a value outside the loaded view. Both source-read paths report
+/// that loss once, while a valid date produces no unread-date notice.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn data_interop_reports_unread_dates_from_the_whole_source() {
+    let fixture = GpkgRegressionFixture::new("interop-dates");
+    let db = rusqlite::Connection::open(fixture.path()).unwrap();
+    db.execute_batch("ALTER TABLE roads ADD COLUMN issued DATE; UPDATE roads SET issued = '2026-01-01' WHERE fid = 1;").unwrap();
+    for valid in [false, true] {
+        db.execute("UPDATE roads SET issued = ?1 WHERE fid = 2", [if valid { "2026-02-02" } else { "not-a-date" }]).unwrap();
+        for format in ["geojson", "kml"] {
+            let mut s = Session::new(Project::default());
+            let added = s.run("layer.addData", &json!({"path": fixture.path(), "stream": true})).unwrap();
+            let id = added["layer"].as_u64().unwrap() as u32;
+            assert!(s.map().layer(id).unwrap().is_streamed());
+            s.map_mut().layer_mut(id).unwrap().dataset.features.clear();
+            let path = fixture.dir.join(format!("dates-{valid}.{format}"));
+            let mark = s.notice_mark();
+            s.run("data.convert", &json!({"layer": id, "format": format, "path": path})).unwrap();
+            let notes: Vec<_> =
+                s.notices_since(mark).iter().filter(|n| n.text.contains("read as empty") && n.text.contains("issued")).collect();
+            assert_eq!(notes.len(), usize::from(!valid), "{format} valid {valid}: {:?}", s.notices_since(mark));
+            if !valid {
+                assert!(notes[0].text.contains("1 value isn't a date"), "{}", notes[0].text);
+            }
+            if format == "geojson" {
+                let out: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                let row = out["features"].as_array().unwrap().iter().find(|f| f["id"] == 2).unwrap();
+                assert_eq!(row["properties"]["issued"].is_null(), !valid);
+            }
+        }
+    }
+}
+
+/// Each serializer observes Cancel during its work and preserves the previous destination.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn data_interop_cancels_every_format_before_replacing_the_file() {
+    use crate::cmd::exports::export_start;
+    use rustgis_analysis::control::Control;
+    let fixture = GpkgRegressionFixture::new("interop-cancel");
+    let mut s = world();
+    for format in ["geojson", "csv", "kml", "gpx", "wkt"] {
+        let path = fixture.dir.join(format!("{format}.txt"));
+        std::fs::write(&path, "previous file").unwrap();
+        let run = export_start(&mut s, "data.convert", &json!({"layer": "Cities", "format": format, "path": path})).unwrap();
+        let control = Control::cancelled_once_started();
+        let error = run.run(&control).err().unwrap();
+        assert!(control.looked() > 0, "{format}: serializer did not check Cancel");
+        assert!(error.contains("cancelled"), "{format}: {error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous file");
+    }
+}
+
 /// A streamed layer's export says how many of its source's rows couldn't be read, written a
 /// chunk at a time (GeoJSON) or from a whole read (KML) alike.
 #[cfg(not(target_arch = "wasm32"))]
@@ -40142,6 +40313,8 @@ fn exports_run_on_another_thread() {
     let at = |name: &str| dir.join(name).display().to_string();
     s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
     for (command, file, p) in [
+        ("data.convert", "converted.geojson", json!({"layer": "Cities", "format": "geojson"})),
+        ("data.convert", "converted.wkt.csv", json!({"layer": "Cities", "format": "wkt"})),
         ("share.exportMap", "map.png", json!({"width": 64, "height": 48})),
         ("layout.export", "layout.png", json!({"dpi": 48})),
         ("layout.export", "layout.pdf", json!({"dpi": 48})),
@@ -43425,6 +43598,7 @@ fn long_commands_stop_when_cancelled_while_they_run() {
     }
 
     let exports = [
+        ("data.convert", json!({"layer": "Cities", "format": "geojson", "path": out("converted.geojson")})),
         ("share.exportLayer", json!({"layer": "Cities", "path": out("cities.geojson")})),
         ("share.exportRaster", json!({"layer": dem, "path": out("dem.tif")})),
         ("share.exportMap", json!({"path": out("map.png"), "width": 320, "height": 200})),
