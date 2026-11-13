@@ -359,13 +359,18 @@ fn changes(a: &Dataset, b: &Dataset, renamed: &[(String, String)]) -> Vec<Change
         if let Some(j) = j {
             taken[j] = true;
         }
-        let change = match j.and_then(|j| b.fields.get(j)) {
-            None => Some(format!("field{nulls} missing ({})", f.name)),
-            Some(g) if g.name != f.name => Some(format!("field renamed ({} → {})", f.name, g.name)),
-            Some(g) if g.ty != f.ty => Some(format!("field{nulls} type changed {:?} → {:?} ({})", f.ty, g.ty, f.name)),
-            Some(_) => None,
+        // A name and a type change each count.
+        let changed = match j.and_then(|j| b.fields.get(j)) {
+            None => vec![format!("field{nulls} missing ({})", f.name)],
+            Some(g) => [
+                (g.name != f.name).then(|| format!("field renamed ({} → {})", f.name, g.name)),
+                (g.ty != f.ty).then(|| format!("field{nulls} type changed {:?} → {:?} ({})", f.ty, g.ty, f.name)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         };
-        out.extend(change.map(|c| (c, Some(f.name.clone()))));
+        out.extend(changed.into_iter().map(|c| (c, Some(f.name.clone()))));
         map.push((i, j));
     }
     let (fa, fb) = (a.features.iter().collect::<Vec<_>>(), b.features.iter().collect::<Vec<_>>());
@@ -447,11 +452,17 @@ fn an_export_that_changes_a_layer_says_so() {
             // A change is said by a notice naming its field, the export's or the reading's, or by
             // any export notice for one in no field (geometry, the feature count): a notice of
             // geometry names no field to look for, so this half is looser.
-            let said_of = |field: &Option<String>| match field {
-                Some(f) => said.export.iter().chain(&said.read).any(|n| n.contains(&format!("'{f}'"))),
+            // A notice that renames a field (`'a' → 'a_1'`) says the rename, not a change in its
+            // values.
+            let said_of = |c: &str, field: &Option<String>| match field {
+                Some(f) => said.export.iter().chain(&said.read).any(|n| {
+                    let n = if c.starts_with("field renamed") { n.clone() } else { n.replace(&format!("'{f}' → '"), "") };
+                    n.contains(&format!("'{f}'"))
+                }),
                 None => !said.export.is_empty(),
             };
-            let silent: Vec<String> = found.into_iter().filter(|(c, field)| !declared(ext, c) && !said_of(field)).map(|(c, _)| c).collect();
+            let silent: Vec<String> =
+                found.into_iter().filter(|(c, field)| !declared(ext, c) && !said_of(c, field)).map(|(c, _)| c).collect();
             if !silent.is_empty() {
                 return Err(TestCaseError::fail(format!(
                     "{ext}: changed without a notice: {silent:?}; said: {:?}, {:?}",
