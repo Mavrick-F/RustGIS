@@ -601,8 +601,9 @@ fn projection(geometry: &str, columns: impl IntoIterator<Item = (String, String)
 const FINE_TIMES_SAMPLE: u64 = 100_000;
 
 /// What a layer says of `datetime2` and `datetimeoffset` columns that hold 100-nanosecond digits
-/// (`fine`), which are read to the microsecond: the columns whose first rows have one, and those
-/// that may when the rows looked at found none but weren't all of them (or the look failed).
+/// (`fine`), which are read to the microsecond: the columns where a row looked at (up to 100,000,
+/// whichever the server returns) has one, and those that may when the rows looked at have none but
+/// weren't all of them (or the look failed).
 fn fine_times_note(conn: &Conn, from: &str, fine: &[String]) -> Vec<String> {
     if fine.is_empty() {
         return Vec::new();
@@ -637,7 +638,7 @@ fn fine_times_said(fine: &[String], found: &[usize], complete: bool) -> Vec<Stri
     let rest: Vec<usize> = (0..fine.len()).map(|i| usize::from(!has(i))).collect();
     if !complete && rest.contains(&1) {
         notes.push(format!(
-            "date-times in {} may hold 100-nanosecond digits (the first rows have none): any are read to the microsecond, the last digit left out",
+            "date-times in {} may hold 100-nanosecond digits (the rows looked at have none): any are read to the microsecond, the last digit left out",
             crate::io::named_fields(&fields, &rest)
         ));
     }
@@ -1033,7 +1034,7 @@ mod tests {
         assert_eq!(bool_of(&ColumnData::Bit(Some(true))), Some(true));
         assert_eq!(bytes_of(&ColumnData::Binary(Some((&b"wkb"[..]).into()))), Some(&b"wkb"[..]));
         // Columns whose rows hold 100-nanosecond digits are named; the rest, and a table read
-        // whole without any, say nothing; a larger table without any in its first rows may.
+        // whole without any, say nothing; a larger table without any in the rows looked at may.
         let fine = ["seen".to_string(), "logged".to_string()];
         assert_eq!(
             fine_times_said(&fine, &[0, 1], true),

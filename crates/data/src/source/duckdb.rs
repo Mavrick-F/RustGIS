@@ -1243,6 +1243,13 @@ mod tests {
         assert!(days.contains(&"2020-01-02".to_string()), "{days:?}");
         assert_eq!(all_points.unread_dates.iter().sum::<usize>(), 1);
         assert_eq!(all_points.unread_dates.get(3), Some(&1));
+        // Each date type passed through writes infinity, which is read as empty and counted.
+        let sql = "SELECT 1 AS id, DATE 'infinity' AS d, TIMESTAMP 'infinity' AS t, TIMESTAMP_S '-infinity' AS s, \
+            TIMESTAMP_MS 'infinity' AS ms, TIMESTAMPTZ 'infinity' AS tz, ST_Point(1, 2) AS geom";
+        let out = run_in(&cache, &Query { sql, ..Query::default() }, false).unwrap();
+        let infinite = open(&out.parts[0].path).read(&crate::source::Request { extent: None, limit: 10 }).unwrap();
+        assert_eq!(infinite.features.len(), 1);
+        assert_eq!(infinite.unread_dates, [0, 1, 1, 1, 1, 1]);
         // No temporary files are left.
         let names: Vec<String> =
             std::fs::read_dir(&cache).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();

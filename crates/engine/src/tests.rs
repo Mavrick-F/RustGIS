@@ -34477,7 +34477,12 @@ fn postgis_dates_live() {
     let Ok(url) = std::env::var("RUSTGIS_TEST_POSTGIS") else { return };
     // Settings that would give other text, on every connection the test and RustGIS make:
     // RustGIS's own session doesn't follow them.
-    let url = format!("{} options='-c DateStyle=SQL,DMY -c TimeZone=America/Chicago'", url.trim_start_matches("postgres:"));
+    let url = if url.contains("://") {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}options=-c%20DateStyle%3DSQL%2CDMY%20-c%20TimeZone%3DAmerica%2FChicago")
+    } else {
+        format!("{} options='-c DateStyle=SQL,DMY -c TimeZone=America/Chicago'", url.trim_start_matches("postgres:"))
+    };
     let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let style: String = db.query_one("SHOW DateStyle", &[]).unwrap().get(0);
     assert_eq!(style, "SQL, DMY");
