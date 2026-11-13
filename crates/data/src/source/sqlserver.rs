@@ -831,7 +831,7 @@ fn native_window(req: &Request, all: Extent, reproject: &Reproject, geography: b
     if !all.is_empty() && e.min_x <= all.min_x && e.min_y <= all.min_y && e.max_x >= all.max_x && e.max_y >= all.max_y {
         return None;
     }
-    box_text(&reproject.extent_from_lonlat(&e), geography)
+    box_text(&reproject.extent_from_lonlat(&e)?, geography)
 }
 
 /// A finite polygon literal. Geography needs a counter-clockwise ring, clear of poles and the

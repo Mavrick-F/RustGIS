@@ -870,7 +870,7 @@ impl MysqlSource {
         if !all.is_empty() && e.min_x <= all.min_x && e.min_y <= all.min_y && e.max_x >= all.max_x && e.max_y >= all.max_y {
             return None;
         }
-        box_text(&self.reproject.extent_from_lonlat(&e), self.reproject.is_lonlat())
+        box_text(&self.reproject.extent_from_lonlat(&e)?, self.reproject.is_lonlat())
     }
 
     fn row_feature(&self, r: &mysql::Row) -> Option<Feature> {

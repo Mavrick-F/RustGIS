@@ -172,7 +172,7 @@ impl FeatureSource for ShpSource {
     fn read(&self, req: &Request) -> Result<Batch> {
         let encoding = self.encoding.decoder();
         let limit = clamp_limit(req.limit);
-        let extent = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let extent = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         if extent.is_some_and(|e| e.is_empty()) {
             return Ok(Batch { complete: super::stride(0, limit) == 1, ..Batch::default() });
         }
@@ -237,7 +237,7 @@ impl FeatureSource for ShpSource {
         let encoding = self.encoding.decoder();
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         let req = Request { extent, limit: usize::MAX };
-        let extent = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let extent = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         if extent.is_some_and(|e| e.is_empty()) {
             return Ok(Batch { complete: true, ..Batch::default() });
         }

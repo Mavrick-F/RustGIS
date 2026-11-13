@@ -1049,7 +1049,7 @@ impl PostgisSource {
     /// (the read then filters nothing on the server).
     fn lonlat_to_native(&self, e: &Extent) -> Option<Extent> {
         if let Some(r) = &self.reproject {
-            let n = r.extent_from_lonlat(e);
+            let n = r.extent_from_lonlat(e)?;
             return (!n.is_empty()).then_some(n);
         }
         let c = Extent::new(e.min_x.max(-180.0), e.min_y.max(-89.9), e.max_x.min(180.0), e.max_y.min(89.9));

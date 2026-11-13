@@ -830,14 +830,22 @@ impl Reproject {
         }
     }
 
-    /// A longitude/latitude extent in native coordinates.
-    pub(crate) fn extent_from_lonlat(&self, e: &Extent) -> Extent {
+    /// A longitude/latitude extent in native coordinates, or `None` when the system refuses a
+    /// place on its edge (one it can't bring back, #1925): the edge's other places no longer bound
+    /// what's inside it, so a read filters nothing rather than leave features out.
+    pub(crate) fn extent_from_lonlat(&self, e: &Extent) -> Option<Extent> {
         match &self.t {
-            None => *e,
+            None => Some(*e),
             Some(t) => {
                 // Clamp to the valid range first: projections fail near the poles.
                 let c = Extent::new(e.min_x.max(-180.0), e.min_y.max(-89.9), e.max_x.min(180.0), e.max_y.min(89.9));
-                around(&c, |p| t.from_lonlat(p))
+                let refused = std::cell::Cell::new(false);
+                let out = around(&c, |p| {
+                    let q = t.from_lonlat(p);
+                    refused.set(refused.get() || q.is_none());
+                    q
+                });
+                (!refused.get()).then_some(out)
             }
         }
     }

@@ -435,7 +435,7 @@ impl FeatureSource for GpkgSource {
         let limit = clamp_limit(req.limit);
         let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
         let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
-        let native = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let mut out = Batch::default();
         let push = |row: Row, out: &mut Batch| match row {
             Row::Feature(f) => out.features.push(f),
@@ -543,7 +543,7 @@ impl FeatureSource for GpkgSource {
         let conn = open_db(path)?;
         same_file()?;
         let req = Request { extent, limit: usize::MAX };
-        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let sql = format!("SELECT {} FROM {}", self.select_list(), quote(&self.table));
         let mut st = conn.prepare(&sql).map_err(err)?;
         let mut rows = st.query([]).map_err(err)?;

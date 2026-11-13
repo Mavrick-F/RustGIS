@@ -392,7 +392,7 @@ impl FeatureSource for ParquetSource {
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let md = self.reader.metadata();
-        let native = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let rows_in = |g: usize| self.rows_in(md, g);
         // Row groups whose bounding box meets the extent.
         let mut groups: Vec<usize> = (0..md.num_row_groups())
@@ -544,7 +544,7 @@ impl FeatureSource for ParquetSource {
         }
         let req = Request { extent, limit: usize::MAX };
         let md = self.reader.metadata();
-        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let mut out = Batch { complete: true, ..Batch::default() };
         let mut base = 0u64;
         for g in 0..md.num_row_groups() {

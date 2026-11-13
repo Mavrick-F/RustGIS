@@ -337,7 +337,7 @@ impl FeatureSource for GpkgMemSource {
     /// Keeps rows without geometry in whole reads; they have no location to match an extent.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
-        let native = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let mut sample = if native.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
         let (mut skipped, mut unread_dates) = (0, Vec::new());
         self.db
@@ -396,7 +396,7 @@ impl FeatureSource for GpkgMemSource {
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         let req = Request { extent, limit: usize::MAX };
-        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let mut out = Batch { complete: true, ..Batch::default() };
         // The visitor's error, which stops the scan.
         let mut failed = None;

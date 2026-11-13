@@ -259,7 +259,7 @@ impl FeatureSource for GeoJsonSource {
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         // Counted first, then the sample taken: no list of every match.
-        let extent = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let extent = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let matched = self.matches(extent).count();
         let step = stride(matched as u64, limit).max(1) as usize;
         let mut f = BufReader::with_capacity(BUFFER, File::open(&self.path)?);

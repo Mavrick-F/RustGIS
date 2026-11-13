@@ -725,8 +725,8 @@ fn comes_back(c: Coord, back: Coord) -> bool {
 /// and that latitude's rounding (or, at some table rows, the piece above's width) puts the
 /// longitude past ±180° by up to 1.4e-7 of it (proj4rs 0.3.0 and PROJ refuse it), so 13% of the
 /// edge's places didn't come back. A point no more than a millionth past the edge is on it: the
-/// meridian opposite the central one, at y's latitude, on the side of the central meridian `c` is
-/// (#1925). `geo` is the projection's own longitude/latitude: the edge is there before any datum
+/// meridian opposite the central one, at y's latitude, on the same side of the central meridian
+/// as `c` (#1925). `geo` is the projection's own longitude/latitude: the edge is there before any datum
 /// shift.
 fn robinson_edge(native: &proj4rs::Proj, geo: &proj4rs::Proj, wgs84: &proj4rs::Proj, c: Coord) -> Option<(f64, f64, f64)> {
     use proj4rs::transform::transform;

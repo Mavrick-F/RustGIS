@@ -4018,3 +4018,32 @@ fn a_feature_just_outside_an_extent_is_left_out_of_its_read() {
     assert!(geojson.read(&req).unwrap().features.is_empty());
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+/// A view the layer's projection refuses part of the edge of (#1925): the box queried in the
+/// layer's coordinates must still hold every place in the view the projection takes, or a read
+/// leaves out features without a word. Here, a UTM zone 17 layer and views reaching past 90°
+/// from its meridian, where transverse Mercator refuses places: such a view isn't bounded.
+#[test]
+fn a_query_box_leaves_out_nothing_in_view_when_its_edge_is_refused() {
+    let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new());
+    let t = r.transformer().unwrap();
+    for view in [
+        Extent::new(-120.0, -30.0, 10.0, 30.0),
+        Extent::new(-180.0, -60.0, 180.0, 60.0),
+        Extent::new(-81.5, -5.0, 15.0, 5.0),
+        Extent::new(-175.0, -1.0, -60.0, 1.0),
+    ] {
+        // Unbounded (`None`) reads everything in view.
+        let Some(native) = r.extent_from_lonlat(&view) else { continue };
+        for i in 0..=40 {
+            for j in 0..=40 {
+                let p = Coord::new(view.min_x + view.width() * f64::from(i) / 40.0, view.min_y + view.height() * f64::from(j) / 40.0);
+                if let Some(q) = t.from_lonlat(p) {
+                    assert!(native.contains(q), "{view:?}: {p:?} goes to {q:?}, outside the box queried, {native:?}");
+                }
+            }
+        }
+    }
+    // A view in the zone is still a box.
+    assert!(r.extent_from_lonlat(&Extent::new(-84.0, 30.0, -78.0, 40.0)).is_some_and(|e| !e.is_empty()));
+}

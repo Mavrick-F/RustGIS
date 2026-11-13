@@ -285,7 +285,7 @@ impl FgbSource {
     fn read_with<R: Read + Seek>(&self, open: &impl Fn() -> Result<R>, req: &Request, scan: bool) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let reader = open_reader(open()?)?;
-        let native = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let indexed = native.filter(|_| self.info.indexed && !scan);
         // Feature numbers in the file, for ids that stay put between reads: the index search's
         // results, in the order the selection visits them.
@@ -355,7 +355,7 @@ impl FgbSource {
     ) -> Result<Batch> {
         let req = Request { extent, limit: usize::MAX };
         let reader = open_reader(open()?)?;
-        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let indexed = native.filter(|_| self.info.indexed);
         let mut numbers: Option<Vec<u64>> = match indexed {
             Some(e) => Some(self.search(open()?, &e)?),
@@ -589,10 +589,8 @@ impl FgbSource {
     /// takes, fetched together before any is read; the others are passed over unread.
     fn read_remote(&self, f: &Arc<Remote>, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
-        let native = match req.extent {
-            Some(e) => self.reproject.extent_from_lonlat(&e),
-            None => Extent::new(f64::MIN, f64::MIN, f64::MAX, f64::MAX),
-        };
+        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        let native = native.unwrap_or(Extent::new(f64::MIN, f64::MIN, f64::MAX, f64::MAX));
         let (index, features) = self.sections(f)?;
         let hits = self.remote_search(f, index, &native)?;
         let n = hits.items.len();
