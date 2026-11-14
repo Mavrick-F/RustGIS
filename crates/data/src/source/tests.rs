@@ -3983,6 +3983,8 @@ fn geopackage_keeps_a_moment_in_a_date_field_from_becoming_a_day() {
     let mut ds = Dataset::new("days", GeometryType::Point, vec![Field::new("day", FieldType::Date)]);
     ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::parse("2026-03-05T00:00:00.000400", FieldType::DateTime)]);
     assert_eq!(crate::io::text_in_dates(ds.features.iter(), &ds.fields), [1]);
+    // Said once, as a value that reads as null: it isn't rounded to the millisecond.
+    assert_eq!(crate::io::fine_dates(ds.features.iter(), &ds.fields), [0]);
     crate::io::write_path(&ds, &path).unwrap();
     let (back, _) = crate::io::read_path(&path).unwrap();
     assert!(back.value(0, 0).is_null(), "{:?}", back.value(0, 0));
