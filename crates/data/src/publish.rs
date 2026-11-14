@@ -311,6 +311,23 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     if let Some(note) = crate::io::dates_as_text_note(&ds.fields, &path.display().to_string()) {
         notes.push(note);
     }
+    // The reader infers integers from whole numeric values, even in a decimal DBF column.
+    let integral: Vec<String> = ds
+        .fields
+        .iter()
+        .zip(&read_back.fields)
+        .filter(|(a, b)| a.ty == FieldType::Double && b.ty == FieldType::Integer)
+        .map(|(field, _)| field.name.clone())
+        .collect();
+    if !integral.is_empty() {
+        notes.push(format!(
+            "{}: {} double field{} read back as integer because all non-null values are whole numbers: {}",
+            path.display(),
+            integral.len(),
+            if integral.len() == 1 { "" } else { "s" },
+            names_list(&integral)
+        ));
+    }
     if !widened.is_empty() {
         let shown: Vec<&str> = widened.iter().take(5).map(String::as_str).collect();
         let more = if widened.len() > 5 { format!(" and {} more", widened.len() - 5) } else { String::new() };
@@ -1171,6 +1188,28 @@ mod tests {
         assert!(note.contains(&path.display().to_string()), "{note}");
         assert_eq!(published.read.fields[0].ty, FieldType::Text);
         assert_eq!(published.read.features.first().unwrap().attrs[0], Value::Text(stamp.into()));
+    }
+
+    /// Editing the last fractional values changes the read-back field kind, which must be said.
+    #[test]
+    fn a_double_field_read_back_as_integer_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (mut ds, sync) = written(&parcels(), &path);
+        assert_eq!(ds.fields[1].ty, FieldType::Double);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[1] = Value::Float(100.0);
+        rows[1].attrs[1] = Value::Float(200.0);
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        assert_eq!(published.read.fields[1].ty, FieldType::Integer);
+        assert_eq!(published.read.features.first().unwrap().attrs[1], Value::Int(100));
+        assert_eq!(published.notes.len(), 1, "{:?}", published.notes);
+        let note = &published.notes[0];
+        assert!(note.contains("1 double field read back as integer") && note.contains("'ACRES'"), "{note}");
+        assert!(note.contains(&path.display().to_string()), "{note}");
+        let again = shapefile(&published.read, &path, &Synced { files: published.files, rows: published.rows }).unwrap();
+        assert!(again.notes.is_empty(), "{:?}", again.notes);
     }
 
     /// A whole-valued double reads as Integer, but its existing wide decimal column still fits.

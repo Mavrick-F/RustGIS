@@ -174,38 +174,33 @@ pub(crate) fn readable_header_date(dbf: &mut [u8]) {
 /// bytes over as text for [`date`] to read instead of failing the whole record on a date it can't
 /// read (`20260230`, `00000000`). Returns the positions of those columns.
 pub(crate) fn dates_as_text(dbf: &mut [u8]) -> Vec<usize> {
+    retype_columns(dbf, b'D', b'C')
+}
+
+/// Marks a `.dbf`'s floating point (`F`) columns as numeric (`N`) in its header: `dbase` reads the
+/// same text of both, but an `F` column only as an `f32`, which rounds `1809878594` to
+/// `1809878656` and a latitude after its seventh digit. As `N` it is read as an `f64`, as GDAL does.
+pub(crate) fn floats_as_numeric(dbf: &mut [u8]) {
+    retype_columns(dbf, b'F', b'N');
+}
+
+/// Changes the type of the `.dbf` columns whose type letter is `from` (either case) to `to` in the
+/// header, and returns their positions among the columns.
+fn retype_columns(dbf: &mut [u8], from: u8, to: u8) -> Vec<usize> {
     let header_len = usize::from(u16::from_le_bytes([dbf.get(8).copied().unwrap_or(0), dbf.get(9).copied().unwrap_or(0)]));
-    let mut dates = Vec::new();
+    let mut changed = Vec::new();
     for (k, start) in (32..header_len.min(dbf.len())).step_by(32).enumerate() {
         if dbf.get(start).is_none_or(|b| *b == 0x0D) {
             break;
         }
         if let Some(ty) = dbf.get_mut(start + 11)
-            && ty.eq_ignore_ascii_case(&b'D')
+            && ty.eq_ignore_ascii_case(&from)
         {
-            *ty = b'C';
-            dates.push(k);
+            *ty = to;
+            changed.push(k);
         }
     }
-    dates
-}
-
-/// Marks a `.dbf`'s float (`F`) columns as numeric (`N`) columns in its header: both hold a
-/// number as decimal text, and `dbase` reads an `F` column's into an `f32`, which keeps only
-/// about seven digits (`123456.12345678` would read `123456.125`). Read as `N`, they keep the
-/// `f64` the text gives.
-pub(crate) fn floats_as_numeric(dbf: &mut [u8]) {
-    let header_len = usize::from(u16::from_le_bytes([dbf.get(8).copied().unwrap_or(0), dbf.get(9).copied().unwrap_or(0)]));
-    for start in (32..header_len.min(dbf.len())).step_by(32) {
-        if dbf.get(start).is_none_or(|b| *b == 0x0D) {
-            break;
-        }
-        if let Some(ty) = dbf.get_mut(start + 11)
-            && ty.eq_ignore_ascii_case(&b'F')
-        {
-            *ty = b'N';
-        }
-    }
+    changed
 }
 
 /// A column of a `.dbf` as its header describes it: its name's bytes (up to the first NUL),
@@ -361,6 +356,7 @@ mod tests {
         dbf[32 + 3 * 32 + 1] = b'F';
         floats_as_numeric(&mut dbf);
         assert_eq!([dbf[43], dbf[75], dbf[107], dbf[129]], [b'N', b'N', b'C', b'F']);
+        floats_as_numeric(&mut [0u8; 10]);
     }
 
     /// A header date that isn't one gets a placeholder; a real one, and a header cut too short
