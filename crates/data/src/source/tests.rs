@@ -4187,6 +4187,61 @@ fn unbounded_parquet_view_refuses_decoded_columns_over_budget() {
     assert_eq!(batch.features[0].attrs[0], Value::Text("x".repeat(1024)));
 }
 
+/// The same small file must remain readable with plain or dictionary-encoded binary columns.
+#[test]
+fn unbounded_parquet_scan_accepts_two_thousand_distinct_points() {
+    let p = dir().join("ordinary-view.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+    for i in 0..2000 {
+        ds.push(Some(Geometry::Point(Coord::new(-82.0 + f64::from(i) / 2000.0, 0.0))), vec![]);
+    }
+    write_projected_parquet_fixture(&ds, &p, 2000, true);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+    let batch = source.read(&req).unwrap();
+    assert_eq!(batch.matched, 2000);
+    assert!((5..=10).contains(&batch.features.len()));
+    drop(source);
+    write_projected_parquet_fixture(&ds, &p, 2000, false);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+    assert_eq!(source.read(&req).unwrap().matched, 2000);
+}
+
+/// Streamed sources own the scan count; nested export writers must still observe Cancel.
+#[test]
+fn streamed_export_progress_counts_each_source_row_once() {
+    use std::sync::atomic::Ordering;
+    let d = dir();
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+    for i in 0..10 {
+        ds.push(Some(Geometry::Point(Coord::new(f64::from(i), 0.0))), vec![]);
+    }
+    for input in ["shp", "fgb", "gpkg", "parquet"] {
+        let path = d.join(format!("input.{input}"));
+        crate::io::write_path(&ds, &path).unwrap();
+        let source = open_path(&path, None).unwrap();
+        let memory = if input == "gpkg" {
+            Some(gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(std::fs::read(&path).unwrap())), None).unwrap())
+        } else {
+            None
+        };
+        let mut sources: Vec<&dyn FeatureSource> = vec![source.as_ref()];
+        if let Some(memory) = &memory {
+            sources.push(memory);
+        }
+        for (i, source) in sources.into_iter().enumerate() {
+            for output in ["geojson", "csv", "gpkg"] {
+                let progress = Arc::new(crate::progress::tests::Counted::default());
+                let _guard = crate::progress::install(Some(progress.clone()));
+                let out = d.join(format!("output-{input}-{i}.{output}"));
+                assert_eq!(crate::export::write_source_in(source, &ds, &out, Crs::LonLat).unwrap().written, 10);
+                assert_eq!(progress.total.load(Ordering::Relaxed), 10, "{input} to {output}");
+                assert_eq!(progress.done.load(Ordering::Relaxed), 10, "{input} to {output}");
+            }
+        }
+    }
+}
+
 /// Writes the projected reader fixture, including formats whose public writer accepts only WGS 84.
 fn write_unbounded_view_fixture(ds: &Dataset, path: &Path) {
     let crs = Crs::from_epsg(32617).unwrap();
@@ -4197,56 +4252,59 @@ fn write_unbounded_view_fixture(ds: &Dataset, path: &Path) {
             json["crs"] = serde_json::json!({"type": "name", "properties": {"name": "EPSG:32617"}});
             std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
         }
-        "parquet" => {
-            use arrow_array::{BinaryArray, Float64Array, RecordBatch, StringArray, StructArray};
-            use arrow_schema::{DataType, Field as AField, Schema};
-            let projected = crate::io::project(ds, crs).unwrap();
-            let wkbs: Vec<_> = projected.features.iter().map(|f| f.geometry.as_ref().map(wkb::encode)).collect();
-            let geometry = BinaryArray::from(wkbs.iter().map(|w| w.as_deref()).collect::<Vec<_>>());
-            let bbox_fields = ["xmin", "ymin", "xmax", "ymax"].map(|n| Arc::new(AField::new(n, DataType::Float64, true)));
-            let coord = |at: fn(Extent) -> f64| -> arrow_array::ArrayRef {
-                Arc::new(Float64Array::from(
-                    projected.features.iter().map(|f| f.geometry.as_ref().map(|g| at(g.extent()))).collect::<Vec<_>>(),
-                ))
-            };
-            let bbox = StructArray::new(
-                bbox_fields.iter().cloned().collect(),
-                vec![coord(|e| e.min_x), coord(|e| e.min_y), coord(|e| e.max_x), coord(|e| e.max_y)],
-                None,
-            );
-            let mut fields = vec![
-                AField::new("geometry", DataType::Binary, true),
-                AField::new("bbox", DataType::Struct(bbox_fields.iter().cloned().collect()), false),
-            ];
-            let mut columns: Vec<arrow_array::ArrayRef> = vec![Arc::new(geometry), Arc::new(bbox)];
-            for (i, field) in ds.fields.iter().enumerate().filter(|(_, f)| f.ty == FieldType::Text) {
-                fields.push(AField::new(&field.name, DataType::Utf8, true));
-                columns.push(Arc::new(StringArray::from(
-                    ds.features
-                        .iter()
-                        .map(|f| match f.attrs.get(i) {
-                            Some(Value::Text(s)) => Some(s.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                )));
-            }
-            let schema = Arc::new(Schema::new(fields));
-            let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-            let geo = serde_json::json!({"version": "1.1.0", "primary_column": "geometry", "columns": {"geometry": {
-                "encoding": "WKB", "geometry_types": ["Point"], "crs": {"type": "ProjectedCRS", "id": {"authority": "EPSG", "code": 32617}},
-                "covering": {"bbox": {"xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"], "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"]}}
-            }}});
-            let props = ::parquet::file::properties::WriterProperties::builder()
-                .set_max_row_group_row_count(Some(100))
-                .set_key_value_metadata(Some(vec![::parquet::file::metadata::KeyValue::new("geo".into(), geo.to_string())]))
-                .build();
-            let mut writer = ::parquet::arrow::ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, Some(props)).unwrap();
-            writer.write(&batch).unwrap();
-            writer.close().unwrap();
-        }
+        "parquet" => write_projected_parquet_fixture(ds, path, 100, true),
         _ => {
             crate::io::write_path_in(ds, path, crs).unwrap();
         }
     }
+}
+
+/// A UTM fixture with selectable row-group size and binary encoding, using the same covering.
+fn write_projected_parquet_fixture(ds: &Dataset, path: &Path, rows: usize, dictionary: bool) {
+    let crs = Crs::from_epsg(32617).unwrap();
+    use arrow_array::{BinaryArray, Float64Array, RecordBatch, StringArray, StructArray};
+    use arrow_schema::{DataType, Field as AField, Schema};
+    let projected = crate::io::project(ds, crs).unwrap();
+    let wkbs: Vec<_> = projected.features.iter().map(|f| f.geometry.as_ref().map(wkb::encode)).collect();
+    let geometry = BinaryArray::from(wkbs.iter().map(|w| w.as_deref()).collect::<Vec<_>>());
+    let bbox_fields = ["xmin", "ymin", "xmax", "ymax"].map(|n| Arc::new(AField::new(n, DataType::Float64, true)));
+    let coord = |at: fn(Extent) -> f64| -> arrow_array::ArrayRef {
+        Arc::new(Float64Array::from(projected.features.iter().map(|f| f.geometry.as_ref().map(|g| at(g.extent()))).collect::<Vec<_>>()))
+    };
+    let bbox = StructArray::new(
+        bbox_fields.iter().cloned().collect(),
+        vec![coord(|e| e.min_x), coord(|e| e.min_y), coord(|e| e.max_x), coord(|e| e.max_y)],
+        None,
+    );
+    let mut fields = vec![
+        AField::new("geometry", DataType::Binary, true),
+        AField::new("bbox", DataType::Struct(bbox_fields.iter().cloned().collect()), false),
+    ];
+    let mut columns: Vec<arrow_array::ArrayRef> = vec![Arc::new(geometry), Arc::new(bbox)];
+    for (i, field) in ds.fields.iter().enumerate().filter(|(_, f)| f.ty == FieldType::Text) {
+        fields.push(AField::new(&field.name, DataType::Utf8, true));
+        columns.push(Arc::new(StringArray::from(
+            ds.features
+                .iter()
+                .map(|f| match f.attrs.get(i) {
+                    Some(Value::Text(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    let geo = serde_json::json!({"version": "1.1.0", "primary_column": "geometry", "columns": {"geometry": {
+        "encoding": "WKB", "geometry_types": ["Point"], "crs": {"type": "ProjectedCRS", "id": {"authority": "EPSG", "code": 32617}},
+        "covering": {"bbox": {"xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"], "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"]}}
+    }}});
+    let props = ::parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rows))
+        .set_dictionary_enabled(dictionary)
+        .set_key_value_metadata(Some(vec![::parquet::file::metadata::KeyValue::new("geo".into(), geo.to_string())]))
+        .build();
+    let mut writer = ::parquet::arrow::ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
 }
