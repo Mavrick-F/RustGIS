@@ -388,8 +388,8 @@ Most feature tools process only the selected rows when an input has a selection,
 features a layer's definition query keeps (the ones the map draws, with the selection cut to them):
 a Clip by a layer filtered to one country uses that country, and a Buffer of a filtered layer
 buffers what is drawn. A tool refuses a layer whose definition query hides every feature it would
-read. Selection tools instead replace the input's selection, leaving out the features the
-definition query hides and saying how many; Select Layer By Location honours the selecting layer's
+read. Selection tools instead replace the input's selection, leaving out the features the map
+doesn't draw (its definition query, time window or display filters) and saying how many; Select Layer By Location honours the selecting layer's
 selection. Summarize Within counts the selected points against **all** input polygons, and
 Calculate Geometry Attributes updates **all** rows, including the ones a definition query hides: the
 run says how many. For tools that create a map layer, `output` is the layer name; `vectorToPmtiles`

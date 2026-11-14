@@ -487,11 +487,17 @@ fn tools_read_the_features_a_definition_query_keeps() {
     let mark = s.notice_mark();
     s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
     assert_eq!(s.map().layer_by_name("Cities").unwrap().selection.len(), big);
-    assert!(said(&s, mark, &format!("{} of the features selected in Cities are hidden by its definition query", cities - big)));
+    assert!(said(&s, mark, &format!("{} of the features selected in Cities aren't drawn", cities - big)));
+    // And the Select By Attributes command.
+    let mark = s.notice_mark();
+    let r = s.run("select.byAttributes", &json!({"layer": "Cities", "where": "pop_max > 0"})).unwrap();
+    assert_eq!(r["selected"], json!(big));
+    assert!(said(&s, mark, &format!("{} more features match but aren't drawn", cities - big)));
     query(&mut s, "Cities", "");
     let mark = s.notice_mark();
     s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
-    assert!(!said(&s, mark, "definition query"));
+    s.run("select.byAttributes", &json!({"layer": "Cities", "where": "pop_max > 0"})).unwrap();
+    assert!(!said(&s, mark, "aren't drawn"));
 
     // Calculate Geometry Attributes updates every row, and says the query hides some.
     query(&mut s, "Countries", populous);

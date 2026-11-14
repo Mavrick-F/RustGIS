@@ -932,8 +932,9 @@ fn read_layers(s: &Session, spec: &rustgis_analysis::ToolSpec, resolved: &Value)
 }
 
 /// Fits a tool's result to the map: a selection made on the complete streamed source becomes
-/// rows of the current window, and a selection leaves out the features the layer's definition
-/// query hides (the Select tools read the whole layer). An update from a selection is still
+/// rows of the current window, and a selection leaves out the features the map doesn't draw at its
+/// scale (the layer's definition query, time window and display filters; the Select tools read the
+/// whole layer). An update from a selection is still
 /// refused: it would replace the complete source with just those selected features.
 fn fit_to_windows(s: &Session, res: &mut Result<rustgis_analysis::ToolResult, String>, full_ids: &FullIds) {
     if let Ok(r) = res
@@ -954,13 +955,13 @@ fn fit_to_windows(s: &Session, res: &mut Result<rustgis_analysis::ToolResult, St
         && let Output::Selection { layer, rows } = &mut r.output
         && let Some(l) = s.map().layer_by_name(layer)
     {
-        let drawn = l.visible_rows();
+        let drawn = l.drawn_rows(s.scale());
         let before = rows.len();
         rows.retain(|row| drawn.get(*row).is_none_or(|d| *d));
         let hidden = before - rows.len();
         if hidden > 0 {
             r.messages
-                .push(format!("{hidden} of the features selected in {layer} are hidden by its definition query, and aren't selected"));
+                .push(format!("{hidden} of the features selected in {layer} aren't drawn (its definition query, time window or display filters hide them), and aren't selected"));
         }
     }
     if let Ok(r) = res
