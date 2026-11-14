@@ -112,12 +112,17 @@ struct Kept {
 }
 
 impl Kept {
-    /// The entries of `o` without a password, key or token, counting those left out.
-    fn without_secrets(&mut self, mut o: Map<String, Value>) -> Map<String, Value> {
+    /// The entries of `o` without a password, key or token, counting those left out. `address` is
+    /// the one they sit beside (a row's own, kept apart from them).
+    fn without_secrets(&mut self, mut o: Map<String, Value>, address: &str) -> Map<String, Value> {
         let before = o.len();
         o.retain(|k, v| !sources::holds_secret(&json!({ k.as_str(): v })));
         // A bare `key` is a secret beside a web address, which one field alone doesn't show.
-        if sources::holds_secret(&Value::Object(o.clone())) {
+        let mut beside = o.clone();
+        if !address.is_empty() {
+            beside.insert("address".into(), address.into());
+        }
+        if sources::holds_secret(&Value::Object(beside)) {
             o.retain(|k, v| !sources::holds_secret(&json!({ k.as_str(): v, "url": "https://a" })));
         }
         self.secrets += before - o.len();
@@ -392,7 +397,7 @@ impl Connections {
         s.next = o.get("next").and_then(Value::as_u64).unwrap_or(1).max(1);
         o.remove("version");
         o.remove("next");
-        s.kept.top = s.kept.without_secrets(o);
+        s.kept.top = s.kept.without_secrets(o, "");
         let mut ids = BTreeSet::new();
         for row in rows {
             let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| Some((clean(r.connection).ok()?.0, r.other)));
@@ -414,7 +419,7 @@ impl Connections {
                         s.next = s.next.max(n.saturating_add(1));
                     }
                     ids.insert(c.id.clone());
-                    let other = s.kept.without_secrets(other);
+                    let other = s.kept.without_secrets(other, &c.address);
                     if !other.is_empty() {
                         s.kept.fields.insert(c.id.clone(), other);
                     }
@@ -1229,6 +1234,13 @@ mod tests {
         let s = Connections::from_json(&beside.to_string());
         assert!(!s.to_json().contains("\"abc\""), "{}", s.to_json());
         assert!(s.to_json().contains("api.example"));
+        // Or beside an address among the preference's own keys.
+        let top = json!({"address":"https://api.example","key":"abc","connections":[]});
+        assert!(!Connections::from_json(&top.to_string()).to_json().contains("\"abc\""));
+        // Or beside the row's own address.
+        let own = json!({"connections":[{"id":"c1","name":"A","kind":"wms","address":"https://a","key":"abc","note":"n"}]});
+        let s = Connections::from_json(&own.to_string());
+        assert!(!s.to_json().contains("\"abc\"") && s.to_json().contains("\"note\""), "{}", s.to_json());
         // Rows past the limit are kept and said as that, not as unreadable.
         let many: Vec<Value> = (1..=MAX_CONNECTIONS + 1)
             .map(|i| json!({"id": format!("c{i}"), "name": format!("N{i}"), "kind": "wms", "address": "https://a"}))
