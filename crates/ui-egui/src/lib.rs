@@ -1961,6 +1961,10 @@ impl RustGisApp {
             }
             return r;
         }
+        // A field package's basemaps are files beside its project, which a page has no folder for.
+        if lower.ends_with(".rgisfield") {
+            return Err(tl!("A field package opens on a computer or a phone, which have a folder for its basemaps: open it there. Bring Back (Data › Offline) takes its edits into the project here.").to_string());
+        }
         if lower.ends_with(".rgispkg") {
             let text = rustgis_engine::cmd::items::package_text(bytes)?;
             let r = self.run("project.openText", json!({"text": text, "package": true}));
@@ -3943,7 +3947,7 @@ impl RustGisApp {
                     open("project");
                     self.ui.backstage = false;
                 } else if let Some(path) = dialogs::pick_open(
-                    &["rgis", "rgisx", "rgispkg", "qgs", "qgz", "geolibre", "json"],
+                    &["rgis", "rgisx", "rgispkg", "rgisfield", "qgs", "qgz", "geolibre", "json"],
                     tl!("Projects and JSON data (RustGIS, QGIS, GeoLibre)"),
                 ) {
                     // A QGIS project opens as a new map of this one.
@@ -4094,19 +4098,31 @@ impl RustGisApp {
             // Project items: save (a file dialog, or a download on the web) and open.
             "ui.saveItem" => {
                 let kind = p.get("kind").and_then(Value::as_str).ok_or("kind is required")?;
+                // A field package makes an offline area first: one not saved after all goes again.
+                let areas = self.session.project.offline_areas.len();
                 let session = &mut self.session;
                 let (name, bytes) =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::items::item_bytes(session, kind, p)))
                         .unwrap_or_else(|_| Err("saving failed unexpectedly".into()))
-                        .inspect_err(|e| self.session.notify(e.clone(), true))?;
+                        .inspect_err(|e| {
+                            // An area a field package made before it failed goes too.
+                            rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
+                            self.session.notify(e.clone(), true);
+                        })?;
                 if self.services.download.is_some() {
                     self.download(&name, bytes);
                 } else {
                     let (ext, label) =
                         rustgis_engine::cmd::items::ITEMS.iter().find(|i| i.0 == kind).map_or(("json", "File"), |i| (i.1, i.2));
-                    if let Some(path) = dialogs::pick_save(&name, &[ext], tl!(label)) {
-                        rustgis_engine::data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| e.to_string())?;
-                        self.session.notify(i18n::fmt("Saved {name}", &[("name", &path)]), false);
+                    match dialogs::pick_save(&name, &[ext], tl!(label)) {
+                        Some(path) => {
+                            if let Err(e) = rustgis_engine::data::io::write_atomic(std::path::Path::new(&path), &bytes) {
+                                rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
+                                return Err(e.to_string());
+                            }
+                            self.session.notify(i18n::fmt("Saved {name}", &[("name", &path)]), false);
+                        }
+                        None => rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas),
                     }
                 }
             }
@@ -4891,6 +4907,9 @@ impl RustGisApp {
             let result = self.run("project.importGeolibre", json!({"text":text}));
             self.map.invalidate();
             return result;
+        }
+        if file.is_some_and(|f| f.to_ascii_lowercase().ends_with(".rgisfield")) {
+            return Err(tl!("A field package opens on a computer or a phone, which have a folder for its basemaps: open it there. Bring Back (Data › Offline) takes its edits into the project here.").to_string());
         }
         let package = file.is_some_and(|f| f.to_ascii_lowercase().ends_with(".rgispkg"));
         let text = if package {

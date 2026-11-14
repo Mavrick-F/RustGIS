@@ -165,6 +165,24 @@ The interface keeps out of the room the system's bars take: the activity's Java 
 insets, and the bars' icons are drawn dark over a light theme's ground and light over a dark
 one's.
 
+## Field packages
+
+A map goes to the phone as a field package (`.rgisfield`), made on the desktop by **Data ›
+Offline › Package for the Field** (or `offline.package`). It holds a project of one map, the
+features in view as an offline area of the desktop project (as Download Map makes one, so the
+area is in that project to bring the edits back to), and the MBTiles and PMTiles archives its tile
+layers draw from, under `basemaps/`, so the basemap shows with no network. Tile layers that draw
+from the web stay in it and show only online; the package says which. Raster layers are left
+out, and said.
+
+Opening a field package (Open Project, the picker, or a file pushed to the app's folder) unpacks it
+into a folder of its own in the app's folder (`field/<name>`, numbered when one of that name is
+there: a copy unpacked before is never written over) and opens its project there, unsaved, as a
+project package opens. Its project's paths are trusted as a project file's are. Packaging and
+opening run on the window's thread, as Package Project and opening a project do, with no Cancel:
+a large basemap archive holds the window while it is read or written. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
+offline basemap with no package.
+
 ## What differs from the desktop
 
 | | On Android |
