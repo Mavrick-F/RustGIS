@@ -4118,10 +4118,11 @@ fn a_view_its_system_cant_bound_reads_what_is_in_view() {
         }
         for source in sources {
             {
-                // A zero limit is a no-op even for a view requiring a complete scan.
+                // A zero limit cannot give a count for a view requiring a complete geometry scan.
                 let probe = crate::progress::tests::Counted::cancelling_after(0);
                 let _guard = crate::progress::install(Some(probe.clone()));
-                assert!(source.read(&Request { extent: Some(view), limit: 0 }).unwrap().features.is_empty(), "{ext}");
+                let error = source.read(&Request { extent: Some(view), limit: 0 }).unwrap_err().to_string();
+                assert!(error.contains("zero-limit") && error.contains("count"), "{ext}: {error}");
                 assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 0, "{ext}");
             }
             for limit in [10, 2201] {

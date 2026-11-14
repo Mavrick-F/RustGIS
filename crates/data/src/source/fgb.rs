@@ -288,7 +288,7 @@ impl FgbSource {
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
         if limit == 0 && req.extent.is_some() && native.is_none() {
-            return Ok(Batch::default());
+            return Err(super::unbounded_count());
         }
         let reader = open_reader(open()?)?;
         let indexed = native.filter(|_| self.info.indexed && !scan);
@@ -608,7 +608,7 @@ impl FgbSource {
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
         if limit == 0 && req.extent.is_some() && native.is_none() {
-            return Ok(Batch::default());
+            return Err(super::unbounded_count());
         }
         let late = req.extent.is_some() && native.is_none();
         let native = native.unwrap_or(Extent::new(f64::MIN, f64::MIN, f64::MAX, f64::MAX));

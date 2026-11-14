@@ -211,6 +211,7 @@ impl SourceInfo {
 }
 
 /// A read: the features intersecting `extent` (longitude/latitude; `None` = all), at most `limit`.
+/// A zero-limit count may be refused when matching would require a full geometry scan.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Request {
     pub extent: Option<Extent>,
@@ -222,6 +223,12 @@ impl Request {
     pub fn all() -> Self {
         Request { extent: None, limit: MAX_LIMIT }
     }
+}
+
+/// Refuses an unknown count rather than reporting an unbounded view as empty. A zero-limit
+/// request does not start the full geometry scan needed to determine its matches.
+pub(crate) fn unbounded_count() -> DataError {
+    DataError::Format("A zero-limit read cannot count a view that cannot be bounded in the source coordinate system; request a nonzero limit to count matching features".into())
 }
 
 /// The answer to a [`Request`].

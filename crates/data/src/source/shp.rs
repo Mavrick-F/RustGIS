@@ -177,7 +177,7 @@ impl FeatureSource for ShpSource {
         let extent = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         // Keep indexed zero-limit counts; a refused view has no cheap candidate count.
         if limit == 0 && req.extent.is_some() && extent.is_none() {
-            return Ok(Batch::default());
+            return Err(super::unbounded_count());
         }
         if extent.is_some_and(|e| e.is_empty()) {
             return Ok(Batch { complete: super::stride(0, limit) == 1, ..Batch::default() });

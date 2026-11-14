@@ -264,7 +264,7 @@ impl FeatureSource for GeoJsonSource {
         let extent = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
         if limit == 0 && req.extent.is_some() && extent.is_none() {
-            return Ok(Batch::default());
+            return Err(super::unbounded_count());
         }
         let matched = self.matches(extent).count();
         // A refused native box needs geometry filtering before sampling, just as an unindexed source does.

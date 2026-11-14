@@ -341,7 +341,7 @@ impl FeatureSource for GpkgMemSource {
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
         if limit == 0 && req.extent.is_some() && native.is_none() {
-            return Ok(Batch::default());
+            return Err(super::unbounded_count());
         }
         // A whole read knows its count; an extent, bounded natively or not, is matched as it goes.
         let mut sample = if req.extent.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
