@@ -1,6 +1,7 @@
 //! A layer on another body than the Earth (IAU 2015, opengeos/RustGIS#1448), added and exported
 //! through the commands: adding it says so once, exporting it says what is written instead of its
-//! system or that its own is written without the body's name, and an export that would write other numbers than the layer's is refused.
+//! system or that its own is written without the body's name, and an export that would write other
+//! numbers than the layer's is refused.
 use rustgis_engine::{
     Project, Session,
     data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value, io, raster::Crs},

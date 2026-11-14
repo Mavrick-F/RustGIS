@@ -612,8 +612,8 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 GeoPackage, Shapefile and FlatGeobuf exports default to the layer's original coordinate system.
 A system with an EPSG code is written by its code; one without (a Shapefile whose `.prj` names
 State Plane by its parameters, say) is written by its WKT definition, which a GeoPackage and a
-FlatGeobuf carry too. A system WKT can't describe is written in WGS 84 (without a `.prj` in a
-Shapefile), and a notice names it. A layer made in RustGIS defaults to WGS 84.
+FlatGeobuf carry too. A system WKT can't describe goes into a Shapefile in its own coordinates
+without a `.prj`, and into a GeoPackage or FlatGeobuf in WGS 84; a notice says which. A layer made in RustGIS defaults to WGS 84.
 `share.exportLayer` takes `"crs"` to choose
 another, such as `{"layer": "Parcels", "path": "parcels.gpkg", "crs": "EPSG:4647"}`. GeoJSON, KML,
 GPX, GeoParquet and CSV are always written in WGS 84.
