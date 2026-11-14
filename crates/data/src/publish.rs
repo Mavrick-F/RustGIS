@@ -766,7 +766,6 @@ fn same_rows(ds: &Dataset, back: &Dataset, tolerance: f64) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::{Coord, Field, GeometryType};

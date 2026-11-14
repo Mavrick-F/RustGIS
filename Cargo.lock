@@ -4872,6 +4872,7 @@ dependencies = [
  "shapefile",
  "sysinfo",
  "tempfile",
+ "terrio-crs",
  "thiserror 2.0.21",
  "tiberius",
  "tiff",
@@ -4954,12 +4955,12 @@ name = "rustgis-map"
 version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
- "proj4rs",
  "roxmltree",
  "rustgis-data",
  "rustgis-geom",
  "serde",
  "serde_json",
+ "terrio-crs",
  "web-time",
 ]
 
@@ -5232,6 +5233,9 @@ name = "ruzstd"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "ryu"
@@ -5846,6 +5850,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "terrio-crs"
+version = "0.2.3"
+source = "git+https://github.com/opengeos/terrio?rev=02068f6fef3c4326199e878687712c41e64552f1#02068f6fef3c4326199e878687712c41e64552f1"
+dependencies = [
+ "geographiclib-rs",
+ "libc",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tiff",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5940,6 +5958,7 @@ dependencies = [
  "fax",
  "flate2",
  "half",
+ "image-webp",
  "quick-error",
  "weezl 0.1.12",
  "zstd 0.13.4",

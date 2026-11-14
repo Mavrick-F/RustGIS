@@ -511,7 +511,6 @@ fn text(p: &Project) -> Result<String, String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

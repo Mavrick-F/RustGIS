@@ -22,6 +22,7 @@ tiff = { workspace = true, features = ["zstd"] }
 weezl.workspace = true
 proj4rs = { workspace = true }
 crs-definitions = { workspace = true }
+terrio-crs = { workspace = true }
 miniz_oxide = { workspace = true }
 roxmltree = { workspace = true }
 quick-xml = { workspace = true }
@@ -46,8 +47,9 @@ lerc-reader = { workspace = true }
 lerc-core = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Azimuthal equidistant systems (Equi7's EPSG 27701–27707, ESRI's polar ones) need proj4rs' `aeqd`,
-# native only as in rustgis-map: its geodesic routines need libm, which wasm32-unknown-unknown lacks.
+# proj4rs reads the PROJ definitions WKT is turned into (`wkt`), azimuthal equidistant ones too
+# (native only: its geodesic routines need libm, which wasm32-unknown-unknown lacks). Transforms
+# are terrio-crs's.
 proj4rs = { workspace = true, features = ["aeqd"] }
 rusqlite = { workspace = true }
 postgres = { workspace = true }

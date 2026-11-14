@@ -173,7 +173,6 @@ pub(crate) fn retain(app: &mut crate::RustGisApp) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use rustgis_engine::data::sync::FileSync;

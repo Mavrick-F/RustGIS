@@ -757,6 +757,14 @@ pub struct Session {
     /// `None` between commands. Its inner steps would each say it (a zoom refused by each layer an
     /// add frames): it is said once in a command, however many notices come after.
     beyond_said: Option<bool>,
+    /// The definitions of the systems whose datum grid note this session has said
+    /// ([`Session::say_grid_notes`]).
+    crs_notes_said: Vec<String>,
+    /// The coordinate systems a background export used on its worker thread, as (definition,
+    /// label), for [`Session::say_grid_notes`].
+    pub(crate) crs_used_elsewhere: Vec<(String, String)>,
+    /// When the frame path last looked for missing datum grids ([`Session::say_grid_notes`]).
+    grid_notes_checked: Option<web_time::Instant>,
     /// The count of cloud-optimised GeoTIFF headers landed when [`Session::notice_landed_rasters`]
     /// last looked back at the dates a dated series has shown (`cog::landed_count`).
     cog_headers_seen: u64,
@@ -773,7 +781,7 @@ pub struct Session {
     /// Source layers' row versions that `pg.saveEdits` or `gpkg.saveEdits` saved over: a layer back on one
     /// (undone, or restored by a failed command, past a save) would write its edits again.
     /// Outside the project, so undo keeps it.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "saving edits back to a database is desktop only"))]
     pub(crate) saved_over: Vec<rustgis_map::source::Versions>,
     /// The feature cache fills itself after projection changes (Data › Feature Cache).
     pub auto_cache: bool,
@@ -866,7 +874,7 @@ pub struct Session {
     /// command reads what it needs from the map when the panel opens.
     pub plugin_panels: std::collections::BTreeMap<String, rustgis_plugins::PanelState>,
     /// What running session plugins were last told of the map, to send them events.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "session plugins run on the desktop only"))]
     pub(crate) plugin_watch: cmd::plugins::Watch,
     /// Data downloads of this project under way (Home › Add › Add Data › From URL), by id.
     downloading: Vec<u64>,
@@ -1186,6 +1194,9 @@ impl Session {
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
             beyond_said: None,
+            crs_notes_said: Vec::new(),
+            crs_used_elsewhere: Vec::new(),
+            grid_notes_checked: None,
             cog_headers_seen: 0,
             table_layer: None,
             table_standalone: None,
@@ -1575,7 +1586,9 @@ impl Session {
                 render::rustgis_tiles::mbtiles::close_unused(files.into_iter());
             }
             // Pixels the command read in place (a project, an import) say what they lost.
-            self.notice_landed_rasters();
+            self.notice_landed_pixels();
+            // And the coordinate systems that needed a missing datum grid, after every command.
+            self.say_grid_notes();
             // A plugin's command waiting for its fetches answers `pending` and runs again when they
             // land: logged then, once. (Another command's `pending`, a download the web app makes, is
             // logged as it is asked for: nothing runs it again.)
@@ -2118,6 +2131,13 @@ impl Session {
     /// Once for each layer's pixels, failure or file, one notice of each kind; the app calls it
     /// each frame.
     pub fn notice_landed_rasters(&mut self) {
+        self.notice_landed_pixels();
+        // From frames too: a system a frame first drew needs no command after it to be said.
+        self.say_grid_notes_now_and_then();
+    }
+
+    /// [`Self::notice_landed_rasters`] but for the datum grids, which a command says itself.
+    fn notice_landed_pixels(&mut self) {
         // Streamed vector windows land after project opening too. Check each installed read
         // once, keeping the same counted notice channel as retained resident expressions.
         let mut landed = Vec::new();
@@ -2265,7 +2285,7 @@ impl Session {
         self.say_bundled_roots(rustgis_data::http::bundled_roots());
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "native HTTPS only: the browser checks certificates itself"))]
     fn say_bundled_roots(&mut self, bundled: bool) {
         if bundled && !self.bundled_roots_said {
             self.bundled_roots_said = true;
@@ -2344,6 +2364,69 @@ impl Session {
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
         use rustgis_data::diagnostics::Severity;
         self.notice(text.into(), if error { Severity::Error } else { Severity::Info });
+    }
+
+    /// Says, once per system, that a coordinate system this project uses (a map's projection, a
+    /// layer's or a raster's) or a command used (an export's target, on its worker thread too)
+    /// needed a datum grid RustGIS doesn't have, so a less accurate transformation placed it:
+    /// after the command, or the frame, that first used it, in one notice with their count.
+    fn say_grid_notes(&mut self) {
+        use rustgis_data::raster::crs::{definition_and_label, grid_notes_text, needs_a_missing_grid, take_used};
+        // What a command used beyond its layers and maps: on this thread (an export's target
+        // system, a grid's, a calculation's), and on a background export's.
+        let mut used = take_used();
+        used.append(&mut self.crs_used_elsewhere);
+        // Each system once: this runs after every frame.
+        let mut codes: Vec<&str> = Vec::new();
+        let mut systems: Vec<rustgis_data::raster::Crs> = Vec::new();
+        for map in &self.project.maps {
+            if let rustgis_map::Projection::Custom(code) = &map.projection
+                && !codes.contains(&code.as_str())
+            {
+                codes.push(code);
+            }
+            for layer in &map.layers {
+                let raster = layer.raster.as_ref().and_then(|r| r.data.as_ref()).map(|r| r.crs);
+                for crs in layer.dataset.crs.into_iter().chain(raster) {
+                    if !systems.contains(&crs) {
+                        systems.push(crs);
+                    }
+                }
+            }
+        }
+        used.extend(codes.into_iter().filter_map(|code| rustgis_map::projection::lookup(code).ok()));
+        used.extend(systems.into_iter().filter_map(definition_and_label));
+        // By definition: two typed systems share a label ("Custom PROJ").
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (def, label) in used {
+            if !found.iter().any(|(d, _)| *d == def) && !self.crs_notes_said.contains(&def) && needs_a_missing_grid(&def) {
+                found.push((def, label));
+            }
+        }
+        // Without a limit: each system is said once, and their number is bounded by the tables
+        // and the custom systems a run keeps.
+        if !found.is_empty() {
+            let labels: Vec<String> = found.iter().map(|(_, label)| label.clone()).collect();
+            // A few named, each cut, and the rest counted: the notice stays short however many.
+            self.notify(grid_notes_text(labels.len(), &names_said(&labels)), false);
+            self.crs_notes_said.extend(found.into_iter().map(|(def, _)| def));
+        }
+        if rustgis_data::raster::crs::take_unnamed_grid_need() {
+            self.notify(
+                "A coordinate system that RustGIS can't name, one of the thousands used this run, needed a datum grid RustGIS doesn't have yet, so the next transformation was used; places may be metres off",
+                false,
+            );
+        }
+    }
+
+    /// [`Self::say_grid_notes`] from the frame path: at most once a second, as a frame comes many
+    /// times a second and a system first drawn waits no longer than that to be said.
+    fn say_grid_notes_now_and_then(&mut self) {
+        let due = self.grid_notes_checked.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
+        if due {
+            self.grid_notes_checked = Some(web_time::Instant::now());
+            self.say_grid_notes();
+        }
     }
 
     /// Publishes English diagnostics and retains redacted templates for translated interfaces.

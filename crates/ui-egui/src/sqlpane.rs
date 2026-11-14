@@ -3,7 +3,7 @@
 //! Queries run off the frame (a thread); DuckDB is a desktop program, so the web app says so.
 
 // The web app shows the pane's explanation only: what runs queries is the desktop's.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+#![cfg_attr(target_arch = "wasm32", expect(dead_code, unused_imports, reason = "the browser shows the explanation only"))]
 
 use egui::{RichText, Ui};
 use serde_json::{Value, json};

@@ -1276,7 +1276,6 @@ fn service_group_row(
 /// Under it, indented, its layers and subgroups (#836) in drawing order; `depth` is its level (1
 /// at the top). With `reorder` the row drags the whole group, and it and its layers' rows join
 /// `rows`, where layers drop (see [`layer_drop`]).
-#[allow(clippy::too_many_arguments)]
 fn layer_group_row(
     app: &mut RustGisApp,
     ui: &mut Ui,
@@ -2715,6 +2714,7 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "rgis",
                         "rgisx",
                         "rgispkg",
+                        "rgisfield",
                         "rgismap",
                         "rgismpk",
                         "rgislyr",
@@ -5602,7 +5602,6 @@ fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: eg
 
 /// The stroke editor's rows for a stroke of markers or hash marks (`st`, its markers `m`): the
 /// shape, its size, where it goes and how far apart, and whether it turns with the line.
-#[allow(clippy::too_many_arguments)]
 fn marker_rows(
     app: &mut RustGisApp,
     ui: &mut Ui,

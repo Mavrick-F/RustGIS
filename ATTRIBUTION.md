@@ -43,6 +43,9 @@ The map's ESRI codes (`crates/data/src/raster/esri.rs`) are Esri's projected coo
 from Esri's [projection-engine-db-doc](https://github.com/Esri/projection-engine-db-doc)
 (Apache-2.0), as imported into the [PROJ](https://proj.org) 9.7.1 database (MIT) and written as
 PROJ definitions by PROJ 9.7.1.
+Coordinates are transformed by [terrio-crs](https://github.com/opengeos/terrio) (MIT), which
+carries its own tables derived from the EPSG Geodetic Parameter Dataset (© IOGP, under its terms
+of use) through PROJ's database; its NOTICE, with their sources, is in THIRD-PARTY-LICENSES.txt.
 The WKT2 test corpus (`crates/data/src/raster/wkt2_corpus.tsv`) is 60 of those EPSG and Esri
 coordinate systems written as WKT2 by PROJ 9.7.1, through pyproj 3.7.2.
 The ESRI datum test corpus (`crates/data/src/raster/esri_datum_corpus.tsv`) contains 13 EPSG
@@ -74,18 +77,16 @@ Copyright (c) 1996 The Regents of the University of California, under a BSD-styl
 cmocean's (MIT, as above) and rio-tiler's cfastie, rplumbo and schwarzwald. The full licence
 texts are in THIRD-PARTY-LICENSES.txt.
 
-Four pieces of code follow other projects' code, and their licences are in
+Three pieces of code follow other projects' code, and their licences are in
 THIRD-PARTY-LICENSES.txt too: the reader of ArcGIS feature-service answers as protocol buffers
 (`crates/data/src/esripbf.rs`) follows [Terrio](https://github.com/opengeos/terrio)'s ESRIPBF reader
 (Copyright (c) 2026 Qiusheng Wu and Terrio contributors, MIT), and both follow Esri's published
 [`FeatureCollection.proto`](https://github.com/Esri/arcgis-pbf) (Apache-2.0); where a label goes in an area (`pole_of_inaccessibility` in
 `crates/tiles/src/symbols.rs`) follows [polylabel](https://github.com/mapbox/polylabel)
-(Copyright (c) 2016 Mapbox, ISC); telling expression filters from legacy ones
+(Copyright (c) 2016 Mapbox, ISC); and telling expression filters from legacy ones
 (`is_expression_filter` in `crates/tiles/src/style.rs`) follows the
 [MapLibre style specification](https://github.com/maplibre/maplibre-style-spec) (Copyright (c)
-2020 MapLibre contributors and Mapbox, BSD-3-Clause); and the sinusoidal projection's meridian distance
-(`crates/geom/src/sinusoidal.rs`) follows [PROJ](https://proj.org)'s `pj_enfn`, `pj_mlfn` and
-`pj_inv_mlfn` (MIT).
+2020 MapLibre contributors and Mapbox, BSD-3-Clause).
 
 Icons are original vector drawings in code (`crates/ui-egui/src/icons.rs`). Fonts are not
 bundled: the interface uses an installed system sans-serif when one is found, otherwise the

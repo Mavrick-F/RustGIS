@@ -193,22 +193,15 @@ instead). The map's Winkel Tripel is at Winkel's own, acos(2/π) (about 50.46°)
 definition and WKT say so. A parameter that isn't a finite number, or a scale factor other than
 1, is refused rather than left out. Esri's orthographic is a spherical projection:
 on an ellipsoid it is refused, with a notice, rather than computed as EPSG's ellipsoidal one.
-The equidistant cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
-semi-major axis, matching legacy PROJ/GDAL coordinates (verified with PROJ 9.7.1), both for data
-and for a map drawn in it (including the
-Equirectangular preset). This also applies to planetary Equirectangular systems and definitions
-that name EPSG method 1028. Shapefile and ASCII-grid `.prj` files and GeoPackage WKT definitions
-whose method is interpreted as EPSG 1028 on an ellipsoid report the formula difference,
-without assuming how the producer computed its coordinates. Effectively spherical definitions
-need no warning. Code-only CRS identifiers use the same compatibility formula without a method
-warning, since no explicit WKT method is being read. Typed WKT inputs also report the method
-difference: Add Data overrides, Define Projection, CSV imports, measured layout grids, Zarr
-inputs, vector exports, XY Table To Point and Kernel Density. ASCII-grid sidecars retain
-datum warnings as well as the projection warning. RustGIS applies the same compatibility formula to GeoTIFF CT 17;
-this key identifies a GeoTIFF transformation, rather than explicitly declaring EPSG method 1028.
-[PROJ 9.9](https://proj.org/en/stable/operations/projections/eqc.html) supports the ellipsoidal
-formula instead. RustGIS preserves coordinates for files created with the legacy spherical formula. Files created with an ellipsoidal EQC formula, including PROJ 9.9 output, can be misplaced by kilometres; check which formula the producer used.
-The datum's ellipsoid is retained for datum transformations and
+The equidistant cylindrical projection (EPSG:4087, World Equidistant Cylindrical) is computed on its
+datum's ellipsoid (EPSG method 1028), as [PROJ 9.8](https://proj.org/en/stable/operations/projections/eqc.html)
+computes it, both for data and for a map drawn in it (including the Equirectangular preset); on
+a sphere it is the spherical formula. PROJ 9.7 and earlier, and so files they wrote, used a
+sphere of the semi-major axis on an ellipsoid too: such coordinates are placed up to tens of
+kilometres away from where that software put them (about 25 km at 55°N). Shapefile and ASCII-grid
+`.prj` files and GeoPackage WKT definitions that name EPSG method 1028 on an ellipsoid say so;
+code-only identifiers and GeoTIFF's coordinate transformation 17 don't name the method and say
+nothing. The datum's ellipsoid is retained for datum transformations and
 exported coordinate system definitions.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as

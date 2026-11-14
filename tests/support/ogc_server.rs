@@ -1,6 +1,6 @@
 //! Shared, test-only HTTP fixture server. Exact routes, recorded requests, bounded shutdown.
 #![cfg(test)]
-#![allow(dead_code)]
+#![allow(dead_code, reason = "each test crate that includes it uses a part")]
 
 use std::io::{Read, Write};
 use std::sync::{

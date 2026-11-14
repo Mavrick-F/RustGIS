@@ -35,7 +35,6 @@ pub mod tiles;
 pub mod time;
 pub mod view;
 mod view_memory;
-pub mod world;
 
 pub use camera::Camera;
 pub use color::{Ramp, RampGroup, Rgba};

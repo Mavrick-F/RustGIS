@@ -172,7 +172,6 @@ impl<O: Offered> List<O> {
     /// that shows (its scroll's viewport: the text edit's own clip rect is its whole text).
     /// Returns an item clicked, to accept. The list closes when the box loses focus or nothing
     /// matches.
-    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &Ui,

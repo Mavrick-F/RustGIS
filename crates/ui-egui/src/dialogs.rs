@@ -2336,7 +2336,7 @@ pub fn pick_open(_: &[&str], _: &str) -> Option<String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "the browser has no folder picker; kept beside the desktop one")]
 pub fn pick_folder() -> Option<String> {
     None
 }
@@ -2345,9 +2345,6 @@ pub fn pick_folder() -> Option<String> {
 pub fn pick_save(_: &str, _: &[&str], _: &str) -> Option<String> {
     None
 }
-
-#[allow(dead_code)]
-fn unused(_: Value) {}
 
 /// The map's coordinate system: Web Mercator, the globe, a preset, or any projected EPSG code. The
 /// list is on the left; the right shows what the selection is, where it can be used, its PROJ

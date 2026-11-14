@@ -568,7 +568,6 @@ fn ruler_at(lv: &LayoutView, area: Rect, p: Pos2) -> Option<bool> {
 
 /// Puts down a guide dragged out of a ruler or moved: dropped on a ruler or off the view, it's
 /// removed.
-#[allow(clippy::too_many_arguments)]
 fn drop_guide(
     app: &mut RustGisApp,
     layout: &Layout,

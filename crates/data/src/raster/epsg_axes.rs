@@ -24,9 +24,7 @@
 /// listed one, `Some(false)` for another RustGIS knows, `None` for one whose order isn't known
 /// here (see [`UNKNOWN`]).
 pub fn north_first(code: u16) -> Option<bool> {
-    // (Whether RustGIS knows the code by its tables, not by what this build can draw: the
-    // browser leaves the azimuthal equidistant systems out of `epsg_proj4`, but their order is
-    // the same.)
+    // (Whether RustGIS knows the code by its tables.)
     let known = crs_definitions::from_code(code).is_some() || super::epsg_gap::proj4(code).is_some();
     if !known || UNKNOWN.binary_search(&code).is_ok() {
         return None;
@@ -224,8 +222,7 @@ mod tests {
         }
         // Easting first: Web Mercator, LV95 and LV03, ETRS89 UTM, WGS 84 UTM, a State Plane in feet,
         // Krovak East North; westing first (Lo15, `+axis=wsu`); polar stereographic; southing
-        // first but turned so by its PROJ string (`+axis=swu`); Equi7 Europe (aeqd, which the
-        // browser can't draw: the same answer there).
+        // first but turned so by its PROJ string (`+axis=swu`); Equi7 Europe (aeqd).
         for code in [3857, 2056, 21781, 25832, 25833, 32633, 2264, 5514, 2046, 3031, 3413, 8352, 27704] {
             assert_eq!(north_first(code), Some(false), "EPSG:{code}");
         }

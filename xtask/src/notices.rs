@@ -76,13 +76,6 @@ const INCLUDED: &[Included] = &[
         ],
     },
     Included {
-        what: "The meridian distance of the sinusoidal projection and its inverse, after pj_enfn, pj_mlfn and \
-               pj_inv_mlfn in PROJ (https://proj.org).",
-        krate: "rustgis-geom",
-        paths: &["crates/geom/src/sinusoidal.rs"],
-        notices: &["PROJ-COPYING.txt"],
-    },
-    Included {
         what: "Where a label goes in an area (pole_of_inaccessibility), after polylabel 1.x \
                (https://github.com/mapbox/polylabel).",
         krate: "rustgis-tiles",
@@ -100,11 +93,11 @@ const INCLUDED: &[Included] = &[
     Included {
         what: "ESRI coordinate system codes: Esri's projected coordinate systems from projection-engine-db-doc \
                (https://github.com/Esri/projection-engine-db-doc), as imported into the PROJ 9.7.1 database and \
-               written as PROJ definitions by PROJ 9.7.1 (PROJ's licence is above). The notice below is the \
-               licensing section of the project's README, at commit aa34139.",
+               written as PROJ definitions by PROJ 9.7.1 (https://proj.org). The notices below are PROJ's \
+               licence and the licensing section of the project's README, at commit aa34139.",
         krate: "rustgis-data",
         paths: &["crates/data/src/raster/esri.rs"],
-        notices: &["projection-engine-db-doc-README-licensing.txt"],
+        notices: &["PROJ-COPYING.txt", "projection-engine-db-doc-README-licensing.txt"],
     },
     Included {
         what: "ArcGIS feature-service answers as protocol buffers (esripbf.rs), after Terrio's ESRIPBF reader \

@@ -19,11 +19,11 @@ fn explicit_method_1028_warns_for_known_geopackage_authorities() {
         if warned {
             assert!(
                 notes[0].contains("srs_id 100001")
-                    && notes[0].contains("PROJ/GDAL")
+                    && notes[0].contains("PROJ 9.8")
                     && notes[0].contains("using EPSG:4087 parameters in preference to the WKT definition"),
                 "{notes:?}"
             );
-            let point = Geometry::Point(Coord::new(0.0, 5_009_377.085_697_311));
+            let point = Geometry::Point(Coord::new(0.0, 4_984_944.377_977_743));
             let Geometry::Point(at) = read.geometry(point).unwrap() else { panic!("not a point") };
             assert!(at.x.abs() < 1e-9 && (at.y - 45.0).abs() < 1e-9, "{at:?}");
         }

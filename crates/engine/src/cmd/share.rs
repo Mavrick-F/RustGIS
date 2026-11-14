@@ -792,6 +792,8 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         then,
         #[cfg(not(target_arch = "wasm32"))]
         owner: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        crs_used: Vec::new(),
     })
 }
 

@@ -310,7 +310,6 @@ fn run_read(s: &mut Session, call: &ToolCall, tokens: usize) -> Result<String, S
         }
         // Fails the way a bug in RustGIS would, for the agent's panic guard.
         #[cfg(test)]
-        #[allow(clippy::panic)]
         "test_panic" => panic!("a test tool panicked"),
         other => return Err(format!("unknown tool '{other}'")),
     };
@@ -940,7 +939,6 @@ pub fn context(s: &Session) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     /// Returned tool and fetch errors are cleaned before active patterns can damage URLs;
     /// successful values and the original call remain outside the generated-error projection.

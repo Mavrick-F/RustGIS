@@ -952,7 +952,6 @@ fn cli() -> ExitCode {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use rustgis_engine::data::secrets::{MemorySecrets, Secret, SecretError};

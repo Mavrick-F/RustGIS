@@ -772,7 +772,7 @@ impl Session {
     /// Runs a plugin command (`plugin:<plugin>/<command>`) as one undoable step.
     pub(crate) fn run_plugin(&mut self, op: crate::policy::Authorized<crate::policy::CommandOp>) -> CmdResult {
         let crate::policy::CommandOp::Plugin { cmd, pin, params } = op.op() else { return Err("not a plugin command".into()) };
-        #[allow(unused_mut)]
+        #[cfg_attr(target_arch = "wasm32", expect(unused_mut, reason = "only the desktop caps the timeout"))]
         let mut cmd = cmd.clone();
         // On the desktop a command runs on the window's own thread, which draws nothing and can't
         // be cancelled until the command answers: a `timeout` longer than the usual two minutes
@@ -1051,7 +1051,7 @@ impl Host for Between<'_> {
 
 /// What session plugins were last told of the map, to tell them what changes.
 #[derive(Debug, Default)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "session plugins run on the desktop only"))]
 pub(crate) struct Watch {
     /// Each running program's, by plugin id.
     seen: Vec<(String, Seen)>,
@@ -1073,7 +1073,6 @@ const RESTYLE_EVERY: web_time::Duration = web_time::Duration::from_secs(1);
 
 /// Fingerprints of what a session plugin hears about.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) struct Seen {
     view: u64,
     /// Their list and order, which is active, names, visibility, opacity, symbology, fields and

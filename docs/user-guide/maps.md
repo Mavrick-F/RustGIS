@@ -556,8 +556,12 @@ projection, and clicking the coordinate system in the status bar opens the **Coo
 System** dialog, which also takes a projected EPSG code (such as `3035`, `32633` for UTM zone
 33N or `2056` for Switzerland) or an ESRI code, the one `.prj` files and ArcGIS name (such as
 `ESRI:102033` for South America Albers Equal Area Conic, or `ESRI:54030` for World Robinson). A
-code whose projection method or datum grid RustGIS can't use (Laborde such as `8441`, or a NAD27
-code that needs a grid) is refused with the reason, rather than drawn in another projection.
+code whose projection method RustGIS can't compute is refused with the reason, rather than drawn
+in another projection. Projections and datum transformations are computed by
+[terrio-crs](https://github.com/opengeos/terrio), as PROJ 9.8 computes them. Datum shift grids
+aren't used yet, neither those installed for PROJ nor downloaded: a datum whose most accurate
+transformation needs one takes the next PROJ lists (a NAD27 code: NAD27 to WGS 84 (4), about
+10 m), and says so once.
 RustGIS supports a subset of Esri's projected systems, checked against
 PROJ at representative points; unsupported codes such as World Miller (`ESRI:54003`) and the
 two-point oblique Mercators (`ESRI:53025`, `ESRI:54025`) are refused as unknown codes. The presets:

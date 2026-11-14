@@ -513,7 +513,6 @@ pub fn tilted_shadow_quads(
 /// there). Features and walls are drawn far to near; walls facing away from the eye are culled,
 /// walls are lit by the way they face the light and shade darker toward their base, and
 /// features fade into `fog` with distance as the ground does.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn extrude_tilted(
     pm: &mut Pixmap,
     view: &View,

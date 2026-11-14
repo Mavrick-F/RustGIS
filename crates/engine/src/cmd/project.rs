@@ -377,16 +377,27 @@ fn sample(s: &mut Session, _: &Value) -> CmdResult {
 /// Largest project package opened (1 GiB).
 const MAX_PACKAGE: u64 = 1 << 30;
 
-/// `project.open`: a project file, or a package (`.rgispkg`) opened unsaved; either must be a
-/// regular file within its limit.
+/// `project.open`: a project file, or a package (`.rgispkg`, or a field package, `.rgisfield`)
+/// opened unsaved; either must be a regular file within its limit.
+///
+/// It runs on the window's thread, as opening a project does: a package is one read, and a field
+/// package's unpacking one write of each file it holds (its tile archives, up to its limit), with
+/// no Cancel between them.
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let path = PathBuf::from(super::ps(p, "path").ok_or("path is required")?);
-    let is_package = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rgispkg"));
+    // A field package opens as a package does, from where it is unpacked.
+    let is_field = super::field::is_field_package(&path.to_string_lossy());
+    let is_package = is_field || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rgispkg"));
     let origin = if is_package { path.canonicalize() } else { std::path::absolute(&path) }
         .map_err(|error| format!("{}: {error}", path.display()))?;
     super::connections::clear_active();
     let proj = (|| {
-        if is_package {
+        if is_field {
+            let bytes = crate::project::read_file(&path, MAX_PACKAGE)?;
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let (dir, text) = super::field::unpack(&bytes, &stem)?;
+            super::field::project_in(&text, &dir)
+        } else if is_package {
             let bytes = crate::project::read_file(&path, MAX_PACKAGE)?;
             Project::from_import_json(&super::items::package_text(&bytes)?, None)
         } else {

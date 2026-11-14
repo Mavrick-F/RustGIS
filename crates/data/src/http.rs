@@ -63,7 +63,10 @@ fn system_roots() -> RootCerts {
 /// asked only then). The variables count as `rustls-native-certs` reads them: any `SSL_CERT_FILE`
 /// (even empty), or an `SSL_CERT_DIR` with a non-empty entry.
 // Only Linux and the BSDs fall back; the rule is tested on every platform.
-#[cfg_attr(not(all(unix, not(target_vendor = "apple"), not(target_os = "android"))), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, all(unix, not(target_vendor = "apple"), not(target_os = "android")))),
+    expect(dead_code, reason = "only Linux and the BSDs fall back")
+)]
 fn roots(file: Option<std::ffi::OsString>, dirs: Option<std::ffi::OsString>, no_system_roots: impl FnOnce() -> bool) -> RootCerts {
     let named = file.is_some() || dirs.is_some_and(|d| std::env::split_paths(&d).any(|p| !p.as_os_str().is_empty()));
     if !named && no_system_roots() { RootCerts::WebPki } else { RootCerts::PlatformVerifier }

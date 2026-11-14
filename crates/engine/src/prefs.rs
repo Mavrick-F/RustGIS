@@ -242,7 +242,6 @@ pub fn use_saved_secrets(s: &mut crate::Session, prefs: &Map<String, Value>, sto
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

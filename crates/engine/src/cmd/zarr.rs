@@ -336,7 +336,7 @@ fn crs_lost(r: &mut raster::Raster, text: Option<&str>, store: &zarr::Store, var
 }
 
 /// The window a command asks for: `"cells"`, or `"bbox"` in the grid's coordinates.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "windowed reads are desktop only"))]
 enum Asked {
     Cells(zarr::Window),
     Bbox([f64; 4]),
@@ -410,7 +410,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         return add_following(s, p);
     }
     let src = source(p)?;
-    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    #[cfg_attr(target_arch = "wasm32", expect(unused_mut, reason = "windowed reads are desktop only"))]
     let mut sel = selection(p);
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
     let crs_parsed = crs.map(Crs::parse).transpose()?;
@@ -1065,7 +1065,7 @@ pub(crate) fn follow_time_now(s: &mut Session) {
     follow(s, true);
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+#[cfg_attr(target_arch = "wasm32", expect(unused_variables, reason = "following a store is desktop only"))]
 fn follow(s: &mut Session, wait: bool) {
     #[cfg(not(target_arch = "wasm32"))]
     {

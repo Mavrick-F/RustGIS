@@ -533,7 +533,6 @@ pub fn paint_marker(p: &egui::Painter, at: egui::Pos2, name: &str, t: &Tokens) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use egui::accesskit::Role;
     use egui_kittest::kittest::{NodeT, Queryable};

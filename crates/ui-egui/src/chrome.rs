@@ -1465,7 +1465,6 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 

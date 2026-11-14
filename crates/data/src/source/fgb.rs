@@ -924,7 +924,6 @@ pub(crate) fn write_features(
 /// multipoints and the export must start again so. With `mixed_points`, a point layer's
 /// geometry of another kind (a line, a polygon) is refused: a file of mixed types is read as
 /// the layer of its first feature's kind.
-#[allow(clippy::too_many_arguments)]
 fn write_run(
     name: &str,
     geometry_type: GeometryType,

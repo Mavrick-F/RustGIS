@@ -225,7 +225,7 @@ fn run(app: &mut RustGisApp, id: &str, p: Value) {
 /// in the background, the pane opened at `section` to show its progress, Cancel and result; one
 /// that can't start (another is under way) is said in the status bar too. The rest run here, a
 /// failure said in the status bar.
-#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+#[cfg_attr(target_arch = "wasm32", expect(unused_variables, reason = "the browser has no background runs"))]
 pub fn run_elsewhere(app: &mut RustGisApp, section: &str, id: &str, p: Value) {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some((command, name)) = background(id) {

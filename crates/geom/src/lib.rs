@@ -7,16 +7,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod body;
-pub mod eqc;
-pub mod sinusoidal;
 pub mod triangulate;
 pub mod ups;
 pub mod utm;
-pub mod world;
 
 pub use body::{BODIES, Body};
-pub use eqc::EquidistantCylindrical;
-pub use sinusoidal::Sinusoidal;
 pub use ups::{Ups, format_ups, from_ups, parse_ups, to_ups};
 pub use utm::{GridError, Mgrs, Utm, format_mgrs, format_utm, parse_mgrs, parse_utm, to_mgrs, to_utm};
 

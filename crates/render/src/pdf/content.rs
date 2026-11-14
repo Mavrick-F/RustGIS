@@ -226,7 +226,6 @@ impl Writer<'_> {
     }
 
     /// Fills `path` with `fill` and strokes it with `stroke` in one, both opaque.
-    #[allow(clippy::too_many_arguments)]
     fn fill_and_stroke(
         &mut self,
         out: &mut Vec<u8>,

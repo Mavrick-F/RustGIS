@@ -833,7 +833,6 @@ pub(crate) fn address_look(look: &Look) -> rustgis_map::raster::AddressLook {
 
 /// A change of a COG layer's look a command asks for (`bands`, `range`, `dequantize`), applied to
 /// the look it has; `None` when it asks for none.
-#[allow(clippy::type_complexity)]
 fn cog_look(p: &Value) -> Result<Option<Box<dyn Fn(Look) -> Look>>, String> {
     if p.get("bands").is_none() && p.get("range").is_none() && p.get("dequantize").is_none() {
         return Ok(None);

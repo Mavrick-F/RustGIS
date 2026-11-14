@@ -451,7 +451,6 @@ fn place_text(v: &serde_json::Map<String, Value>) -> Option<String> {
 /// A pick: a button that waits for a place on the map (a click, or a box dragged for a box), then
 /// runs the widget's command with it. Clicked again while it waits, it stops waiting. Under it,
 /// what it waits for, or the place picked last.
-#[allow(clippy::too_many_arguments)]
 fn pick_item(
     app: &mut RustGisApp,
     ui: &mut Ui,

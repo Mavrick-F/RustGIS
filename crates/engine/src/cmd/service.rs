@@ -1578,7 +1578,6 @@ fn fetch_records(url: &str, _: &str) -> Result<rustgis_data::ogc::RecordPage, St
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
