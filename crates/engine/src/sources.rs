@@ -73,16 +73,38 @@ struct Kept {
     /// Rows and fields that couldn't be read and held a password, key or token: not kept, since
     /// this version can't strip it from what it doesn't understand.
     secrets: usize,
+    /// Readable sources whose name or details [`clean`] cut down (a name past 200 characters, a
+    /// detail that isn't short text, more than eight, or one that looks secret): saved cut down.
+    cut: usize,
 }
 
 impl Kept {
-    /// The entries of `o` without a password, key or token, counting those left out.
-    fn without_secrets(&mut self, mut o: Map<String, Value>) -> Map<String, Value> {
+    /// The entries of `o` without a password, key or token, counting those left out. `address` is
+    /// the one the entries sit beside (a source's own, kept apart from them): a bare `key` is a
+    /// secret beside a web address, which one entry alone doesn't show.
+    fn without_secrets(&mut self, mut o: Map<String, Value>, address: &str) -> Map<String, Value> {
         let before = o.len();
         o.retain(|k, v| !holds_secret(&json!({ k.as_str(): v })));
+        let mut beside = o.clone();
+        beside.insert("address".into(), address.into());
+        if holds_secret(&Value::Object(beside)) {
+            o.retain(|k, v| !holds_secret(&json!({ k.as_str(): v, "address": "https://a" })));
+        }
         self.secrets += before - o.len();
         o
     }
+}
+
+/// Whether [`clean`] took something of `before` away that isn't just tidied (whitespace, an
+/// empty name or details).
+fn cut(before: &Source, after: &Source) -> bool {
+    let name = before.name.trim();
+    let extra = match &before.extra {
+        Value::Null => false,
+        Value::Object(o) => !o.is_empty() && before.extra != after.extra,
+        _ => true,
+    };
+    (!name.is_empty() && after.name != name) || extra
 }
 
 /// A saved row: the source, and the fields this version doesn't know.
@@ -124,18 +146,22 @@ impl Sources {
                 }
             }
         }
-        s.kept.top = s.kept.without_secrets(o);
+        s.kept.top = s.kept.without_secrets(o, "");
         for (list, rows) in LISTS.into_iter().zip(lists) {
             let cap = if list == "recent" { MAX_RECENT } else { MAX_KEPT };
             let mut into = Vec::new();
             for row in rows {
                 // Entry by entry: one that doesn't read is kept as it was, not the whole list.
-                let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| Some((clean(r.source).ok()?, r.other)));
+                let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| {
+                    let cleaned = clean(r.source.clone()).ok()?;
+                    Some((cut(&r.source, &cleaned), cleaned, r.other))
+                });
                 match read {
-                    Some((mut source, other)) if into.len() < cap => {
+                    Some((was_cut, mut source, other)) if into.len() < cap => {
+                        s.kept.cut += usize::from(was_cut);
                         // Preferences carry provenance, never authority from an earlier process's login.
                         crate::s3_connections::clear_bindings(std::iter::once(&mut source.address));
-                        let other = s.kept.without_secrets(other);
+                        let other = s.kept.without_secrets(other, &source.address);
                         if !other.is_empty() {
                             s.kept.fields.insert((list, source.kind.clone(), source.address.clone()), other);
                         }
@@ -188,11 +214,20 @@ impl Sources {
                 if n == 1 { " has" } else { "s have" }
             ));
         }
+        if k.cut > 0 {
+            let n = k.cut;
+            said.push(format!(
+                "{n} saved data source{} a name past 200 characters, or details this version can't keep (not short text, more than eight, or a password, key or token): cut down, and saved cut down",
+                if n == 1 { " has" } else { "s have" }
+            ));
+        }
         if k.secrets > 0 {
             let n = k.secrets;
             said.push(format!(
-                "{n} entr{} of the saved data sources couldn't be read and held a password, key or token: dropped, and not saved again",
-                if n == 1 { "y" } else { "ies" }
+                "{n} value{} in the saved data sources {} dropped because {} held a password, key or token",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "was" } else { "were" },
+                if n == 1 { "it" } else { "they" }
             ));
         }
         said
@@ -925,11 +960,39 @@ MIIE
             {"kind": "gcs", "name": "B", "address": "https://g.example/b?sig=hidden"}
         ]});
         let s = Sources::from_json(&secret.to_string());
-        assert!(s.unread().iter().any(|t| t.starts_with("3 entries of the saved data sources")), "{:?}", s.unread());
+        assert!(
+            s.unread()
+                .iter()
+                .any(|t| t.starts_with("3 values in the saved data sources were dropped because they held a password, key or token")),
+            "{:?}",
+            s.unread()
+        );
         assert!(!s.to_json().contains("hidden"));
-        for clean in
-            ["", r#"{"favourites": [], "recent": [], "saved": []}"#, r#"{"recent": [{"kind": "file", "name": "R", "address": "/r.csv"}]}"#]
-        {
+        // A key beside a web address is one, in a readable source and among the preference's own keys.
+        let beside = json!({"endpoint": "https://api.example", "key": "abc", "saved": [
+            {"kind": "url", "name": "A", "address": "https://a/x.fgb", "mirror": "https://m.example", "key": "abc"}
+        ]});
+        let s = Sources::from_json(&beside.to_string());
+        assert!(
+            !s.to_json().contains("abc") && s.to_json().contains("api.example") && s.to_json().contains("m.example"),
+            "{}",
+            s.to_json()
+        );
+        assert!(s.unread().iter().any(|t| t.starts_with("2 values in the saved data sources were dropped")), "{:?}", s.unread());
+        // Details and a name this version cuts down when it reads them are said.
+        let long = "n".repeat(300);
+        let cut = json!({"saved": [
+            {"kind": "service", "name": "S", "address": "https://h/wms", "extra": {"type": "wms", "future": {"mode": 1}}},
+            {"kind": "file", "name": long, "address": "/a.csv"}
+        ]});
+        let s = Sources::from_json(&cut.to_string());
+        assert!(matches!(s.unread().as_slice(), [one] if one.starts_with("2 saved data sources have")), "{:?}", s.unread());
+        for clean in [
+            "",
+            r#"{"favourites": [], "recent": [], "saved": []}"#,
+            r#"{"recent": [{"kind": "file", "name": " R ", "address": "/r.csv", "extra": {}}]}"#,
+            r#"{"saved": [{"kind": "service", "name": "", "address": "https://h/wms", "extra": {"type": "wms"}}]}"#,
+        ] {
             assert!(Sources::from_json(clean).unread().is_empty(), "{clean}");
         }
     }

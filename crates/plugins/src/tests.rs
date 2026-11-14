@@ -1850,6 +1850,13 @@ fn plugin_state_keeps_what_this_version_cannot_read() {
         assert!(crate::store::load_installed().iter().any(|e| e.contains("state.json")), "{unreadable}");
         let e = crate::store::set_enabled("state-test", true).unwrap_err();
         assert!(e.contains("kept as it is"), "{e}");
+        // A refused change leaves the plugin as it was, not changed for this session only.
+        assert!(crate::get("state-test").is_some_and(|p| !p.enabled));
+        let folder = plugins.join("folder-plugin");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("plugin.json"), crate::testing::manifest("folder-test", &[])).unwrap();
+        std::fs::write(folder.join("plugin.wasm"), testing::wasm()).unwrap();
+        assert!(crate::store::install_path(&folder).is_err() && crate::get("folder-test").is_none());
         assert!(crate::store::uninstall("state-test").is_err());
         assert_eq!(std::fs::read_to_string(&state).unwrap(), unreadable);
     }

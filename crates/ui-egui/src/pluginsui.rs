@@ -327,6 +327,18 @@ fn update_saved(app: &RustGisApp, f: impl FnOnce(&mut Vec<Saved>)) {
     }
 }
 
+/// Puts `entry` in `list` in place of the one with its id, which hands it the fields this version
+/// doesn't know; `keep` false only removes the old one.
+fn put_saved(list: &mut Vec<Saved>, mut entry: Saved, keep: bool) {
+    if let Some(old) = list.iter().find(|s| s.id == entry.id) {
+        entry.other = old.other.clone();
+    }
+    list.retain(|s| s.id != entry.id);
+    if keep {
+        list.push(entry);
+    }
+}
+
 /// Loads the plugins the web app installed in earlier visits.
 pub fn restore(app: &mut RustGisApp) {
     if !keeps_prefs() {
@@ -527,12 +539,7 @@ fn install_confirmed(app: &mut RustGisApp) {
                 other: serde_json::Map::new(),
             };
             let kept = entry.url.is_some() || entry.data.is_some();
-            update_saved(app, |list| {
-                list.retain(|s| s.id != entry.id);
-                if kept {
-                    list.push(entry);
-                }
-            });
+            update_saved(app, |list| put_saved(list, entry, kept));
             let mut text = crate::i18n::fmt(
                 "Installed {name} {version}. Find it on the Plugins tab; its tools are also in the Tools pane.",
                 &[("name", &p.manifest.name), ("version", &p.manifest.version)],
@@ -1347,6 +1354,12 @@ mod tests {
         assert_eq!(again[0]["enabled"], false);
         assert_eq!(again[1]["id"], "c");
         assert_eq!(again[2], json!({"id": "b", "sha256": {"v2": "0"}}));
+        // Installing it again (an update) keeps the fields this version doesn't know.
+        put_saved(&mut list, record("a", "2"), true);
+        assert_eq!(
+            (list.len(), list.last().map(|s| s.sha256.as_str()), list.last().and_then(|s| s.other.get("channel"))),
+            (2, Some("2"), Some(&json!("beta")))
+        );
         assert!(read_saved(Some("{\"plugins\": []}")).is_none());
         assert_eq!(read_saved(None).map(|(l, k)| (l.len(), k.len())), Some((0, 0)));
     }

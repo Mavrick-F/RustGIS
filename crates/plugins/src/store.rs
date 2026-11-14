@@ -76,13 +76,20 @@ fn read_state() -> State {
     read.unwrap_or_else(|e| State { unreadable: Some(format!("{}: {e}", path.display())), ..State::default() })
 }
 
+/// Refuses a change to `state.json` when [`read_state`] couldn't read the one there. Callers ask
+/// before they change anything in memory, so a refused change isn't half made.
+fn writable(st: &State) -> Result<(), String> {
+    match &st.unreadable {
+        Some(why) => Err(format!(
+            "{why}; it is kept as it is, so which plugins are disabled or added from folders can't be changed until it is fixed or removed"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Writes `state.json`, refused when [`read_state`] couldn't read the one there.
 fn write_state(st: &State) -> Result<(), String> {
-    if let Some(why) = &st.unreadable {
-        return Err(format!(
-            "{why}; it is kept as it is, so which plugins are disabled or added from folders can't be changed until it is fixed or removed"
-        ));
-    }
+    writable(st)?;
     let path = state_path().ok_or("there is no folder for plugins")?;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -324,9 +331,12 @@ pub fn install_path(path: &Path) -> Result<Arc<Plugin>, String> {
         return install_bytes(&bytes);
     }
     let pkg = Package::from_dir(path)?;
-    let plugin = crate::load(pkg, &path.display().to_string())?;
     let mut st = read_state();
     let p = path.display().to_string();
+    if !st.folders.contains(&p) {
+        writable(&st)?;
+    }
+    let plugin = crate::load(pkg, &p)?;
     if !st.folders.contains(&p) {
         st.folders.push(p);
         write_state(&st)?;
@@ -360,8 +370,9 @@ pub fn uninstall(id: &str) -> Result<(), String> {
 
 /// Enables or disables a plugin, and remembers it.
 pub fn set_enabled(id: &str, enabled: bool) -> Result<(), String> {
-    crate::set_enabled(id, enabled)?;
     let mut st = read_state();
+    writable(&st)?;
+    crate::set_enabled(id, enabled)?;
     st.disabled.retain(|d| d != id);
     if !enabled {
         st.disabled.push(id.to_string());
