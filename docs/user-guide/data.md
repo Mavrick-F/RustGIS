@@ -1388,7 +1388,7 @@ a few at a time, in the background.
 Stores are read in pure Rust, in the web app as well as on the desktop: Zarr 2 with consolidated
 metadata (`.zmetadata`, as xarray writes) and Zarr 3 (`zarr.json`, sharded arrays too), chunks
 compressed with blosc (LZ4, zlib or zstd, byte- or bit-shuffled), zlib, gzip, zstd or LZ4, of
-integer or float values, in C or Fortran order. A sharded array's shards are fetched whole.
+integer or float values, in C or Fortran order. A sharded array's shards are fetched whole, except in a window (below).
 `_FillValue`, `missing_value` and a Zarr 2 array's fill value are no data; a Zarr 3 array's fill
 value isn't: chunks never written are left empty, but chunks missing from inside a shard show the
 fill value. `scale_factor` and `add_offset` are applied. The coordinates must be evenly spaced (a curvilinear grid isn't read);
@@ -1405,7 +1405,9 @@ rustgis-cli run --cmd 'layer.addZarr={"url":"https://storage.googleapis.com/gcp-
 **A window** of the map (`layer.addZarr` with `"cells": [first column, first row, end column, end
 row]`, the ends not included, or `"bbox": [west, south, east, north]` in the grid's coordinates,
 degrees for a longitude/latitude grid) reads only the chunks it touches, and only its part of the
-coordinates (by byte range when they are stored uncompressed). A box is placed by the variable's
+coordinates (by byte range when they are stored uncompressed). In a sharded array it reads each
+shard's index by range, then only the shard's chunks the window needs, one range each; a window
+over more than 4,096 of the shards' chunks reads its shards whole instead. A box is placed by the variable's
 coordinates, read whole, so it takes grids of up to 4,000,000 cells a side; a longer one takes
 `"cells"`. A box reaching past the grid is read within it, and says so; one over a longitude grid's
 edge (0°/360°, or ±180°) is refused: give a box on each side (one round the whole globe is the

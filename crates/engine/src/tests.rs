@@ -46441,21 +46441,24 @@ fn serve_ranged_files(files: Vec<(String, Vec<u8>)>) -> (String, std::sync::Arc<
     (base, asked)
 }
 
-/// A window of a Zarr variable by web address (#1720) reads only what it needs: the chunks it
-/// touches, and only the window's bytes of its coordinates (stored plain), by range. A folder's
-/// window is the same, a box placed by the coordinates gives the same cells, and a box past the
-/// grid is said.
+/// A window of a sharded Zarr variable by web address (#1720) reads only what it needs: the
+/// shard's index by its last bytes, then only the shard's chunks the window touches, by range, and
+/// the window's coordinates; no other shard, and no shard whole. A folder's window is the same,
+/// a box placed by the coordinates gives the same cells, and a box past the grid is said.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_zarr_window_reads_only_its_chunks_by_range() {
-    // `v` (time 2, lat 8, lon 12; int16, `t·1000 + row·100 + col`) in chunks of 1 × 2 × 3;
-    // latitudes 8.5 down by 1, longitudes 0.5 up by 1, both stored plain.
+    // `v` (time 2, lat 8, lon 12; int16, `t·1000 + row·100 + col`) in shards of 1 × 4 × 6 holding
+    // chunks of 1 × 2 × 3, the index at the end with a checksum; latitudes 8.5 down by 1,
+    // longitudes 0.5 up by 1, both stored plain.
     let coord = |n: u64, units: &str| {
         json!({"zarr_format": 3, "node_type": "array", "shape": [n], "data_type": "float64", "attributes": {"units": units},
             "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [n]}}, "codecs": [{"name": "bytes"}], "fill_value": 0})
     };
     let v = json!({"zarr_format": 3, "node_type": "array", "shape": [2, 8, 12], "data_type": "int16",
-        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 2, 3]}}, "codecs": [{"name": "bytes"}],
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 4, 6]}},
+        "codecs": [{"name": "sharding_indexed", "configuration": {"chunk_shape": [1, 2, 3], "codecs": [{"name": "bytes"}],
+            "index_codecs": [{"name": "bytes"}, {"name": "crc32c"}], "index_location": "end"}}],
         "fill_value": -1, "dimension_names": ["time", "lat", "lon"]});
     let root = json!({"zarr_format": 3, "node_type": "group", "consolidated_metadata": {"kind": "inline", "metadata": {
         "v": v, "lat": coord(8, "degrees_north"), "lon": coord(12, "degrees_east")}}});
@@ -46465,12 +46468,19 @@ fn a_zarr_window_reads_only_its_chunks_by_range() {
         ("lat/c/0".to_string(), f64s((0..8).map(|i| 8.5 - i as f64).collect())),
         ("lon/c/0".to_string(), f64s((0..12).map(|i| 0.5 + i as f64).collect())),
     ];
-    for (t, gy, gx) in (0..2u64).flat_map(|t| (0..4u64).flat_map(move |gy| (0..4u64).map(move |gx| (t, gy, gx)))) {
-        let body: Vec<u8> = (0..2)
-            .flat_map(|r| (0..3).map(move |c| (t * 1000 + (gy * 2 + r) * 100 + gx * 3 + c) as i16))
-            .flat_map(i16::to_le_bytes)
-            .collect();
-        files.push((format!("v/c/{t}/{gy}/{gx}"), body));
+    for (t, sy, sx) in (0..2u64).flat_map(|t| (0..2u64).flat_map(move |sy| (0..2u64).map(move |sx| (t, sy, sx)))) {
+        let (mut body, mut index) = (Vec::new(), Vec::new());
+        for (iy, ix) in [(0u64, 0u64), (0, 1), (1, 0), (1, 1)] {
+            index.extend([body.len() as u64, 12]);
+            for r in 0..2 {
+                for c in 0..3 {
+                    body.extend(((t * 1000 + (sy * 4 + iy * 2 + r) * 100 + sx * 6 + ix * 3 + c) as i16).to_le_bytes());
+                }
+            }
+        }
+        body.extend(index.iter().flat_map(|v| v.to_le_bytes()));
+        body.extend([0u8; 4]);
+        files.push((format!("v/c/{t}/{sy}/{sx}"), body));
     }
     // Removed however the test ends.
     struct Gone(std::path::PathBuf);
@@ -46486,7 +46496,7 @@ fn a_zarr_window_reads_only_its_chunks_by_range() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b).unwrap();
     }
-    let (base, asked) = serve_ranged_files(files.iter().map(|(k, b)| (format!("/s.zarr/{k}"), b.clone())).collect());
+    let (base, log) = serve_ranged_files(files.iter().map(|(k, b)| (format!("/s.zarr/{k}"), b.clone())).collect());
     let url = format!("{base}/s.zarr");
     let pixels = |s: &Session, r: &Value| {
         let id = r["layer"].as_u64().unwrap() as u32;
@@ -46499,21 +46509,26 @@ fn a_zarr_window_reads_only_its_chunks_by_range() {
     assert_eq!((w, h), (3, 3));
     assert_eq!(data, (1..4).flat_map(|r| (2..5).map(move |c| (1000 + r * 100 + c) as f32)).collect::<Vec<_>>());
     assert_eq!((transform.origin_x, transform.origin_y), (2.0, 8.0));
-    let asked: Vec<(String, String)> = asked.lock().unwrap().clone();
+    let asked: Vec<(String, String)> = log.lock().unwrap().clone();
     let of = |key: &str| asked.iter().filter(|(p, _)| p == &format!("/s.zarr/{key}")).map(|(_, r)| r.as_str()).collect::<Vec<_>>();
-    // The four chunks it touches, whole, and the window's bytes of the coordinates.
-    let mut chunks: Vec<&str> = asked
-        .iter()
-        .filter(|(p, _)| p.starts_with("/s.zarr/v/"))
-        .map(|(p, r)| {
-            assert_eq!(r, "", "{p}");
-            p.as_str()
-        })
-        .collect();
-    chunks.sort();
-    assert_eq!(chunks, ["/s.zarr/v/c/1/0/0", "/s.zarr/v/c/1/0/1", "/s.zarr/v/c/1/1/0", "/s.zarr/v/c/1/1/1"]);
+    // The index (4 chunks × 16 bytes and a checksum), then the four chunks, 12 bytes each.
+    let mut shard = of("v/c/1/0/0");
+    shard.sort();
+    assert_eq!(shard, ["-68", "0-11", "12-23", "24-35", "36-47"], "{asked:?}");
     assert_eq!(of("lat/c/0"), ["8-31"]);
     assert_eq!(of("lon/c/0"), ["16-39"]);
+    assert!(asked.iter().all(|(p, _)| !p.starts_with("/s.zarr/v/") || p == "/s.zarr/v/c/1/0/0"), "{asked:?}");
+    // A window inside one of the shard's chunks (rows 2–3, columns 3–4: its last chunk) asks for
+    // the index and that chunk's 12 bytes only.
+    log.lock().unwrap().clear();
+    let r = s.run("layer.addZarr", &json!({"url": url, "variable": "v", "index": {"time": 1}, "cells": [3, 2, 5, 4]})).unwrap();
+    assert_eq!(pixels(&s, &r).2, (2..4).flat_map(|r| (3..5).map(move |c| (1000 + r * 100 + c) as f32)).collect::<Vec<_>>());
+    let one: Vec<(String, String)> = log.lock().unwrap().clone();
+    let v: Vec<&(String, String)> = one.iter().filter(|(p, _)| p.starts_with("/s.zarr/v/")).collect();
+    assert!(v.iter().all(|(p, _)| p == "/s.zarr/v/c/1/0/0"), "{one:?}");
+    let mut ranges: Vec<&str> = v.iter().map(|(_, r)| r.as_str()).collect();
+    ranges.sort();
+    assert_eq!(ranges, ["-68", "36-47"], "{one:?}");
     // From a folder: the same cells, kept in the project as a GeoTIFF (an older RustGIS would read
     // the folder again by the label, whole), with the folder kept as where its store is.
     let r =
@@ -46549,7 +46564,7 @@ fn a_zarr_window_reads_only_its_chunks_by_range() {
     // Cells aren't placed (nor checked) here: they are refused, not echoed back.
     let e = s.run("raster.zarrInfo", &json!({"url": url, "cells": [0, 0, 999_999, 999_999]})).unwrap_err();
     assert!(e.contains("raster.zarrInfo takes a bbox"), "{e}");
-    assert_eq!(info["variables"][0]["chunks"], json!([1, 2, 3]));
+    assert_eq!(info["variables"][0]["innerChunks"], json!([1, 2, 3]));
     let mark = s.notice_mark();
     s.run("layer.addZarr", &json!({"url": url, "variable": "v", "bbox": [-20.0, 5.2, 4.8, 7.8]})).unwrap();
     assert!(
