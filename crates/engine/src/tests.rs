@@ -44792,6 +44792,13 @@ fn a_layer_publishes_its_edits_to_its_shapefile() {
         assert!(rustgis_data::progress::Probe::cancelled(probe.as_ref()), "the probe saw the committed shape");
     }
     assert_eq!(state(&mut s), "inSync");
+    // Define Projection makes the geographic CRS explicit. Publishing normalizes it as
+    // the reader does, so the live layer and its new sync point agree after completion.
+    s.run("layer.defineProjection", &json!({"layer": id, "crs": "EPSG:4326"})).unwrap();
+    assert_eq!(state(&mut s), "edited");
+    assert_eq!(s.run("source.publish", &json!({"layer": id})).unwrap()["published"], true);
+    assert_eq!(state(&mut s), "inSync");
+    assert_eq!(s.run("source.publish", &json!({"layer": id})).unwrap()["published"], false);
     // Changed since: refused, the file left as it was.
     s.run("edit.setValue", &json!({"layer": id, "row": 1, "field": "name", "value": "Mine"})).unwrap();
     let mut theirs = dbf();

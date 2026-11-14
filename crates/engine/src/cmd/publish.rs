@@ -96,6 +96,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 .collect::<Vec<_>>()
                 .into();
             held.fields = published.read.fields.clone();
+            held.crs = published.read.crs;
             // Already hashed before the files were placed: Cancel must not leave a successful
             // write without its sync record. Feature ids do not contribute to the digest.
             let read = published.rows;
@@ -120,6 +121,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                         {
                             l.dataset.features = held.features;
                             l.dataset.fields = held.fields;
+                            l.dataset.crs = held.crs;
                             l.touch_geometry();
                             s.revision = s.revision.wrapping_add(1);
                         }
