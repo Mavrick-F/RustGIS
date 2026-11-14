@@ -77,9 +77,9 @@ struct Kept {
     /// control characters, an address with a password, key or token, details that aren't short
     /// text, more than eight, or secret-looking): saved that way.
     cut: usize,
-    /// Readable rows that repeat the kind and address of an earlier row of their list: kept as
-    /// they were, not listed, so each row keeps its own unknown fields.
-    twins: usize,
+    /// Readable rows that repeat the kind and address of an earlier row of their list: merged
+    /// into it (a list is keyed by that identity), keeping unknown fields it lacks.
+    merged: usize,
 }
 
 impl Kept {
@@ -93,7 +93,11 @@ impl Kept {
             .filter(|(k, v)| {
                 let mut probe = Map::new();
                 probe.insert((*k).clone(), (*v).clone());
-                if web_address(&Value::String(address.into()), 0) || o.iter().any(|(other, v)| other != *k && web_address(v, 0)) {
+                if web_address(&Value::String(address.into()), 0)
+                    || o.iter().any(|(other, v)| {
+                        other != *k && !other.eq_ignore_ascii_case("data") && !other.eq_ignore_ascii_case("text") && web_address(v, 0)
+                    })
+                {
                     probe.insert("\u{1}beside".into(), "https://a".into());
                 }
                 holds_secret(&Value::Object(probe))
@@ -180,19 +184,23 @@ impl Sources {
                     Some((cut(&r.source, &cleaned), cleaned, r.other))
                 });
                 match read {
-                    Some((_, source, _)) if into.len() < cap && into.iter().any(|r| same(r, &source)) && !holds_secret(&row) => {
-                        s.kept.twins += 1;
-                        s.kept.rows.entry(list).or_default().push(row);
-                    }
                     Some((was_cut, mut source, other)) if into.len() < cap => {
                         s.kept.cut += usize::from(was_cut);
                         // Preferences carry provenance, never authority from an earlier process's login.
                         crate::s3_connections::clear_bindings(std::iter::once(&mut source.address));
                         let other = s.kept.without_secrets(other, &source.address);
+                        let repeat = into.iter().any(|r| same(r, &source));
+                        s.kept.merged += usize::from(repeat);
                         if !other.is_empty() {
-                            s.kept.fields.insert((list, source.kind.clone(), source.address.clone()), other);
+                            // A repeated row adds the unknown fields the first lacks.
+                            let kept = s.kept.fields.entry((list, source.kind.clone(), source.address.clone())).or_default();
+                            for (k, v) in other {
+                                kept.entry(k).or_insert(v);
+                            }
                         }
-                        into.push(source);
+                        if !repeat {
+                            into.push(source);
+                        }
                     }
                     _ if holds_secret(&row) => s.kept.secrets += 1,
                     read => {
@@ -218,13 +226,12 @@ impl Sources {
             )];
         }
         let mut said = Vec::new();
-        let rows = k.rows.values().map(Vec::len).sum::<usize>().saturating_sub(k.over + k.twins);
-        if k.twins > 0 {
-            let n = k.twins;
+        let rows = k.rows.values().map(Vec::len).sum::<usize>().saturating_sub(k.over);
+        if k.merged > 0 {
+            let n = k.merged;
             said.push(format!(
-                "{n} saved data source{} another in the same list: not listed, and kept as {} when the sources are saved",
-                if n == 1 { " repeats" } else { "s repeat" },
-                if n == 1 { "it was" } else { "they were" }
+                "{n} saved data source{} another in the same list: merged into it, keeping its settings and adding the unknown ones it lacks",
+                if n == 1 { " repeats" } else { "s repeat" }
             ));
         }
         if k.over > 0 {
@@ -1040,15 +1047,26 @@ MIIE
         assert_eq!(s.favourites.len(), MAX_KEPT);
         assert!(s.unread()[0].starts_with("1 saved data source is past"), "{:?}", s.unread());
         assert!(s.to_json().contains(&format!("/{}.csv", MAX_KEPT - 1)) && s.to_json().contains(&format!("\"pinned\":{}", MAX_KEPT - 1)));
-        // Two rows of one identity each keep their own fields.
+        // Rows of one identity are one source: the first row's fields stay, a later row adds the
+        // ones it lacks (without a secret), and forgetting it leaves nothing behind.
         let twins = json!({"saved": [
             {"kind": "file", "name": "A", "address": "/a.csv", "future": 1},
-            {"kind": "file", "name": "A", "address": "/a.csv", "future": 2}
+            {"kind": "file", "name": "A", "address": "/a.csv", "future": 2, "more": 3, "token": "hidden"}
         ]});
-        let s = Sources::from_json(&twins.to_string());
+        let mut s = Sources::from_json(&twins.to_string());
+        assert_eq!(s.saved.len(), 1);
         let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
-        assert_eq!((&saved["saved"][0]["future"], &saved["saved"][1]["future"]), (&json!(1), &json!(2)));
+        assert_eq!(
+            (saved["saved"].as_array().map(Vec::len), &saved["saved"][0]["future"], &saved["saved"][0]["more"]),
+            (Some(1), &json!(1), &json!(3))
+        );
+        assert!(!s.to_json().contains("hidden"));
         assert!(s.unread()[0].starts_with("1 saved data source repeats"), "{:?}", s.unread());
+        s.forget("saved", "file", "/a.csv").unwrap();
+        assert!(!s.to_json().contains("/a.csv"));
+        // A file's contents beside a field isn't an address for it.
+        let file = json!({"data": "https://example.invalid/a.csv", "key": "feature_id"});
+        assert!(Sources::from_json(&file.to_string()).to_json().contains("feature_id"));
         // An address with a signed query is changed, and said.
         let signed = json!({"saved": [{"kind": "url", "name": "U", "address": "https://a/x.fgb?sig=hidden"}]});
         let s = Sources::from_json(&signed.to_string());
