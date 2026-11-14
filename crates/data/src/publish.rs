@@ -232,7 +232,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
 
     // 1. It reads as the layer was read: in the layer's system, and in the file's own
     // coordinates (the system taken for longitude/latitude, which converts nothing).
-    let (as_read, _) = crate::io::read_shapefile_parts(original.parts(), &name, crs)?;
+    let (as_read, _) = crate::io::read_shapefile_parts(original.parts(), &name, ds.crs)?;
     if crate::sync::rows_digest(&as_read)? != synced.rows {
         // Define Projection changes the layer's CRS, which is part of its digest. The
         // unedited file must still reproduce the saved baseline in its own CRS. Keep the
@@ -829,20 +829,25 @@ mod tests {
         assert!(e.contains("reads otherwise now") && e.contains("nothing was written"), "{e}");
     }
 
-    /// Defining a previously undefined source CRS publishes the definition without moving
+    /// Defining a missing or incorrect source CRS publishes the definition without moving
     /// its native coordinates, and records a sync point that permits the next publish.
     #[test]
     fn a_defined_projection_publishes_without_moving_native_coordinates() {
-        for crs in [Crs::WebMercator, Crs::LonLat] {
+        for (source, crs) in [(None, Crs::WebMercator), (None, Crs::LonLat), (Some(Crs::WebMercator), Crs::LonLat)] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("parcels.shp");
             crate::io::write_path(&parcels(), &path).unwrap();
-            std::fs::remove_file(path.with_extension("prj")).unwrap();
+            match source {
+                Some(c) => std::fs::write(path.with_extension("prj"), crate::raster::wkt::to_wkt(c).unwrap()).unwrap(),
+                None => std::fs::remove_file(path.with_extension("prj")).unwrap(),
+            }
             let before = std::fs::read(&path).unwrap();
             let (ds, sync) = read(&path);
             let defined = crate::io::define_projection(&ds, crs).unwrap();
             let published = shapefile(&defined, &path, &sync).unwrap();
-            assert!(same_shapes(&before, &std::fs::read(&path).unwrap(), 0.0).is_none());
+            if source.is_none() {
+                assert!(same_shapes(&before, &std::fs::read(&path).unwrap(), 0.0).is_none());
+            }
             assert!(published.notes.iter().any(|n| n.contains(".prj now says")), "{:?}", published.notes);
             let (back, next) = read(&path);
             assert_eq!(Original::read(&path).unwrap().crs(), Some(crs));
