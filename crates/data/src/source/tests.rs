@@ -3903,6 +3903,34 @@ fn flatgeobuf_classifies_local_dates_and_preserves_remote_text() {
     assert!(remote_batch.features.iter().any(|f| f.attrs[0] == Value::Text("2026-02-30".into())));
 }
 
+/// A FlatGeobuf column with a date and a date-time with digits past the microsecond is a
+/// date-time column: classification reads the date-time as the read does, rounded and counted.
+#[test]
+fn flatgeobuf_classifies_fine_date_times_as_date_times() {
+    use flatgeobuf::geozero::{ColumnValue, PropertyProcessor, wkb::Wkb};
+    use flatgeobuf::{ColumnType, FgbWriter, FgbWriterOptions, GeometryType as G};
+    let mut writer = FgbWriter::create_with_options("fine", G::Point, FgbWriterOptions::default()).unwrap();
+    writer.add_column("at", ColumnType::DateTime, |_, c| c.nullable = true);
+    for (i, s) in ["2026-03-05", "2026-03-05T14:30:00.123456789Z"].iter().enumerate() {
+        writer
+            .add_feature_geom(Wkb(wkb::encode(&Geometry::Point(Coord::new(i as f64, 0.0)))), |out| {
+                out.property(0, "at", &ColumnValue::DateTime(s)).unwrap();
+            })
+            .unwrap();
+    }
+    let mut bytes = Vec::new();
+    writer.write(&mut bytes).unwrap();
+    let src = open_bytes("fine.fgb", bytes, None).unwrap();
+    assert_eq!(src.info().fields[0].ty, FieldType::DateTime);
+    let batch = src.read(&Request::all()).unwrap();
+    // FlatGeobuf keeps features in its spatial index's order.
+    let mut shown: Vec<String> = batch.features.iter().map(|f| f.attrs[0].to_string()).collect();
+    shown.sort();
+    assert_eq!(shown, ["2026-03-05T00:00:00", "2026-03-05T14:30:00.123457Z"]);
+    assert!(batch.unread_dates.is_empty());
+    assert_eq!(batch.rounded_dates, [1]);
+}
+
 /// A readable size prefix can contain invalid UTF-8 properties. Classification ignores
 /// that row just as whole and streamed reads do, and the read reports the skipped feature.
 #[test]

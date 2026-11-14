@@ -281,8 +281,9 @@ impl EditTable {
                 let field = fields.get(i).ok_or_else(|| self.shape_error())?;
                 let old = row.get(c).ok_or_else(|| self.shape_error())?;
                 let attr = f.attrs.get(i).unwrap_or(&Value::Null);
-                // A stored date that isn't one reads as null and is kept unless edited.
-                let previous = value(ValueRef::from(old), field.ty, &mut Vec::new(), None, 0);
+                // A stored date that isn't one reads as null and is kept unless edited; one with
+                // digits past the microsecond reads rounded, as the load showed it, so it is kept too.
+                let previous = value(ValueRef::from(old), field.ty, &mut Vec::new(), Some(&mut Vec::new()), 0);
                 let same_nan = matches!((&previous, attr), (Value::Float(a), Value::Float(b)) if a.is_nan() && b.is_nan());
                 if previous != *attr && !same_nan {
                     sets.push(format!("{} = ?", quote(columns.get(c).ok_or_else(|| self.shape_error())?)));
@@ -402,7 +403,9 @@ impl EditTable {
             for &(i, c) in &snapshot_columns {
                 let field = fields.get(i).ok_or_else(|| self.shape_error())?;
                 let attr = feature.attrs.get_mut(i).ok_or_else(|| self.shape_error())?;
-                *attr = value(ValueRef::from(row.get(c).ok_or_else(|| self.shape_error())?), field.ty, &mut Vec::new(), None, 0);
+                // Read as the load reads it: rounded past the microsecond.
+                let stored = row.get(c).ok_or_else(|| self.shape_error())?;
+                *attr = value(ValueRef::from(stored), field.ty, &mut Vec::new(), Some(&mut Vec::new()), 0);
             }
             saved.versions.push((k.cast_unsigned(), fingerprint(row.iter().map(ValueRef::from))));
             features.push(feature);
@@ -1505,6 +1508,34 @@ mod tests {
         assert_eq!(conn.query_row("SELECT id FROM rtree_roads_geom", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
         assert_eq!(conn.query_row("SELECT name FROM roads", [], |r| r.get::<_, String>(0)).unwrap(), "default");
         assert_eq!(conn.query_row("SELECT v FROM other", [], |r| r.get::<_, String>(0)).unwrap(), "keep");
+    }
+
+    /// A stored date-time with digits past the microsecond loads rounded. Saving an edit to another
+    /// field of the feature leaves it as stored, says nothing of it, and the saved feature shows
+    /// what the load showed.
+    #[test]
+    fn gpkg_an_untouched_fine_date_time_is_kept_when_another_field_is_saved() {
+        let (_dir, path) = fixture();
+        let stored = "2026-03-05T14:30:00.123456789Z";
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!("ALTER TABLE roads ADD COLUMN seen DATETIME; UPDATE roads SET seen = '{stored}';"))
+            .unwrap();
+        let table = EditTable::open(&path, "roads").unwrap();
+        let fields = table.info().fields.clone();
+        let (name, seen) = (fields.iter().position(|f| f.name == "name").unwrap(), fields.iter().position(|f| f.name == "seen").unwrap());
+        let loaded = table.read_editable(MAX_EDITABLE).unwrap();
+        assert_eq!(loaded.features[0].attrs[seen].to_string(), "2026-03-05T14:30:00.123457Z");
+        assert_eq!(loaded.rounded_dates.get(seen), Some(&1));
+        let mut feature = loaded.features[0].clone();
+        feature.attrs[name] = Value::Text("renamed".into());
+        let edits = Edits { updates: vec![(feature, loaded.versions[0].1)], ..Default::default() };
+        let saved = table.save(&edits, &fields, std::iter::empty(), &loaded.revision).unwrap().unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(conn.query_row("SELECT seen FROM roads", [], |r| r.get::<_, String>(0)).unwrap(), stored);
+        assert_eq!(conn.query_row("SELECT name FROM roads", [], |r| r.get::<_, String>(0)).unwrap(), "renamed");
+        assert!(saved.fine_dates.iter().all(|&n| n == 0), "nothing was rounded to the millisecond: {:?}", saved.fine_dates);
+        assert_eq!(saved.features[0].attrs[seen], loaded.features[0].attrs[seen]);
     }
 
     #[test]

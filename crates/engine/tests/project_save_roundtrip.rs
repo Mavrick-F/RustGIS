@@ -255,18 +255,23 @@ fn seen(s: &Session) -> Value {
     serde_json::to_value(&s.project).unwrap()
 }
 
-/// Each layer's date and date-time fields (name, type) and their values, as they are held. Other
+/// Each map's layers' date and date-time fields (name, type) and their values, as they are held. Other
 /// fields are left out: a NaN is written as null and said so, and compares unequal to itself.
-fn held_values(s: &Session) -> Vec<Vec<(String, FieldType, Vec<DataValue>)>> {
-    s.map()
-        .layers
+fn held_values(s: &Session) -> Vec<Vec<Vec<(String, FieldType, Vec<DataValue>)>>> {
+    s.project
+        .maps
         .iter()
-        .map(|l| {
-            let d = &l.dataset;
-            let dates = d.fields.iter().enumerate().filter(|(_, f)| matches!(f.ty, FieldType::Date | FieldType::DateTime));
-            dates
-                .map(|(i, f)| {
-                    (f.name.clone(), f.ty, d.features.iter().map(|x| x.attrs.get(i).cloned().unwrap_or(DataValue::Null)).collect())
+        .map(|m| {
+            m.layers
+                .iter()
+                .map(|l| {
+                    let d = &l.dataset;
+                    let dates = d.fields.iter().enumerate().filter(|(_, f)| matches!(f.ty, FieldType::Date | FieldType::DateTime));
+                    dates
+                        .map(|(i, f)| {
+                            (f.name.clone(), f.ty, d.features.iter().map(|x| x.attrs.get(i).cloned().unwrap_or(DataValue::Null)).collect())
+                        })
+                        .collect()
                 })
                 .collect()
         })

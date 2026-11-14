@@ -257,7 +257,7 @@ impl FgbSource {
                 if let Some(Value::Text(s)) = props.values.get(k) {
                     let state = if crate::Date::parse(s).is_some() {
                         1
-                    } else if crate::DateTime::parse(s).is_some() {
+                    } else if crate::DateTime::parse_rounding(s).is_some() {
                         2
                     } else if is_clock(s) {
                         4

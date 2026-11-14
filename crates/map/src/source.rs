@@ -102,6 +102,8 @@ pub struct SourceLayer {
     #[serde(skip)]
     unread_dates_said: bool,
     #[serde(skip)]
+    rounded_dates_said: bool,
+    #[serde(skip)]
     window: Option<Window>,
     /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
     #[serde(skip)]
@@ -711,14 +713,12 @@ impl SourceLayer {
     /// Keeps what view reads found of values in date fields that weren't dates, until
     /// [`SourceLayer::take_unread_dates`] says it. Once said, later reads aren't counted: they
     /// read the same features again, and the notice says Load All Features counts them all.
+    /// Each kind is counted until its own notice is said, so saying one doesn't silence the other.
     pub fn saw_unread_dates(&mut self, unread: &[usize], rounded: &[usize]) {
-        if self.unread_dates_said {
-            return;
-        }
-        if unread.iter().any(|n| *n > 0) {
+        if !self.unread_dates_said && unread.iter().any(|n| *n > 0) {
             rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), unread);
         }
-        if rounded.iter().any(|n| *n > 0) {
+        if !self.rounded_dates_said && rounded.iter().any(|n| *n > 0) {
             rustgis_data::source::add_unread_dates(self.rounded_dates.get_or_insert_with(Vec::new), rounded);
         }
     }
@@ -732,7 +732,8 @@ impl SourceLayer {
         if unread.is_none() && rounded.is_none() {
             return (None, None);
         }
-        self.unread_dates_said = true;
+        self.unread_dates_said |= unread.is_some();
+        self.rounded_dates_said |= rounded.is_some();
         (
             unread.and_then(|c| rustgis_data::source::unread_dates_note(&fields, &c)),
             rounded.and_then(|c| rustgis_data::source::rounded_dates_note(&fields, &c)),
@@ -1409,6 +1410,7 @@ impl SourceLayer {
         self.unread_dates = None;
         self.rounded_dates = None;
         self.unread_dates_said = false;
+        self.rounded_dates_said = false;
         self.reset();
         self.open()
     }
@@ -1727,6 +1729,7 @@ impl SourceLayer {
             unread_dates: _,
             rounded_dates: _,
             unread_dates_said: _,
+            rounded_dates_said: _,
             gdal,
             duckdb,
             postgis,
@@ -1821,6 +1824,33 @@ mod tests {
         assert!(repaired.is_open() && !repaired.is_pending());
         assert_eq!(repaired.info().unwrap().fields[0].ty, FieldType::Date);
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Unread dates and rounded date-times are each said once, and saying one doesn't silence the
+    /// other, whichever a view read finds first.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unread_and_rounded_date_notices_are_said_independently() {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
+        let mut ds = Dataset::new("dates", GeometryType::Point, vec![Field::new("at", FieldType::DateTime)]);
+        ds.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![Value::Null]);
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&ds).unwrap());
+        for unread_first in [true, false] {
+            let mut source =
+                super::SourceLayer { file_name: Some("dates.fgb".into()), embedded: Some(bytes.clone()), ..Default::default() };
+            source.open().unwrap();
+            source.wait_open(std::time::Duration::from_secs(5));
+            assert!(source.is_open(), "{:?}", source.error);
+            let (first, second): (&[usize], &[usize]) = if unread_first { (&[1], &[]) } else { (&[], &[1]) };
+            source.saw_unread_dates(first, second);
+            let said = source.take_unread_dates();
+            assert_eq!((said.0.is_some(), said.1.is_some()), (unread_first, !unread_first));
+            // The other kind, found by a later read, is still said; the said kind isn't again.
+            source.saw_unread_dates(&[2], &[2]);
+            let said = source.take_unread_dates();
+            assert_eq!((said.0.is_some(), said.1.is_some()), (!unread_first, unread_first), "unread first: {unread_first}");
+            assert_eq!(source.take_unread_dates(), (None, None));
+        }
     }
 
     /// A paused schema worker reports real progress; Cancel wins for every source copy and
