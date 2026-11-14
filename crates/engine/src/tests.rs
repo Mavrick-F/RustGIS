@@ -11647,6 +11647,138 @@ fn analysis_workflows_models_scripts_and_raster_functions() {
     assert!(g.as_array().unwrap().iter().any(|t| t["id"] == "raster.function"));
 }
 
+/// `model.new` refuses steps or a name given past their limits, rather than cutting them; from
+/// the history, it says the runs it can't replay and a history longer than a model takes.
+#[test]
+fn model_new_refuses_or_says_what_it_leaves() {
+    let mut s = world();
+    let said = |s: &Session, mark: u64, what: &str| {
+        s.notices_since(mark).iter().filter(|n| n.text.contains(what)).map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    let step = json!({"tool": "buffer", "params": {"input": "Cities", "distance": 1}});
+    // Steps given: refused past 2,000, nothing added; taken at 2,000.
+    let models = s.project.models.len();
+    let e = s.run("model.new", &json!({"name": "Long", "steps": vec![step.clone(); 2001]})).unwrap_err();
+    assert!(e.contains("steps has 2001 entries") && e.contains("at most 2000"), "{e}");
+    assert_eq!(s.project.models.len(), models);
+    let r = s.run("model.new", &json!({"name": "Long", "steps": vec![step.clone(); 2000]})).unwrap();
+    assert_eq!(r["steps"], 2000);
+    // A graph, steps or the history: one way to make a model. Two are refused, and nothing is added.
+    let graph = json!({"nodes": [{"id": "i", "kind": "input", "layer": "Cities"}], "edges": []});
+    let models = s.project.models.len();
+    let e = s.run("model.new", &json!({"name": "Both", "graph": graph, "steps": [step.clone()]})).unwrap_err();
+    assert!(e.contains("not more than one"), "{e}");
+    let e = s.run("model.new", &json!({"name": "Both", "graph": graph, "fromHistory": true})).unwrap_err();
+    assert!(e.contains("not more than one"), "{e}");
+    let e = s.run("model.new", &json!({"name": "Both", "steps": [step.clone()], "fromHistory": true})).unwrap_err();
+    assert!(e.contains("not more than one"), "{e}");
+    assert_eq!(s.project.models.len(), models);
+    // A name given: refused past 200 characters (é: two bytes, one character), taken at 200. The
+    // same name again is told apart within the 200, and that is said.
+    let at = |n: usize| "é".repeat(n);
+    let e = s.run("model.new", &json!({"name": at(201), "steps": [step.clone()]})).unwrap_err();
+    assert!(e.contains("201 characters") && e.contains("at most 200"), "{e}");
+    assert_eq!(s.project.models.len(), models);
+    assert_eq!(s.run("model.new", &json!({"name": at(200), "steps": [step.clone()]})).unwrap()["model"], at(200));
+    let mark = s.notice_mark();
+    let r = s.run("model.new", &json!({"name": at(200), "steps": [step.clone()]})).unwrap();
+    assert_eq!(r["model"].as_str().map(|n| (n.chars().count(), n.ends_with(" 2"))), Some((200, true)), "{r}");
+    assert_eq!(
+        said(&s, mark, "ModelBuilder"),
+        ["ModelBuilder: a model has that name already, so the name given is cut to 198 characters to fit \" 2\""]
+    );
+    let mark = s.notice_mark();
+    s.run("model.new", &json!({"name": "Long", "steps": [step.clone()]})).unwrap();
+    assert!(said(&s, mark, "ModelBuilder").is_empty(), "a short name only gains the suffix");
+    // A cut that lands on a space keeps no space before the suffix: the name's 197 letters, then " 2".
+    let spaced = format!("{} bc", "a".repeat(197));
+    s.run("model.new", &json!({"name": spaced, "steps": [step.clone()]})).unwrap();
+    let mark = s.notice_mark();
+    let r = s.run("model.new", &json!({"name": spaced, "steps": [step.clone()]})).unwrap();
+    assert_eq!(r["model"], format!("{} 2", "a".repeat(197)), "{r}");
+    assert_eq!(said(&s, mark, "ModelBuilder").len(), 1, "the cut to 197 is said");
+    // From the history: 2,006 runs, five with a tool that isn't available. The model replays the
+    // first 2,000 of the 2,001 it can, in their order, and says both.
+    let run = |i: usize| crate::GpRecord {
+        tool: "Buffer".into(),
+        id: "buffer".into(),
+        params: json!({"input": "Cities", "distance": i}),
+        command: None,
+        at: 0,
+        ok: true,
+        messages: Vec::new(),
+        millis: 0,
+        outputs: Vec::new(),
+    };
+    let mystery = |i: usize| crate::GpRecord { tool: "Mystery".into(), id: "mystery".into(), ..run(i) };
+    let history = |s: &Session, mark: u64| said(s, mark, "the history");
+    s.project.gp_history = (0..2006).map(|i| if i % 400 == 7 { mystery(i) } else { run(i) }).collect();
+    let mark = s.notice_mark();
+    let r = s.run("model.new", &json!({"name": "Replay", "fromHistory": true})).unwrap();
+    assert_eq!(r["steps"], 2000);
+    let replay = s.project.models.iter().find(|m| m.name == "Replay").unwrap();
+    assert_eq!(replay.steps[7].params["distance"], 8, "run 7 is left out");
+    assert_eq!(
+        history(&s, mark),
+        [
+            "Replay: 5 successful runs in the history use a tool that isn't available, so they're left out",
+            "Replay: the model takes the first 2000 of the 2001 successful runs it can replay from the history",
+        ]
+    );
+    // One it can't replay, within the limit: said in the singular, nothing cut.
+    s.project.gp_history = (0..3).map(|i| if i == 1 { mystery(i) } else { run(i) }).collect();
+    let mark = s.notice_mark();
+    assert_eq!(s.run("model.new", &json!({"name": "Few", "fromHistory": true})).unwrap()["steps"], 2);
+    assert_eq!(history(&s, mark), ["Few: 1 successful run in the history uses a tool that isn't available, so it's left out"]);
+    // A null steps is none given: the history is replayed.
+    assert_eq!(s.run("model.new", &json!({"name": "Few", "fromHistory": true, "steps": null})).unwrap()["steps"], 2);
+    // A run left out that made a layer a later step reads: the step isn't wired to an older run's
+    // output of that name, but reads the layer by its name, and that is said. Without the run left
+    // out, the step is wired to the older run.
+    let making = |i: usize, input: &str| crate::GpRecord {
+        params: json!({"input": input, "distance": i}),
+        outputs: vec!["Made".to_string()],
+        ..run(i)
+    };
+    s.project.gp_history = vec![making(0, "Cities"), crate::GpRecord { tool: "Mystery".into(), ..making(1, "Cities") }, making(2, "Made")];
+    let mark = s.notice_mark();
+    s.run("model.new", &json!({"name": "Rewired", "fromHistory": true})).unwrap();
+    let rewired = s.project.models.iter().find(|m| m.name == "Rewired").unwrap();
+    assert_eq!(rewired.steps[1].params["input"], "Made", "not %1, the older run's output");
+    assert_eq!(
+        said(&s, mark, "Rewired:"),
+        [
+            "Rewired: 1 successful run in the history uses a tool that isn't available, so it's left out",
+            "Rewired: 1 step(s) read a layer made by a run that's left out, so they read the project's layer of that name",
+        ]
+    );
+    s.project.gp_history = vec![making(0, "Cities"), making(2, "Made")];
+    let mark = s.notice_mark();
+    s.run("model.new", &json!({"name": "Wired", "fromHistory": true})).unwrap();
+    assert_eq!(s.project.models.iter().find(|m| m.name == "Wired").unwrap().steps[1].params["input"], "%1");
+    assert!(said(&s, mark, "Wired:").is_empty());
+    // A step past the 2,000 a model keeps that reads such a layer isn't counted: the model has
+    // none.
+    let mut long: Vec<crate::GpRecord> = (0..2000).map(run).collect();
+    long.push(crate::GpRecord { tool: "Mystery".into(), ..making(2000, "Cities") });
+    long.push(making(2001, "Made"));
+    s.project.gp_history = long;
+    let mark = s.notice_mark();
+    assert_eq!(s.run("model.new", &json!({"name": "Late", "fromHistory": true})).unwrap()["steps"], 2000);
+    assert_eq!(
+        said(&s, mark, "Late:"),
+        [
+            "Late: 1 successful run in the history uses a tool that isn't available, so it's left out",
+            "Late: the model takes the first 2000 of the 2001 successful runs it can replay from the history",
+        ]
+    );
+    // A clean history of 2,000 runs: all replayed, nothing said.
+    s.project.gp_history = (0..2000).map(run).collect();
+    let mark = s.notice_mark();
+    assert_eq!(s.run("model.new", &json!({"name": "Clean", "fromHistory": true})).unwrap()["steps"], 2000);
+    assert!(history(&s, mark).is_empty());
+}
+
 /// A web link chart past its limits says what it leaves out, to whoever shares it and on its page
 /// (#1947): links past a feature's 200, and features past the chart's 3,000. Within them,
 /// nothing is said.
