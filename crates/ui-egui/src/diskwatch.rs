@@ -1605,6 +1605,24 @@ mod tests {
     }
 
     #[test]
+    fn edits_on_a_missing_file_point_to_export_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id, path) = published_layer(dir.path());
+        let ctx = egui::Context::default();
+        scan(&mut app, &ctx, 2);
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        app.run("edit.setValue", json!({"layer": id, "row": 0, "field": "owner", "value": "Jones"})).unwrap();
+        assert!(edited(&mut app, &ctx, id));
+        std::fs::remove_file(&path).unwrap();
+        scan(&mut app, &ctx, 2);
+        assert_eq!(status_of(&app, id), Status::Missing);
+        let l = app.session.map().layer(id).unwrap().clone();
+        let (_, detail, _) = crate::panes::layer_note(&mut app, &l, &ctx).unwrap();
+        assert!(detail.contains("Export Features"), "{detail}");
+        assert!(!detail.contains("writes them to the file"), "Publish refuses a missing file: {detail}");
+    }
+
+    #[test]
     fn a_layer_on_a_network_share_is_not_marked_as_publishable() {
         let dir = tempfile::tempdir().unwrap();
         let (app, id, _) = published_layer(dir.path());

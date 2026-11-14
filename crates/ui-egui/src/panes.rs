@@ -1908,7 +1908,7 @@ fn disk_note(app: &RustGisApp, layer: Option<&Layer>, tile: Option<usize>) -> Op
 /// whole from a Shapefile or GeoJSON file it publishes to (`source.publish`) also says whether it
 /// holds edits the file lacks (`syncmark`), and its file's changes point to Publish to Source,
 /// which refuses to overwrite them, rather than Reload Data, which can't read it again.
-fn layer_note(app: &mut RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<(String, String, Option<bool>)> {
+pub(crate) fn layer_note(app: &mut RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<(String, String, Option<bool>)> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use crate::diskwatch::Status;
@@ -1930,8 +1930,11 @@ fn layer_note(app: &mut RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<(S
                 Some(false),
             )),
             (Status::Unchanged | Status::Folder, true) => Some((tl!("(edits not published)").to_string(), unpublished.to_string(), None)),
+            // Missing or unreadable: Publish refuses a file unlike its record, so edits can only be
+            // exported until it's back.
             (status, edited) => crate::diskwatch::row_note(&status, false).map(|(note, detail, tint)| {
-                let detail = if edited { crate::i18n::fmt("{detail}\n{unpublished}", &[("detail", &detail), ("unpublished", unpublished)]) } else { detail };
+                let blocked = tl!("This layer has edits its file doesn't have. Publish to Source can't write them until the file is back as it was read; Export Features keeps them in a new file.");
+                let detail = if edited { crate::i18n::fmt("{detail}\n{blocked}", &[("detail", &detail), ("blocked", blocked)]) } else { detail };
                 (note, detail, tint)
             }),
         }
