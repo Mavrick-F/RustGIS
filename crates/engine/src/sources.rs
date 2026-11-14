@@ -83,21 +83,38 @@ struct Kept {
 }
 
 impl Kept {
-    /// The entries of `o` without a password, key or token, counting those left out. `address` is
-    /// the one the entries sit beside (a source's own, kept apart from them): a bare `key` is a
-    /// secret beside a web address, which one entry alone doesn't show.
+    /// The entries of `o` without a password, key or token, counting those left out. Every entry is
+    /// classified on the original object first, beside the others and `address` (the one a row
+    /// keeps apart from them): a bare `key` is a secret beside a web address, and an address
+    /// holding a secret doesn't stop being one. Only then are the classified entries removed.
     fn without_secrets(&mut self, mut o: Map<String, Value>, address: &str) -> Map<String, Value> {
-        let before = o.len();
-        o.retain(|k, v| !holds_secret(&json!({ k.as_str(): v })));
-        let mut beside = o.clone();
-        if !address.is_empty() {
-            beside.insert("address".into(), address.into());
-        }
-        if holds_secret(&Value::Object(beside)) {
-            o.retain(|k, v| !holds_secret(&json!({ k.as_str(): v, "address": "https://a" })));
-        }
-        self.secrets += before - o.len();
+        let secret: Vec<String> = o
+            .iter()
+            .filter(|(k, v)| {
+                let mut probe = Map::new();
+                probe.insert((*k).clone(), (*v).clone());
+                if web_address(&Value::String(address.into()), 0) || o.iter().any(|(other, v)| other != *k && web_address(v, 0)) {
+                    probe.insert("\u{1}beside".into(), "https://a".into());
+                }
+                holds_secret(&Value::Object(probe))
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        self.secrets += secret.len();
+        o.retain(|k, _| !secret.contains(k));
         o
+    }
+}
+
+/// Whether `v` is, or holds, a web address (not under a file's `data` or `text`).
+fn web_address(v: &Value, depth: usize) -> bool {
+    match v {
+        Value::String(t) => t.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")),
+        Value::Object(o) if depth < 4 => {
+            o.iter().any(|(k, v)| !k.eq_ignore_ascii_case("data") && !k.eq_ignore_ascii_case("text") && web_address(v, depth + 1))
+        }
+        Value::Array(a) if depth < 4 => a.iter().any(|v| web_address(v, depth + 1)),
+        _ => false,
     }
 }
 
@@ -1010,6 +1027,10 @@ MIIE
         // A key beside an address among the preference's own keys.
         let top = json!({"address": "https://api.example", "key": "abc"});
         assert!(!Sources::from_json(&top.to_string()).to_json().contains("abc"));
+        // Even when that address holds a secret itself.
+        let top = json!({"address": "https://api.example?token=hidden", "key": "abc"});
+        let saved = Sources::from_json(&top.to_string()).to_json();
+        assert!(!saved.contains("abc") && !saved.contains("hidden"), "{saved}");
         // A change before the first read that fills a list doesn't drop what was stored.
         let stored: Vec<Value> =
             (0..MAX_KEPT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv"), "pinned": i})).collect();
