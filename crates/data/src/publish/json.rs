@@ -316,7 +316,6 @@ fn unique_keys(text: &str) -> std::result::Result<(), String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::Value;

@@ -2463,13 +2463,13 @@ pub(crate) enum Origin<'a> {
     Path(&'a str),
     Bytes(&'a str, std::sync::Arc<Vec<u8>>),
     /// A PostGIS table, always opened by the caller (desktop only).
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "database sources are desktop only"))]
     Postgis(&'a rustgis_map::source::PostgisOrigin),
     /// A MySQL or MariaDB table, always opened by the caller (desktop only).
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "database sources are desktop only"))]
     Mysql(&'a rustgis_map::source::MysqlOrigin),
     /// A SQL Server table, always opened by the caller (desktop only).
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "database sources are desktop only"))]
     Sqlserver(&'a rustgis_map::source::SqlServerOrigin),
 }
 

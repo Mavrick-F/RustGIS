@@ -14,7 +14,7 @@ mod phone;
 /// The files of `picked` to open, each by its path: all but the parts another of them reads from
 /// beside it (a Shapefile's `.dbf`, `.shx`, `.prj` and `.cpg`, a MapInfo file's `.mid`), matched
 /// by name whatever the case. A part picked without its main file stays, and is refused by name.
-#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", test)), expect(dead_code, reason = "only Android picks files"))]
 fn without_sidecars(picked: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
     let lower = |part: Option<&std::ffi::OsStr>| part.map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
     let named: Vec<(String, String)> = picked.iter().map(|p| (lower(p.file_stem()), lower(p.extension()))).collect();
@@ -474,7 +474,7 @@ mod android {
 
     /// Android's entry point for a `NativeActivity` (`android-activity` calls it on its own thread).
     // `no_mangle` is the one unsafe attribute here: the name is what `android-activity` calls.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "`no_mangle`: `android-activity` calls this name")]
     #[unsafe(no_mangle)]
     fn android_main(android: AndroidApp) {
         android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("rustgis"));

@@ -121,7 +121,6 @@ pub fn complete_at(text: &str, cursor: usize, ds: &Dataset) -> Option<Completion
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::query::Func;

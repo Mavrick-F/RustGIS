@@ -416,7 +416,7 @@ fn print_dir() -> Result<std::path::PathBuf, String> {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let dir = tmp.join(format!("{prefix}{nanos}"));
     // Only Unix sets a mode on it.
-    #[allow(unused_mut)]
+    #[cfg_attr(not(unix), expect(unused_mut, reason = "only Unix sets a mode on the builder"))]
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
@@ -6200,7 +6200,6 @@ pub(crate) mod fetching {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
 mod start_with_tests {
     use super::StartWith;
     use serde_json::json;
@@ -6299,7 +6298,6 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
 ];
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod record_tests {
     use super::{DEFAULTS_TO_ACTIVE_LAYER, RustGisApp};
     use serde_json::json;
@@ -7064,7 +7062,6 @@ mod record_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod vertex_undo_tests {
     use super::RustGisApp;
     use rustgis_engine::data::VertexId;
@@ -7767,7 +7764,6 @@ mod peer_output_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod look_tests {
     use super::RustGisApp;
     use crate::theme;

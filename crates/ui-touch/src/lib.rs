@@ -1195,7 +1195,6 @@ fn toggle_chip(ui: &mut Ui, t: &Tokens, label: &str, width: f32, on: bool) -> bo
 /// The Capture sheet in Edit mode: pick the feature under the cross, then a vertex of it near the
 /// cross, and move the vertex to where the cross is next, insert one there after it, or delete it;
 /// or move a point, or delete the feature. `cross` is the cross's place, snapped with snapping on.
-#[allow(clippy::too_many_arguments)]
 fn edit_sheet(
     app: &mut RustGisApp,
     ui: &mut Ui,

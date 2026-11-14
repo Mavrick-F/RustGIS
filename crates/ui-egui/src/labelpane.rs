@@ -1284,7 +1284,6 @@ fn apply_color_drag(app: &mut RustGisApp, drag: ColorDrag) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use egui_kittest::kittest::{NodeT, Queryable};
     use rustgis_engine::map::Rgba;

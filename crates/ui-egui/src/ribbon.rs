@@ -5218,7 +5218,6 @@ fn language_menu(app: &mut RustGisApp, ui: &mut Ui) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable;

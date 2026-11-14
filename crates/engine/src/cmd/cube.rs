@@ -675,7 +675,6 @@ impl TrendRun {
     /// One piece's slices read into a block, cell by date: the piece's first slice (its grid), the
     /// block, and its cells. Dates are read [`TimeCube::readers`] at a time; `too_long` checks the
     /// run's length on the first slice when the cube didn't know its size.
-    #[allow(clippy::type_complexity)]
     fn read_piece(
         &self,
         piece: usize,
@@ -730,7 +729,6 @@ impl TrendRun {
     /// Each cell's trend in `block` (cells × dates), worked out on as many threads as there are
     /// cores: its four outputs a cell. `first` is the block's first cell among all of the run's,
     /// so progress is counted over the whole grid.
-    #[allow(clippy::too_many_arguments)]
     fn work_out(
         &self,
         block: &[f32],
@@ -1962,7 +1960,6 @@ mod tests {
     /// end is never told.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    #[allow(clippy::panic)]
     fn a_long_run_that_panics_says_why() {
         fn tell(_: &str, share: f64) {
             assert!(share < 1.0, "a run that panicked is told as done");

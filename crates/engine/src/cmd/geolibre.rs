@@ -583,7 +583,6 @@ fn group_look(groups: &std::collections::HashMap<&str, &Value>, id: &str) -> (bo
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod admission_tests {
     use super::*;
 

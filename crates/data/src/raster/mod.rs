@@ -732,7 +732,6 @@ pub fn gdal_metadata_changed(r: &Raster, bands: &[usize]) -> usize {
 
 impl Raster {
     /// Builds a raster from bands of `width × height` pixels and computes statistics.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: impl Into<String>,
         width: u32,
@@ -749,7 +748,6 @@ impl Raster {
 
     /// [`Raster::new`] without statistics (each band's are empty): a part of a larger raster,
     /// drawn with the whole's (a cloud-optimised GeoTIFF's view, read in place).
-    #[allow(clippy::too_many_arguments)]
     pub fn unmeasured(
         name: impl Into<String>,
         width: u32,
@@ -764,7 +762,6 @@ impl Raster {
         Raster::build(name, width, height, bands, transform, crs, nodata, color, data_type, false)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build(
         name: impl Into<String>,
         width: u32,

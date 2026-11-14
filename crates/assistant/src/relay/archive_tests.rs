@@ -1,5 +1,4 @@
 //! Real archive reads across the relay's approval, worker and completion boundaries.
-#![allow(clippy::unwrap_used, clippy::panic)]
 
 use super::*;
 use rustgis_engine::{

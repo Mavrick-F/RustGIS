@@ -31,7 +31,7 @@ impl Phone {
                     // SAFETY: `android-activity` keeps this global reference to the activity alive
                     // for as long as `android_main` runs, and it is only borrowed here to make a
                     // global reference of our own.
-                    #[allow(unsafe_code)]
+                    #[expect(unsafe_code, reason = "see SAFETY above")]
                     let activity = unsafe { JObject::from_raw(env, raw) };
                     let held = env.new_global_ref(&activity);
                     // The borrowed reference is `android-activity`'s to delete, not ours.

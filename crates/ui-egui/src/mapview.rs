@@ -664,7 +664,7 @@ pub(crate) fn handle_gpu_errors_once(app: &mut RustGisApp, ctx: &egui::Context) 
 ///
 /// A frame is asked of `ctx` for each error, so the map leaves the card even when nothing else
 /// would draw again (an error in the last frame before the window goes idle).
-#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+#[cfg_attr(target_arch = "wasm32", expect(unused_variables, reason = "only native builds catch uncaptured GPU errors"))]
 pub(crate) fn handle_gpu_errors(device: &egui_wgpu::wgpu::Device, errors: std::sync::Arc<GpuErrors>, ctx: egui::Context) {
     #[cfg(not(target_arch = "wasm32"))]
     device.on_uncaptured_error(std::sync::Arc::new(move |e: egui_wgpu::wgpu::Error| {
@@ -690,7 +690,7 @@ const MAX_GPU_ERRORS_LOGGED: u32 = 20;
 
 impl GpuErrors {
     /// Notes `e`, and logs it while few have been: whether it was logged.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "only native builds catch uncaptured GPU errors"))]
     fn note(&self, e: &egui_wgpu::wgpu::Error) -> bool {
         use std::sync::atomic::Ordering;
         let oom = matches!(e, egui_wgpu::wgpu::Error::OutOfMemory { .. });
@@ -1764,7 +1764,6 @@ fn show_gpu_frame(
 
 /// Shows a frame the CPU drew for `view` (of a `w × h` map view) as the map's texture, with its
 /// labels, credits and tile errors.
-#[allow(clippy::too_many_arguments)]
 fn show_frame(
     app: &mut RustGisApp,
     ctx: &egui::Context,

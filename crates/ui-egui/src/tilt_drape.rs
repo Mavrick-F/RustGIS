@@ -129,7 +129,7 @@ impl TiltDrape {
     }
 
     /// Whether the next drape is being drawn.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "only the desktop draws the next drape in the background"))]
     pub fn busy(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         return self.job.is_some();
@@ -163,7 +163,6 @@ impl TiltDrape {
     /// Starts drawing the drape of `map` (a copy) for `view` on a worker, waking `ctx` when it
     /// is done. False when no thread could be started.
     #[cfg(not(target_arch = "wasm32"))]
-    #[allow(clippy::too_many_arguments)]
     fn start(&mut self, ctx: &egui::Context, mut map: Map, view: View, max_side: u32, key: DrapeKey, tiles: u64, time: f64) -> bool {
         self.start_with(ctx, key, move || {
             let drawn = draw(&mut map, &view, max_side, key, tiles, time);
@@ -254,7 +253,6 @@ impl TiltDrape {
 
     /// Whether the drape shows this map change as it is now over the `w × h` view of `cam`:
     /// drawn at about its zoom, covering it, and with the tiles come since (or drawn just now).
-    #[allow(clippy::too_many_arguments)]
     fn fresh(&self, cam: &Camera, key: DrapeKey, drape_ppp: f32, tiles: u64, w: f64, h: f64, time: f64) -> bool {
         self.drape.as_ref().is_some_and(|d| {
             d.key == key
@@ -269,7 +267,6 @@ impl TiltDrape {
     /// came, the view moved past it) or there is none, so the next gesture starts on a drape of
     /// the map as it is: one drawn when the gesture starts shows what the map showed then (on a
     /// map just opened, nothing). In the browser, with no threads, the gesture draws it.
-    #[allow(clippy::too_many_arguments)]
     pub fn warm(&mut self, ctx: &egui::Context, map: &mut Map, key: DrapeKey, tiles: u64, w: f64, h: f64, ppp: f32, time: f64) {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -299,7 +296,6 @@ impl TiltDrape {
     /// view has moved or zoomed past it or the map changed. The first drape of a map change is
     /// drawn at once; one following the view is drawn off the UI thread, the last staying on
     /// screen meanwhile. False when there is nothing to drape.
-    #[allow(clippy::too_many_arguments)]
     pub fn prepare(&mut self, ctx: &egui::Context, map: &mut Map, key: DrapeKey, tiles: u64, w: f64, h: f64, ppp: f32, time: f64) -> bool {
         let cam = map.camera;
         // A screen's worth of detail at most: the settled frame is sharp.

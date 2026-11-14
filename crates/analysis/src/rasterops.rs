@@ -707,7 +707,6 @@ pub fn idw(
 }
 
 /// [`idw`] on `threads` threads, or as many as its work calls for.
-#[allow(clippy::too_many_arguments)]
 fn idw_on(
     threads: Option<usize>,
     points: &[(Coord, f64)],

@@ -97,7 +97,6 @@ pub(crate) struct Lights<'a> {
 /// Draws a raster layer onto `pm` at `opacity`. `stats` are the renderer bands' statistics
 /// without the masked pixels, when the style has a mask. `light` is what it is lit with, for
 /// Shaded Relief with shadows or sky.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw(
     pm: &mut Pixmap,
     r: &Raster,
@@ -140,7 +139,6 @@ const UNBLENDED: &str = "no memory to blend the part in view with its overview, 
 /// Returns whether tiles are still to come (the map is drawn again as they land), or why it drew
 /// less than the view needs (the overview, or other levels for tiles that couldn't be read): the
 /// map shows what it has, an export refuses it. `light` is as [`draw`] takes it.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_in_place(
     pm: &mut Pixmap,
     address: &str,
@@ -385,7 +383,6 @@ fn in_view(r: &Raster, view: &View, place: Place, width: u32, height: u32, full_
 }
 
 /// [`draw`], its rows spread over `threads` threads.
-#[allow(clippy::too_many_arguments)]
 fn draw_with(
     pm: &mut Pixmap,
     r: &Raster,

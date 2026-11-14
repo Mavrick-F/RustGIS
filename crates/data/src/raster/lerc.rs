@@ -351,7 +351,6 @@ fn push(out: &mut DecodingResult, v: Option<f64>, fill: f64) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     //! The files in `tests/data/lerc` were written by GDAL 3.9 (`make_lerc.py` there); their
     //! values follow the formulas computed again here.
