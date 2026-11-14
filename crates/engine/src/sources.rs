@@ -73,9 +73,13 @@ struct Kept {
     /// Rows and fields that couldn't be read and held a password, key or token: not kept, since
     /// this version can't strip it from what it doesn't understand.
     secrets: usize,
-    /// Readable sources whose name or details [`clean`] cut down (a name past 200 characters, a
-    /// detail that isn't short text, more than eight, or one that looks secret): saved cut down.
+    /// Readable sources whose name, address or details [`clean`] changed (a name too long or with
+    /// control characters, an address with a password, key or token, details that aren't short
+    /// text, more than eight, or secret-looking): saved that way.
     cut: usize,
+    /// Readable rows that repeat the kind and address of an earlier row of their list: kept as
+    /// they were, not listed, so each row keeps its own unknown fields.
+    twins: usize,
 }
 
 impl Kept {
@@ -86,7 +90,9 @@ impl Kept {
         let before = o.len();
         o.retain(|k, v| !holds_secret(&json!({ k.as_str(): v })));
         let mut beside = o.clone();
-        beside.insert("address".into(), address.into());
+        if !address.is_empty() {
+            beside.insert("address".into(), address.into());
+        }
         if holds_secret(&Value::Object(beside)) {
             o.retain(|k, v| !holds_secret(&json!({ k.as_str(): v, "address": "https://a" })));
         }
@@ -95,8 +101,8 @@ impl Kept {
     }
 }
 
-/// Whether [`clean`] took something of `before` away that isn't just tidied (whitespace, an
-/// empty name or details).
+/// Whether [`clean`] changed something of `before` that isn't just tidied (whitespace, an empty
+/// name or details).
 fn cut(before: &Source, after: &Source) -> bool {
     let name = before.name.trim();
     let extra = match &before.extra {
@@ -104,7 +110,7 @@ fn cut(before: &Source, after: &Source) -> bool {
         Value::Object(o) => !o.is_empty() && before.extra != after.extra,
         _ => true,
     };
-    (!name.is_empty() && after.name != name) || extra
+    (!name.is_empty() && after.name != name) || after.address != before.address.trim() || extra
 }
 
 /// A saved row: the source, and the fields this version doesn't know.
@@ -157,6 +163,10 @@ impl Sources {
                     Some((cut(&r.source, &cleaned), cleaned, r.other))
                 });
                 match read {
+                    Some((_, source, _)) if into.len() < cap && into.iter().any(|r| same(r, &source)) && !holds_secret(&row) => {
+                        s.kept.twins += 1;
+                        s.kept.rows.entry(list).or_default().push(row);
+                    }
                     Some((was_cut, mut source, other)) if into.len() < cap => {
                         s.kept.cut += usize::from(was_cut);
                         // Preferences carry provenance, never authority from an earlier process's login.
@@ -191,7 +201,15 @@ impl Sources {
             )];
         }
         let mut said = Vec::new();
-        let rows = k.rows.values().map(Vec::len).sum::<usize>().saturating_sub(k.over);
+        let rows = k.rows.values().map(Vec::len).sum::<usize>().saturating_sub(k.over + k.twins);
+        if k.twins > 0 {
+            let n = k.twins;
+            said.push(format!(
+                "{n} saved data source{} another in the same list: not listed, and kept as {} when the sources are saved",
+                if n == 1 { " repeats" } else { "s repeat" },
+                if n == 1 { "it was" } else { "they were" }
+            ));
+        }
         if k.over > 0 {
             let n = k.over;
             said.push(format!(
@@ -217,7 +235,7 @@ impl Sources {
         if k.cut > 0 {
             let n = k.cut;
             said.push(format!(
-                "{n} saved data source{} a name past 200 characters, or details this version can't keep (not short text, more than eight, or a password, key or token): cut down, and saved cut down",
+                "{n} saved data source{} a name, address or details this version changes (a name too long or with control characters, an address with a password, key or token, details that aren't short text, more than eight, or secret-looking): saved changed",
                 if n == 1 { " has" } else { "s have" }
             ));
         }
@@ -236,21 +254,31 @@ impl Sources {
     /// Takes in the sources kept with the preferences, keeping what this session already has:
     /// in-memory entries stay (and first), stored ones are added after them unless the same source
     /// ([`Source::is`]) is there already.
-    pub fn merge(&mut self, stored: Sources) {
-        fn join(now: &mut Vec<Source>, stored: Vec<Source>, cap: usize) {
-            for s in stored {
-                if now.len() >= cap {
-                    break;
+    pub fn merge(&mut self, mut stored: Sources) {
+        // Stored sources that no longer fit (a change before the first read filled the list) are
+        // kept as rows, so they are said and written back.
+        let mut over = Vec::new();
+        for list in LISTS {
+            let cap = if list == "recent" { MAX_RECENT } else { MAX_KEPT };
+            let Ok(incoming) = stored.list_mut(list).map(std::mem::take) else { continue };
+            let Ok(now) = self.list_mut(list) else { continue };
+            for source in incoming {
+                if now.iter().any(|n| same(n, &source)) {
+                    continue;
                 }
-                if !now.iter().any(|n| n.is(&s.kind, &s.address)) {
-                    now.push(s);
+                if now.len() < cap {
+                    now.push(source);
+                } else {
+                    over.push((list, stored.row(list, &source)));
+                    stored.kept.fields.remove(&(list, source.kind.clone(), source.address.clone()));
                 }
             }
         }
-        join(&mut self.favourites, stored.favourites, MAX_KEPT);
-        join(&mut self.saved, stored.saved, MAX_KEPT);
-        join(&mut self.recent, stored.recent, MAX_RECENT);
         self.kept = stored.kept;
+        self.kept.over += over.len();
+        for (list, row) in over {
+            self.kept.rows.entry(list).or_default().push(row);
+        }
         self.generation += 1;
     }
 
@@ -262,23 +290,23 @@ impl Sources {
         }
         let mut o = self.kept.top.clone();
         for (list, sources) in LISTS.into_iter().zip([&self.favourites, &self.recent, &self.saved]) {
-            let mut rows: Vec<Value> = sources
-                .iter()
-                .map(|source| {
-                    let mut row = serde_json::to_value(source).unwrap_or(Value::Null);
-                    let key = (list, source.kind.clone(), source.address.clone());
-                    if let (Value::Object(row), Some(other)) = (&mut row, self.kept.fields.get(&key)) {
-                        for (k, v) in other {
-                            row.entry(k.clone()).or_insert_with(|| v.clone());
-                        }
-                    }
-                    row
-                })
-                .collect();
+            let mut rows: Vec<Value> = sources.iter().map(|source| self.row(list, source)).collect();
             rows.extend(self.kept.rows.get(list).into_iter().flatten().cloned());
             o.insert(list.into(), Value::Array(rows));
         }
         Value::Object(o).to_string()
+    }
+
+    /// A source as a preference row: with the fields kept for it that this version doesn't know.
+    fn row(&self, list: &'static str, source: &Source) -> Value {
+        let mut row = serde_json::to_value(source).unwrap_or(Value::Null);
+        let key = (list, source.kind.clone(), source.address.clone());
+        if let (Value::Object(row), Some(other)) = (&mut row, self.kept.fields.get(&key)) {
+            for (k, v) in other {
+                row.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        row
     }
 
     /// Notes a source just added (the most recent first, each once).
@@ -979,6 +1007,31 @@ MIIE
             s.to_json()
         );
         assert!(s.unread().iter().any(|t| t.starts_with("2 values in the saved data sources were dropped")), "{:?}", s.unread());
+        // A key beside an address among the preference's own keys.
+        let top = json!({"address": "https://api.example", "key": "abc"});
+        assert!(!Sources::from_json(&top.to_string()).to_json().contains("abc"));
+        // A change before the first read that fills a list doesn't drop what was stored.
+        let stored: Vec<Value> =
+            (0..MAX_KEPT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv"), "pinned": i})).collect();
+        let mut s = Sources::default();
+        s.keep("favourites", Source { kind: "file".into(), address: "/new.csv".into(), ..Source::default() }).unwrap();
+        s.merge(Sources::from_json(&json!({ "favourites": stored }).to_string()));
+        assert_eq!(s.favourites.len(), MAX_KEPT);
+        assert!(s.unread()[0].starts_with("1 saved data source is past"), "{:?}", s.unread());
+        assert!(s.to_json().contains(&format!("/{}.csv", MAX_KEPT - 1)) && s.to_json().contains(&format!("\"pinned\":{}", MAX_KEPT - 1)));
+        // Two rows of one identity each keep their own fields.
+        let twins = json!({"saved": [
+            {"kind": "file", "name": "A", "address": "/a.csv", "future": 1},
+            {"kind": "file", "name": "A", "address": "/a.csv", "future": 2}
+        ]});
+        let s = Sources::from_json(&twins.to_string());
+        let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!((&saved["saved"][0]["future"], &saved["saved"][1]["future"]), (&json!(1), &json!(2)));
+        assert!(s.unread()[0].starts_with("1 saved data source repeats"), "{:?}", s.unread());
+        // An address with a signed query is changed, and said.
+        let signed = json!({"saved": [{"kind": "url", "name": "U", "address": "https://a/x.fgb?sig=hidden"}]});
+        let s = Sources::from_json(&signed.to_string());
+        assert!(matches!(s.unread().as_slice(), [one] if one.starts_with("1 saved data source has")), "{:?}", s.unread());
         // Details and a name this version cuts down when it reads them are said.
         let long = "n".repeat(300);
         let cut = json!({"saved": [
@@ -1215,7 +1268,8 @@ MIIE
         assert_eq!(back.favourites.len(), 1);
         assert_eq!(back.favourites[0].address, "https://h/x.fgb");
         assert!(back.recent.is_empty());
-        assert_eq!(back.unread().len(), 1, "{:?}", back.unread());
+        // The unreadable rows, and the address cut of its token.
+        assert_eq!(back.unread().len(), 2, "{:?}", back.unread());
         let unreadable = Sources::from_json("not json");
         assert!(unreadable.favourites.is_empty() && unreadable.recent.is_empty() && unreadable.saved.is_empty());
     }

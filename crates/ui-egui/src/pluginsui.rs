@@ -97,6 +97,8 @@ pub struct PluginsState {
     /// Ids of plugins that failed to load at start, not yet told (one notice for all, once every
     /// start download is done).
     start_failures: Vec<String>,
+    /// Whether this session was told that changes to the installed plugins aren't remembered.
+    unsaved_told: bool,
 }
 
 /// A plugin's Python environment being made on a background thread.
@@ -315,12 +317,19 @@ fn saved_text(list: &[Saved], kept: &[Value]) -> String {
 
 /// Changes the installed plugins the web app keeps with `f`, writing back the entries it couldn't
 /// read as they were; nothing on the desktop, or when the preference couldn't be read.
-fn update_saved(app: &RustGisApp, f: impl FnOnce(&mut Vec<Saved>)) {
+fn update_saved(app: &mut RustGisApp, f: impl FnOnce(&mut Vec<Saved>)) {
     if !keeps_prefs() {
         return;
     }
     // One that can't be read was said at start, and isn't written over.
-    let Some((mut list, kept)) = saved(app) else { return };
+    let Some((mut list, kept)) = saved(app) else {
+        if !std::mem::replace(&mut app.plugins.unsaved_told, true) {
+            app.session.warn(tl!(
+                "The plugins installed in this browser can't be read, so this change isn't remembered: fix or remove \"plugins_web\" in the browser's saved preferences."
+            ));
+        }
+        return;
+    };
     f(&mut list);
     if let Some(s) = &app.services.save_pref {
         s("plugins_web", &saved_text(&list, &kept));
