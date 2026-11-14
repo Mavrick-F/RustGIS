@@ -455,11 +455,12 @@ impl FeatureSource for ParquetSource {
     /// and fields before sampling matches; a refused view therefore scans the selected file.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
-        if limit == 0 {
-            return Ok(Batch::default());
-        }
         let md = self.reader.metadata();
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
+        if limit == 0 && req.extent.is_some() && native.is_none() {
+            return Ok(Batch::default());
+        }
         let rows_in = |g: usize| self.rows_in(md, g);
         // Row groups whose bounding box meets the extent.
         let mut groups: Vec<usize> = (0..md.num_row_groups())

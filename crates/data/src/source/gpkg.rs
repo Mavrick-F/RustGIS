@@ -435,12 +435,13 @@ impl FeatureSource for GpkgSource {
     /// Scans count records and check Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
-        if limit == 0 {
-            return Ok(Batch::default());
-        }
         let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
         let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
+        if limit == 0 && req.extent.is_some() && native.is_none() {
+            return Ok(Batch::default());
+        }
         let mut out = Batch::default();
         let push = |row: Row, out: &mut Batch| match row {
             Row::Feature(f) => out.features.push(f),

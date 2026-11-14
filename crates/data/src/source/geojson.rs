@@ -260,11 +260,12 @@ impl FeatureSource for GeoJsonSource {
     /// counting records and checking Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
-        if limit == 0 {
-            return Ok(Batch::default());
-        }
         // Counted first, then sampled, unless the native box is refused: no list of every match.
         let extent = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
+        if limit == 0 && req.extent.is_some() && extent.is_none() {
+            return Ok(Batch::default());
+        }
         let matched = self.matches(extent).count();
         // A refused native box needs geometry filtering before sampling, just as an unindexed source does.
         let late = req.extent.is_some() && extent.is_none();
