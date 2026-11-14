@@ -338,6 +338,9 @@ impl FeatureSource for GpkgMemSource {
     /// Counts scanned records and checks Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
+        if limit == 0 {
+            return Ok(Batch::default());
+        }
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         // A whole read knows its count; an extent, bounded natively or not, is matched as it goes.
         let mut sample = if req.extent.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };

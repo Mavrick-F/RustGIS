@@ -4117,6 +4117,13 @@ fn a_view_its_system_cant_bound_reads_what_is_in_view() {
             sources.push(fetched);
         }
         for source in sources {
+            {
+                // A zero limit is a no-op even for a view requiring a complete scan.
+                let probe = crate::progress::tests::Counted::cancelling_after(0);
+                let _guard = crate::progress::install(Some(probe.clone()));
+                assert!(source.read(&Request { extent: Some(view), limit: 0 }).unwrap().features.is_empty(), "{ext}");
+                assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 0, "{ext}");
+            }
             for limit in [10, 2201] {
                 let read = source.read(&Request { extent: Some(view), limit }).unwrap();
                 assert_eq!(read.matched, 200, "{ext}: count only view matches before sampling");
@@ -4240,6 +4247,22 @@ fn streamed_export_progress_counts_each_source_row_once() {
             }
         }
     }
+}
+
+/// Per-group limits do not bound the sum of the masks retained across many small groups.
+#[test]
+fn unbounded_parquet_view_bounds_aggregate_row_masks() {
+    let p = dir().join("many-groups.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+    ds.features =
+        (0..40_000).map(|id| crate::Feature { id, geometry: Some(Geometry::Point(Coord::new(-81.0, 0.0))), attrs: vec![] }).collect();
+    write_projected_parquet_fixture(&ds, &p, 100, true);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_scan_bytes(32 << 10);
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+    let error = source.read(&req).unwrap_err().to_string();
+    assert!(error.contains("row-mask budget"), "{error}");
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+    assert_eq!(source.read(&req).unwrap().matched, 40_000);
 }
 
 /// Writes the projected reader fixture, including formats whose public writer accepts only WGS 84.

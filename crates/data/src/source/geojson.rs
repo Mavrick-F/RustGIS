@@ -260,6 +260,9 @@ impl FeatureSource for GeoJsonSource {
     /// counting records and checking Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
+        if limit == 0 {
+            return Ok(Batch::default());
+        }
         // Counted first, then sampled, unless the native box is refused: no list of every match.
         let extent = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let matched = self.matches(extent).count();

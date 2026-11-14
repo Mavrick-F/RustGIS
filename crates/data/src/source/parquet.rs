@@ -450,11 +450,14 @@ impl FeatureSource for ParquetSource {
     }
 
     /// Keeps rows with null geometry in whole reads; they have no location to match an extent.
-    /// Unbounded spatial scans refuse groups over the decoded-column budget before decoding,
-    /// count rows and check Cancel between them. They decode every selected group's geometry
+    /// Unbounded spatial scans bound retained row masks and refuse groups over the decoded-column
+    /// budget before decoding, count rows and check Cancel between them. They decode every selected group's geometry
     /// and fields before sampling matches; a refused view therefore scans the selected file.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
+        if limit == 0 {
+            return Ok(Batch::default());
+        }
         let md = self.reader.metadata();
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let rows_in = |g: usize| self.rows_in(md, g);
@@ -483,8 +486,22 @@ impl FeatureSource for ParquetSource {
         // or refuse explicitly: thinning groups first could discard all of a nonempty view.
         let unbounded = req.extent.is_some() && native.is_none();
         if unbounded {
+            // Keep/take headers and one bool per candidate row stay live across all groups.
+            // A per-group decode bound and a compressed-byte budget do not bound their sum.
+            let headers = groups.len().saturating_mul(std::mem::size_of::<Option<Vec<bool>>>() + std::mem::size_of::<Vec<bool>>());
+            let mask_bytes = groups.iter().try_fold(headers as u64, |n, &g| {
+                crate::progress::check()?;
+                Ok::<_, DataError>(n.saturating_add(rows_in(g) as u64))
+            })?;
+            if mask_bytes > self.scan_bytes {
+                return Err(DataError::Format(format!(
+                    "GeoParquet: the unbounded view exceeds the {} byte row-mask budget; choose a view that can be bounded in the file's coordinate system",
+                    self.scan_bytes
+                )));
+            }
             // Every selected group must be scanned before sampling its view matches.
             for &g in &groups {
+                crate::progress::check()?;
                 self.check_scan_bytes(md, g, false)?;
                 let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
                 if declared > self.group_rows as u64 {

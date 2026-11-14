@@ -435,6 +435,9 @@ impl FeatureSource for GpkgSource {
     /// Scans count records and check Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
+        if limit == 0 {
+            return Ok(Batch::default());
+        }
         let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
         let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));

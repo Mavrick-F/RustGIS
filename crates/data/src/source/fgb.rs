@@ -285,6 +285,9 @@ impl FgbSource {
     /// counts features and checks Cancel between them.
     fn read_with<R: Read + Seek>(&self, open: &impl Fn() -> Result<R>, req: &Request, scan: bool) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
+        if limit == 0 {
+            return Ok(Batch::default());
+        }
         let reader = open_reader(open()?)?;
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let indexed = native.filter(|_| self.info.indexed && !scan);
@@ -601,6 +604,9 @@ impl FgbSource {
     /// spatial read scans every candidate within the budget, counting features and checking Cancel.
     fn read_remote(&self, f: &Arc<Remote>, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
+        if limit == 0 {
+            return Ok(Batch::default());
+        }
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let late = req.extent.is_some() && native.is_none();
         let native = native.unwrap_or(Extent::new(f64::MIN, f64::MIN, f64::MAX, f64::MAX));

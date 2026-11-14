@@ -728,9 +728,12 @@ fn comes_back(c: Coord, back: Coord) -> bool {
 /// edge's places didn't come back. A point no more than a millionth past the edge is on it: the
 /// meridian opposite the central one, at y's latitude, on the same side of the central meridian
 /// as `c` (#1925). `geo` is the projection's own longitude/latitude: the edge is there before any datum
-/// shift.
+/// shift. Recovery requires normalized east/north axes.
 fn robinson_edge(native: &proj4rs::Proj, geo: &proj4rs::Proj, wgs84: &proj4rs::Proj, c: Coord) -> Option<(f64, f64, f64)> {
     use proj4rs::transform::transform;
+    if !native.is_normalized_axis() {
+        return None;
+    }
     let x0 = native.false_easting() / native.to_meter();
     let mut centre = (x0, c.y, 0.0);
     transform(native, geo, &mut centre).ok()?;

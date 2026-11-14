@@ -175,6 +175,10 @@ impl FeatureSource for ShpSource {
         let encoding = self.encoding.decoder();
         let limit = clamp_limit(req.limit);
         let extent = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        // Keep indexed zero-limit counts; a refused view has no cheap candidate count.
+        if limit == 0 && req.extent.is_some() && extent.is_none() {
+            return Ok(Batch::default());
+        }
         if extent.is_some_and(|e| e.is_empty()) {
             return Ok(Batch { complete: super::stride(0, limit) == 1, ..Batch::default() });
         }
