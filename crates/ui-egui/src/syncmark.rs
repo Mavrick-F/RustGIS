@@ -3,11 +3,15 @@
 //! (`rustgis_data::sync::rows_digest`) on a thread of their own and compared with the record of
 //! the last sync; the answer is kept until the rows, fields, coordinate system or record change.
 //! An edit copies the rows, so a changed layer is told by their allocation without a hash. The
-//! rows hashed are held only while their hash runs. App state alone: nothing here dirties the
-//! project or adds an undo step.
+//! rows hashed are held only while their hash runs. A hash whose layer changed or went away is
+//! cancelled (`rows_digest` looks at Cancel between rows), and no more hashes run at once than
+//! the thread setting allows (`rustgis_data::threads::max`), so opening a project of many large
+//! layers doesn't start one each. Nothing is counted: the mark is a status, not a run with
+//! progress. App state alone: nothing here dirties the project or adds an undo step.
 
 use std::collections::HashMap;
-use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use rustgis_engine::data::{Feature, Field, sync::Synced};
 use rustgis_engine::map::Layer;
@@ -20,10 +24,36 @@ struct Entry {
     synced: Synced,
     /// The rows' hash once it lands; `Err` when it couldn't be made.
     digest: Option<Result<u64, String>>,
-    /// The one hash under way for the layer, and whether it hashes the layer as this entry has
-    /// it. One for an earlier state runs out before another starts, so edits in quick succession
-    /// never hash the layer more than once at a time.
-    job: Option<(crate::Slot<Result<u64, String>>, bool)>,
+    /// The one hash under way for the layer. One for an earlier state is cancelled and lands
+    /// before another starts, so edits in quick succession never hash a layer twice at once.
+    job: Option<Job>,
+    /// When to try again after the OS refused a thread.
+    retry: Option<web_time::Instant>,
+}
+
+/// A hash on its thread: where it lands, its Cancel, and whether it hashes the layer as its entry
+/// has it. Dropped, it is cancelled.
+struct Job {
+    slot: crate::Slot<Result<u64, String>>,
+    stop: Arc<AtomicBool>,
+    current: bool,
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The hash thread's Cancel, as `rows_digest` looks at it.
+struct Stop(Arc<AtomicBool>);
+
+impl rustgis_engine::data::progress::Probe for Stop {
+    fn cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+    fn begin(&self, _: u64) {}
+    fn advance(&self, _: u64) {}
 }
 
 impl Entry {
@@ -35,6 +65,9 @@ impl Entry {
             && l.synced.as_ref() == Some(&self.synced)
     }
 }
+
+/// How long after the OS refused a thread one is asked for again.
+const RETRY: web_time::Duration = web_time::Duration::from_secs(5);
 
 /// Each layer's answer, by its map's instance and its own.
 #[derive(Default)]
@@ -52,7 +85,12 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
     let synced = l.synced.as_ref()?;
     let id = (app.session.map().instance_id(), l.instance_id());
     if !app.syncmark.entries.get(&id).is_some_and(|e| e.of(l)) {
-        let earlier = app.syncmark.entries.remove(&id).and_then(|e| e.job).map(|(job, _)| (job, false));
+        // The earlier hash is stopped, and kept until it lands.
+        let earlier = app.syncmark.entries.remove(&id).and_then(|mut e| e.job.take()).map(|mut job| {
+            job.stop.store(true, Ordering::Relaxed);
+            job.current = false;
+            job
+        });
         let entry = Entry {
             rows: l.dataset.features.allocation_key(),
             fields: l.dataset.fields.clone(),
@@ -60,13 +98,16 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
             synced: synced.clone(),
             digest: None,
             job: earlier,
+            retry: None,
         };
         app.syncmark.entries.insert(id, entry);
     }
+    let running = app.syncmark.entries.values().filter(|e| e.job.is_some()).count();
     let entry = app.syncmark.entries.get_mut(&id)?;
-    if let Some((job, current)) = &entry.job {
-        let landed = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        let current = *current;
+    let now = web_time::Instant::now();
+    if let Some(job) = &entry.job {
+        let landed = job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let current = job.current;
         if let Some(digest) = landed {
             entry.job = None;
             if current {
@@ -75,21 +116,32 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
         }
         // Looked at again soon: either it lands, or the next hash starts once it has.
         ctx.request_repaint_after(web_time::Duration::from_millis(100));
-    } else if entry.digest.is_none() {
-        let slot = crate::Slot::default();
-        let out = slot.clone();
-        let dataset = l.dataset.clone();
-        // A thread the OS refuses leaves the layer unmarked: an unknown state isn't shown as edited.
-        let spawned = std::thread::Builder::new().name("Edits not published".into()).spawn(move || {
-            let digest = rustgis_engine::data::sync::rows_digest(&dataset).map_err(|e| e.to_string());
-            *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(digest);
-        });
-        match spawned {
-            Ok(_) => {
-                entry.job = Some((slot, true));
-                ctx.request_repaint_after(web_time::Duration::from_millis(100));
+    } else if entry.digest.is_none() && entry.retry.is_none_or(|at| now >= at) {
+        if running >= rustgis_engine::data::threads::max() {
+            // Its turn comes when another hash lands.
+            ctx.request_repaint_after(web_time::Duration::from_millis(100));
+        } else {
+            let (slot, stop) = (crate::Slot::default(), Arc::new(AtomicBool::new(false)));
+            let (out, probe) = (slot.clone(), Stop(stop.clone()));
+            let dataset = l.dataset.clone();
+            let spawned = std::thread::Builder::new().name("Edits not published".into()).spawn(move || {
+                let _probe = rustgis_engine::data::progress::install(Some(Arc::new(probe)));
+                let digest = rustgis_engine::data::sync::rows_digest(&dataset).map_err(|e| e.to_string());
+                *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(digest);
+            });
+            match spawned {
+                Ok(_) => {
+                    entry.job = Some(Job { slot, stop, current: true });
+                    entry.retry = None;
+                    ctx.request_repaint_after(web_time::Duration::from_millis(100));
+                }
+                // A thread the OS refuses costs time, not the mark: the layer stays unmarked (an
+                // unknown state isn't shown as edited) and it is tried again shortly.
+                Err(_) => {
+                    entry.retry = Some(now + RETRY);
+                    ctx.request_repaint_after(RETRY);
+                }
             }
-            Err(e) => entry.digest = Some(Err(e.to_string())),
         }
     }
     match &entry.digest {
@@ -98,8 +150,8 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
     }
 }
 
-/// Forgets layers that are gone, so the answers kept follow the project; looked at once per
-/// project revision.
+/// Forgets layers that are gone, cancelling their hashes, so the answers kept follow the project;
+/// looked at once per project revision.
 pub(crate) fn retain(app: &mut crate::RustGisApp) {
     if app.syncmark.revision == Some(app.session.revision) {
         return;

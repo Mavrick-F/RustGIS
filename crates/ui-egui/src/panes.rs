@@ -1932,7 +1932,7 @@ fn layer_note(app: &mut RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<(S
             )),
             (Status::Unchanged | Status::Folder, true) => Some((tl!("(edits not published)").to_string(), unpublished.to_string(), None)),
             (status, edited) => crate::diskwatch::row_note(&status, false).map(|(note, detail, tint)| {
-                let detail = if edited { format!("{detail}\n{unpublished}") } else { detail };
+                let detail = if edited { crate::i18n::fmt("{detail}\n{unpublished}", &[("detail", &detail), ("unpublished", unpublished)]) } else { detail };
                 (note, detail, tint)
             }),
         }

@@ -737,7 +737,7 @@ pub(crate) fn ran(app: &mut RustGisApp, command: &str, params: &Value, answer: &
         }
         // A save that wrote nothing (no edits) isn't a write.
         "gpkg.saveEdits" if answer.get("saved").and_then(Value::as_bool) == Some(false) => {}
-        "gpkg.saveEdits" | "share.exportLayer" | "share.exportTable" | "data.convert" => {
+        "gpkg.saveEdits" | "share.exportLayer" | "share.exportTable" | "data.convert" | "source.publish" => {
             if let Some(write) = before {
                 wrote(app, write, answer);
             }
@@ -1475,6 +1475,12 @@ mod tests {
         scan(&mut app, &ctx, 3);
         assert_eq!(status_of(&app, id), Status::Unchanged, "RustGIS's own publish is not an outside change");
         assert!(!edited(&mut app, &ctx, id), "published");
+        // Published where it is asked (a script), not on the export thread: the same.
+        app.run("edit.setValue", json!({"layer": id, "row": 0, "field": "owner", "value": "Lee"})).unwrap();
+        app.run("source.publish", json!({"layer": id})).unwrap();
+        scan(&mut app, &ctx, 3);
+        assert_eq!(status_of(&app, id), Status::Unchanged, "a publish run in place is RustGIS's own write too");
+        assert!(!edited(&mut app, &ctx, id));
         // Another program writes the file; the notification leaves it to the Layers pane.
         std::fs::write(&path, r#"{"type":"FeatureCollection","features":[]}"#).unwrap();
         scan(&mut app, &ctx, 2);
