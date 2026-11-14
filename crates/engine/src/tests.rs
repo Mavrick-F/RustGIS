@@ -355,8 +355,13 @@ fn a_standalone_table_is_edited_with_the_edit_commands() {
     let steps =
         json!([{"title": "Add a field", "command": "edit.addField", "params": {"table": "sites", "name": "checked", "type": "boolean"}}]);
     s.run("task.new", &json!({"name": "Check sites", "steps": steps})).unwrap();
-    s.run("task.run", &json!({"task": "Check sites"})).unwrap();
-    assert!(table(&s).field_index("checked").is_some());
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(s.run("task.run", &json!({"task": "Check sites"})).is_err_and(|e| e.contains("run the table edit directly")));
+    #[cfg(target_arch = "wasm32")]
+    {
+        s.run("task.run", &json!({"task": "Check sites"})).unwrap();
+        assert!(table(&s).field_index("checked").is_some());
+    }
     assert_eq!(s.active_layer, None);
     // Rows change only while editing is on; fields either way, as a layer's.
     s.run("edit.enable", &json!({"on": false})).unwrap();

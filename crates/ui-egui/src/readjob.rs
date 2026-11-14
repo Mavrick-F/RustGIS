@@ -1253,6 +1253,31 @@ mod tests {
         assert!(l.is_streamed() && !l.labels.enabled);
     }
 
+    /// Task steps cannot bypass the worker through direct or scripted table writes.
+    #[test]
+    fn a_task_refuses_table_writes_before_scanning_rows() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let csv = format!("n\n{}", "1\n".repeat(20_000));
+        app.run("layer.addDataText", json!({"fileName": "records.csv", "text": csv})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        app.reads_off_frame = true;
+        for (command, params) in [
+            ("edit.calculateField", json!({"table": "records", "field": "n", "expression": "n + 1"})),
+            ("edit.deleteField", json!({"table": "records", "field": "n"})),
+            ("script.run", json!({"script": "edit.calculateField {\"table\":\"records\",\"field\":\"n\",\"expression\":\"n + 1\"}"})),
+        ] {
+            app.run("task.new", json!({"name": "Edit records", "steps": [{"title": "Write table", "command": command, "params": params}]}))
+                .unwrap();
+            let before = serde_json::to_value(&app.session.project.tables).unwrap();
+            let depth = app.session.undo_depth();
+            let error = app.run_by_user("task.run", json!({"task": "Edit records"})).unwrap_err();
+            assert!(error.contains("run the table edit directly"), "{error}");
+            assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before);
+            assert_eq!(app.session.undo_depth(), depth);
+            app.run("task.remove", json!({"task": "Edit records"})).unwrap();
+        }
+    }
+
     /// The actual app dispatch schedules a table calculation and installs it once with Undo.
     /// A cell edited while it runs prevents stale results from overwriting the new value.
     #[test]

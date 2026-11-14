@@ -56,7 +56,8 @@ run in the background with progress or a busy indicator and **Cancel**. Queued e
 order, each using the preceding edit's result. If the table changes independently while an edit
 runs, its result is refused; run the edit again to use the new values. A schema change clears
 the view's sort when it lands, including a sort picked while an edit waits. Replacing a table
-with a tool result discards its open cell draft and waiting writes; ordinary edits keep them.
+with a tool result discards its open cell draft and waiting writes. Field edits that change the
+schema also discard open drafts; ordinary row edits keep them.
 
 Desktop scripts also prepare table writes off the frame and keep the script as one undo step.
 If an earlier line cannot be prepared safely (for example, opening a file or saving a project),
@@ -64,7 +65,10 @@ run that setup separately from the table-writing script. Models and batches befo
 write are checked for file-producing and plugin tools too; those steps must run separately.
 A script run under restricted permissions must dispatch the table edit commands individually. A failed worker start refuses
 the edit instead of running it on the window thread. The command line continues to run scripts
-synchronously.
+synchronously. Native tasks cannot write standalone tables, including through a script step:
+run those edits directly or as a separate script so the desktop can offer progress and Cancel.
+Calculate Field lists only columns reachable by name; a later column whose name differs only
+by case cannot be changed there.
 
 The `edit.*` commands take the table as `"table"` (its name or id) instead of `"layer"`:
 `edit.setValue`, `edit.addField`, `edit.deleteField`, `edit.convertField`, `edit.calculateField`,

@@ -89,11 +89,11 @@ impl Dialogs {
             "calculateField" => "calculateField",
             other => return Err(format!("dialog '{other}' doesn't open on a table")),
         };
-        let fields = &s.project.table(id).ok_or("no such table")?.dataset.fields;
+        let dataset = &s.project.table(id).ok_or("no such table")?.dataset;
         *self = Dialogs { open: Some(name), mode: "new", reset_collapse: true, table: Some((s.opened, id)), ..Dialogs::default() };
         match name {
             "addField" => self.b = "Double".into(),
-            _ => self.a = fields.last().map(|f| f.name.clone()).unwrap_or_default(),
+            _ => self.a = calculation_fields(dataset).last().map(|f| f.name.clone()).unwrap_or_default(),
         }
         Ok(())
     }
@@ -202,7 +202,9 @@ impl Dialogs {
                 self.c = format!("{:.0}", s.scale());
             }
             "addField" => self.b = "Double".into(),
-            "calculateField" => self.a = active.and_then(|l| l.dataset.fields.last()).map(|f| f.name.clone()).unwrap_or_default(),
+            "calculateField" => {
+                self.a = active.and_then(|l| calculation_fields(&l.dataset).last()).map(|f| f.name.clone()).unwrap_or_default()
+            }
             "renameLayer" => self.text = active.map(|l| l.name.clone()).unwrap_or_default(),
             // A file name can't hold a folder separator, which a project name may.
             "saveProject" => self.text = format!("{}.rgis", s.project.name.replace(['/', '\\'], "-")),
@@ -528,7 +530,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                         None => app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| &l.dataset),
                     }
                 }
-                let fields: Vec<String> = data(app).map(|d| d.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default();
+                let fields: Vec<String> = data(app).map(|d| calculation_fields(d).map(|f| f.name.clone()).collect()).unwrap_or_default();
                 ui.horizontal(|ui| {
                     let input_label = ui.label(tl!("Field"));
                     egui::ComboBox::from_id_salt("cf_field").selected_text(app.dialogs.a.clone()).width(220.0).show_ui(ui, |ui| {
@@ -558,6 +560,9 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 };
                 ui.label(egui::RichText::new(help).small().weak());
                 close = buttons(app, ui, "Calculate", |app| {
+                    if !fields.contains(&app.dialogs.a) {
+                        return Err(tl!("Choose a field from the list: the previous choice is missing or shadowed by an earlier field with the same name ignoring case.").into());
+                    }
                     let p = app.dialogs.on_table(&app.session, json!({"field": app.dialogs.a, "expression": app.dialogs.text}))?;
                     app.run("edit.calculateField", p).map(|_| ())
                 });
@@ -2431,6 +2436,12 @@ fn crs_details(ui: &mut egui::Ui, chosen: &str, current: &str, t: &Tokens) {
     }
 }
 
+/// The columns a name-based edit can reach. Keep both the initial choice and the picker in
+/// step with the command's case-insensitive lookup, including duplicate names in imported data.
+fn calculation_fields(dataset: &rustgis_engine::data::Dataset) -> impl Iterator<Item = &rustgis_engine::data::Field> {
+    dataset.fields.iter().enumerate().filter(|(i, field)| dataset.field_index(&field.name) == Some(*i)).map(|(_, field)| field)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2450,6 +2461,42 @@ mod tests {
         app.run("layer.addDataText", csv).unwrap();
         assert_eq!(app.session.project.tables[0].id, id, "the new project's table has the same id");
         assert!(app.dialogs.on_table(&app.session, json!({"name": "note"})).is_err());
+    }
+
+    /// A case-shadowed field cannot be selected or submitted as another column by the dialog.
+    #[test]
+    fn table_calculation_dialog_refuses_a_shadowed_field() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName": "names.csv", "text": "Name,name\nfirst,second\n"})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        let id = app.session.project.tables[0].id;
+        app.run("ui.dialog", json!({"name": "calculateField", "table": id})).unwrap();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        // A stale choice (for example after a schema change) must not reach the first column.
+        h.state_mut().dialogs.a = "name".into();
+        h.state_mut().dialogs.text = "'changed'".into();
+        h.run_steps(1);
+        h.get_by_label("Calculate").click();
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.open, Some("calculateField"));
+        assert!(h.state().dialogs.error.is_some());
+        let ds = &h.state().session.project.tables[0].dataset;
+        assert_eq!(ds.value(0, 0), &rustgis_engine::data::Value::Text("first".into()));
+        assert_eq!(ds.value(0, 1), &rustgis_engine::data::Value::Text("second".into()));
+        // The reachable first name is still offered and works.
+        h.get_by_role(egui::accesskit::Role::ComboBox).click();
+        h.run_steps(2);
+        assert!(h.query_by_label("name").is_none(), "the shadowed option is not offered");
+        h.get_by_label("Name").click();
+        h.run_steps(2);
+        h.get_by_label("Calculate").click();
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.open, None);
+        let ds = &h.state().session.project.tables[0].dataset;
+        assert_eq!(ds.value(0, 0), &rustgis_engine::data::Value::Text("changed".into()));
+        assert_eq!(ds.value(0, 1), &rustgis_engine::data::Value::Text("second".into()));
     }
 
     /// The app in a harness, its fonts installed on the first pass (the dialog draws on the next).

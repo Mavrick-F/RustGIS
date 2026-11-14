@@ -51,6 +51,14 @@ fn target(s: &Session, p: &Json) -> Result<Target, String> {
     if p.get("layer").is_some_and(|l| !l.is_null()) {
         return Err("give a layer or a standalone table (\"table\"), not both".into());
     }
+    // Native tasks invoke handlers inline, including through nested scripts. Refuse here,
+    // before any row scan, so that every table-write path keeps progress and Cancel.
+    #[cfg(not(target_arch = "wasm32"))]
+    if s.task_running {
+        return Err(
+            "tasks cannot write standalone tables: run the table edit directly or in a separate script for progress and Cancel".into()
+        );
+    }
     s.table_index(p).map(Target::Table)
 }
 
