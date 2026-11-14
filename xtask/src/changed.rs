@@ -10,7 +10,8 @@
 //!   workspace setting) changes everything. A file a test opens only at run time isn't seen: a
 //!   change to it checks what the rules above find, which may leave that test out.
 //! - Every package that depends on a changed one, as a dependency of any kind, is checked too. So
-//!   a changed package is built with the features the whole workspace gives it.
+//!   a changed package gets the features every workspace package turns on in it; a feature that a
+//!   package left out turns on in an outside crate isn't, which can make a result differ from CI's.
 //!
 //! `--list` prints the packages it would check, one a line, or `all`, and checks nothing. CI still
 //! runs the whole workspace: a pass here says nothing about the packages left out.
@@ -100,11 +101,18 @@ fn normalize(path: &Path) -> Option<String> {
 /// forms (a macro's argument, `OUT_DIR`) are left out: they name files the package itself holds or
 /// makes.
 fn named_paths(text: &str, dir: &Path, package_dir: &Path) -> Vec<PathBuf> {
-    /// The string literal at the start of `s`, and what follows it.
+    /// The string literal at the start of `s`, plain or raw (`r"…"`, `r#"…"#`), and what follows it.
     fn literal(s: &str) -> Option<(&str, &str)> {
-        let s = s.trim_start().strip_prefix('"')?;
-        let end = s.find('"')?;
-        Some((&s[..end], s[end + 1..].trim_start()))
+        let s = s.trim_start();
+        let (s, close) = match s.strip_prefix('r') {
+            Some(raw) => {
+                let hashes = raw.len() - raw.trim_start_matches('#').len();
+                (raw.get(hashes..)?.strip_prefix('"')?, format!("\"{}", "#".repeat(hashes)))
+            }
+            None => (s.strip_prefix('"')?, "\"".to_string()),
+        };
+        let end = s.find(&close)?;
+        Some((&s[..end], s[end + close.len()..].trim_start()))
     }
     let mut out = Vec::new();
     for marker in ["include_str!(", "include_bytes!(", "include!("] {
@@ -236,7 +244,10 @@ fn packages(root: &Path) -> Result<Vec<Package>, String> {
     for p in meta["packages"].as_array().into_iter().flatten() {
         let manifest = PathBuf::from(p["manifest_path"].as_str().unwrap_or_default());
         let dir = manifest.parent().and_then(|d| d.strip_prefix(&workspace).ok()).and_then(normalize);
-        let (Some(name), Some(dir)) = (p["name"].as_str(), dir) else { continue };
+        // One left out would leave its dependents unchecked, so it stops the run.
+        let (Some(name), Some(dir)) = (p["name"].as_str(), dir) else {
+            return Err(format!("cargo metadata: a package without a name or a directory in the workspace: {}", manifest.display()));
+        };
         let deps = p["dependencies"].as_array().into_iter().flatten().filter_map(|d| d["name"].as_str().map(str::to_string)).collect();
         list.push(Package { name: name.to_string(), dir, deps });
     }
@@ -384,17 +395,21 @@ mod tests {
 
     #[test]
     fn reads_the_ways_a_source_names_a_file() {
-        let text = r#"
+        let text = r##"
             include_str!( "../a.txt" );
+            include_str!(r#"../raw.txt"#);
             #[path="../../../tests/support/b.rs"] mod b;
             include_bytes!(concat!("../pages/page_", $n, ".bin"));
             include!(concat!(env!("CARGO_MANIFEST_DIR"), "/gen/c.rs"));
             include_str!(concat!(env!("OUT_DIR"), "/made.json"));
             println!("cargo:rerun-if-changed=../shared/d.csv");
-        "#;
+        "##;
         let found: Vec<String> =
             named_paths(text, Path::new("crates/x/src"), Path::new("crates/x")).iter().filter_map(|p| normalize(p)).collect();
-        assert_eq!(found, ["crates/x/a.txt", "crates/x/pages", "crates/x/gen/c.rs", "tests/support/b.rs", "crates/shared/d.csv"]);
+        assert_eq!(
+            found,
+            ["crates/x/a.txt", "crates/x/raw.txt", "crates/x/pages", "crates/x/gen/c.rs", "tests/support/b.rs", "crates/shared/d.csv"]
+        );
     }
 
     // The reads found in this repository's own sources, which the selection depends on.
