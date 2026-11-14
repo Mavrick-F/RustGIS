@@ -2582,8 +2582,8 @@ fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut
     let mut entries: Vec<Option<(String, Vec<u8>)>> = entries.into_iter().map(Some).collect();
     let mut shps: Vec<String> = entries.iter().flatten().filter(|(n, _)| ext_of(n) == "shp").map(|(n, _)| n.clone()).collect();
     shps.sort();
-    // Keep the original paths: sidecars of Shapefiles past the limit aren't standalone tables.
-    let shp_stems: std::collections::HashSet<String> = shps.iter().map(|n| stem(n)).collect();
+    // The Shapefiles past the limit, already named: their `.dbf` isn't a table of its own.
+    let mut past_limit: std::collections::HashSet<String> = std::collections::HashSet::new();
     let take = |entries: &mut Vec<Option<(String, Vec<u8>)>>, base: &str, ext: &str| -> Option<(String, Vec<u8>)> {
         entries.iter_mut().find(|e| e.as_ref().is_some_and(|(n, _)| ext_of(n) == ext && stem(n) == base))?.take()
     };
@@ -2593,6 +2593,7 @@ fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut
     for n in shps {
         if out.len() >= MAX_ZIP_LAYERS {
             skipped.push(format!("{n} (past the {MAX_ZIP_LAYERS}-layer limit)"));
+            past_limit.insert(stem(&n));
             continue;
         }
         let base = stem(&n);
@@ -2639,7 +2640,7 @@ fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut
         .into_iter()
         .flatten()
         .filter(|(n, _)| {
-            !matches!(ext_of(n).as_str(), "shp" | "shx" | "prj" | "cpg" | "mid") && (ext_of(n) != "dbf" || !shp_stems.contains(&stem(n)))
+            !matches!(ext_of(n).as_str(), "shp" | "shx" | "prj" | "cpg" | "mid") && (ext_of(n) != "dbf" || !past_limit.contains(&stem(n)))
         })
         .collect();
     others.sort_by(|a, b| a.0.cmp(&b.0));
@@ -5620,6 +5621,14 @@ mod tests {
         assert_eq!(mixed[0].0.features.len(), 2);
         assert_eq!(mixed[0].0.value(1, 0), &Value::Text("two".into()));
         assert_eq!(mixed[0].1.messages, ["county.zip: skipped tables/Places.DBF (a .dbf table without a .shp is not read)"]);
+        // A second `.dbf` beside the Shapefile, its name differing only in case, isn't its table.
+        entries.push(("shapes/PLACES.dbf".into(), dbf.clone()));
+        let twice = read_zip("county.zip", &crate::zip::write(&entries).unwrap()).unwrap();
+        assert!(
+            twice[0].1.messages.iter().any(|m| m.contains("shapes/PLACES.dbf (a .dbf table without a .shp is not read)")),
+            "{:?}",
+            twice[0].1.messages
+        );
         // With only an unsupported table, the archive refuses to open and names it too.
         let only_table = crate::zip::write(&[("tables/Places.DBF".into(), dbf)]).unwrap();
         let error = read_zip("county.zip", &only_table).unwrap_err().to_string();
