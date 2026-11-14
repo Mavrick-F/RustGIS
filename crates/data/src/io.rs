@@ -727,6 +727,8 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
             }
         }
         unstage(staged);
+        // The old parts put back, durably too.
+        sync_folder(path);
         let e = DataError::from(e);
         if kept.is_empty() {
             return Err(e);
@@ -748,7 +750,26 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
             let _ = std::fs::remove_file(path.with_extension(extension));
         }
     }
+    // Every part is renamed within `path`'s folder.
+    sync_folder(path);
     Ok(())
+}
+
+/// Makes a rename into `path`'s folder survive a power cut: on Linux and macOS a synced file can
+/// still come back under its old name until the folder itself is synced. Best effort, after the
+/// rename: the file is written either way, so a folder that can't be opened (writable but not
+/// readable) or synced (some network and FUSE mounts refuse it) leaves the rename to land when
+/// the system writes it, as every rename did before, and the write still succeeds. Windows can't
+/// open a folder this way without unsafe code, so there NTFS's own journal decides when it lands;
+/// the browser has no folders to sync.
+pub(crate) fn sync_folder(path: &Path) {
+    #[cfg(unix)]
+    {
+        let folder = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let _ = std::fs::File::open(folder).and_then(|f| f.sync_all());
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// A new temporary name beside `path`, unique per call, so concurrent writes to the same target
@@ -892,6 +913,7 @@ fn atomic_write_at<T, E: From<std::io::Error>>(
     }
     std::fs::rename(&tmp, path)?;
     std::mem::forget(staged);
+    sync_folder(path);
     Ok(value)
 }
 

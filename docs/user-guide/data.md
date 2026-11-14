@@ -44,6 +44,10 @@ double-clicked in the Browser: **Choose Layers** lists them, all ticked, with **
 **Select None** and a filter for a long list. Turn **Ask Which Layers to Add** off in the Add Data
 menu to add every layer, as before. Scripts pick one with `layer.addData`'s `"layer"`;
 `info.fileLayers` lists them.
+A DXF drawing opens **Import DXF** when it is picked, dropped or double-clicked: it asks for the
+coordinate system the drawing's coordinates are in (the map's, to start with; blank keeps them as
+they are) and whether its blocks (图块) are drawn. Drawings dropped together ask one after the
+other, so each keeps its own answers.
 A KML, KMZ, GPX, OpenStreetMap, DXF, LandXML or GeoRSS file, a zip of Shapefiles or a File
 Geodatabase that RustGIS reads itself, with layers of several geometry types, adds its polygons
 first and its points last, so its points are drawn on top, and a KML's ground overlays go under

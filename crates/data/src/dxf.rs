@@ -9,8 +9,10 @@
 //! and BYBLOCK resolved), linetype, text and elevation.
 //!
 //! A drawing doesn't say its coordinate system: one given converts the coordinates to
-//! longitude/latitude; without one they're kept as they are and the report says so. Binary DXF and
-//! DWG aren't read here.
+//! longitude/latitude; without one they're kept as they are and the report says so. Its text is
+//! UTF-8 (2007 and later), else the ANSI code page its header names (`$DWGCODEPAGE`), else Latin-1,
+//! which a report names. Whether the contents of its blocks (图块) are drawn is the caller's
+//! choice ([`Options::blocks`]). Binary DXF and DWG aren't read here.
 //!
 //! The file is hostile: counts are bounded, block nesting is cut off (and cycles refused), and an
 //! entity that can't be read is skipped and counted.
@@ -56,13 +58,24 @@ const MAX_TOTAL_VERTICES: usize = if cfg!(test) {
 /// Segments of a full circle.
 const CIRCLE: f64 = 72.0;
 
-/// What to read: the coordinate system of a drawing (which never says), one DXF layer only, and
-/// whether the layouts' entities (paper space) are drawn with the model's.
-#[derive(Clone, Copy, Debug, Default)]
+/// What to read: the coordinate system of a drawing (which never says), one DXF layer only,
+/// whether the layouts' entities (paper space) are drawn with the model's, and whether the
+/// contents of inserted blocks (图块) are drawn.
+#[derive(Clone, Copy, Debug)]
 pub struct Options<'a> {
     pub crs: Option<Crs>,
     pub layer: Option<&'a str>,
     pub paper_space: bool,
+    /// Whether INSERTs and DIMENSIONs draw the contents of the blocks they place. `false` leaves
+    /// them out, counted in the report; what the drawing draws without blocks is kept.
+    pub blocks: bool,
+}
+
+impl Default for Options<'_> {
+    fn default() -> Self {
+        // A drawing's blocks are part of what it draws: drawn unless asked otherwise.
+        Options { crs: None, layer: None, paper_space: false, blocks: true }
+    }
 }
 
 pub fn is_dxf_name(name: &str) -> bool {
@@ -75,13 +88,107 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.starts_with(b"AutoCAD Binary DXF")
 }
 
-/// The text of a drawing: UTF-8 (AutoCAD 2007 and later), else one byte per character (the ANSI
-/// code pages of older drawings, read as Latin-1).
-fn decode(bytes: &[u8]) -> Cow<'_, str> {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(bytes.iter().map(|&b| char::from(b)).collect()),
+/// The text of a drawing and what had to be assumed to read it: UTF-8 (AutoCAD 2007 and later),
+/// else the ANSI code page its header names ([`code_page`], the `$DWGCODEPAGE` of older drawings),
+/// else Latin-1.
+fn decode(bytes: &[u8]) -> (Cow<'_, str>, Option<String>) {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return (Cow::Borrowed(s), None);
     }
+    let page = code_page(bytes);
+    let Some(encoding) = page.as_deref().and_then(encoding_of) else {
+        let said = match page.as_deref() {
+            Some(p) => format!(
+                "the drawing's text isn't UTF-8 and its code page '{p}' isn't one RustGIS knows: it is read as Latin-1, so non-ASCII text (such as layer names) may be wrong"
+            ),
+            None => "the drawing's text isn't UTF-8 and it names no code page ($DWGCODEPAGE): it is read as Latin-1, so non-ASCII text (such as layer names) may be wrong".to_string(),
+        };
+        return (Cow::Owned(bytes.iter().map(|&b| char::from(b)).collect()), Some(said));
+    };
+    let (text, _) = encoding.decode_without_bom_handling(bytes);
+    let lost = text.matches('\u{fffd}').count();
+    let said = (lost > 0).then(|| {
+        format!(
+            "{lost} characters of the drawing's text couldn't be read as {} (its code page): they are drawn as a replacement character",
+            encoding.name()
+        )
+    });
+    (text, said)
+}
+
+/// The code page a drawing's header gives (`$DWGCODEPAGE`, such as `ANSI_936`), read from the
+/// first megabyte: a header is small, and a file that isn't a drawing isn't searched further.
+/// Blank code lines are skipped without consuming a value, as in [`records`].
+fn code_page(bytes: &[u8]) -> Option<String> {
+    let head = bytes.get(..bytes.len().min(1 << 20)).unwrap_or(bytes);
+    let mut lines = head.split(|&b| b == b'\n');
+    let (mut section, mut header, mut page) = (false, false, false);
+    while let Some(code) = lines.next() {
+        let code = trim_ascii(code);
+        if code.is_empty() {
+            continue;
+        }
+        let value = trim_ascii(lines.next()?);
+        let code = std::str::from_utf8(code).ok().and_then(|s| s.parse::<u16>().ok());
+        match code {
+            Some(999) => continue, // Comments never name a section or header variable.
+            Some(0) => {
+                section = value.eq_ignore_ascii_case(b"SECTION");
+                header = false;
+                page = false;
+            }
+            Some(2) if section => {
+                header = value.eq_ignore_ascii_case(b"HEADER");
+                section = false;
+            }
+            Some(9) if header => page = value.eq_ignore_ascii_case(b"$DWGCODEPAGE"),
+            Some(3) if header && page => return Some(String::from_utf8_lossy(value).into_owned()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// ASCII whitespace off both ends of a line of raw bytes.
+fn trim_ascii(mut b: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = b.split_first() {
+        if !first.is_ascii_whitespace() {
+            break;
+        }
+        b = rest;
+    }
+    while let Some((last, rest)) = b.split_last() {
+        if !last.is_ascii_whitespace() {
+            break;
+        }
+        b = rest;
+    }
+    b
+}
+
+/// The encoding a DXF code page names (`ANSI_936` is GBK, `ANSI_950` Big5, …): the ANSI and DOS
+/// code pages AutoCAD writes in `$DWGCODEPAGE`.
+fn encoding_of(page: &str) -> Option<&'static encoding_rs::Encoding> {
+    use encoding_rs::*;
+    Some(match page.trim().to_ascii_uppercase().as_str() {
+        "ANSI_874" => WINDOWS_874,
+        "ANSI_932" => SHIFT_JIS,
+        "ANSI_936" => GBK,
+        "ANSI_949" => EUC_KR,
+        "ANSI_950" => BIG5,
+        "ANSI_1250" => WINDOWS_1250,
+        "ANSI_1251" => WINDOWS_1251,
+        "ANSI_1252" => WINDOWS_1252,
+        "ANSI_1253" => WINDOWS_1253,
+        "ANSI_1254" => WINDOWS_1254,
+        "ANSI_1255" => WINDOWS_1255,
+        "ANSI_1256" => WINDOWS_1256,
+        "ANSI_1257" => WINDOWS_1257,
+        "ANSI_1258" => WINDOWS_1258,
+        "ANSI_65001" => UTF_8,
+        "ANSI_866" | "DOS866" => IBM866,
+        _ => return None,
+    })
 }
 
 type Pair<'a> = (i32, &'a str);
@@ -94,11 +201,12 @@ struct Record<'a> {
 
 /// The records of a drawing, in order, up to a line that isn't a group code (a stray line, or a
 /// pairing shifted by a missing one): what came before is kept, and the line is said.
-fn records(text: &str) -> (Vec<Record<'_>>, Option<String>) {
+fn records(text: &str) -> Result<(Vec<Record<'_>>, Option<String>)> {
     let mut lines = text.lines();
     let mut out: Vec<Record> = Vec::new();
     let mut line = 0usize;
     while let Some(code) = lines.next() {
+        crate::progress::step(code.len() + 1)?;
         line += 1;
         let code = code.trim();
         if code.is_empty() {
@@ -106,10 +214,11 @@ fn records(text: &str) -> (Vec<Record<'_>>, Option<String>) {
         }
         let Some(value) = lines.next() else { break };
         line += 1;
+        crate::progress::step(value.len() + 1)?;
         let value = value.trim_end_matches('\r');
         let Ok(code) = code.parse::<i32>() else {
             let said = format!("line {}: '{}' isn't a DXF group code: the drawing is read up to it", line - 1, crate::io::cut(code, 40));
-            return (out, Some(said));
+            return Ok((out, Some(said)));
         };
         if code == 0 {
             let kind = value.trim();
@@ -121,7 +230,7 @@ fn records(text: &str) -> (Vec<Record<'_>>, Option<String>) {
             r.groups.push((code, value));
         }
     }
-    (out, None)
+    Ok((out, None))
 }
 
 /// A point in three dimensions.
@@ -947,13 +1056,14 @@ struct Drawing {
 }
 
 /// Reads the records of each section.
-fn drawing(records: &[Record]) -> Drawing {
+fn drawing(records: &[Record]) -> Result<Drawing> {
     let mut d = Drawing { layers: HashMap::new(), blocks: HashMap::new(), entities: Vec::new(), unread: BTreeMap::new(), bad: 0 };
     let mut section = "";
     // The block being read: name, base point, entities.
     let mut block: Option<(String, P3, Vec<Ent>)> = None;
     let mut i = 0usize;
     while let Some(r) = records.get(i) {
+        crate::progress::check()?;
         i += 1;
         let g = G { p: &r.groups };
         match r.kind {
@@ -1046,7 +1156,7 @@ fn drawing(records: &[Record]) -> Drawing {
             _ => {}
         }
     }
-    d
+    Ok(d)
 }
 
 /// What an inserted entity takes from the INSERT placing it.
@@ -1075,6 +1185,8 @@ struct Out {
     trimmed: bool,
     /// Paper-space entities left out.
     paper: usize,
+    /// Inserted blocks (and dimensions) left out because `blocks` was false.
+    blocked: usize,
     /// Coordinates placed so far ([`MAX_TOTAL_VERTICES`]), and whether the budget ran out.
     vertices: usize,
     vertex_capped: bool,
@@ -1106,21 +1218,31 @@ fn finite(ps: &[P3]) -> bool {
 }
 
 /// Draws entities through `xf` (a block's placement), into `out`.
-fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: &mut Vec<String>, opts: &Options, out: &mut Out) {
+fn emit(
+    d: &Drawing,
+    ents: &[Ent],
+    xf: &Xf,
+    from: Inherit,
+    depth: usize,
+    stack: &mut Vec<String>,
+    opts: &Options,
+    out: &mut Out,
+) -> Result<()> {
     for e in ents {
+        crate::progress::check()?;
         if out.vertex_capped {
-            return;
+            return Ok(());
         }
         if out.count >= MAX_FEATURES {
             out.capped = true;
-            return;
+            return Ok(());
         }
         // Every placement costs a step, drawn or not: nested arrays of empty or filtered blocks
         // can't make the walk run on.
         out.steps += 1;
         if out.steps > MAX_STEPS {
             out.overworked = true;
-            return;
+            return Ok(());
         }
         // A layout's entities (paper space) aren't the model's: drawn only when asked for.
         if depth == 0 && e.paper && !opts.paper_space {
@@ -1148,6 +1270,12 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
             c => c.abs(),
         };
         if let Shape::Insert(ins) = &e.shape {
+            // The contents of blocks (图块) are drawn only when asked for: left out, they are
+            // counted, not walked.
+            if !opts.blocks && (ins.fallback.is_empty() || d.blocks.contains_key(&ins.block.to_ascii_lowercase())) {
+                out.blocked += 1;
+                continue;
+            }
             // Block names are case-insensitive, in the cycle check too.
             let key = ins.block.to_ascii_lowercase();
             if depth >= MAX_DEPTH || stack.contains(&key) {
@@ -1173,7 +1301,7 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
                             shape: s.clone(),
                         })
                         .collect();
-                    emit(d, &drawn, xf, from, depth + 1, stack, opts, out);
+                    emit(d, &drawn, xf, from, depth + 1, stack, opts, out)?;
                     continue;
                 }
                 out.cut += 1;
@@ -1206,11 +1334,11 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
                         block: Some(ins.block.as_str()),
                         paper: from.paper || e.paper,
                     };
-                    emit(d, inner, &xf.then(&local), inner_from, depth + 1, stack, opts, out);
+                    emit(d, inner, &xf.then(&local), inner_from, depth + 1, stack, opts, out)?;
                     if out.capped || out.overworked || out.vertex_capped {
                         stack.pop();
                         out.copies = outer;
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -1233,7 +1361,7 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
         };
         if out.vertices.saturating_add(n) > MAX_TOTAL_VERTICES {
             out.vertex_capped = true;
-            return;
+            return Ok(());
         }
         out.vertices += n;
         let tr = |ps: &[P3]| -> Vec<P3> { ps.iter().map(|p| xf.apply(*p)).collect() };
@@ -1291,6 +1419,7 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
         ds.push_next(Some(geometry), attrs);
         out.count += 1;
     }
+    Ok(())
 }
 
 /// Reads a DXF drawing into its points, lines and polygons layers (those with features).
@@ -1299,15 +1428,17 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     if is_binary(bytes) {
         return Err(DataError::Unsupported(format!("{file_name}: a binary DXF (save it as an ASCII DXF to read it here)")));
     }
-    let text = decode(bytes);
-    let (recs, cut_short) = records(text.trim_start_matches('\u{feff}'));
+    crate::progress::check()?;
+    let (text, encoding_note) = decode(bytes);
+    crate::progress::begin(text.len());
+    let (recs, cut_short) = records(text.trim_start_matches('\u{feff}'))?;
     if !recs.iter().any(|r| r.kind == "SECTION") {
         return Err(DataError::Format(match cut_short {
             Some(why) => format!("{file_name}: not a DXF drawing ({why})"),
             None => format!("{file_name}: not a DXF drawing"),
         }));
     }
-    let d = drawing(&recs);
+    let d = drawing(&recs)?;
     let mut out = Out {
         points: Dataset::new(format!("{name} points"), GeometryType::Point, fields()),
         lines: Dataset::new(format!("{name} lines"), GeometryType::Polyline, fields()),
@@ -1319,14 +1450,18 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         overworked: false,
         trimmed: false,
         paper: 0,
+        blocked: 0,
         vertices: 0,
         vertex_capped: false,
         copies: 1,
     };
     let none = Inherit { layer: None, layer_key: None, color: None, linetype: None, block: None, paper: false };
-    emit(&d, &d.entities, &Xf::ID, none, 0, &mut Vec::new(), opts, &mut out);
+    emit(&d, &d.entities, &Xf::ID, none, 0, &mut Vec::new(), opts, &mut out)?;
 
     let mut report = ReadReport::default();
+    if let Some(why) = encoding_note {
+        report.messages.push(why);
+    }
     if let Some(why) = cut_short {
         report.messages.push(why);
     }
@@ -1345,6 +1480,12 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         report.messages.push(format!(
             "{} entities of the drawing's layouts (paper space) were left out; add the drawing with \"paperSpace\" to draw them",
             out.paper
+        ));
+    }
+    if out.blocked > 0 {
+        report.messages.push(format!(
+            "{} inserted blocks (图块) were left out; add the drawing with \"blocks\": true to draw their contents",
+            out.blocked
         ));
     }
     if out.trimmed {
@@ -1382,6 +1523,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         if let Some((t, c)) = &transformer {
             let mut lost = 0usize;
             for f in &mut ds.features {
+                crate::progress::check()?;
                 if let Some(g) = f.geometry.take() {
                     let moved = g.map_coords(&|p| t.to_lonlat(p).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
                     let mut ok = true;
@@ -1403,6 +1545,10 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     if layers.is_empty() {
         return Err(DataError::Format(match opts.layer {
             Some(l) => format!("{file_name}: nothing drawn on layer '{l}'"),
+            // Everything the drawing draws is in inserted blocks, and blocks were left out.
+            None if out.blocked > 0 => format!(
+                "{file_name}: everything it draws is in its inserted blocks (图块), which were left out; add it with \"blocks\": true to draw them"
+            ),
             None => format!("{file_name}: nothing RustGIS draws"),
         }));
     }
@@ -1414,14 +1560,14 @@ pub fn layers(file_name: &str, bytes: &[u8]) -> Result<Vec<String>> {
     if is_binary(bytes) {
         return Err(DataError::Unsupported(format!("{file_name}: a binary DXF (save it as an ASCII DXF to read it here)")));
     }
-    let text = decode(bytes);
-    let (recs, _) = records(text.trim_start_matches('\u{feff}'));
+    let (text, _) = decode(bytes);
+    let (recs, _) = records(text.trim_start_matches('\u{feff}'))?;
     if !recs.iter().any(|r| r.kind == "SECTION") {
         return Err(DataError::Format(format!("{file_name}: not a DXF drawing")));
     }
     // The table's layers and those entities (paper space and blocks' too) are on, without
     // drawing anything. Layer 0 in a block takes its INSERT's, so it isn't one of its own there.
-    let d = drawing(&recs);
+    let d = drawing(&recs)?;
     let mut names: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut add = |name: &str, key: &str| {
@@ -1677,14 +1823,14 @@ mod tests {
     fn layers_filter_and_crs() {
         // The table's layers and the entities' (layer 0: an INSERT without a layer group).
         assert_eq!(layers("a.dxf", &sample()).unwrap(), ["0", "Fill", "Labels", "Roads", "Trees"]);
-        let only = read("a.dxf", &sample(), &Options { crs: None, layer: Some("roads"), paper_space: false }).unwrap();
+        let only = read("a.dxf", &sample(), &Options { layer: Some("roads"), ..Options::default() }).unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].0.features.len(), 2);
-        assert!(read("a.dxf", &sample(), &Options { crs: None, layer: Some("nope"), paper_space: false }).is_err());
+        assert!(read("a.dxf", &sample(), &Options { layer: Some("nope"), ..Options::default() }).is_err());
         // Converted from a projected system: UTM 33N near its central meridian.
         let crs = Crs::parse("EPSG:32633").unwrap();
         let utm = dxf(&[(0, "SECTION"), (2, "ENTITIES"), (0, "POINT"), (10, "500000"), (20, "4649776"), (0, "ENDSEC"), (0, "EOF")]);
-        let l = read("u.dxf", &utm, &Options { crs: Some(crs), layer: None, paper_space: false }).unwrap();
+        let l = read("u.dxf", &utm, &Options { crs: Some(crs), ..Options::default() }).unwrap();
         assert!(l[0].1.messages.is_empty(), "{:?}", l[0].1.messages);
         if let Some(Geometry::Point(c)) = &l[0].0.features[0].geometry {
             assert!((c.x - 15.0).abs() < 1e-6 && (c.y - 42.0).abs() < 0.01, "{c:?}");
@@ -1869,7 +2015,7 @@ mod tests {
         p.extend([(0, "ENDSEC".into()), (0, "EOF".into())]);
         let text: String = p.iter().map(|(c, v)| format!("{c:>3}\n{v}\n")).collect();
         let t = std::time::Instant::now();
-        let r = read("arrays.dxf", text.as_bytes(), &Options { crs: None, layer: Some("y"), paper_space: false });
+        let r = read("arrays.dxf", text.as_bytes(), &Options { layer: Some("y"), ..Options::default() });
         assert!(t.elapsed() < std::time::Duration::from_secs(60), "{:?}", t.elapsed());
         assert!(r.is_err(), "nothing on layer y");
         // Drawn: a cap stops the walk and says so, and the arrays cut short are said.
@@ -2107,6 +2253,129 @@ mod tests {
             (0, "EOF"),
         ]);
         assert_eq!(layers("l.dxf", &d).unwrap(), ["Empty", "InBlock", "Layout", "Trees"]);
+    }
+
+    /// A drawing's text in the code page its header names (AutoCAD 2004 and earlier): its Chinese
+    /// layer names and text are read as they were written, not as Latin-1 mojibake. Comments naming
+    /// a different code page, outside and inside HEADER, must not override the real variable.
+    #[test]
+    fn an_ansi_code_page_is_decoded() {
+        let mut d =
+            b"999\n$DWGCODEPAGE\n999\nANSI_1252\n  0\nSECTION\n  2\nHEADER\n999\n$DWGCODEPAGE\n999\nANSI_1252\n  9\n$DWGCODEPAGE\n999\nignored comment\n  3\nANSI_936\n  0\nENDSEC\n  0\nSECTION\n  2\nTABLES\n  0\nLAYER\n  2\n"
+                .to_vec();
+        let (gbk, _, _) = encoding_rs::GBK.encode("道路");
+        d.extend_from_slice(&gbk);
+        d.extend_from_slice(b"\n  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n  0\nTEXT\n  8\n");
+        d.extend_from_slice(&gbk);
+        d.extend_from_slice(b"\n 10\n5\n 20\n5\n 40\n2.5\n  1\n");
+        let (text, _, _) = encoding_rs::GBK.encode("中文");
+        d.extend_from_slice(&text);
+        d.extend_from_slice(b"\n  0\nENDSEC\n  0\nEOF\n");
+        // Code-line whitespace is accepted by records(); empty comment values stay paired.
+        for prefix in ["", "\n", " \r\n\t\n999\n\n"] {
+            let d = [prefix.as_bytes(), d.as_slice()].concat();
+            assert_eq!(layers("gbk.dxf", &d).unwrap(), ["道路"]);
+            let l = read("gbk.dxf", &d, &Options::default()).unwrap();
+            let points = &l[0].0;
+            assert_eq!(points.value(0, 0), &Value::Text("道路".into()), "the layer's name");
+            assert_eq!(points.value(0, 4), &Value::Text("中文".into()), "its text");
+            // Nothing beyond the coordinate system had to be assumed.
+            assert!(!l[0].1.messages.iter().any(|m| m.contains("code page") || m.contains("Latin-1")), "{:?}", l[0].1.messages);
+        }
+    }
+
+    /// UTF-8 (2007 and later) needs no code page, and its Chinese text is kept as it is.
+    #[test]
+    fn utf8_chinese_text_is_read_as_it_is() {
+        let d = dxf(&[(0, "SECTION"), (2, "ENTITIES"), (0, "POINT"), (8, "水系"), (10, "1"), (20, "2"), (0, "ENDSEC"), (0, "EOF")]);
+        let l = read("utf8.dxf", &d, &Options::default()).unwrap();
+        assert_eq!(l[0].0.value(0, 0), &Value::Text("水系".into()));
+        assert!(!l[0].1.messages.iter().any(|m| m.contains("code page") || m.contains("Latin-1")), "{:?}", l[0].1.messages);
+    }
+
+    /// A code page RustGIS doesn't know falls back to Latin-1, and says so: a reader never guesses
+    /// silently.
+    #[test]
+    fn an_unknown_code_page_is_said() {
+        let mut d =
+            b"  0\nSECTION\n  2\nHEADER\n  9\n$DWGCODEPAGE\n  3\nANSI_9999\n  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n  0\nPOINT\n  8\n"
+                .to_vec();
+        d.push(0xE9);
+        d.extend_from_slice(b"\n 10\n1\n 20\n2\n  0\nENDSEC\n  0\nEOF\n");
+        let l = read("old.dxf", &d, &Options::default()).unwrap();
+        assert_eq!(l[0].0.value(0, 0), &Value::Text("é".into()), "Latin-1");
+        assert!(l[0].1.messages.iter().any(|m| m.contains("ANSI_9999") && m.contains("Latin-1")), "{:?}", l[0].1.messages);
+    }
+
+    /// Cancellation during record parsing returns an error rather than a partial drawing.
+    #[test]
+    fn reading_stops_when_cancelled() {
+        let probe = std::sync::Arc::new(crate::progress::tests::Counted { after: Some(10), ..Default::default() });
+        let _guard = crate::progress::install(Some(probe));
+        assert!(matches!(read("site.dxf", &sample(), &Options::default()), Err(DataError::Cancelled)));
+    }
+
+    /// Disabling blocks keeps standalone entities and DIMENSION fallback geometry.
+    #[test]
+    fn blocks_can_be_left_out() {
+        let l = read("site.dxf", &sample(), &Options { blocks: false, ..Options::default() }).unwrap();
+        let names: Vec<&str> = l.iter().map(|(d, _)| d.name.as_str()).collect();
+        assert_eq!(names, ["site points", "site lines", "site polygons"]);
+        // The two texts only: the trees' point and circle are gone.
+        assert_eq!(l[0].0.features.len(), 2);
+        assert!(l.iter().all(|(d, _)| d.features.iter().all(|f| f.attrs[1] != Value::Text("CIRCLE".into()))));
+        assert_eq!(l[0].1.skipped, 0, "{:?}", l[0].1.messages);
+        assert!(l[0].1.messages.iter().any(|m| m.contains("3 inserted blocks") && m.contains("\"blocks\": true")), "{:?}", l[0].1.messages);
+        // A DIMENSION without a block keeps the lines and text it describes itself.
+        let dimension = dxf(&[
+            (0, "SECTION"),
+            (2, "ENTITIES"),
+            (0, "DIMENSION"),
+            (2, "missing"),
+            (70, "0"),
+            (10, "0"),
+            (20, "2"),
+            (13, "0"),
+            (23, "0"),
+            (14, "5"),
+            (24, "0"),
+            (0, "ENDSEC"),
+            (0, "EOF"),
+        ]);
+        let kept = read("dimension.dxf", &dimension, &Options { blocks: false, ..Options::default() }).unwrap();
+        let all_dimension = read("dimension.dxf", &dimension, &Options::default()).unwrap();
+        assert_eq!(
+            kept.iter().map(|(ds, _)| ds.features.len()).sum::<usize>(),
+            all_dimension.iter().map(|(ds, _)| ds.features.len()).sum::<usize>()
+        );
+        assert!(kept.iter().any(|(ds, _)| ds.geometry_type == GeometryType::Polyline));
+        assert!(kept.iter().all(|(_, r)| r.skipped == 0 && !r.messages.iter().any(|m| m.contains("left out"))));
+        // Asked for, they are drawn as before.
+        let all = read("site.dxf", &sample(), &Options::default()).unwrap();
+        assert_eq!(all[0].0.features.len(), 2 + 2, "the block adds its point for each of two copies");
+        // A drawing that is nothing but its blocks says why it came out empty.
+        let only_block = dxf(&[
+            (0, "SECTION"),
+            (2, "BLOCKS"),
+            (0, "BLOCK"),
+            (2, "B"),
+            (0, "POINT"),
+            (10, "1"),
+            (20, "1"),
+            (0, "ENDBLK"),
+            (0, "ENDSEC"),
+            (0, "SECTION"),
+            (2, "ENTITIES"),
+            (0, "INSERT"),
+            (2, "B"),
+            (10, "5"),
+            (20, "5"),
+            (0, "ENDSEC"),
+            (0, "EOF"),
+        ]);
+        let e = read("blocks.dxf", &only_block, &Options { blocks: false, ..Options::default() }).unwrap_err().to_string();
+        assert!(e.contains("\"blocks\": true"), "{e}");
+        assert_eq!(read("blocks.dxf", &only_block, &Options::default()).unwrap()[0].0.features.len(), 1);
     }
 
     #[test]

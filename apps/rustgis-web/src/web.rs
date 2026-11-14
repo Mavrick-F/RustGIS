@@ -485,6 +485,9 @@ async fn read_together(files: Vec<web_sys::File>, mark: &str, inbox: &Inbox, not
         }
         if let Some(bytes) = crate::parts::read_file(file, notes.clone()).await {
             read.push((name, bytes));
+        } else if mark.starts_with(rustgis_ui_egui::DXF_PICK) {
+            // A failed read completes this request just like cancelling its picker.
+            inbox.lock().unwrap_or_else(|e| e.into_inner()).push((mark.to_string(), Vec::new()));
         }
     }
     let (read, problems) = rustgis_ui_egui::rustgis_engine::data::io::gather_shapefiles(read);
@@ -1120,6 +1123,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
     let arcgis_ctx = ctx.clone();
     let clipboard_ctx = ctx.clone();
     Services {
+        // The browser's camera isn't asked yet (a phone's shell asks its own).
+        take_photo: None,
         // A text field's Paste: the page reads the clipboard (Firefox and Safari show a Paste
         // button to confirm, Chrome asks once); only over HTTPS, where the browser offers it.
         read_clipboard: clipboard().map(|clipboard| -> Box<dyn Fn(Slot<Result<String, String>>)> {
@@ -1169,12 +1174,18 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             // A file picked for Add Delimited Text carries its dialog's options.
             // So does a file picked for a tool's file parameter, which goes to the Tools pane.
             let tool_exts = purpose.strip_prefix(rustgis_ui_egui::TOOL_FILE_PURPOSE);
-            let mark = match (purpose, tool_exts) {
-                ("shortcuts", _) => rustgis_ui_egui::SHORTCUT_PICK,
-                ("text", _) => rustgis_ui_egui::DELIMITED_PICK,
-                ("shapefile", _) => rustgis_ui_egui::SHAPEFILE_PICK,
-                (_, Some(_)) => rustgis_ui_egui::TOOL_FILE_PICK,
-                _ => "",
+            let dxf = purpose.strip_prefix("dxf:");
+            let mark = if let Some(id) = dxf {
+                format!("{}{id}:", rustgis_ui_egui::DXF_PICK)
+            } else {
+                match (purpose, tool_exts) {
+                    ("shortcuts", _) => rustgis_ui_egui::SHORTCUT_PICK,
+                    ("text", _) => rustgis_ui_egui::DELIMITED_PICK,
+                    ("shapefile", _) => rustgis_ui_egui::SHAPEFILE_PICK,
+                    (_, Some(_)) => rustgis_ui_egui::TOOL_FILE_PICK,
+                    _ => "",
+                }
+                .to_string()
             };
             let dialog = if let Some(exts) = tool_exts {
                 let exts: Vec<&str> = exts.split(',').filter(|e| !e.is_empty()).collect();
@@ -1216,6 +1227,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             } else if purpose == "text" {
                 rfd::AsyncFileDialog::new()
                     .add_filter("Delimited text and spreadsheets", &["csv", "tsv", "txt", "xlsx", "xlsm", "xlsb", "xls", "ods"])
+            } else if dxf.is_some() {
+                rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("DXF drawing"), &["dxf"])
             } else if purpose == "picture" {
                 rfd::AsyncFileDialog::new().add_filter("Pictures", &["png", "jpg", "jpeg"])
             } else {
@@ -1223,10 +1236,14 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             };
             // Data may come several files at once (photos gather in one layer).
             let many = matches!(purpose, "data" | "shapefile");
+            let dxf = dxf.is_some();
             wasm_bindgen_futures::spawn_local(async move {
                 let files: Vec<rfd::FileHandle> =
                     if many { dialog.pick_files().await.unwrap_or_default() } else { dialog.pick_file().await.into_iter().collect() };
-                read_together(files.iter().map(|f| f.inner().clone()).collect(), mark, &inbox, notes).await;
+                if dxf && files.is_empty() {
+                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((mark.clone(), Vec::new()));
+                }
+                read_together(files.iter().map(|f| f.inner().clone()).collect(), &mark, &inbox, notes).await;
                 ctx.request_repaint();
             });
         })),

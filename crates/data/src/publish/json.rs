@@ -89,6 +89,7 @@ pub fn geojson(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> 
         unchanged()?;
         crate::progress::check()?;
         std::fs::rename(temporary, path)?;
+        crate::io::sync_folder(path);
         Ok(())
     })();
     crate::io::unstage(&staged);
@@ -123,6 +124,10 @@ fn document(ds: &Dataset, original: &Json) -> std::result::Result<Json, String> 
                 .into(),
         );
     }
+    // A bbox describes the coordinates, so it is recomputed from what is written; a source box
+    // that doesn't match its own coordinates fails the round trip and is refused.
+    let feature_boxes = originals.iter().any(|f| f.get("bbox").is_some());
+    let mut total = None;
     crate::progress::begin(ds.features.len());
     let mut features = Vec::with_capacity(ds.features.len());
     for (i, f) in ds.features.iter().enumerate() {
@@ -159,6 +164,21 @@ fn document(ds: &Dataset, original: &Json) -> std::result::Result<Json, String> 
                 _ => {}
             }
         }
+        let mut own = None;
+        if let Some(geometry) = feature.get("geometry") {
+            extent(geometry, &mut own);
+        }
+        if let Some(own) = own {
+            grow(&mut total, own);
+            // A row in its place keeps its own choice; after rows change, any box means boxes for all.
+            let boxed = match originals.get(i) {
+                Some(template) if !rows_changed => template.get("bbox").is_some(),
+                _ => feature_boxes,
+            };
+            if boxed {
+                feature["bbox"] = json!(own);
+            }
+        }
         features.push(feature);
     }
     let mut out = match kind {
@@ -166,6 +186,10 @@ fn document(ds: &Dataset, original: &Json) -> std::result::Result<Json, String> 
             let mut out = json!({"type": "FeatureCollection", "features": features});
             if let Some(name) = original.get("name") {
                 out["name"] = name.clone();
+            }
+            if original.get("bbox").is_some() {
+                let total = total.ok_or("its bbox can't be kept: no geometry is left to bound; export a copy instead")?;
+                out["bbox"] = json!(total);
             }
             out
         }
@@ -178,6 +202,35 @@ fn document(ds: &Dataset, original: &Json) -> std::result::Result<Json, String> 
     };
     keep_numbers(&mut out, original)?;
     Ok(out)
+}
+
+/// Widens `acc` (`[west, south, east, north]`) by the positions of a written GeoJSON geometry:
+/// its `coordinates`, or the members of a GeometryCollection. A null geometry adds nothing.
+/// The geometry was written by RustGIS from a layer whose nesting the reader bounded.
+fn extent(geometry: &Json, acc: &mut Option<[f64; 4]>) {
+    match geometry {
+        Json::Array(items) if items.first().is_some_and(Json::is_number) => {
+            if let (Some(x), Some(y)) = (items.first().and_then(Json::as_f64), items.get(1).and_then(Json::as_f64)) {
+                grow(acc, [x, y, x, y]);
+            }
+        }
+        Json::Array(items) => items.iter().for_each(|item| extent(item, acc)),
+        Json::Object(object) => {
+            if let Some(coordinates) = object.get("coordinates") {
+                extent(coordinates, acc);
+            }
+            if let Some(Json::Array(members)) = object.get("geometries") {
+                members.iter().for_each(|member| extent(member, acc));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Widens `acc` to cover `other`, both `[west, south, east, north]`.
+fn grow(acc: &mut Option<[f64; 4]>, [w, s, e, n]: [f64; 4]) {
+    let [aw, as_, ae, an] = *acc.get_or_insert([w, s, e, n]);
+    *acc = Some([aw.min(w), as_.min(s), ae.max(e), an.max(n)]);
 }
 
 /// Keeps the original JSON number type where it says exactly the same decimal value. Geometry
@@ -420,6 +473,7 @@ mod tests {
             SOURCE.replace("\"type\":\"FeatureCollection\"", "\"type\":\"FeatureCollection\",\"custom\":42"),
             SOURCE.replace("\"type\":\"Point\"", "\"type\":\"Point\",\"bbox\":[1,2,1,2]"),
             SOURCE.replace("[1,2]", "[1,2,3]"),
+            SOURCE.replace("\"features\":[", "\"bbox\":[0,0,9,9],\"features\":["),
             SOURCE.replace("[1,2]", "[1.00,2]"),
             SOURCE.replace("\"owner\":\"Smith\"", "\"owner\":\"Lost\",\"owner\":\"Smith\""),
             SOURCE.replace("\"features\":[", "\"crs\":null,\"features\":["),
@@ -430,6 +484,57 @@ mod tests {
             assert!(error.contains("nothing was written"), "{error}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
+    }
+
+    #[test]
+    fn a_bbox_is_recomputed_from_the_edited_geometry() {
+        let text = r#"{"type":"FeatureCollection","bbox":[1,2,5,6],"features":[{"type":"Feature","bbox":[1,2,1,2],"properties":{"owner":"Smith"},"geometry":{"type":"Point","coordinates":[1,2]}},{"type":"Feature","bbox":[3,4,5,6],"properties":{"owner":"Jones"},"geometry":{"type":"LineString","coordinates":[[3,4],[5,6]]}}]}"#;
+        let (_dir, path, mut ds, sync) = loaded(text);
+        rename_owner(&mut ds, "Taylor");
+        geojson(&ds, &path, &sync).unwrap();
+        let parsed = |t: &str| serde_json::from_str::<Json>(t).unwrap();
+        assert_eq!(parsed(&std::fs::read_to_string(&path).unwrap()), parsed(&text.replace("Smith", "Taylor")));
+        let (_dir, path, mut ds, sync) = loaded(text);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows.first_mut().unwrap().geometry = Some(crate::Geometry::Point(crate::Coord::new(7.5, 0.0)));
+        ds.features = rows.into();
+        geojson(&ds, &path, &sync).unwrap();
+        let written: Json = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["bbox"], json!([3.0, 0.0, 7.5, 6]));
+        assert_eq!(written["features"][0]["bbox"], json!([7.5, 0.0, 7.5, 0.0]));
+        assert_eq!(written["features"][1]["bbox"], json!([3, 4, 5, 6]));
+        // A row removed shrinks the collection's box; one added gets a box of its own.
+        let (_dir, path, mut ds, sync) = loaded(text);
+        let mut rows: Vec<_> = ds.features.iter().skip(1).cloned().collect();
+        let mut added = rows.first().unwrap().clone();
+        added.geometry = Some(crate::Geometry::Point(crate::Coord::new(4.0, 5.0)));
+        rows.push(added);
+        ds.features = rows.into();
+        geojson(&ds, &path, &sync).unwrap();
+        let written: Json = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["bbox"], json!([3.0, 4.0, 5, 6]));
+        assert_eq!(written["features"][1]["bbox"], json!([4.0, 5.0, 4.0, 5.0]));
+    }
+
+    #[test]
+    fn a_feature_without_a_bbox_keeps_none_beside_one_that_has_it() {
+        let text = r#"{"type":"FeatureCollection","features":[{"type":"Feature","bbox":[1,2,1,2],"properties":{"owner":"Smith"},"geometry":{"type":"Point","coordinates":[1,2]}},{"type":"Feature","properties":{"owner":"Jones"},"geometry":{"type":"Point","coordinates":[3,4]}}]}"#;
+        let (_dir, path, mut ds, sync) = loaded(text);
+        rename_owner(&mut ds, "Taylor");
+        geojson(&ds, &path, &sync).unwrap();
+        let written: Json = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["features"][0]["bbox"], json!([1, 2, 1, 2]));
+        assert!(written["features"][1].get("bbox").is_none());
+    }
+
+    #[test]
+    fn a_collection_bbox_with_nothing_left_to_bound_is_refused() {
+        let text = r#"{"type":"FeatureCollection","bbox":[1,2,1,2],"features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
+        let (_dir, path, mut ds, sync) = loaded(text);
+        ds.features = Vec::new().into();
+        let error = geojson(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(error.contains("no geometry is left to bound"), "{error}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), text);
     }
 
     #[test]
