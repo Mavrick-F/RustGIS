@@ -259,6 +259,195 @@ fn table_remove_takes_a_standalone_table_out_of_the_project() {
     assert!(undone["id"].as_u64() < next["id"].as_u64(), "{undone} then {next}");
 }
 
+/// Trusted notebook cells also run inline; a failed cell must preserve rows and release its guard.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn notebook_table_writes_are_refused_before_rows_change() {
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName": "records.csv", "text": format!("n\n{}", "1\n".repeat(20_000))})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    s.run("notebook.new", &json!({"name": "Edit records"})).unwrap();
+    let p = json!({"table": "records", "field": "n", "expression": "n + 1"});
+    let cell = s.run("notebook.addCell", &json!({"source": format!("edit.calculateField {p}")})).unwrap()["cell"].clone();
+    let before = serde_json::to_value(&s.project.tables).unwrap();
+    let result = s.run("notebook.run", &json!({"cell": cell})).unwrap();
+    assert_eq!(result["error"], cell);
+    assert_eq!(serde_json::to_value(&s.project.tables).unwrap(), before);
+    let at = usize::try_from(cell.as_u64().unwrap()).unwrap();
+    assert!(s.project.notebooks[0].cells[at].output.as_deref().is_some_and(|text| text.contains("prepare the table edit on a worker")));
+    s.run("edit.calculateField", &p).unwrap();
+    assert_eq!(s.project.tables[0].dataset.value(0, 0), &rustgis_data::Value::Int(2));
+}
+
+/// Native scoped callers must prepare table work; owned results still land under that scope.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn scoped_table_writes_need_prepared_worker_results() {
+    use crate::{
+        cmd::reads::{read_ahead, read_land},
+        policy::{Call, Effects, Revocation, Scope},
+    };
+    use std::sync::Arc;
+    struct Live;
+    impl Revocation for Live {
+        fn allows(&self, _: Effects) -> bool {
+            true
+        }
+    }
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName": "records.csv", "text": format!("n\n{}", "1\n".repeat(20_000))})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    let scope = Scope::assistant(195509, Arc::new(Live));
+    let p = json!({"table": "records", "field": "n", "expression": "n + 1"});
+    let before = serde_json::to_value(&s.project.tables).unwrap();
+    let depth = s.undo_depth();
+    let error = s.run_scoped(scope.clone(), &Call::command("edit.calculateField", p.clone())).unwrap_err();
+    assert!(error.contains("prepare the table edit on a worker"), "{error}");
+    assert_eq!(serde_json::to_value(&s.project.tables).unwrap(), before);
+    assert_eq!(s.undo_depth(), depth);
+    let ahead = s.with_scope(scope, |s| read_ahead(s, "edit.calculateField", &p)).unwrap().unwrap();
+    assert!(ahead.reads());
+    let read = ahead.run(&rustgis_analysis::control::Control::stoppable()).unwrap();
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.project.tables[0].dataset.value(0, 0), &rustgis_data::Value::Int(2));
+    assert_eq!(s.undo_depth(), depth + 1);
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(serde_json::to_value(&s.project.tables).unwrap(), before);
+}
+
+#[test]
+fn a_standalone_table_is_edited_with_the_edit_commands() {
+    let mut s = world();
+    s.run("layer.addDataText", &json!({"fileName": "sites.csv", "text": "id,street,visits\n1,Champ de Mars,3\n2,Rue Cler,5\n"})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    // No layer active: the table is what the commands are checked against and change.
+    s.active_layer = None;
+    let layers = serde_json::to_value(&s.map().layers).unwrap();
+    let table = |s: &Session| s.project.tables[0].dataset.clone();
+    let cell = |s: &Session, row: usize, field: &str| {
+        let t = table(s);
+        t.value(row, t.field_index(field).unwrap()).clone()
+    };
+    let depth = s.undo_depth();
+    let mark = s.notice_mark();
+    s.run("edit.setValue", &json!({"table": "sites", "row": 1, "field": "street", "value": "Rue Saint-Dominique"})).unwrap();
+    assert_eq!(cell(&s, 1, "street"), rustgis_data::Value::Text("Rue Saint-Dominique".into()));
+    let row = s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"id": 3, "street": "Quai Branly"}})).unwrap();
+    assert_eq!((row["row"].as_u64(), table(&s).features.len()), (Some(2), 3));
+    assert!(table(&s).features[2].geometry.is_none());
+    s.run("edit.addField", &json!({"table": "sites", "name": "opened", "type": "text"})).unwrap();
+    s.run("edit.calculateField", &json!({"table": "sites", "field": "opened", "expression": "'2026-0' || id || '-01'"})).unwrap();
+    let converted = s.run("edit.convertField", &json!({"table": "sites", "field": "opened", "type": "date"})).unwrap();
+    assert_eq!(converted, json!({"converted": 3, "null": 0}));
+    s.run("edit.deleteField", &json!({"table": "sites", "field": "visits"})).unwrap();
+    assert!(table(&s).field_index("visits").is_none() && table(&s).features.iter().all(|f| f.attrs.len() == 3));
+    assert!(s.notices_since(mark).is_empty(), "clean edits say nothing: {:?}", s.notices_since(mark));
+    // An undo step each, and the map's layers untouched.
+    assert_eq!(s.undo_depth(), depth + 6);
+    assert_eq!(serde_json::to_value(&s.map().layers).unwrap(), layers);
+    for _ in 0..6 {
+        s.run("edit.undo", &Value::Null).unwrap();
+    }
+    assert_eq!((cell(&s, 1, "street"), table(&s).features.len()), (rustgis_data::Value::Text("Rue Cler".into()), 2));
+    // A value a field can't hold whole is said, as in a layer.
+    let mark = s.notice_mark();
+    s.run("edit.setValue", &json!({"table": "sites", "row": 0, "field": "visits", "value": "2.7"})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("sites, field 'visits', row 1") && n.text.contains("fraction")));
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"visits": 1.5}})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("sites, field 'visits', row 3") && n.text.contains("fraction")));
+    // Supplied attributes must be an object; null remains an optional blank row.
+    let before = (serde_json::to_value(&s.project.tables).unwrap(), s.undo_depth());
+    for attributes in [json!("street=Quai Branly"), json!([]), json!(7), json!(true)] {
+        let err = s.run("edit.addFeature", &json!({"table": "sites", "attributes": attributes})).unwrap_err();
+        assert!(err.contains("attributes is an object"), "{err}");
+        assert_eq!((serde_json::to_value(&s.project.tables).unwrap(), s.undo_depth()), before);
+    }
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "sites", "attributes": null})).unwrap();
+    assert!(s.notices_since(mark).is_empty());
+    s.run("edit.undo", &Value::Null).unwrap();
+    // A row past the 32-bit range is no row, on every build.
+    assert!(s.run("edit.setValue", &json!({"table": "sites", "row": 4_294_967_296u64, "field": "street", "value": "x"})).is_err());
+    // A name in another case finds its field; one naming no field is said, not dropped quietly.
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"STREET": "Rue Amélie", "stret": "x"}})).unwrap();
+    assert_eq!(cell(&s, 3, "street"), rustgis_data::Value::Text("Rue Amélie".into()));
+    let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert!(said.len() == 1 && said[0].contains("leaves out 1 attribute naming no field: 'stret'"), "{said:?}");
+    // Fields named alike but for case: a key gives the one it names exactly and no other, and a
+    // second key reaching a field already given is said.
+    s.run("layer.addDataText", &json!({"fileName": "twins.csv", "text": "id,Name,name\n1,a,b\n"})).unwrap();
+    let twin = |s: &Session, f: usize| s.project.tables[1].dataset.value(1, f).clone();
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "twins", "attributes": {"name": "lower"}})).unwrap();
+    assert_eq!((twin(&s, 1), twin(&s, 2)), (rustgis_data::Value::Null, rustgis_data::Value::Text("lower".into())));
+    assert!(s.notices_since(mark).is_empty());
+    s.run("edit.undo", &Value::Null).unwrap();
+    let rows = s.project.tables[1].dataset.features.len();
+    let depth = s.undo_depth();
+    let err = s.run("edit.addFeature", &json!({"table": "twins", "attributes": {"Name": "A", "NAME": "B"}})).unwrap_err();
+    assert!(err.contains("matches more than one field"), "{err}");
+    assert_eq!(s.project.tables[1].dataset.features.len(), rows);
+    assert_eq!(s.undo_depth(), depth);
+    let mark = s.notice_mark();
+    s.run("edit.addFeature", &json!({"table": "sites", "attributes": {"street": "A", "STREET": "B"}})).unwrap();
+    assert_eq!(cell(&s, 4, "street"), rustgis_data::Value::Text("A".into()));
+    let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert!(
+        said.len() == 1 && said[0].contains("leaves out 1 attribute naming a field another attribute already gives: 'STREET'"),
+        "{said:?}"
+    );
+    let mark = s.notice_mark();
+    s.run("edit.calculateField", &json!({"table": "sites", "field": "visits", "expression": "visits / 2"})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("Calculate Field: 'visits'") && n.text.contains("fraction")));
+    // A script's line and a task's step naming the table are checked against it too.
+    s.run(
+        "script.run",
+        &json!({"script": "edit.setValue {\"table\": \"sites\", \"row\": 0, \"field\": \"street\", \"value\": \"Avenue Rapp\"}"}),
+    )
+    .unwrap();
+    assert_eq!(cell(&s, 0, "street"), rustgis_data::Value::Text("Avenue Rapp".into()));
+    let steps =
+        json!([{"title": "Add a field", "command": "edit.addField", "params": {"table": "sites", "name": "checked", "type": "boolean"}}]);
+    s.run("task.new", &json!({"name": "Check sites", "steps": steps})).unwrap();
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(s.run("task.run", &json!({"task": "Check sites"})).is_err_and(|e| e.contains("run the table edit directly")));
+    #[cfg(target_arch = "wasm32")]
+    {
+        s.run("task.run", &json!({"task": "Check sites"})).unwrap();
+        assert!(table(&s).field_index("checked").is_some());
+    }
+    assert_eq!(s.active_layer, None);
+    // Rows change only while editing is on; fields either way, as a layer's.
+    s.run("edit.enable", &json!({"on": false})).unwrap();
+    for (id, p) in [
+        ("edit.setValue", json!({"table": "sites", "row": 0, "field": "street", "value": "x"})),
+        ("edit.addFeature", json!({"table": "sites"})),
+        ("edit.calculateField", json!({"table": "sites", "field": "id", "expression": "1"})),
+    ] {
+        assert!(s.run(id, &p).is_err_and(|e| e.contains("editing is turned off")), "{id}");
+    }
+    s.run("edit.addField", &json!({"table": "sites", "name": "note", "type": "text"})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    // A table has no geometry or templates; a layer and a table at once, or a table that isn't
+    // there, are refused and change nothing.
+    let before = (serde_json::to_value(&s.project.tables).unwrap(), s.undo_depth());
+    for (id, p) in [
+        ("edit.addFeature", json!({"table": "sites", "geometry": {"type": "Point", "coordinates": [2.3, 48.9]}})),
+        ("edit.addFeature", json!({"table": "sites", "template": "Default"})),
+        ("edit.setValue", json!({"table": "sites", "layer": "Cities", "row": 0, "field": "street", "value": "x"})),
+        ("edit.setValue", json!({"table": "nope", "row": 0, "field": "street", "value": "x"})),
+        ("edit.setValue", json!({"table": "sites", "row": 9, "field": "street", "value": "x"})),
+        ("edit.addField", json!({"table": "sites", "name": "street", "type": "text"})),
+        ("edit.deleteField", json!({"table": "sites", "field": "nope"})),
+        ("edit.convertField", json!({"table": "sites", "field": "id", "type": "date"})),
+    ] {
+        assert!(s.run(id, &p).is_err(), "{id} {p}");
+    }
+    assert_eq!((serde_json::to_value(&s.project.tables).unwrap(), s.undo_depth()), before);
+}
+
 #[test]
 fn a_saved_selection_is_read_in_range_in_order_and_once() {
     // A selection edited by hand: a row repeated, out of order, and one past the layer's end.
@@ -294,6 +483,8 @@ fn standalone_tables_keep_their_ids_in_the_project_file() {
     // Saved and read again: the same ids, and the next table gets one that was never used.
     let text = serde_json::to_string(&s.project).unwrap();
     let mut p = Project::from_json(&text).unwrap();
+    assert!(!text.contains("instance_id"), "runtime table identities must not change the saved format");
+    assert_ne!(p.tables[0].instance_id(), s.project.tables[0].instance_id());
     assert_eq!(
         p.tables.iter().map(|t| (t.id, t.name.clone(), t.features.len())).collect::<Vec<_>>(),
         [(ids[0], "sites".to_string(), 1), (ids[1], "notes".to_string(), 1)]
@@ -317,8 +508,10 @@ fn standalone_tables_keep_their_ids_in_the_project_file() {
     let stats = json!({"tool": "summaryStatistics", "params": {"input": "Countries", "field": "pop_est", "case": "continent"}});
     s.run("gp.run", &stats).unwrap();
     let id = s.project.tables.last().map(|t| t.id).unwrap();
+    let instance = s.project.table(id).unwrap().instance_id();
     s.run("gp.run", &stats).unwrap();
     assert_eq!((s.project.tables.len(), s.project.tables.last().map(|t| t.id)), (3, Some(id)));
+    assert_ne!(s.project.table(id).unwrap().instance_id(), instance, "rerunning a tool replaces its table contents");
     // Commands and tools reach a table by its id as well as by its name, which is the first of
     // two tables sharing it.
     for v in [10, 99] {
@@ -422,6 +615,113 @@ fn geoprocessing_adds_layers_and_history() {
     assert_eq!(s.project.tables.len(), 1);
     assert!(s.run("gp.run", &json!({"tool": "buffer", "params": {"input": "Nope"}})).is_err());
     assert_eq!(s.project.gp_history.len(), 2, "a failed run restores the project");
+}
+
+/// A tool reads what its layers show (#1995): the features a definition query keeps, with a
+/// selection cut to them, for the input and for an overlay layer. The Select tools leave out the
+/// features it hides, a layer it hides entirely is refused, and a tool that reads a layer whole
+/// says how many features the query hides.
+#[test]
+fn tools_read_the_features_a_definition_query_keeps() {
+    let mut s = world();
+    let shown = |s: &Session, layer: &str| s.map().layer_by_name(layer).unwrap().visible_rows().iter().filter(|v| **v).count();
+    let rows = |s: &Session, layer: &str| s.map().layer_by_name(layer).unwrap().dataset.features.len();
+    let said = |s: &Session, mark, what: &str| s.notices_since(mark).iter().any(|n| n.text.contains(what));
+    let (cities, countries) = (rows(&s, "Cities"), rows(&s, "Countries"));
+    // Each run's output has its own name, so one run's layer isn't mistaken for another's.
+    let buffer = |out: &str| json!({"tool": "buffer", "params": {"input": "Cities", "distance": 10, "output": out}});
+    let query = |s: &mut Session, layer: &str, text: &str| s.run("layer.definitionQuery", &json!({"layer": layer, "where": text})).unwrap();
+
+    // The input: a Buffer of the features the query keeps, not of every city.
+    query(&mut s, "Cities", "pop_max > 10000000");
+    let big = shown(&s, "Cities");
+    assert!(big > 1 && big < cities, "{big} of {cities}");
+    s.run("gp.run", &buffer("Big")).unwrap();
+    assert_eq!(rows(&s, "Big"), big);
+    // A selection within them: its drawn features only.
+    let drawn = s.map().layer_by_name("Cities").unwrap().visible_rows();
+    let (Some(on), Some(off)) = (drawn.iter().position(|d| *d), drawn.iter().position(|d| !*d)) else { panic!("no drawn and hidden city") };
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    s.map_mut().layer_mut(id).unwrap().selection = vec![off, on];
+    s.run("gp.run", &buffer("One")).unwrap();
+    assert_eq!(rows(&s, "One"), 1);
+    // A selection of hidden features only, or a query that hides all of them, is refused: no
+    // rows would mean every city.
+    s.map_mut().layer_mut(id).unwrap().selection = vec![off];
+    let e = s.run("gp.run", &buffer("None")).unwrap_err();
+    assert!(e.contains("Cities: its definition query hides every feature the tool would read"), "{e}");
+    s.map_mut().layer_mut(id).unwrap().selection.clear();
+    query(&mut s, "Cities", "pop_max < 0");
+    assert!(s.run("gp.run", &buffer("None")).is_err());
+    // Without a query, or with one that doesn't read, every city is buffered, as the map draws them.
+    for (i, text) in ["", "no_such_field > 1"].into_iter().enumerate() {
+        // The command refuses a query that doesn't read; a saved project can hold one.
+        s.map_mut().layer_mut(id).unwrap().definition_query = Some(text.to_string());
+        let out = format!("All {i}");
+        s.run("gp.run", &buffer(&out)).unwrap();
+        assert_eq!(rows(&s, &out), cities, "{text:?}");
+    }
+
+    // An overlay layer: Clip by the countries the query keeps is Clip by those countries selected.
+    let clip = json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "Clipped"}});
+    let populous = "pop_est > 100000000";
+    s.run("select.byAttributes", &json!({"layer": "Countries", "where": populous})).unwrap();
+    s.run("gp.run", &clip).unwrap();
+    let selected = rows(&s, "Clipped");
+    s.map_mut().clear_selection();
+    query(&mut s, "Countries", populous);
+    assert!(shown(&s, "Countries") < countries);
+    s.run("gp.run", &clip).unwrap();
+    assert_eq!(rows(&s, "Clipped"), selected);
+    assert!(selected < cities);
+
+    // The Select tools read the whole layer, and select only the features it draws.
+    query(&mut s, "Cities", "pop_max > 10000000");
+    let mark = s.notice_mark();
+    s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().selection.len(), big);
+    assert!(said(&s, mark, &format!("{} of the features selected in Cities aren't drawn", cities - big)));
+    // And the Select By Attributes command.
+    let mark = s.notice_mark();
+    let r = s.run("select.byAttributes", &json!({"layer": "Cities", "where": "pop_max > 0"})).unwrap();
+    assert_eq!(r["selected"], json!(big));
+    assert!(said(&s, mark, &format!("{} more features match but aren't drawn", cities - big)));
+    // A query that hides every feature: a Select tool selects nothing, rather than being refused.
+    query(&mut s, "Cities", "pop_max < 0");
+    s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
+    assert!(s.map().layer_by_name("Cities").unwrap().selection.is_empty());
+    query(&mut s, "Cities", "");
+    let mark = s.notice_mark();
+    s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
+    s.run("select.byAttributes", &json!({"layer": "Cities", "where": "pop_max > 0"})).unwrap();
+    assert!(!said(&s, mark, "aren't drawn"));
+
+    // Calculate Geometry Attributes updates every row, and says the query hides some.
+    query(&mut s, "Countries", populous);
+    let mark = s.notice_mark();
+    s.run("gp.run", &json!({"tool": "calculateGeometry", "params": {"input": "Countries"}})).unwrap();
+    assert_eq!(rows(&s, "Countries"), countries);
+    assert!(said(
+        &s,
+        mark,
+        &format!(
+            "reads all {countries} features of Countries, including the {} its definition query hides",
+            countries - shown(&s, "Countries")
+        )
+    ));
+    // Every row has its area and perimeter, the hidden countries' as much as the drawn ones'.
+    let layer = s.map().layer_by_name("Countries").unwrap();
+    let ds = &layer.dataset;
+    let (area, perimeter) = (ds.field_index("area_km2").unwrap(), ds.field_index("perimeter_km").unwrap());
+    let hidden = layer.visible_rows().iter().position(|v| !*v).unwrap();
+    for row in [hidden, layer.visible_rows().iter().position(|v| *v).unwrap()] {
+        assert!(ds.value(row, area).as_f64().is_some_and(|a| a > 0.0), "row {row}");
+        assert!(ds.value(row, perimeter).as_f64().is_some_and(|p| p > 0.0), "row {row}");
+    }
+    query(&mut s, "Countries", "");
+    let mark = s.notice_mark();
+    s.run("gp.run", &json!({"tool": "calculateGeometry", "params": {"input": "Countries"}})).unwrap();
+    assert!(!said(&s, mark, "definition query"));
 }
 
 /// Pivot Table adds a standalone table in one undo step: a row for each continent and a field for
@@ -19854,6 +20154,38 @@ fn area_review_repair_checks_retained_classification_fields() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn repair_source_checks_the_extrusion_base_field() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    let c = Coord::new;
+    let square = || Some(Geometry::Polygon(vec![vec![vec![c(0.0, 0.0), c(1.0, 0.0), c(1.0, 1.0), c(0.0, 0.0)]]]));
+    let mut data = Dataset::new("Raised", GeometryType::Polygon, vec![Field::new("floor", FieldType::Double)]);
+    data.push(square(), vec![Value::Float(3.0)]);
+    let mut session = Session::new(Project::default());
+    let id = session.map_mut().add_dataset(data);
+    let layer = session.map_mut().layer_mut(id).unwrap();
+    layer.labels.default.field.clear();
+    layer.extrusion = Some(rustgis_map::effects::Extrusion { base_field: Some("floor".into()), ..Default::default() });
+    let dir = std::env::temp_dir().join(format!("rustgis-base-repair-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("old.fgb");
+    std::fs::write(&old, rustgis_data::source::fgb::write(&layer.dataset).unwrap()).unwrap();
+    let handle = rustgis_data::source::open_path(&old, None).unwrap();
+    layer.source = Some(rustgis_map::source::SourceLayer::from_path(old.display().to_string(), None, handle));
+    let mut without = Dataset::new("Raised", GeometryType::Polygon, vec![]);
+    without.push(square(), vec![]);
+    let mut text = Dataset::new("Raised", GeometryType::Polygon, vec![Field::new("floor", FieldType::Text)]);
+    text.push(square(), vec![Value::Text("3".into())]);
+    for (name, replacement, expected) in [("without", without, "no field floor"), ("text", text, "field floor must remain numeric")] {
+        let new = dir.join(format!("{name}.fgb"));
+        std::fs::write(&new, rustgis_data::source::fgb::write(&replacement).unwrap()).unwrap();
+        let error = session.run("layer.repairSource", &json!({"layer":id,"path":new})).unwrap_err();
+        assert!(error.contains(expected), "{name}: {error}");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn area_review_attribute_edits_keep_retained_display_expressions() {
     let (mut session, id) = area_review_fixture();
@@ -20407,8 +20739,8 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
     let areas = layer("Area table", GeometryType::Polygon, vec![(square(0.0, true), vec![V::Text("A".into()), V::Float(2.5)])]);
     let points =
         layer("Point table", GeometryType::Point, vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])]);
-    s.project.tables.push(crate::project::Table { id: 9001, dataset: areas });
-    s.project.tables.push(crate::project::Table { id: 9002, dataset: points });
+    s.project.tables.push(crate::project::Table::new(9001, areas));
+    s.project.tables.push(crate::project::Table::new(9002, points));
     let n = said(&mut s, "share.exportTable", json!({"table": 9001, "path": out("table.csv")}));
     assert!(n.len() == 1 && n[0].contains("the geometry of 1 feature wasn't written"), "{n:?}");
     let n = said(&mut s, "share.exportTable", json!({"table": 9001, "path": out("table.gpx")}));
@@ -21460,6 +21792,52 @@ fn layers_export_in_the_system_they_were_read_in() {
     // GeoJSON is longitude/latitude only; an unknown system is an error.
     assert!(s.run("share.exportLayer", &json!({"layer": "squares", "path": path("x.geojson"), "crs": "EPSG:25832"})).is_err());
     assert!(s.run("share.exportLayer", &json!({"layer": "squares", "path": path("x.gpkg"), "crs": "EPSG:1"})).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Shapefile whose `.prj` names its system without an EPSG code (State Plane by its parameters)
+/// exports to GeoPackage and FlatGeobuf in that system, as the guide says; a system with no WKT
+/// form is written in WGS 84, and a notice names it. Reads the files back for where they are.
+#[test]
+fn a_system_without_an_epsg_code_is_exported_in_its_own_system() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-export-prj-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = |name: &str| dir.join(name).display().to_string();
+    // A point in Memphis, written to a Shapefile in EPSG:2274, whose `.prj` is then the text
+    // for NAD83 / Tennessee (ftUS) that has no `AUTHORITY`.
+    let prj = r#"PROJCS["NAD_1983_StatePlane_Tennessee_FIPS_4100_Feet",GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Lambert_Conformal_Conic"],PARAMETER["False_Easting",1968500.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-86.0],PARAMETER["Standard_Parallel_1",35.25],PARAMETER["Standard_Parallel_2",36.41666666666666],PARAMETER["Latitude_Of_Origin",34.33333333333334],UNIT["Foot_US",0.3048006096012192]]"#;
+    std::fs::write(dir.join("sites.csv"), "name,longitude,latitude\nMemphis,-90.049,35.1495\n").unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path("sites.csv"), "name": "seed"})).unwrap();
+    s.run("share.exportLayer", &json!({"layer": "seed", "path": path("sites.shp"), "crs": "EPSG:2274"})).unwrap();
+    std::fs::write(dir.join("sites.prj"), prj).unwrap();
+    s.run("layer.addData", &json!({"path": path("sites.shp"), "name": "sites"})).unwrap();
+    let own = s.map().layers.iter().find(|l| l.name == "sites").and_then(|l| l.dataset.crs).unwrap();
+    assert_eq!(own.epsg(), 0, "the .prj has no authority: {}", own.label());
+    for file in ["sites.gpkg", "sites.fgb", "again.shp"] {
+        let mark = s.notices.len();
+        let r = s.run("share.exportLayer", &json!({"layer": "sites", "path": path(file)})).unwrap();
+        assert_eq!(r["crs"], own.label(), "{file}");
+        let said: Vec<_> = s.notices[mark..].iter().map(|n| n.text.clone()).filter(|t| !t.starts_with("Exported ")).collect();
+        assert!(said.is_empty(), "{file}: {said:?}");
+        // Added back, the point is where it was and the layer is in the same system.
+        let r = s.run("layer.addData", &json!({"path": path(file)})).unwrap();
+        let l = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap();
+        let ds = if l.is_streamed() { l.load_all().unwrap() } else { l.dataset.clone() };
+        assert_eq!(ds.crs.map(|c| c.label()), Some(own.label()), "{file}");
+        let at = ds.features[0].geometry.as_ref().unwrap().extent();
+        assert!((at.min_x + 90.049).abs() < 1e-6 && (at.min_y - 35.1495).abs() < 1e-6, "{file}: {at:?}");
+    }
+    // A system WKT1 has no name for can't be written into either: WGS 84, and the notice says so.
+    let gnomonic = "+proj=gnom +lat_0=35 +lon_0=-90 +datum=WGS84 +units=m +no_defs";
+    s.run("layer.addData", &json!({"path": path("sites.csv"), "name": "far", "x": "longitude", "y": "latitude", "crs": gnomonic})).unwrap();
+    for file in ["far.gpkg", "far.fgb"] {
+        let mark = s.notices.len();
+        let r = s.run("share.exportLayer", &json!({"layer": "far", "path": path(file)})).unwrap();
+        assert_eq!(r["crs"], "EPSG:4326", "{file}");
+        let said: Vec<_> = s.notices[mark..].iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|t| t.contains("WGS 84") && t.contains(file) && t.contains("far")), "{file}: {said:?}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -41720,6 +42098,52 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The y of every position in a glTF written by `share.webScene` (its first accessor of
+/// positions), in the order written.
+fn gltf_heights(path: &str) -> Vec<f64> {
+    let g: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let prim = &g["meshes"][0]["primitives"][0];
+    let at = &g["accessors"][prim["attributes"]["POSITION"].as_u64().unwrap() as usize];
+    let uri = g["buffers"][0]["uri"].as_str().unwrap();
+    let bytes = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(uri.split_once(",").unwrap().1).unwrap()
+    };
+    let view = &g["bufferViews"][at["bufferView"].as_u64().unwrap() as usize];
+    let start = (view["byteOffset"].as_u64().unwrap_or(0) + at["byteOffset"].as_u64().unwrap_or(0)) as usize;
+    let count = at["count"].as_u64().unwrap() as usize;
+    bytes[start..start + count * 12].chunks(12).map(|v| f64::from(f32::from_le_bytes(v[4..8].try_into().unwrap()))).collect()
+}
+
+#[test]
+fn a_raised_part_stands_on_its_base_in_a_web_scene() {
+    let dir = std::env::temp_dir().join(format!("rustgis-gltf-base-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scene.gltf").display().to_string();
+    let scene = |base: f64| {
+        let mut s = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
+        if let Some(l) = s.map_mut().layers.first_mut() {
+            l.extrusion = Some(rustgis_map::effects::Extrusion { field: Some("h".into()), base, ..Default::default() });
+        }
+        s.run("share.webScene", &json!({"path": path})).unwrap();
+        gltf_heights(&path)
+    };
+    // The cap (written first, one position per corner of the ring) sits on the walls' top; the
+    // walls run from the base.
+    let raised = scene(20.0);
+    let (cap, walls) = raised.split_at(raised.len() - 16);
+    assert!(cap.iter().all(|y| *y == 50.0), "cap at base + height: {cap:?}");
+    assert_eq!(walls.iter().cloned().fold(f64::MAX, f64::min), 20.0, "wall foot at the base");
+    assert_eq!(walls.iter().cloned().fold(f64::MIN, f64::max), 50.0, "wall top at base + height");
+    // With no base the walls stand on the ground and the cap at the height, as before.
+    let grounded = scene(0.0);
+    assert_eq!(grounded.iter().cloned().fold(f64::MAX, f64::min), 0.0);
+    assert_eq!(grounded.iter().cloned().fold(f64::MIN, f64::max), 30.0);
+    // A base at the cap leaves no room for the height: the top stays within it.
+    assert_eq!(scene(1e9).iter().cloned().fold(f64::MIN, f64::max), 1e6);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn layer_meshes_report_single_vertex_lines_and_skip_heights_of_empty_features() {
     // A one-vertex line part is left out and said; a feature without geometry draws nothing, so
@@ -42379,6 +42803,24 @@ fn a_scripts_tools_run_ahead_are_taken_by_its_run() {
     assert_eq!(s.project.gp_history.len(), here.project.gp_history.len());
     assert_eq!(s.undo_depth(), depth + 1);
 
+    // Table writes keep their worker rows, so the following tool is taken as well. A table
+    // write, its preceding model and following tool remain one script undo step.
+    let mut s = session();
+    let text = serde_json::to_string(&s.project).unwrap();
+    s.run("project.openText", &json!({"text": text})).unwrap();
+    assert_ne!(s.opened, 0, "the worker must preserve an actual project opening and its policy epoch");
+    s.run("layer.addDataText", &json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    let depth = s.undo_depth();
+    let p = json!({"script": format!("model.run {{\"name\":\"Steps\"}}\nedit.setValue {{\"table\":\"records\",\"row\":0,\"field\":\"n\",\"value\":9}}\n{}", tool(2000))});
+    let read = read_ahead(&mut s, "script.run", &p).unwrap().run(&Control::stoppable()).unwrap();
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.tools_taken, 2);
+    assert_eq!(s.project.tables[0].dataset.value(0, 0).as_f64(), Some(9.0));
+    assert_eq!(s.undo_depth(), depth + 1);
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.project.tables[0].dataset.value(0, 0).as_f64(), Some(1.0));
+
     // A line that may reach outside the session stops the copy: the run here runs it and what
     // follows, so the project is saved once.
     let dir = std::env::temp_dir().join(format!("rustgis-script-ahead-{}", std::process::id()));
@@ -42974,6 +43416,72 @@ fn importing_a_file_that_is_neither_map_nor_project_says_so() {
     // A project from a newer RustGIS keeps its advice.
     let e = s.run("map.import", &json!({"text": r#"{"format": 99999, "maps": 3}"#})).unwrap_err();
     assert!(e.contains("Update RustGIS"), "{e}");
+}
+
+/// Format 2 is read a release before anything writes it (#1853 piece 1): a project of format 2
+/// opens, and is saved again in the format this RustGIS writes; one needing a capability this
+/// RustGIS doesn't know is refused naming it; a newer format is refused as before.
+#[test]
+fn format_2_is_read_unless_it_needs_what_this_rustgis_cannot_read() {
+    let s = world();
+    let as_format = |format: u64, requires: Option<Value>| {
+        let mut v: Value = serde_json::to_value(&s.project).unwrap();
+        v["format"] = json!(format);
+        if let Some(r) = requires {
+            v["requires"] = r;
+        }
+        v.to_string()
+    };
+    // Format 2, with no capabilities, an empty list or none: read whole, and written back as
+    // format 1, the format this RustGIS writes.
+    for requires in [None, Some(json!([])), Some(Value::Null)] {
+        let p = Project::from_json(&as_format(2, requires.clone())).unwrap();
+        assert_eq!(p.format, 2);
+        assert_eq!(p.maps.len(), s.project.maps.len(), "{requires:?}");
+        assert_eq!(p.map().layers.len(), s.map().layers.len(), "{requires:?}");
+        let again: Value = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(again["format"], json!(crate::project::FORMAT));
+        assert!(again.get("requires").is_none());
+    }
+    // A capability this RustGIS doesn't know, in format 2 or a format 1 file that names one:
+    // refused, named once, with the advice to update.
+    for format in [1, 2] {
+        let e = Project::from_json(&as_format(format, Some(json!(["z-values", "z-values"])))).unwrap_err();
+        assert_eq!(e, "this project needs what this RustGIS can't read: z-values. Update RustGIS to open it.");
+    }
+    // A list that isn't one of names says so, whatever it holds instead.
+    for requires in [json!("z-values"), json!([1]), json!(["a", [["deep"]]]), json!({"z": true}), json!(true)] {
+        let e = Project::from_json(&as_format(2, Some(requires.clone()))).unwrap_err();
+        assert!(
+            e.contains("lists what it needs (`requires`) as something other than names") && e.contains("update RustGIS"),
+            "{requires}: {e}"
+        );
+    }
+    // Long names with line breaks and text-reordering characters, or none at all: five named, cut
+    // short, flattened, and how many more.
+    let mut many: Vec<String> = (0..20).map(|i| format!("cap{i}\n\u{202E}{}", "x".repeat(100))).collect();
+    many.insert(0, "\u{2066}".into());
+    let e = Project::from_json(&as_format(2, Some(json!(many)))).unwrap_err();
+    assert!(e.contains("(unnamed), cap0") && e.contains("cap3") && !e.contains("cap4") && e.contains("and 16 more"), "{e}");
+    assert!(!e.contains(['\n', '\u{202E}', '\u{2066}']) && e.contains("x…"), "{e}");
+    // More names than a document may list: refused without reading them.
+    let too_many: Vec<String> = (0..1000).map(|i| format!("c{i}")).collect();
+    let e = Project::from_json(&as_format(2, Some(json!(too_many)))).unwrap_err();
+    assert!(e.contains("lists more than 256 things it needs"), "{e}");
+    // A name of a million characters is said cut short (`requires_tests` checks what is kept).
+    let e = Project::from_json(&as_format(2, Some(json!(["y".repeat(1_000_000)])))).unwrap_err();
+    assert!(e.len() < 400 && e.contains("yyy…"), "{}", e.len());
+    // Names that look alike once flattened are said once.
+    let e = Project::from_json(&as_format(2, Some(json!(["a\n", "a\r"])))).unwrap_err();
+    assert!(e.contains("read: a. Update"), "{e}");
+    // Format 3 is still from a newer RustGIS, before its capabilities are looked at.
+    let e = Project::from_json(&as_format(3, Some(json!(["z-values"])))).unwrap_err();
+    assert!(e.contains("saved by a newer RustGIS (format 3)"), "{e}");
+    // Importing maps from a format 2 project reads it too.
+    let mut t = world();
+    let maps = t.project.maps.len();
+    t.run("map.import", &json!({"text": as_format(2, None)})).unwrap();
+    assert!(t.project.maps.len() > maps);
 }
 
 #[test]
@@ -44346,6 +44854,29 @@ fn long_commands_stop_when_cancelled_while_they_run() {
     let params = json!({"url":"https://maps.example.org/dataset","type":"ogcapi","text":"{\"collections\":[]}"});
     for command in ["service.layers", "service.add"] {
         let read = crate::cmd::reads::read_ahead(&mut s, command, &params).unwrap();
+        assert!(read.reads());
+        let control = Control::cancelled_once_started();
+        note(command, read.run(&control).map(|_| ()), &control);
+    }
+
+    s.run("layer.addDataText", &json!({"fileName": "calc.csv", "text": "n,day\n1,x\n2,y\n"})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    let edits = [
+        ("edit.setValue", json!({"table": "calc", "row": 0, "field": "n", "value": 3})),
+        ("edit.addFeature", json!({"table": "calc", "attributes": {"n": 3}})),
+        ("edit.addField", json!({"table": "calc", "name": "extra", "type": "text"})),
+        ("edit.deleteField", json!({"table": "calc", "field": "day"})),
+        ("edit.convertField", json!({"table": "calc", "field": "day", "type": "date"})),
+        ("edit.calculateField", json!({"table": "calc", "field": "n", "expression": "n * 2"})),
+    ];
+    assert_eq!(listed(&edits), crate::cmd::edit::TABLE_EDITS.iter().map(|(id, ..)| *id).collect(), "add a new table worker here");
+    for (command, p) in edits {
+        let read = crate::cmd::reads::read_ahead(&mut s, command, &p).unwrap();
+        assert!(read.reads());
+        let control = Control::cancelled_once_started();
+        note(command, read.run(&control).map(|_| ()), &control);
+        let script = json!({"script": format!("{command} {p}")});
+        let read = crate::cmd::reads::read_ahead(&mut s, "script.run", &script).unwrap();
         assert!(read.reads());
         let control = Control::cancelled_once_started();
         note(command, read.run(&control).map(|_| ()), &control);
@@ -46000,6 +46531,129 @@ fn native_date_source_repair_and_reload_use_finished_candidates() {
         assert_eq!(layer.load_all_counted().unwrap().0.value(0, 0).to_string(), "2024-02-29");
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A mobile map package says what simplifying its layers changed or left alone (#1811): a line
+/// reaching 95° (bad data) has its vertex taken as the pole, and a part of one vertex left out;
+/// lines with a longitude too far out are left as they were; one notice per kind. A clean layer,
+/// or one only reaching beyond 85.05°, is simplified with nothing to say.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_mobile_package_says_what_simplifying_did() {
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-mobile-notes-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let said =
+        |s: &Session| s.notices.iter().filter(|n| n.text.starts_with("Mobile map package")).map(|n| n.text.clone()).collect::<Vec<_>>();
+    let package_all = |lines: Vec<Vec<Vec<Coord>>>, name: &str| {
+        let mut s = Session::new(Project::default());
+        let mut ds = Dataset::new("ways", GeometryType::Polyline, vec![]);
+        for line in lines {
+            ds.push(Some(Geometry::Line(line)), vec![]);
+        }
+        s.map_mut().add_dataset(ds);
+        let path = dir.0.join(name);
+        s.run("map.package", &json!({"path": path.display().to_string(), "mobile": true})).unwrap();
+        s
+    };
+    let package = |line: Vec<Vec<Coord>>, name: &str| package_all(vec![line], name);
+    let bad =
+        package(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)], vec![Coord::new(5.0, 5.0)]], "bad.rgismpk");
+    let notes = said(&bad);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes.contains(&"Mobile map package, simplifying: 1 line part(s) of fewer than 2 vertices left out".to_string()), "{notes:?}");
+    assert!(
+        notes.contains(
+            &"Mobile map package, simplifying: 1 vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"
+                .to_string()
+        ),
+        "{notes:?}"
+    );
+    // Lines with a longitude too far out for the analysis plane are left as they were, and said.
+    // (A missing coordinate is too, but a package can't hold one: that's not Simplify's to say.)
+    let unplaced = package_all(
+        vec![
+            vec![vec![Coord::new(0.0, 10.0), Coord::new(-1e300, 10.5), Coord::new(2.0, 10.0)]],
+            vec![vec![Coord::new(0.0, 20.0), Coord::new(1e300, 20.0), Coord::new(2.0, 20.0)]],
+        ],
+        "unplaced.rgismpk",
+    );
+    assert_eq!(
+        said(&unplaced),
+        [
+            "Mobile map package, simplifying: 2 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+        ]
+    );
+    // Clean, or only simplified less than asked (reaching 88°, as Antarctica does): nothing to say.
+    for (line, name) in [
+        (vec![vec![Coord::new(0.0, 40.0), Coord::new(1.0, 40.0001), Coord::new(2.0, 40.0)]], "clean.rgismpk"),
+        (vec![vec![Coord::new(0.0, -80.0), Coord::new(1.0, -88.0), Coord::new(2.0, -80.0)]], "south.rgismpk"),
+    ] {
+        let clean = package(line, name);
+        assert!(said(&clean).is_empty(), "{name}: {:?}", said(&clean));
+    }
+}
+
+/// A globe locator says what simplifying its polygons changed or left alone (#1811), in the
+/// layout's warnings: a ring's vertex at 95° (bad data) taken as the pole; a polygon with a
+/// coordinate missing left as it was, a ring of 3 too. A ring the sketch keeps as it was, or a
+/// clean layer, or one only reaching beyond 85.05°: nothing.
+#[test]
+fn a_globe_locator_says_what_simplifying_did() {
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    let warned = |ring: Vec<Coord>| {
+        let mut s = Session::new(Project::default());
+        let mut ds = Dataset::new("areas", GeometryType::Polygon, vec![]);
+        ds.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+        s.map_mut().add_dataset(ds);
+        let r = s.run("layout.publication", &json!({"extent": [0, 60, 20, 85], "locator": "globe"})).unwrap();
+        r["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w.as_str())
+            .filter(|w| w.starts_with("the globe locator"))
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    let c = Coord::new;
+    let bad = warned(vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 95.0), c(0.0, 80.0), c(0.0, 70.0)]);
+    assert!(
+        bad.contains(
+            &"the globe locator, simplifying its polygons: 1 vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"
+                .to_string()
+        ),
+        "{bad:?}"
+    );
+    // A ring with a coordinate missing is left as it was, and said.
+    let unplaced = warned(vec![c(0.0, 70.0), c(20.0, 70.0), c(f64::NAN, 80.0), c(10.0, 82.0), c(0.0, 80.0), c(0.0, 70.0)]);
+    assert_eq!(
+        unplaced,
+        [
+            "the globe locator, simplifying its polygons: 1 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+        ]
+    );
+    // A ring of 3 with a coordinate missing is too short for the sketch, kept as it was, and said.
+    assert_eq!(warned(vec![c(0.0, 70.0), c(f64::NAN, 80.0), c(0.0, 70.0)]), unplaced);
+    // A ring smaller than the tolerance keeps its vertices as they were, the one past the pole
+    // too, so nothing was taken to the pole: nothing said.
+    let tiny = warned(vec![c(10.0, 89.99999), c(10.00001, 89.99999), c(10.000005, 95.0), c(10.0, 89.99999)]);
+    assert!(tiny.is_empty(), "{tiny:?}");
+    // Clean, or only simplified less than asked (reaching 89°, as Antarctica's -90° does): nothing.
+    for ring in [
+        vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 82.0), c(0.0, 80.0), c(0.0, 70.0)],
+        vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 89.0), c(0.0, 80.0), c(0.0, 70.0)],
+    ] {
+        let clean = warned(ring);
+        assert!(clean.is_empty(), "{clean:?}");
+    }
 }
 
 /// An orbit draws the map at a bearing a frame and puts the view back: a whole turn stops one

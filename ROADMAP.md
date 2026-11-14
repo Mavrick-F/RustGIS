@@ -243,7 +243,7 @@ And alongside it:
   [#596](https://github.com/opengeos/RustGIS/issues/596)).
 
 ### Edit
-- Editable standalone tables (they are read-only today).
+- Selecting and deleting rows of a standalone table (its cells, rows and fields are editable).
 - Shared edges, so that moving one polygon boundary moves its neighbour's too
   ([#872](https://github.com/opengeos/RustGIS/issues/872)). Coincident vertices already move
   together (`edit.moveSharedVertex`, with Shared Vertices on); boundaries with different vertex
