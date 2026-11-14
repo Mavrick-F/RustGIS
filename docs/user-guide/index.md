@@ -488,7 +488,9 @@ retain a field schema.
 The new file is written beside the source with its existing permissions, synced and read back.
 The source is checked again immediately before the atomic replacement; cancellation or failure
 before replacement leaves it unchanged. The same OS lock as for Shapefile prevents concurrent
-RustGIS publishers; its empty `.filename.geojson.rustgis-lock` sidecar stays for reuse. A field
+RustGIS publishers; its empty `.filename.geojson.rustgis-lock` sidecar stays for reuse. Other
+programs do not follow this lock: changes they make after RustGIS's final source check can be
+overwritten by the publish. Stop other writers before publishing. A field
 removed or renamed in the layer produces a notice naming the properties left out. Afterward the
 layer takes the file's read-back values and its new sync point, without changing the project
 format. Undo changes the layer, and shows it as edited; it does not undo a write to the file.

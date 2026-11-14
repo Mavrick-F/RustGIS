@@ -43,14 +43,16 @@ pub fn geojson(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> 
     if crate::sync::rows_digest(&as_read)? != synced.rows {
         return Err(refused(path, "it reads otherwise now than when the layer was read; add the file again to compare it"));
     }
-    let rebuilt = document(&as_read, &original).map_err(|e| refused(path, e))?;
-    if let Some(at) = difference(&original, &rebuilt) {
-        return Err(refused(
-            path,
-            format!(
-                "reading and rewriting it would change {at}; its geometry, properties, numbers or foreign members aren't fully retained"
-            ),
-        ));
+    {
+        let rebuilt = document(&as_read, &original).map_err(|e| refused(path, e))?;
+        if let Some(at) = difference(&original, &rebuilt) {
+            return Err(refused(
+                path,
+                format!(
+                    "reading and rewriting it would change {at}; its geometry, properties, numbers or foreign members aren't fully retained"
+                ),
+            ));
+        }
     }
     let edited = document(ds, &original).map_err(|e| refused(path, e))?;
     let written = serde_json::to_vec(&edited).map_err(|e| refused(path, e))?;
@@ -175,9 +177,13 @@ fn keep_numbers(out: &mut Json, original: &Json) -> std::result::Result<(), Stri
     crate::progress::check().map_err(|e| e.to_string())?;
     match (out, original) {
         (Json::Number(a), Json::Number(b)) => {
-            let (a_text, b_text) = (a.to_string(), b.to_string());
-            if a == b || super::decimal(a_text.as_bytes()).zip(super::decimal(b_text.as_bytes())).is_some_and(|(a, b)| a == b) {
+            if a == b {
                 *a = b.clone();
+            } else {
+                let (a_text, b_text) = (a.to_string(), b.to_string());
+                if super::decimal(a_text.as_bytes()).zip(super::decimal(b_text.as_bytes())).is_some_and(|(a, b)| a == b) {
+                    *a = b.clone();
+                }
             }
         }
         (Json::Object(out), Json::Object(original)) => {
