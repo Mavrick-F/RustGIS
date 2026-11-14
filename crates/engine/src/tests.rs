@@ -422,6 +422,8 @@ fn standalone_tables_keep_their_ids_in_the_project_file() {
     // Saved and read again: the same ids, and the next table gets one that was never used.
     let text = serde_json::to_string(&s.project).unwrap();
     let mut p = Project::from_json(&text).unwrap();
+    assert!(!text.contains("instance_id"), "runtime table identities must not change the saved format");
+    assert_ne!(p.tables[0].instance_id(), s.project.tables[0].instance_id());
     assert_eq!(
         p.tables.iter().map(|t| (t.id, t.name.clone(), t.features.len())).collect::<Vec<_>>(),
         [(ids[0], "sites".to_string(), 1), (ids[1], "notes".to_string(), 1)]
@@ -445,8 +447,10 @@ fn standalone_tables_keep_their_ids_in_the_project_file() {
     let stats = json!({"tool": "summaryStatistics", "params": {"input": "Countries", "field": "pop_est", "case": "continent"}});
     s.run("gp.run", &stats).unwrap();
     let id = s.project.tables.last().map(|t| t.id).unwrap();
+    let instance = s.project.table(id).unwrap().instance_id();
     s.run("gp.run", &stats).unwrap();
     assert_eq!((s.project.tables.len(), s.project.tables.last().map(|t| t.id)), (3, Some(id)));
+    assert_ne!(s.project.table(id).unwrap().instance_id(), instance, "rerunning a tool replaces its table contents");
     // Commands and tools reach a table by its id as well as by its name, which is the first of
     // two tables sharing it.
     for v in [10, 99] {
@@ -20427,8 +20431,8 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
     let areas = layer("Area table", GeometryType::Polygon, vec![(square(0.0, true), vec![V::Text("A".into()), V::Float(2.5)])]);
     let points =
         layer("Point table", GeometryType::Point, vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])]);
-    s.project.tables.push(crate::project::Table { id: 9001, dataset: areas });
-    s.project.tables.push(crate::project::Table { id: 9002, dataset: points });
+    s.project.tables.push(crate::project::Table::new(9001, areas));
+    s.project.tables.push(crate::project::Table::new(9002, points));
     let n = said(&mut s, "share.exportTable", json!({"table": 9001, "path": out("table.csv")}));
     assert!(n.len() == 1 && n[0].contains("the geometry of 1 feature wasn't written"), "{n:?}");
     let n = said(&mut s, "share.exportTable", json!({"table": 9001, "path": out("table.gpx")}));
@@ -42366,7 +42370,7 @@ fn a_scripts_tools_run_ahead_are_taken_by_its_run() {
     assert_eq!(s.undo_depth(), depth + 1);
 
     // Table writes keep their worker rows, so the following tool is taken as well. A table
-    // write and both tools remain one script undo step.
+    // write, its preceding model and following tool remain one script undo step.
     let mut s = session();
     let text = serde_json::to_string(&s.project).unwrap();
     s.run("project.openText", &json!({"text": text})).unwrap();
@@ -42374,7 +42378,7 @@ fn a_scripts_tools_run_ahead_are_taken_by_its_run() {
     s.run("layer.addDataText", &json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
     s.run("edit.enable", &json!({"on": true})).unwrap();
     let depth = s.undo_depth();
-    let p = json!({"script": format!("{}\nedit.setValue {{\"table\":\"records\",\"row\":0,\"field\":\"n\",\"value\":9}}\n{}", tool(1000), tool(2000))});
+    let p = json!({"script": format!("model.run {{\"name\":\"Steps\"}}\nedit.setValue {{\"table\":\"records\",\"row\":0,\"field\":\"n\",\"value\":9}}\n{}", tool(2000))});
     let read = read_ahead(&mut s, "script.run", &p).unwrap().run(&Control::stoppable()).unwrap();
     read_land(&mut s, read).unwrap();
     assert_eq!(s.tools_taken, 2);

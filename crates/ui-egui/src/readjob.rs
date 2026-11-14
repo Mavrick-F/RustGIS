@@ -1315,6 +1315,26 @@ mod tests {
         assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), current);
     }
 
+    /// A file-producing model before a table write must be refused before its file is written.
+    #[test]
+    fn a_table_script_refuses_a_file_model_before_any_live_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("model.pmtiles");
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+        app.run("model.new", json!({"name": "File", "steps": [{"tool": "vectorToPmtiles", "params": {"input": "Cities", "minZoom": 0, "maxZoom": 0, "output": output}}]})).unwrap();
+        app.reads_off_frame = true;
+        let before = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
+        let p = json!({"script": "model.run {\"name\":\"File\"}\nedit.addField {\"table\":\"records\",\"name\":\"extra\"}"});
+        let result = run(&mut app, "script.run", p);
+        if result.is_ok() {
+            landed(&mut app, 60);
+        }
+        assert!(!output.exists(), "the model must not write before a missing table result is refused");
+        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), before);
+        assert!(result.is_err() || app.session.notices.iter().any(|n| n.text.contains("separate scripts")));
+    }
+
     /// A failed worker start refuses every registered table write without installing or undoing data.
     #[test]
     fn a_table_worker_failure_does_not_run_on_the_frame() {
@@ -1379,16 +1399,26 @@ mod tests {
             app.run("edit.undo", Value::Null).unwrap();
         }
         assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before);
-        // Refreshing input must not retarget a waiting command to a replacement with its name.
-        let p = json!({"table": "records", "attributes": {"n": 3}});
-        app.run_by_user("edit.addFeature", p.clone()).unwrap();
-        app.run_by_user("edit.addFeature", p).unwrap();
-        app.session.run("table.remove", &json!({"table": "records"})).unwrap();
-        app.session.run("layer.addDataText", &json!({"fileName": "records.csv", "text": "n\n7\n"})).unwrap();
-        let replacement = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
-        landed(&mut app, 60);
-        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), replacement);
-        assert!(app.session.notices.iter().any(|n| n.text.contains("table changed while the edit was waiting")));
+        // Refreshing input must not retarget a waiting command, even if put_table keeps its id.
+        for keeps_id in [false, true] {
+            let mut app = fixture();
+            app.reads_off_frame = true;
+            let p = json!({"table": "records", "attributes": {"n": 3}});
+            app.run_by_user("edit.addFeature", p.clone()).unwrap();
+            app.run_by_user("edit.addFeature", p).unwrap();
+            if keeps_id {
+                let mut data = app.session.project.tables[0].dataset.clone();
+                data.features[0].attrs[0] = rustgis_engine::data::Value::Int(7);
+                app.session.project.put_table(data);
+            } else {
+                app.session.run("table.remove", &json!({"table": "records"})).unwrap();
+                app.session.run("layer.addDataText", &json!({"fileName": "records.csv", "text": "n\n7\n"})).unwrap();
+            }
+            let replacement = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
+            landed(&mut app, 60);
+            assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), replacement);
+            assert!(app.session.notices.iter().any(|n| n.text.contains("table changed while the edit was waiting")));
+        }
     }
 
     /// Landing rechecks the current editing setting before installing any queued row edit.

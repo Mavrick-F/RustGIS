@@ -66,7 +66,10 @@ pub(crate) fn prune_views(app: &mut RustGisApp) {
             app.table.sort_schema = current.map(|fields| (key, fields.clone()));
         }
     }
-    if app.table.editing.as_ref().is_some_and(|edit| fields_for(edit.view).is_none_or(|fields| fields != &edit.schema)) {
+    if app.table.editing.as_ref().is_some_and(|edit| {
+        fields_for(edit.view).is_none_or(|fields| fields != &edit.schema)
+            || matches!(edit.view, ViewKey::Table(id) if project.table(id).is_none_or(|t| Some(t.instance_id()) != edit.table_instance))
+    }) {
         app.table.editing = None;
     }
 }
@@ -193,6 +196,8 @@ struct CellEdit {
     /// The schema this positional column belongs to. A schema change discards the draft before
     /// the old index can identify another field, including fields with duplicate names.
     schema: Vec<Field>,
+    /// The standalone table contents this draft belongs to; ordinary edits preserve the identity.
+    table_instance: Option<u64>,
     text: String,
     /// The text it opened with: left as it was, nothing is written (a null stays null).
     was: String,
@@ -203,9 +208,9 @@ struct CellEdit {
 
 impl CellEdit {
     /// An edit of column `col` in its opening schema, starting from `text` and taking focus.
-    /// A later schema change discards it instead of redirecting its positional column.
-    fn new(view: ViewKey, fid: u64, col: usize, text: String, fields: &[Field]) -> CellEdit {
-        CellEdit { view, fid, col, schema: fields.to_vec(), was: text.clone(), text, focus: true }
+    /// A schema change or table replacement discards it instead of redirecting the draft.
+    fn new(view: ViewKey, fid: u64, col: usize, text: String, fields: &[Field], table_instance: Option<u64>) -> CellEdit {
+        CellEdit { view, fid, col, table_instance, schema: fields.to_vec(), was: text.clone(), text, focus: true }
     }
 }
 
@@ -234,11 +239,11 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         .frame(egui::Frame::NONE.fill(t.pane))
         .show(ui, |ui| {
             // Data source: a layer or a standalone table.
-            let (ds, selection, title, key): (Dataset, Vec<usize>, String, ViewKey) =
+            let (ds, selection, title, key, table_instance): (Dataset, Vec<usize>, String, ViewKey, Option<u64>) =
                 match layer_id.and_then(|id| app.session.map().layer(id)) {
-                    Some(l) => (l.dataset.clone(), l.selection.clone(), l.name.clone(), ViewKey::Layer(l.instance_id())),
+                    Some(l) => (l.dataset.clone(), l.selection.clone(), l.name.clone(), ViewKey::Layer(l.instance_id()), None),
                     None => match app.session.table_standalone.and_then(|id| app.session.project.table(id)) {
-                        Some(tb) => (tb.dataset.clone(), Vec::new(), tb.name.clone(), ViewKey::Table(tb.id)),
+                        Some(tb) => (tb.dataset.clone(), Vec::new(), tb.name.clone(), ViewKey::Table(tb.id), Some(tb.instance_id())),
                         None => {
                             app.session.table_standalone = None;
                             return;
@@ -513,7 +518,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                                 commits.push((e.fid, e.col, e.text, e.was));
                                             }
                                             let text = if matches!(v, V::Null) { String::new() } else { v.to_string() };
-                                            app.table.editing = Some(CellEdit::new(key, oid, c, text, &ds.fields));
+                                            app.table.editing = Some(CellEdit::new(key, oid, c, text, &ds.fields, table_instance));
                                         } else if resp.clicked() {
                                             clicked = Some((r, ui.input(|i| i.modifiers.command || i.modifiers.shift)));
                                         }
@@ -694,7 +699,7 @@ mod tests {
         h.run_steps(4);
         let tool = h.state().session.tool;
         // Opened as a double-click opens it, the text selected by nothing: typing adds to it.
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, first.clone(), &schema));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, first.clone(), &schema, None));
         h.run_steps(2);
         h.event(egui::Event::Text("Zed".into()));
         h.run_steps(2);
@@ -703,7 +708,7 @@ mod tests {
         assert_eq!(value(h.state(), 0), format!("{first}Zed"));
         assert!(h.state().table.editing.is_none(), "the editor closed");
         // Escape: typed, then left as it was, the tool kept.
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[1], col, second.clone(), &schema));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[1], col, second.clone(), &schema, None));
         h.run_steps(2);
         h.event(egui::Event::Text("Nope".into()));
         h.run_steps(2);
@@ -714,11 +719,11 @@ mod tests {
         assert_eq!(h.state().session.tool, tool, "Escape left the cell, not the tool");
         // Shown another layer meanwhile (Ctrl+T), an open edit is dropped, not written there;
         // so is one left open when the table closes.
-        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Layer(u64::MAX), fid[0], col, String::new(), &schema));
+        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Layer(u64::MAX), fid[0], col, String::new(), &schema, None));
         h.run_steps(2);
         assert!(h.state().table.editing.is_none());
         // A number mistyped is refused, not written as null.
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], num, String::new(), &schema));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], num, String::new(), &schema, None));
         h.run_steps(2);
         h.event(egui::Event::Text("12a".into()));
         h.run_steps(2);
@@ -729,7 +734,7 @@ mod tests {
         // With editing turned off, a value isn't kept, and the table says why.
         h.state_mut().session.map_mut().editing.settings.enabled = false;
         let mark = h.state().session.notice_mark();
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new(), &schema));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new(), &schema, None));
         h.run_steps(2);
         h.event(egui::Event::Text("Off".into()));
         h.run_steps(2);
@@ -738,7 +743,7 @@ mod tests {
         assert_eq!(value(h.state(), 0), format!("{first}Zed"));
         assert!(h.state().session.notices_since(mark).iter().any(|n| n.text.contains("editing is turned off")), "said why");
         h.state_mut().session.map_mut().editing.settings.enabled = true;
-        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new(), &schema));
+        h.state_mut().table.editing = Some(CellEdit::new(key, fid[0], col, String::new(), &schema, None));
         h.state_mut().session.table_layer = None;
         h.run_steps(2);
         assert!(h.state().table.editing.is_none(), "dropped when the table closed");
@@ -747,9 +752,10 @@ mod tests {
         let table = h.state().session.project.tables[0].id;
         let tfid = h.state().session.project.tables[0].dataset.features[0].id;
         let table_fields = h.state().session.project.tables[0].dataset.fields.clone();
+        let table_instance = Some(h.state().session.project.tables[0].instance_id());
         h.state_mut().session.table_standalone = Some(table);
         h.run_steps(2);
-        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Table(table), tfid, 1, "Rue Cler".into(), &table_fields));
+        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Table(table), tfid, 1, "Rue Cler".into(), &table_fields, table_instance));
         h.run_steps(2);
         h.event(egui::Event::Text(" 2".into()));
         h.run_steps(2);
@@ -903,12 +909,13 @@ mod tests {
         // The table follows this project from here.
         prune_views(&mut app);
         let (id, fs) = table(&mut app);
+        let table_instance = Some(app.session.project.table(id).unwrap().instance_id());
         let mut v = ColumnView::default();
         v.hide(&fs, 0);
         app.table.views.insert(ViewKey::Table(id), v);
         prune_views(&mut app);
         assert_eq!(app.table.views.get(&ViewKey::Table(id)).map(|v| v.hidden_count(&fs)), Some(1), "kept in its project");
-        app.table.editing = Some(CellEdit::new(ViewKey::Table(id), 1, 0, "old draft".into(), &fs));
+        app.table.editing = Some(CellEdit::new(ViewKey::Table(id), 1, 0, "old draft".into(), &fs, table_instance));
         app.session.run("project.new", &json!({})).unwrap();
         let (again, _) = table(&mut app);
         assert_eq!(again, id, "the new project's table takes the same id");
@@ -917,37 +924,62 @@ mod tests {
         assert!(app.table.editing.is_none(), "a pending draft must not reach the new project's same-id table");
     }
 
-    /// An agent can remove an earlier column between frames while a cell owns focus. Enter
-    /// must discard that draft rather than write into the next field at the same raw index.
+    /// Schema changes and tool replacements discard a focused draft, but ordinary edits keep it.
     #[test]
-    fn a_cell_draft_cannot_write_another_field_after_schema_changes() {
-        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
-        let added = app.run("layer.addDataText", json!({"fileName": "draft.csv", "text": "gone,edited,victim\nA,B,C\n"})).unwrap();
-        app.run("edit.enable", json!({"on": true})).unwrap();
-        let id = added["id"].as_u64().unwrap() as u32;
-        app.session.table_standalone = Some(id);
-        let fields = app.session.project.tables[0].dataset.fields.clone();
-        let fid = app.session.project.tables[0].dataset.features[0].id;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
-            |ui, app: &mut RustGisApp| {
-                let ctx = ui.ctx().clone();
-                app.logic(&ctx);
-                app.ui(ui);
-            },
-            app,
-        );
-        h.run_steps(4);
-        h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Table(id), fid, 1, "B".into(), &fields));
-        h.run_steps(2);
-        h.event(egui::Event::Text(" draft".into()));
-        h.run_steps(2);
-        h.state_mut().session.run("edit.deleteField", &json!({"table": id, "field": "gone"})).unwrap();
-        h.key_press(egui::Key::Enter);
-        h.run_steps(4);
-        let data = &h.state().session.project.tables[0].dataset;
-        assert_eq!(data.value(0, data.field_index("victim").unwrap()).to_string(), "C");
-        assert_eq!(data.value(0, data.field_index("edited").unwrap()).to_string(), "B");
-        assert!(h.state().table.editing.is_none());
+    fn a_cell_draft_cannot_write_replaced_data() {
+        for change in ["schema", "replacement", "edit"] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let added =
+                app.run("layer.addDataText", json!({"fileName": "draft.csv", "text": "gone,edited,victim\nA,B,C\nD,E,F\n"})).unwrap();
+            app.run("edit.enable", json!({"on": true})).unwrap();
+            let id = added["id"].as_u64().unwrap() as u32;
+            app.session.table_standalone = Some(id);
+            let fields = app.session.project.tables[0].dataset.fields.clone();
+            let fid = app.session.project.tables[0].dataset.features[0].id;
+            let table_instance = Some(app.session.project.tables[0].instance_id());
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+            h.run_steps(4);
+            h.state_mut().table.editing = Some(CellEdit::new(ViewKey::Table(id), fid, 1, "B".into(), &fields, table_instance));
+            h.run_steps(2);
+            h.event(egui::Event::Text(" draft".into()));
+            h.run_steps(2);
+            match change {
+                "schema" => {
+                    h.state_mut().session.run("edit.deleteField", &json!({"table": id, "field": "gone"})).unwrap();
+                }
+                "replacement" => {
+                    let mut data = h.state().session.project.table(id).unwrap().dataset.clone();
+                    data.features[0].attrs[1] = V::Text("replacement".into());
+                    assert_eq!(h.state_mut().session.project.put_table(data), id);
+                }
+                _ => {
+                    h.state_mut()
+                        .session
+                        .run("edit.setValue", &json!({"table": id, "row": 1, "field": "edited", "value": "ordinary edit"}))
+                        .unwrap();
+                }
+            }
+            h.key_press(egui::Key::Enter);
+            h.run_steps(4);
+            let data = &h.state().session.project.tables[0].dataset;
+            assert_eq!(data.value(0, data.field_index("victim").unwrap()).to_string(), "C");
+            assert_eq!(
+                data.value(0, data.field_index("edited").unwrap()).to_string(),
+                match change {
+                    "replacement" => "replacement",
+                    "edit" => "B draft",
+                    _ => "B",
+                }
+            );
+            assert!(h.state().table.editing.is_none());
+        }
     }
 
     /// Deleting through the menu clears sorting when the schema lands, including a sort picked

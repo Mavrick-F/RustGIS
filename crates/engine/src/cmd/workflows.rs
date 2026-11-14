@@ -706,20 +706,52 @@ pub(crate) fn script_ahead(s: &Session, p: &Value, native: bool) -> Result<Optio
     let Some(script) = ps(p, "script") else { return Ok(None) };
     let Ok(lines) = script_commands(script) else { return Ok(None) };
     let table = |id: &str, p: &Value| super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null());
-    if let Some(last) = lines.iter().rposition(|(_, id, p)| table(id, p)) {
+    if lines.iter().any(|(_, id, p)| table(id, p)) {
         if !native {
             return Err(
                 "this script cannot prepare table writes under its current permissions: run the table edit commands directly".into()
             );
         }
-        if let Some((n, id, _)) = lines.iter().take(last + 1).find(|(_, id, p)| !runs_on_a_copy(s, id, p)) {
+        check_table_prefix(s, &lines)?;
+    }
+    let Some((_, id, params)) = lines.first() else { return Ok(None) };
+    Ok((native && runs_on_a_copy(s, id, params)).then(|| ahead_on_copy(s, SCRIPT_AHEAD, p)))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Refuses an unrecordable prefix before any live line can run ahead of a table write. Inspect
+/// model tool metadata too: their command id alone does not reveal file-producing or plugin steps.
+/// Recheck at landing, since a named model may have changed while the script worker ran.
+fn check_table_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(), String> {
+    let Some(last) = lines
+        .iter()
+        .rposition(|(_, id, p)| super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null()))
+    else {
+        return Ok(());
+    };
+    let recordable_tool = |id: &str| {
+        rustgis_analysis::resolve_published(id)
+            .is_some_and(|tool| tool.source() != Some(rustgis_plugins::tools::SOURCE) && !super::gp::writes_files(tool.spec()))
+    };
+    for (n, id, p) in lines.iter().take(last + 1) {
+        let nested = match id.as_str() {
+            "model.run" => model_graph(s, p).is_ok_and(|(_, graph, _)| {
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == crate::project::ModelNodeKind::Tool)
+                    .all(|node| node.tool.as_deref().is_some_and(recordable_tool))
+            }),
+            "gp.batch" => ps(p, "tool").is_some_and(recordable_tool),
+            _ => true,
+        };
+        if !nested || !runs_on_a_copy(s, id, p) {
             return Err(format!(
                 "line {n} ({id}) cannot be prepared before the table writes: run the setup and table writes as separate scripts"
             ));
         }
     }
-    let Some((_, id, params)) = lines.first() else { return Ok(None) };
-    Ok((native && runs_on_a_copy(s, id, params)).then(|| ahead_on_copy(s, SCRIPT_AHEAD, p)))
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -920,8 +952,13 @@ pub(crate) fn run_script(s: &mut Session, p: &Value) -> CmdResult {
 fn run_script_here(s: &mut Session, p: &Value, prepared: bool) -> CmdResult {
     let _ = prepared;
     let script = ps(p, "script").ok_or("script is required")?;
+    let lines = script_commands(script)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if prepared {
+        check_table_prefix(s, &lines)?;
+    }
     let mut out = Vec::new();
-    for (n, id, params) in script_commands(script)? {
+    for (n, id, params) in lines {
         let spec = *s.registry.get(&id).ok_or_else(|| format!("line {n}: unknown command '{id}'"))?;
         let (mutates, label) = (spec.mutates, spec.label);
         // On a copy of the session ([`ahead_on_copy`]): from a line that may reach outside it,
