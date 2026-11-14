@@ -1751,6 +1751,16 @@ pub fn gzip_text_prefix(reader: impl std::io::Read, limit: usize) -> Result<Vec<
 /// expanded file. Other encodings can be decompressed and added as .txt. The existing table
 /// builder retains rows for type inference; this isn't a read-in-place provider.
 pub fn read_gzip_text(reader: impl std::io::Read, file_name: &str, opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
+    read_gzip_text_budget(reader, file_name, opts, &mut csv_memory_budget())
+}
+
+/// Reads a gzip member against the remaining retained-table allowance shared by its archive.
+fn read_gzip_text_budget(
+    reader: impl std::io::Read,
+    file_name: &str,
+    opts: &CsvOptions,
+    budget: &mut usize,
+) -> Result<(Dataset, ReadReport)> {
     use std::io::{BufRead, Read};
     if !is_gzip_text_name(file_name) {
         return Err(DataError::Unsupported(format!("{file_name}: decompress it first, then add the supported file inside")));
@@ -1800,7 +1810,7 @@ pub fn read_gzip_text(reader: impl std::io::Read, file_name: &str, opts: &CsvOpt
             )));
         }
     }
-    let result = read_csv_records(&mut rdr, name, opts, csv_memory_budget());
+    let result = read_csv_records(&mut rdr, name, opts, budget);
     crate::progress::check()?;
     let (mut dataset, report) =
         result.map_err(|e| DataError::Format(format!("{file_name}: {e}; if not UTF-8, decompress and add as .txt")))?;
@@ -1822,7 +1832,7 @@ fn read_csv_records(
     reader: &mut csv::Reader<impl std::io::Read>,
     name: &str,
     opts: &CsvOptions,
-    budget: usize,
+    budget: &mut usize,
 ) -> Result<(Dataset, ReadReport)> {
     let cost = |r: &csv::StringRecord, columns: usize| {
         r.as_slice()
@@ -1832,7 +1842,9 @@ fn read_csv_records(
             .saturating_add(columns.saturating_mul(2 * std::mem::size_of::<Value>()))
             .saturating_add(2 * (std::mem::size_of::<Vec<String>>() + std::mem::size_of::<crate::Feature>()))
     };
-    let too_large = || DataError::Format(format!("CSV retained table exceeds the {budget}-byte memory budget; import a smaller file"));
+    let allowance = *budget;
+    let too_large =
+        || DataError::Format(format!("CSV retained table exceeds the {allowance}-byte remaining memory budget; import a smaller file"));
     let header = reader.headers().map_err(|e| DataError::Format(format!("CSV: {e}")))?;
     let mut left = budget.checked_sub(cost(header, header.len())).ok_or_else(too_large)?;
     let headers: Vec<String> = header.iter().map(str::to_string).collect();
@@ -1851,17 +1863,24 @@ fn read_csv_records(
             Err(_) => malformed += 1,
         }
     }
-    read_rows(&headers, &rows, malformed, name, opts, None)
+    let result = read_rows(&headers, &rows, malformed, name, opts, None)?;
+    *budget = left;
+    Ok(result)
 }
 
 /// Reads delimited text with explicit columns/separator, including gzip. Uncompressed text
 /// uses [`delimited_text`]'s encoding detection. A DAT needs a delimiter or recognisable rows.
 pub fn read_delimited_bytes(file_name: &str, bytes: &[u8], opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
+    read_delimited_bytes_budget(file_name, bytes, opts, &mut csv_memory_budget())
+}
+
+/// Reads an archive member without resetting the retained-table allowance.
+fn read_delimited_bytes_budget(file_name: &str, bytes: &[u8], opts: &CsvOptions, budget: &mut usize) -> Result<(Dataset, ReadReport)> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(DataError::Format(format!("{file_name}: file exceeds the {MAX_BYTES}-byte limit")));
     }
     if is_gzip_text_name(file_name) {
-        return read_gzip_text(bytes, file_name, opts);
+        return read_gzip_text_budget(bytes, file_name, opts, budget);
     }
     let (text, note) = delimited_text(file_name, bytes)?;
     if file_name.to_ascii_lowercase().ends_with(".dat") && opts.delimiter.is_none() && delimited_table_columns(&text) < 2 {
@@ -1870,7 +1889,7 @@ pub fn read_delimited_bytes(file_name: &str, bytes: &[u8], opts: &CsvOptions) ->
         )));
     }
     let name = Path::new(file_name).file_stem().and_then(|n| n.to_str()).unwrap_or("table");
-    let (mut ds, mut report) = read_csv_with(&text, name, opts)?;
+    let (mut ds, mut report) = read_csv_with_budget(&text, name, opts, budget)?;
     ds.source = Some(file_name.to_string());
     report.messages.extend(note);
     Ok((ds, report))
@@ -1884,11 +1903,16 @@ pub fn read_csv(text: &str, name: &str) -> Result<(Dataset, ReadReport)> {
 /// Reads delimited text: points from x/y columns (longitude/latitude unless `crs` says
 /// otherwise), or geometry from a WKT column; without either it is a table.
 pub fn read_csv_with(text: &str, name: &str, opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
+    read_csv_with_budget(text, name, opts, &mut csv_memory_budget())
+}
+
+/// Parses a text member using the same retained-table accounting as streamed gzip records.
+fn read_csv_with_budget(text: &str, name: &str, opts: &CsvOptions, budget: &mut usize) -> Result<(Dataset, ReadReport)> {
     // Spreadsheet exports often start with a byte-order mark, which would hide the first header.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let delimiter = opts.delimiter.unwrap_or_else(|| sniff_delimiter(text));
     let mut rdr = csv::ReaderBuilder::new().flexible(true).delimiter(delimiter).from_reader(text.as_bytes());
-    read_csv_records(&mut rdr, name, opts, csv_memory_budget())
+    read_csv_records(&mut rdr, name, opts, budget)
 }
 
 /// Rows of text cells under a header row (delimited text, a spreadsheet's sheet) as a dataset, as
@@ -2478,6 +2502,11 @@ pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadRepor
 /// knows. The override is applied before reading any shapes. Cancellation is checked between
 /// archive members and records; inflating one member cannot be interrupted mid-decompression.
 pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Vec<(Dataset, ReadReport)>> {
+    read_zip_budget(file_name, bytes, crs, &mut csv_memory_budget())
+}
+
+/// Delimited members share one allowance, including gzip members whose text is nested in ZIP.
+fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut usize) -> Result<Vec<(Dataset, ReadReport)>> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(DataError::Format(format!("file is too large ({} bytes)", bytes.len())));
     }
@@ -2587,7 +2616,7 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
         let read = if is_city_model(leaf, &b) {
             read_city_member(leaf, &b, crs)
         } else if is_delimited_name(leaf) {
-            read_delimited_bytes(leaf, &b, &CsvOptions { crs, ..Default::default() }).map(|r| vec![r])
+            read_delimited_bytes_budget(leaf, &b, &CsvOptions { crs, ..Default::default() }, budget).map(|r| vec![r])
         } else {
             read_bytes(leaf, &b).map(|r| vec![r])
         };
@@ -5291,18 +5320,38 @@ mod tests {
         let bytes = gzip_csv(format!("a,b,c,d\n{}", ",,,\n".repeat(1000)).as_bytes());
         assert!(bytes.len() < 100);
         let mut reader = csv::ReaderBuilder::new().from_reader(GzipText::new(bytes.as_slice()));
-        let error = read_csv_records(&mut reader, "small", &CsvOptions::default(), 4096).unwrap_err();
+        let error = read_csv_records(&mut reader, "small", &CsvOptions::default(), &mut 4096).unwrap_err();
         assert!(error.to_string().contains("memory budget"), "{error}");
         let mut reader = csv::ReaderBuilder::new().from_reader(GzipText::new(bytes.as_slice()));
-        let (table, report) = read_csv_records(&mut reader, "small", &CsvOptions::default(), 1 << 20).unwrap();
+        let (table, report) = read_csv_records(&mut reader, "small", &CsvOptions::default(), &mut (1 << 20)).unwrap();
         assert_eq!(table.features.len(), 1000);
         assert!(report.messages.is_empty());
         // Missing fields still become dataset attributes, so charge the complete header width.
         let header = (0..100).map(|i| format!("f{i}")).collect::<Vec<_>>().join(",");
         let bytes = gzip_csv(format!("{header}\n{}", "x\n".repeat(100)).as_bytes());
         let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(GzipText::new(bytes.as_slice()));
-        let error = read_csv_records(&mut reader, "short", &CsvOptions::default(), 64 << 10).unwrap_err();
+        let error = read_csv_records(&mut reader, "short", &CsvOptions::default(), &mut (64 << 10)).unwrap_err();
         assert!(error.to_string().contains("memory budget"), "{error}");
+    }
+
+    /// Two nested gzip tables can each fit while their combined retained cells do not.
+    #[test]
+    fn zip_delimited_members_share_retained_budget() {
+        let text = b"id,n\nA,1\n";
+        let gzip = gzip_csv(text);
+        let mut left = 1 << 20;
+        read_delimited_bytes_budget("a.csv.gz", &gzip, &CsvOptions::default(), &mut left).unwrap();
+        let cost = (1 << 20) - left;
+        for second in ["b.csv.gz", "b.csv"] {
+            let bytes = if second.ends_with(".gz") { gzip.clone() } else { text.to_vec() };
+            let zip = crate::zip::write(&[("a.csv.gz".into(), gzip.clone()), (second.into(), bytes)]).unwrap();
+            let limited = read_zip_budget("tables.zip", &zip, None, &mut { cost }).unwrap();
+            assert_eq!(limited.len(), 1);
+            assert!(limited[0].1.messages.iter().any(|m| m.contains(second) && m.contains("memory budget")));
+            let clean = read_zip_budget("tables.zip", &zip, None, &mut (cost * 2)).unwrap();
+            assert_eq!(clean.len(), 2);
+            assert!(clean.iter().all(|(_, report)| report.messages.is_empty()));
+        }
     }
 
     /// Cancellation while the CSV parser asks for more of a long DAT header stays cancellation.

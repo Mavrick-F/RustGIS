@@ -78,7 +78,8 @@ Gzip-compressed UTF-8 `.csv.gz`, `.tsv.gz`, `.txt.gz` and `.dat.gz` open directl
 URL or upload. Decompression streams records, checks the gzip checksum and stops at 256 MiB of
 expanded text. Table rows are still kept in memory for type inference; CSV imports also refuse
 a retained-table estimate above a quarter of physical memory, between 256 MiB (the browser
-budget) and 4 GiB. This estimate includes cell objects and the dataset built alongside the rows.
+budget) and 4 GiB. This estimate includes cell objects and the dataset built alongside the rows. Delimited members
+in one ZIP share this allowance, including gzip-compressed members.
 For another encoding, decompress the file and add the `.txt` file, whose reader detects the encoding. Delimited text
 is exported as `.csv`; gzip is an input format.
 

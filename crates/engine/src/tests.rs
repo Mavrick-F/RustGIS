@@ -47066,6 +47066,22 @@ fn a_command_says_once_that_it_couldnt_zoom() {
     assert_eq!(s.map().camera.center, view.center);
 }
 
+/// Column inspection rejects the same invalid gzip encoding as import, on disk and upload.
+#[test]
+fn gzip_columns_require_utf8() {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode("H4sIAAAAAAAC/8tM0clLzE3lctRJTkx7yQUACDIXQA8AAAA=").unwrap();
+    let p = json!({});
+    assert!(super::cmd::layer::columns_of("latin.csv.gz", &bytes, &p).unwrap_err().contains("UTF-8"));
+    let path = std::env::temp_dir().join(format!("rustgis-latin-columns-{}.csv.gz", std::process::id()));
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(super::cmd::layer::columns_in_file(path.to_str().unwrap(), &p).unwrap_err().contains("UTF-8"));
+    assert!(rustgis_data::io::read_bytes("latin.csv.gz", &bytes).is_err());
+    std::fs::remove_file(path).unwrap();
+    // The documented fallback still accepts the decompressed Windows-1252 text.
+    assert!(super::cmd::layer::columns_of("latin.txt", b"id,name\nA,caf\xe9\n", &p).is_ok());
+}
+
 /// Compressed and DAT imports reach the same command options through files and uploads.
 #[test]
 fn published_text_import_paths() {

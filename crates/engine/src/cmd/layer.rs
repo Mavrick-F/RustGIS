@@ -3589,7 +3589,7 @@ pub fn columns_in_file(path: &str, p: &Value) -> CmdResult {
         let reader = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
         let prefix = rustgis_data::io::gzip_text_prefix(reader, COLUMNS_PREFIX).map_err(|e| format!("{path}: {e}"))?;
         let plain = path.get(..path.len().saturating_sub(3)).unwrap_or(path);
-        return columns_of(plain, &prefix, p);
+        return gzip_columns(plain, &prefix, p);
     }
     let mut bytes = Vec::new();
     let read = if sheet {
@@ -3599,6 +3599,16 @@ pub fn columns_in_file(path: &str, p: &Value) -> CmdResult {
     };
     read.map_err(|e| format!("{path}: {e}"))?;
     columns_of(path, &bytes, p)
+}
+
+/// Gzip import accepts UTF-8 only. A bounded picker prefix may end inside one character.
+fn gzip_columns(plain: &str, prefix: &[u8], p: &Value) -> CmdResult {
+    let text = match std::str::from_utf8(prefix) {
+        Ok(text) => text,
+        Err(e) if e.error_len().is_none() => std::str::from_utf8(prefix.get(..e.valid_up_to()).unwrap_or_default()).unwrap_or_default(),
+        Err(_) => return Err(format!("{plain}.gz: gzip text must be UTF-8; decompress and add as .txt for another encoding")),
+    };
+    columns_of(plain, text.as_bytes(), p)
 }
 
 /// What `info.fileColumns` reads of delimited text: its header and first rows, not all of it.
@@ -3616,7 +3626,7 @@ pub fn columns_of(name: &str, bytes: &[u8], p: &Value) -> CmdResult {
     } else if rustgis_data::io::is_gzip_text_name(name) {
         let prefix = rustgis_data::io::gzip_text_prefix(bytes, COLUMNS_PREFIX).map_err(err)?;
         let plain = name.get(..name.len().saturating_sub(3)).unwrap_or(name);
-        return columns_of(plain, &prefix, p);
+        return gzip_columns(plain, &prefix, p);
     } else if is_delimited_name(name) {
         let bytes = bytes.get(..COLUMNS_PREFIX).unwrap_or(bytes);
         let text = match std::str::from_utf8(bytes) {
