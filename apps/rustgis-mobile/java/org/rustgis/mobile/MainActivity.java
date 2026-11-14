@@ -24,6 +24,7 @@ import java.util.ArrayList;
  *   position  lon  lat  accuracy  time   where the device is (accuracy in metres, or empty;
  *                                        time in milliseconds since 1970)
  *   stopped                          positioning ended without being asked to
+ *   photo     name  path             a photo the camera took, in the app's photos folder
  *   failed    text                   what went wrong, to show the user
  */
 public class MainActivity extends NativeActivity {
@@ -31,6 +32,7 @@ public class MainActivity extends NativeActivity {
     private static final int SAVE = 2;
     private static final int LOCATION = 3;
     private static final int NOTIFY = 4;
+    private static final int PHOTO = 5;
     /**
      * The most events kept for the Rust side: two days of a position a second out of sight. The
      * Rust side keeps as many positions between frames (FIXES_KEPT), so a batch goes whole into a track.
@@ -63,6 +65,8 @@ public class MainActivity extends NativeActivity {
     private boolean started;
     /** A picker for opening is shown and has not answered (the main thread's alone). */
     private boolean picking;
+    /** The photo the camera app is writing, until it answers (the main thread's alone). */
+    private File photo;
     private String saveName = "";
     private byte[] saveBytes;
 
@@ -70,6 +74,14 @@ public class MainActivity extends NativeActivity {
     protected void onCreate(android.os.Bundle saved) {
         super.onCreate(saved);
         current = this;
+        // A photo being taken when Android ended the app (the camera app in front): its file.
+        if (saved != null && saved.getString("photo") != null) {
+            photo = new File(saved.getString("photo"));
+            // The camera's answer is still to come: answered() balances this.
+            synchronized (events) {
+                asked++;
+            }
+        }
         // The insets are read where Android hands them over, on the main thread, and kept for
         // the Rust side to ask for from its own.
         getWindow().getDecorView().setOnApplyWindowInsetsListener((view, given) -> {
@@ -345,6 +357,50 @@ public class MainActivity extends NativeActivity {
         super.onDestroy();
     }
 
+    /** Keeps the photo being taken's file, should Android end the app while the camera is up. */
+    @Override
+    protected void onSaveInstanceState(android.os.Bundle out) {
+        super.onSaveInstanceState(out);
+        if (photo != null) {
+            out.putString("photo", photo.getAbsolutePath());
+        }
+    }
+
+    /**
+     * Asks the camera app for a photo, written to the app's photos folder through PhotoProvider:
+     * a "photo" event follows, or "cancelled". The device's own camera app takes it, so RustGIS
+     * needs no camera permission.
+     */
+    public void takePhoto() {
+        runOnUiThread(() -> {
+            if (photo != null) {
+                add("failed\tA photo is already being taken. Take another when it is done.");
+                return;
+            }
+            String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.ROOT).format(new java.util.Date());
+            File file = new File(PhotoProvider.folder(this), "photo-" + stamp + ".jpg");
+            for (int n = 2; file.exists(); n++) {
+                file = new File(PhotoProvider.folder(this), "photo-" + stamp + "-" + n + ".jpg");
+            }
+            Uri uri = Uri.parse("content://" + PhotoProvider.AUTHORITY + "/" + file.getName());
+            Intent intent = new Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE);
+            intent.putExtra(android.provider.MediaStore.EXTRA_OUTPUT, uri);
+            // The leave to write goes with the address, to whichever camera app answers.
+            intent.setClipData(ClipData.newRawUri("photo", uri));
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            photo = file;
+            try {
+                startActivityForResult(intent, PHOTO);
+                synchronized (events) {
+                    asked++;
+                }
+            } catch (RuntimeException e) {
+                photo = null;
+                add("failed\tThis device has no camera app: " + e.getMessage());
+            }
+        });
+    }
+
     /** Asks the user for files with the system's picker; each arrives as a "picked" event. */
     public void pick(final String purpose) {
         runOnUiThread(() -> {
@@ -494,6 +550,29 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == PHOTO) {
+            File file = photo;
+            photo = null;
+            // Kept only when the camera said it took it and wrote something: a cancelled
+            // camera leaves an empty file behind, which goes. One that wrote a photo and then
+            // said it was cancelled keeps it, unattached, and that is said.
+            if (file != null && result == RESULT_OK && file.length() > 0) {
+                add("photo\t" + file.getName() + "\t" + file.getAbsolutePath());
+            } else if (file != null && file.length() > 0) {
+                add("failed\tThe camera app wrote a photo and then said it was cancelled: it wasn't attached, and is kept as " + file.getAbsolutePath());
+            } else {
+                if (file != null) {
+                    file.delete();
+                }
+                if (file == null && result == RESULT_OK) {
+                    add("failed\tThe camera app took a photo, but RustGIS lost track of it: look in its photos folder.");
+                } else {
+                    add(result == RESULT_OK ? "failed\tThe camera app said it took a photo, but wrote none." : "cancelled");
+                }
+            }
+            answered();
+            return;
+        }
         if (request == PICK) {
             picking = false;
             final ArrayList<Uri> uris = new ArrayList<>();
