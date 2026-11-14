@@ -6324,6 +6324,75 @@ fn applying_a_style_keeps_the_layers_own_label_moves() {
     assert!(s.notices_since(mark).iter().any(|n| n.text.contains("1 saved label move(s) in style Moved not applied")));
 }
 
+/// Styles: a name given past 200 characters is refused, not cut; a file's styles past the 1,000
+/// one file adds, names cut to fit and styles a later one of the same name replaces are said, one
+/// notice a kind with its count (#1972). Within the limits, nothing is said.
+#[test]
+fn styles_refuse_or_say_what_they_cut() {
+    let mut s = world();
+    let at = |n: usize| "é".repeat(n);
+    let said = |s: &Session, mark: u64, what: &str| {
+        s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.starts_with(what)).collect::<Vec<_>>()
+    };
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    // A name given: refused past 200 characters, nothing added; taken whole at 200.
+    let styles = s.project.styles.len();
+    let e = s.run("style.new", &json!({"layer": id, "name": at(201)})).unwrap_err();
+    assert!(e.contains("201 characters") && e.contains("at most 200"), "{e}");
+    assert_eq!(s.project.styles.len(), styles);
+    assert_eq!(s.run("style.new", &json!({"layer": id, "name": at(200)})).unwrap()["style"], at(200));
+    // No name, from a layer whose name is longer (an import's): its first 200, said, and the
+    // answer gives the name kept.
+    let long = format!("{}x", at(200));
+    s.map_mut().layer_mut(id).unwrap().name = long.clone();
+    let mark = s.notice_mark();
+    let r = s.run("style.new", &json!({"layer": id})).unwrap();
+    assert_eq!(r["style"], at(200));
+    assert_eq!(said(&s, mark, "New Style"), ["New Style: the style takes the first 200 characters of the layer's name"]);
+    s.map_mut().layer_mut(id).unwrap().name = "Cities".into();
+    // A style file of 1,002: two of one name, one name past 200, and 999 others. The first 1,000
+    // are read; the later twin replaces the earlier.
+    s.run("style.new", &json!({"layer": id, "name": "Base"})).unwrap();
+    let base = serde_json::to_value(s.project.styles.iter().find(|t| t.name == "Base").unwrap()).unwrap();
+    let named = |name: &str| {
+        let mut v = base.clone();
+        v["name"] = json!(name);
+        v
+    };
+    let mut file = vec![named("Twin"), named("twin"), named(&format!("{}y", at(200)))];
+    file.extend((0..999).map(|i| named(&format!("S{i}"))));
+    let mark = s.notice_mark();
+    let r = s.run("style.add", &json!({"text": Value::Array(file).to_string()})).unwrap();
+    // Twin and twin are one style; the 1,000 read hold 999 names.
+    assert_eq!(r["added"], 999);
+    assert!(s.project.styles.iter().any(|t| t.name == "twin") && !s.project.styles.iter().any(|t| t.name == "Twin"));
+    assert!(s.project.styles.iter().any(|t| t.name == "S996") && !s.project.styles.iter().any(|t| t.name == "S997"));
+    let mut notes = said(&s, mark, "Add Style");
+    notes.sort();
+    assert_eq!(
+        notes,
+        [
+            "Add Style: 1 style name(s) cut to 200 characters",
+            "Add Style: 1 style(s) replaced by a later one of the same name in the file",
+            "Add Style: the first 1000 of the file's 1002 styles are added",
+        ]
+    );
+    // A clean file says nothing.
+    let mark = s.notice_mark();
+    s.run("style.add", &json!({"text": json!([named("Clean")]).to_string()})).unwrap();
+    assert!(said(&s, mark, "Add Style").is_empty());
+    // Import Styles from a map file with two feature layers of one name: one style, said.
+    let other =
+        s.map().layers.iter().find(|l| !l.is_raster() && l.id != id && l.geometry_type() != rustgis_data::GeometryType::None).unwrap().id;
+    s.map_mut().layer_mut(other).unwrap().name = "Cities".into();
+    let map = serde_json::to_value(s.map()).unwrap();
+    let mark = s.notice_mark();
+    let r = s.run("style.import", &json!({"text": map.to_string()})).unwrap();
+    let layers = s.map().layers.iter().filter(|l| !l.is_raster() && l.geometry_type() != rustgis_data::GeometryType::None).count();
+    assert_eq!(r["imported"], layers - 1, "the two Cities are one style");
+    assert_eq!(said(&s, mark, "Import Styles"), ["Import Styles: 1 style(s) replaced by a later one of the same name in the file"]);
+}
+
 /// A project template keeps no features, so no saved label moves either, and says so.
 #[test]
 fn a_project_template_leaves_out_label_moves() {

@@ -82,11 +82,23 @@ pub fn commands() -> Vec<C> {
         C::new("style.new", "New Style", "Style › Styles", |s, p| {
             let id = s.layer_id(p)?;
             let l = s.map().layer(id).ok_or("no such layer")?;
-            let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| l.name.clone());
+            // A name given past the limit is refused, not cut (#1972). Without one, the
+            // style takes the layer's name, the first of it when that's longer, and says so.
+            let given = ps(p, "name").map(str::trim).filter(|n| !n.is_empty());
+            if let Some(n) = given {
+                let length = n.chars().count();
+                if length > MAX_STYLE_NAME {
+                    return Err(format!("name is {length} characters: a style's name takes at most {MAX_STYLE_NAME}"));
+                }
+            }
+            let name = given.map(String::from).unwrap_or_else(|| l.name.clone());
             let (renderer, left_out) = super::layer::renderer_with_fills(l);
             let layer = l.name.clone();
-            let item = StyleItem { name: name.clone(), geometry: l.geometry_type(), renderer, labels: l.labels.clone(), transparency: l.transparency };
-            add_style(s, item);
+            let item = StyleItem { name, geometry: l.geometry_type(), renderer, labels: l.labels.clone(), transparency: l.transparency };
+            let (name, cut) = add_style(s, item);
+            if cut {
+                s.notify(format!("New Style: the style takes the first {MAX_STYLE_NAME} characters of the layer's name"), false);
+            }
             if left_out > 0 {
                 s.notify(format!("Style {name} from {layer}: {left_out} fill(s) No Fill hid couldn't be put back in it, as their classes have fills of their own now, are gone or their opacity wasn't kept; it draws them as the layer does now"), false);
             }
@@ -98,12 +110,7 @@ pub fn commands() -> Vec<C> {
             let text = read_text(p)?;
             crate::project::check_format(&text, "style file")?;
             let items: Vec<StyleItem> = serde_json::from_str(&text).map_err(|e| format!("not a RustGIS style file: {e}"))?;
-            let mut n = 0;
-            for it in items.into_iter().take(1000) {
-                add_style(s, it);
-                n += 1;
-            }
-            Ok(json!({"added": n}))
+            Ok(json!({"added": add_file_styles(s, "Add Style", items)}))
         }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(r#"{"path"?: "*.rgisstyle", "text"?: style file JSON, "data"?: base64 file}"#),
         C::new("style.import", "Import Styles", "Style › Styles", import_styles).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(r#"{"path"?: "*.rgislyr|*.rgismap|*.rgis", "text"?: JSON, "data"?: base64 file}"#),
@@ -569,13 +576,48 @@ fn not_a(error: String, kinds: &str) -> String {
     }
 }
 
-fn add_style(s: &mut Session, mut item: StyleItem) {
-    item.name = item.name.trim().chars().take(200).collect();
+/// The most characters a style's name takes.
+const MAX_STYLE_NAME: usize = 200;
+/// The most styles one file adds.
+const MAX_FILE_STYLES: usize = 1000;
+
+/// Keeps a style, in place of any of its name: its name as kept, and whether it was cut to fit.
+fn add_style(s: &mut Session, mut item: StyleItem) -> (String, bool) {
+    let name = item.name.trim();
+    let cut = name.chars().nth(MAX_STYLE_NAME).is_some();
+    item.name = name.chars().take(MAX_STYLE_NAME).collect();
     if item.name.is_empty() {
         item.name = "Style".into();
     }
+    let kept = item.name.clone();
     s.project.styles.retain(|t| !t.name.eq_ignore_ascii_case(&item.name));
     s.project.styles.push(item);
+    (kept, cut)
+}
+
+/// A file's styles, as many as one file adds. A file isn't refused for what it holds: what it
+/// loses is said, one notice a kind with its count (#1972). The number of styles the
+/// project gains or has replaced, one a name.
+fn add_file_styles(s: &mut Session, what: &str, items: Vec<StyleItem>) -> usize {
+    let total = items.len();
+    let mut names = std::collections::HashSet::new();
+    let (mut cut, mut replaced) = (0usize, 0usize);
+    for item in items.into_iter().take(MAX_FILE_STYLES) {
+        let (name, was_cut) = add_style(s, item);
+        cut += usize::from(was_cut);
+        // A later style of the same name takes the place of an earlier one from the file.
+        replaced += usize::from(!names.insert(name.to_ascii_lowercase()));
+    }
+    if total > MAX_FILE_STYLES {
+        s.notify(format!("{what}: the first {MAX_FILE_STYLES} of the file's {total} styles are added"), false);
+    }
+    if cut > 0 {
+        s.notify(format!("{what}: {cut} style name(s) cut to {MAX_STYLE_NAME} characters"), false);
+    }
+    if replaced > 0 {
+        s.notify(format!("{what}: {replaced} style(s) replaced by a later one of the same name in the file"), false);
+    }
+    names.len()
 }
 
 /// Styles from every feature layer of a layer file, map file or project.
@@ -604,24 +646,21 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
         }
         project.maps.into_iter().flat_map(|m| m.layers).collect()
     };
-    let mut n = 0;
-    for l in layers.into_iter().filter(|l| !l.is_raster() && l.geometry_type() != GeometryType::None).take(1000) {
-        add_style(
-            s,
-            StyleItem {
-                name: l.name.clone(),
-                geometry: l.geometry_type(),
-                renderer: l.renderer,
-                labels: l.labels,
-                transparency: l.transparency,
-            },
-        );
-        n += 1;
-    }
-    if n == 0 {
+    let items: Vec<StyleItem> = layers
+        .into_iter()
+        .filter(|l| !l.is_raster() && l.geometry_type() != GeometryType::None)
+        .map(|l| StyleItem {
+            name: l.name.clone(),
+            geometry: l.geometry_type(),
+            renderer: l.renderer,
+            labels: l.labels,
+            transparency: l.transparency,
+        })
+        .collect();
+    if items.is_empty() {
         return Err("no feature layers to take styles from".into());
     }
-    Ok(json!({"imported": n}))
+    Ok(json!({"imported": add_file_styles(s, "Import Styles", items)}))
 }
 
 /// Copies `old`'s saved label moves into the class of the same name in `new` (Default into
