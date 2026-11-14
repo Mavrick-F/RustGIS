@@ -153,11 +153,13 @@ impl Sources {
     /// says what was kept.
     pub fn from_json(text: &str) -> Sources {
         let mut s = Sources::default();
-        if text.trim().is_empty() {
+        // An editor's byte-order mark isn't part of the JSON; a preference kept whole keeps it.
+        let body = text.trim_start_matches('\u{feff}');
+        if body.trim().is_empty() {
             return s;
         }
         let whole = |why: &str| Kept { whole: Some((text.to_string(), why.to_string())), ..Kept::default() };
-        let mut o = match serde_json::from_str::<Value>(text) {
+        let mut o = match serde_json::from_str::<Value>(body) {
             Ok(Value::Object(o)) => o,
             _ => {
                 s.kept = whole("they aren't a JSON object");
@@ -1077,6 +1079,9 @@ MIIE
             "folders": ["/data"]
         })
         .to_string();
+        // With an editor's byte-order mark it reads the same.
+        let bom = Sources::from_json(&format!("\u{feff}{text}"));
+        assert_eq!((bom.favourites.len(), bom.unread().len()), (1, 2), "{:?}", bom.unread());
         let mut s = Sources::default();
         s.merge(Sources::from_json(&text));
         assert_eq!(s.unread().len(), 2, "{:?}", s.unread());

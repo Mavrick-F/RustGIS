@@ -1873,6 +1873,7 @@ fn plugin_state_keeps_what_this_version_cannot_read() {
         std::fs::write(folder.join("plugin.json"), crate::testing::manifest("folder-test", &[])).unwrap();
         std::fs::write(folder.join("plugin.wasm"), testing::wasm()).unwrap();
         assert!(crate::store::install_path(&folder).is_err() && crate::get("folder-test").is_none());
+        assert!(crate::store::install_bytes(&testing::package("state-test", &[])).is_err_and(|e| e.contains("kept as it is")));
         assert!(crate::store::uninstall("state-test").is_err());
         assert_eq!(std::fs::read_to_string(&state).unwrap(), unreadable);
         // At start none is loaded (it may have been disabled, and be a native program), and it is said.
