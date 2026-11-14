@@ -11499,7 +11499,7 @@ mod tests {
             .unwrap();
         let mut table =
             Dataset::new("Coordinates", GeometryType::None, vec![Field::new("x", FieldType::Double), Field::new("y", FieldType::Double)]);
-        table.push(None, vec![Value::Float(0.0), Value::Float(5_009_377.085_697_311)]);
+        table.push(None, vec![Value::Float(0.0), Value::Float(4_984_944.377_977_743)]);
         let mut points = Dataset::new("Density points", GeometryType::Point, vec![]);
         points.push(Some(Geometry::Point(Coord::new(0.0, 45.0))), vec![]);
         points.push(Some(Geometry::Point(Coord::new(0.01, 45.01))), vec![]);

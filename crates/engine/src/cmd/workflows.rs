@@ -1794,6 +1794,8 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             then,
             #[cfg(not(target_arch = "wasm32"))]
             owner: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            crs_used: Vec::new(),
         })
     }))
 }

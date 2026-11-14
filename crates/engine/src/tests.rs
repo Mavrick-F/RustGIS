@@ -4205,6 +4205,87 @@ fn vn2000_projection_command_and_project_persistence() {
     assert_eq!(s2.map().projection.label(), "VN-2000 / TM-3 (Vietnam) (lon_0=107.75)");
 }
 
+/// A map in NAD27 (EPSG:26717), whose most accurate datum transformation needs a grid RustGIS
+/// doesn't have yet: the session says so once, naming the system, however often it draws.
+#[test]
+fn a_missing_datum_grid_is_said_once() {
+    let mut s = world();
+    let said = |s: &Session| s.notices.iter().filter(|n| n.text.starts_with("EPSG:26717:") && n.text.contains("grid")).count();
+    s.run("map.projection", &json!({"type": "EPSG:26717"})).unwrap();
+    assert!(crate::cmd::share::map_png(&mut s, Some(200.0), Some(150.0), None).unwrap().len() > 100);
+    s.run("map.zoomIn", &json!({})).unwrap();
+    assert_eq!(said(&s), 1, "{:?}", s.notices);
+    assert!(crate::cmd::share::map_png(&mut s, Some(200.0), Some(150.0), None).unwrap().len() > 100);
+    s.run("map.zoomOut", &json!({})).unwrap();
+    assert_eq!(said(&s), 1, "once");
+    // An export to NAD27 longitude/latitude says it too, though nothing in the project is in it.
+    let mut s = world();
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-nad27-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cities.gpkg");
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": path, "crs": "EPSG:4267"})).unwrap();
+    let nad27 = s.notices.iter().filter(|n| n.text.starts_with("EPSG:4267:") && n.text.contains("grid")).count();
+    assert_eq!(nad27, 1, "{:?}", s.notices);
+    std::fs::remove_dir_all(&dir).ok();
+    // WGS 84's UTM has nothing to say.
+    let mut s = world();
+    s.run("map.projection", &json!({"type": "EPSG:32617"})).unwrap();
+    s.run("map.zoomIn", &json!({})).unwrap();
+    assert!(s.notices.iter().all(|n| !n.text.starts_with("EPSG:32617:")), "{:?}", s.notices);
+}
+
+/// A background export's target system is said as the export lands, as when it runs here; and
+/// several systems that need a missing grid are said in one notice, with their count.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn missing_datum_grids_are_said_from_a_background_export_and_counted() {
+    use crate::cmd::exports::{export_land, export_start};
+    use rustgis_analysis::control::Control;
+    let grid = |s: &Session, mark| {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("needs a grid")).map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    let mut s = world();
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-nad27-bg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cities.gpkg");
+    let run = export_start(&mut s, "share.exportLayer", &json!({"layer": "Cities", "path": path, "crs": "EPSG:4267"})).unwrap();
+    let (mark, started) = (s.notice_mark(), run.started());
+    let wrote = std::thread::spawn(move || run.run(&Control::new())).join().unwrap();
+    export_land(&mut s, started, wrote).unwrap();
+    let said = grid(&s, mark);
+    assert_eq!(said.len(), 1, "{:?}", s.notices);
+    assert!(said[0].starts_with("EPSG:4267: "), "{said:?}");
+    std::fs::remove_dir_all(&dir).ok();
+    // A layer in NAD27 longitude/latitude on a map in NAD27's UTM: both said at once, counted.
+    let mut s = world();
+    let nad27 = rustgis_data::raster::Crs::from_epsg(4267).unwrap();
+    assert!(nad27.transformer().is_ok());
+    s.project.maps[0].layers[0].dataset.crs = Some(nad27);
+    let mark = s.notice_mark();
+    s.run("map.projection", &json!({"type": "EPSG:26717"})).unwrap();
+    let said = grid(&s, mark);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].starts_with("2 coordinate systems (") && said[0].contains("EPSG:4267") && said[0].contains("EPSG:26717"), "{said:?}");
+    // Many at once: a few named, the rest counted, so the notice keeps its explanation.
+    let many: Vec<String> = (0..300).map(|i| format!("Custom system {i} {}", "x".repeat(200))).collect();
+    let text = rustgis_data::raster::crs::grid_notes_text(many.len(), &crate::names_said(&many));
+    assert!(text.starts_with("300 coordinate systems (") && text.contains("and 295 more") && text.contains("10 m"), "{text}");
+    assert!(text.len() < 1000, "{}", text.len());
+    // A map drawn in a system before any command: the frame after it says it.
+    let mut s = world();
+    s.project.maps[0].projection = rustgis_map::Projection::Custom("EPSG:26717".into());
+    let mark = s.notice_mark();
+    assert!(crate::cmd::share::map_png(&mut s, Some(200.0), Some(150.0), None).unwrap().len() > 100);
+    s.notice_landed_rasters();
+    let said = grid(&s, mark);
+    assert!(said.len() == 1 && said[0].starts_with("EPSG:26717: "), "{said:?}");
+    // Said once: another frame or command says nothing more.
+    let mark = s.notice_mark();
+    s.notice_landed_rasters();
+    s.run("map.zoomIn", &json!({})).unwrap();
+    assert!(grid(&s, mark).is_empty());
+}
+
 #[test]
 fn custom_projections_switch_keep_scale_query_and_render() {
     let mut s = with_raster();
@@ -4227,11 +4308,12 @@ fn custom_projections_switch_keep_scale_query_and_render() {
     assert!(crate::cmd::share::map_png(&mut s, Some(400.0), Some(300.0), None).unwrap().len() > 1000);
     assert!(s.run("map.projection", &json!({"type": "EPSG:4326"})).is_err(), "degrees are refused");
     assert!(s.run("map.projection", &json!({"type": "nope"})).is_err());
-    // A known code whose method isn't implemented (EPSG:8441, Laborde) is refused, not drawn in
-    // Web Mercator under its own name; the map keeps its projection (#208). proj4rs 0.3 grew
-    // Brazil Polyconic, so EPSG:5880 switches now.
-    let e = s.run("map.projection", &json!({"type": "EPSG:8441"})).unwrap_err();
-    assert!(e.contains("labrd"), "{e}");
+    // EPSG:8441 (Laborde), refused while its method had no implementation (#208), switches now;
+    // an unknown code is refused and the map keeps its projection.
+    s.run("map.projection", &json!({"type": "EPSG:8441"})).unwrap();
+    assert_eq!(s.map().projection.code(), "EPSG:8441");
+    s.run("map.projection", &json!({"type": "EPSG:32617"})).unwrap();
+    assert!(s.run("map.projection", &json!({"type": "EPSG:1"})).is_err());
     assert_eq!(s.map().projection.code(), "EPSG:32617");
     assert!(s.run("map.goToXY", &json!({"lon": 100.0, "lat": 0.0})).is_err(), "folded far side of the UTM zone");
     // Undo and save/reload keep the projection.
@@ -12402,17 +12484,12 @@ fn view_effects_scene_and_navigation() {
     s.run("map.displayType", &json!({"mode": "quality"})).unwrap();
     assert!(png(&mut s) == plain);
     // Views and navigation.
-    if rustgis_map::projection::local_views_supported() {
-        s.run("map.viewMode", &json!({"mode": "local"})).unwrap();
-        assert!(s.map().projection.code().starts_with("local:"));
-        let local = png(&mut s);
-        // The local view is azimuthal equidistant, not Web Mercator under another name (#208).
-        s.run("map.projection", &json!({"type": "mercator"})).unwrap();
-        assert!(png(&mut s) != local, "a local view draws in its own projection");
-    } else {
-        let e = s.run("map.viewMode", &json!({"mode": "local"})).unwrap_err();
-        assert!(e.contains("web app"), "{e}");
-    }
+    s.run("map.viewMode", &json!({"mode": "local"})).unwrap();
+    assert!(s.map().projection.code().starts_with("local:"));
+    let local = png(&mut s);
+    // The local view is azimuthal equidistant, not Web Mercator under another name (#208).
+    s.run("map.projection", &json!({"type": "mercator"})).unwrap();
+    assert!(png(&mut s) != local, "a local view draws in its own projection");
     s.run("map.viewMode", &json!({"mode": "global"})).unwrap();
     assert!(s.map().projection.is_globe());
     s.run("map.navigation", &json!({"mode": "planar"})).unwrap();
@@ -21730,7 +21807,7 @@ fn projection_review_typed_layer_inputs_report_the_formula_choice() {
                 }
                 "csv" => {
                     let path = dir.join("point.csv");
-                    std::fs::write(&path, "e,n\n0,5009377.085697311\n").unwrap();
+                    std::fs::write(&path, "e,n\n0,4984944.377977743\n").unwrap();
                     let result = session.run("layer.addData", &json!({"path":path,"x":"e","y":"n","crs":definition})).unwrap();
                     let layer = session.map().layer(result["layer"].as_u64().unwrap() as u32).unwrap();
                     assert!((layer.dataset.features[0].geometry.as_ref().unwrap().label_point().unwrap().y - 45.0).abs() < 1e-9);
@@ -21890,7 +21967,7 @@ fn ascii_grid_reports_declared_method_1028_compatibility() {
         .nth(5)
         .unwrap();
     let geographic = r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#;
-    for (name, wkt, y, expected) in [("projected", projected, 5_009_377.085_697_311, 1), ("geographic", geographic, 40.0, 0)] {
+    for (name, wkt, y, expected) in [("projected", projected, 4_984_944.377_977_743, 1), ("geographic", geographic, 40.0, 0)] {
         let path = dir.join(format!("{name}.asc"));
         std::fs::write(&path, format!("ncols 1\nnrows 1\nxllcorner 0\nyllcorner {y}\ncellsize 1\n7\n")).unwrap();
         std::fs::write(path.with_extension("prj"), wkt).unwrap();
@@ -40595,7 +40672,7 @@ fn a_layout_pdf_georeferences_its_map_frames() {
     // (PDF 1.5 for its layers, #1815.)
     assert!(pdf.starts_with("%PDF-1.5") && !pdf.contains("/VP ["));
     assert!(said.iter().any(|t| t == &format!("The PDF doesn't georeference 1 map frame ({}: it is tilted)", frame.name)), "{said:?}");
-    // A world projection RustGIS computes itself (Winkel Tripel) is written as WKT too.
+    // A world projection proj4rs doesn't read (Winkel Tripel) is written as WKT too.
     s.run("layout.update", &json!({"element": frame.id, "pitch": 0})).unwrap();
     s.run("map.projection", &json!({"type": "winkelTripel"})).unwrap();
     let (pdf, said) = export(&mut s);

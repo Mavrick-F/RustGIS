@@ -969,7 +969,7 @@ impl Raster {
             let (lo, hi) = (e.min_x - shift, e.max_x - shift);
             (e.min_x, e.max_x) = if lo >= -180.0 && hi <= 180.0 { (lo, hi) } else { (-180.0, 180.0) };
         }
-        // A whole world in a world projection RustGIS computes reaches the antimeridian and the
+        // A whole world in Natural Earth, Winkel Tripel or Eckert IV reaches the antimeridian and the
         // poles at its outline's edge, which samples miss when the grid's edges are a little past
         // it (its corners are off the outline): whatever of them is in the grid is in its extent
         // (#1701).

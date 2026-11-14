@@ -78,6 +78,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                     written_path: None,
                     then: None,
                     owner: None,
+                    crs_used: Vec::new(),
                 });
             }
             let publish =
@@ -144,6 +145,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 written_path,
                 then: Some(then),
                 owner: None,
+                crs_used: Vec::new(),
             })
         }))
     }

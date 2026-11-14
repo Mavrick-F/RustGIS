@@ -1047,6 +1047,8 @@ fn write_geotiff_with_guidance(r: &Raster, bi: usize, cog: bool, path: &str, ban
         then: None,
         #[cfg(not(target_arch = "wasm32"))]
         owner: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        crs_used: Vec::new(),
     })
 }
 

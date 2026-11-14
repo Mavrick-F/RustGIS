@@ -568,6 +568,22 @@ pub fn projection_compatibility_note(text: &str, crs: Crs) -> Option<&'static st
     projection_note(&wkt1(parse(text).ok()?, 0).ok()?, crs)
 }
 
+/// Longitude/latitude on the datum (its ellipsoid, shift to WGS 84 and prime meridian) of a PROJ
+/// definition of an equidistant cylindrical projection: every parameter but the projection's own.
+/// proj4rs replaces the ellipsoid of the projection itself with a sphere of its semi-major axis.
+fn eqc_geographic(def: &str) -> Result<proj4rs::Proj, String> {
+    const PROJECTION: [&str; 13] =
+        ["proj", "lat_ts", "lat_0", "lon_0", "x_0", "y_0", "units", "to_meter", "k", "k_0", "axis", "type", "wktext"];
+    let datum: Vec<String> = def
+        .split_whitespace()
+        .map(|t| t.trim_start_matches('+'))
+        .map(|t| t.split_once('=').unwrap_or((t, "")))
+        .filter(|(k, _)| !PROJECTION.contains(k))
+        .map(|(k, v)| if v.is_empty() { format!("+{k}") } else { format!("+{k}={v}") })
+        .collect();
+    proj4rs::Proj::from_proj_string(&format!("+proj=longlat {}", datum.join(" "))).map_err(|e| e.to_string())
+}
+
 /// The semi-major axis used by the resolved equidistant cylindrical projection.
 fn eqc_semi_major(crs: Crs) -> Option<f64> {
     let custom = crs.custom_def();
@@ -577,10 +593,32 @@ fn eqc_semi_major(crs: Crs) -> Option<f64> {
         _ => None,
     };
     let proj4 = proj4.filter(|p| p.split_whitespace().any(|p| p == "+proj=eqc"))?;
-    proj4rs::Proj::from_proj_string(proj4).ok().map(|proj| proj.ellipse_parameters().0)
+    earth_params(proj4).map(|proj| proj.ellipse_parameters().0)
 }
 
-/// Method 1028 is ellipsoidal, unlike the legacy PROJ 9.7.1 `eqc` formula; a sphere has no discrepancy.
+/// A definition read by proj4rs for its ellipsoid, prime meridian and unit only (transforms are
+/// terrio-crs's): a method proj4rs lacks (Natural Earth, Winkel Tripel, Eckert IV, Laborde, and
+/// the azimuthal equidistant in the browser, where its build leaves it out) is read as the same
+/// definition's longitude/latitude.
+fn earth_params(def: &str) -> Option<proj4rs::Proj> {
+    match proj4rs::Proj::from_proj_string(def) {
+        Ok(proj) => Some(proj),
+        // Only a method it lacks: a definition it can't read otherwise isn't read.
+        Err(proj4rs::errors::Error::ProjectionNotFound) => {
+            let kind = def.split_whitespace().find_map(|t| t.strip_prefix("+proj="))?;
+            proj4rs::Proj::from_proj_string(&def.replacen(&format!("+proj={kind}"), "+proj=longlat", 1)).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+/// The ellipsoidal formula of EPSG method 1028, as PROJ 9.8 computes it (PROJ #4656): files
+/// written with the spherical formula of PROJ 9.7 and earlier may be placed kilometres away.
+/// Said when a WKT names the method on an ellipsoid; a sphere has no discrepancy.
+const ELLIPSOIDAL_EQC: &str = "the WKT method is interpreted as EPSG method 1028 (ellipsoidal), as PROJ 9.8 and later compute it; coordinates written with the spherical formula of PROJ 9.7 and earlier are placed up to tens of kilometres away from where that software put them";
+
+/// An equidistant cylindrical WKT naming EPSG method 1028 on an ellipsoid: [`ELLIPSOIDAL_EQC`],
+/// and, when its semi-major axis isn't the resolved system's, that the resolved one is used.
 fn projection_note(root: &Node, crs: Crs) -> Option<&'static str> {
     let method = root.child("PROJECTION")?.child("AUTHORITY")?;
     if !method.title().eq_ignore_ascii_case("EPSG") || authority_code(method) != Some(1028) {
@@ -588,18 +626,15 @@ fn projection_note(root: &Node, crs: Crs) -> Option<&'static str> {
     }
     let spheroid = root.child("GEOGCS")?.child("DATUM")?.child("SPHEROID")?;
     let resolved_axis = eqc_semi_major(crs)?;
+    let flattened = spheroid.num(1).is_some_and(|rf| rf.is_finite() && rf > 0.0 && rf.recip() > 1e-12);
     if spheroid.num(0).is_some_and(|axis| (axis - resolved_axis).abs() > resolved_axis.abs() * 1e-12) {
-        return Some(if spheroid.num(1).is_some_and(|rf| rf.is_finite() && rf > 0.0 && rf.recip() > 1e-12) {
-            "the equidistant cylindrical WKT semi-major axis differs from the resolved CRS; RustGIS uses the resolved CRS semi-major axis, so coordinates may differ from the declared spheroid; the WKT method is interpreted as EPSG method 1028 (ellipsoidal), but RustGIS uses the legacy PROJ/GDAL spherical formula (PROJ 9.7.1 compatibility), which differs from the ellipsoidal formula"
+        return Some(if flattened {
+            "the equidistant cylindrical WKT semi-major axis differs from the resolved CRS; RustGIS uses the resolved CRS semi-major axis, so coordinates may differ from the declared spheroid; the WKT method is interpreted as EPSG method 1028 (ellipsoidal), as PROJ 9.8 and later compute it; coordinates written with the spherical formula of PROJ 9.7 and earlier are placed up to tens of kilometres away from where that software put them"
         } else {
             "the equidistant cylindrical WKT semi-major axis differs from the resolved CRS; RustGIS uses the resolved CRS semi-major axis, so coordinates may differ from the declared spheroid"
         });
     }
-    let rf = spheroid.num(1)?;
-    (rf.is_finite()
-        && rf > 0.0
-        && rf.recip() > 1e-12)
-    .then_some("the WKT method is interpreted as EPSG method 1028 (ellipsoidal); RustGIS uses the legacy PROJ/GDAL spherical equidistant cylindrical formula (PROJ 9.7.1 compatibility), which differs from the ellipsoidal formula")
+    flattened.then_some(ELLIPSOIDAL_EQC)
 }
 
 /// Whether a WKT1 geographic system's ellipsoid is another body's. It is checked before the system
@@ -1601,16 +1636,15 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
             format!("+proj=cea +lat_ts={ts} {at}")
         }
         "MOLLWEIDE" => format!("+proj=moll {at}"),
-        // Sinusoidal is computed by RustGIS (`rustgis_geom::Sinusoidal`), Robinson by proj4rs
-        // from Robinson's table, on a sphere of the semi-major axis as in PROJ.
         "SINUSOIDAL" => format!("+proj=sinu {at}"),
+        // Robinson from Robinson's table, on a sphere of the semi-major axis as in PROJ.
         "ROBINSON" => format!("+proj=robin {at}"),
-        // Computed by RustGIS too (`rustgis_geom::world`), on a sphere of the semi-major axis as in
-        // PROJ (#1701). Winkel Tripel's standard parallel is the file's (GDAL and PROJ always
-        // write one), else 0, as PROJ reads WKT without one (and a bare `+proj=wintri` used as a
-        // coordinate system; the `proj` program takes acos(2/π)). A parameter that isn't a finite
-        // number (`1e400`, which `parameters` leaves out) is refused rather than taken as not
-        // given, as for Web Mercator: a parallel given so would be read as 0.
+        // On a sphere of the semi-major axis, as in PROJ (#1701). Winkel Tripel's standard
+        // parallel is the file's (GDAL and PROJ always write one), else 0, as PROJ reads WKT
+        // without one (and a bare `+proj=wintri` used as a coordinate system; the `proj` program
+        // takes acos(2/π)). A parameter that isn't a finite number (`1e400`, which `parameters`
+        // leaves out) is refused rather than taken as not given, as for Web Mercator: a parallel
+        // given so would be read as 0.
         "NATURAL_EARTH" | "ECKERT_IV" | "WINKEL_TRIPEL"
             if p.nodes().any(|n| n.name.eq_ignore_ascii_case("PARAMETER") && n.num(0).is_none()) =>
         {
@@ -1620,8 +1654,8 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
             ));
         }
         // None of the three has a scale factor, and PROJ ignores one. A definition with a scale
-        // other than 1 is refused (`WorldProjection::from_proj4`), so WKT with one is too, rather
-        // than read without it.
+        // other than 1 is refused (`crs::transformer_of`), so WKT with one is too, rather than
+        // read without it.
         "NATURAL_EARTH" | "ECKERT_IV" | "WINKEL_TRIPEL" if k0 != 1.0 => {
             return Err(format!(
                 "the {} projection with a scale factor other than 1 isn't supported",
@@ -1655,9 +1689,9 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
         flip = Some("wsu");
     }
     let axis = match flip {
-        // The projections RustGIS computes itself (sinusoidal, the world projections proj4rs lacks,
-        // and equidistant cylindrical on an ellipsoid) don't take `+axis`, and `Crs::custom` would
-        // refuse their definition.
+        // Sinusoidal, the world projections proj4rs lacks and equidistant cylindrical on an
+        // ellipsoid weren't read with other axes before terrio-crs computed them, and still
+        // aren't until WKT is read through it (opengeos/RustGIS#2032).
         Some(_)
             if ["+proj=sinu", "+proj=natearth", "+proj=wintri", "+proj=eck4"].iter().any(|p| proj.starts_with(p))
                 || (proj.starts_with("+proj=eqc") && !sphere) =>
@@ -1757,7 +1791,7 @@ fn national_datum(datum: Option<&Node>) -> Option<&'static str> {
 
 /// Whether the file's ellipsoid axes agree with a known definition within a centimetre.
 fn ellipsoid_matches(datum: &Node, def: &str) -> bool {
-    let Ok(proj) = proj4rs::Proj::from_proj_string(def) else { return false };
+    let Some(proj) = earth_params(def) else { return false };
     let Some(sph) = datum.child_of(&["SPHEROID", "ELLIPSOID"]) else { return false };
     let (Some(actual_a), Some(rf)) = (sph.num(0), sph.num(1)) else { return false };
     let (a, b) = proj.ellipse_parameters();
@@ -1948,7 +1982,7 @@ fn national_datum_name(def: &str, code: Option<u16>) -> Option<&'static str> {
 /// A definition's ellipsoid axes and its shift to WGS 84 as seven parameters (three padded with
 /// zeros), a named datum's shift included; `None` without a shift.
 fn earth_of(def: &str) -> Option<((f64, f64), [f64; 7])> {
-    let proj = proj4rs::Proj::from_proj_string(def).ok()?;
+    let proj = earth_params(def)?;
     let value = |k: &str| def.split_whitespace().find_map(|t| t.strip_prefix(k));
     let shift = value("+towgs84=").or_else(|| DATUMS.iter().find(|r| value("+datum=").is_some_and(|d| r.0.eq_ignore_ascii_case(d)))?.3)?;
     let parts: Vec<f64> = shift.split(',').map(|v| v.trim().parse().ok()).collect::<Option<_>>()?;
@@ -2017,16 +2051,7 @@ pub fn proj4_to_wkt(def: &str, name: &str) -> Option<String> {
 
 /// A PROJ definition as WKT1, with `code` as its EPSG authority.
 fn def_wkt(def: &str, name: &str, code: Option<u16>) -> Option<String> {
-    // proj4rs doesn't project the world projections RustGIS computes itself
-    // (`rustgis_geom::world`): their ellipsoid, prime meridian and unit are read from the
-    // definition as a geographic one.
-    let proj = proj4rs::Proj::from_proj_string(def).ok().or_else(|| {
-        let kind = def.split_whitespace().find_map(|t| t.strip_prefix("+proj="))?;
-        if !matches!(kind, "natearth" | "wintri" | "eck4") {
-            return None;
-        }
-        proj4rs::Proj::from_proj_string(&def.replacen(&format!("+proj={kind}"), "+proj=longlat", 1)).ok()
-    })?;
+    let proj = earth_params(def)?;
     let params: Vec<(&str, Option<&str>)> = def
         .split_whitespace()
         .filter_map(|t| t.strip_prefix('+'))
@@ -2034,7 +2059,12 @@ fn def_wkt(def: &str, name: &str, code: Option<u16>) -> Option<String> {
         .collect();
     let text = |k: &str| params.iter().find(|(n, _)| *n == k).and_then(|(_, v)| *v);
     let flag = |k: &str| params.iter().any(|(n, _)| *n == k);
-    let get = |k: &str| text(k).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite());
+    // Angles as they are read ([`crate::raster::crs::angle_degrees`]): `50d27'35"` is no 0.
+    let get = |k: &str| {
+        text(k)
+            .and_then(|v| if crate::raster::crs::angular(k, v) { crate::raster::crs::angle_degrees(v) } else { v.parse::<f64>().ok() })
+            .filter(|v| v.is_finite())
+    };
     let authority = |c: Option<u16>| c.map(|c| format!(",AUTHORITY[\"EPSG\",\"{c}\"]")).unwrap_or_default();
 
     // The datum and its ellipsoid.
@@ -2045,7 +2075,7 @@ fn def_wkt(def: &str, name: &str, code: Option<u16>) -> Option<String> {
     // proj4rs computes `eqc` on a sphere of the semi-major axis and gives that sphere. Keep the
     // datum's original ellipsoid in the definition, as PROJ/GDAL do.
     let (a, b) = match text("proj") {
-        Some("eqc") => super::crs::eqc_geographic(def).ok()?.ellipse_parameters(),
+        Some("eqc") => eqc_geographic(def).ok()?.ellipse_parameters(),
         _ => proj.ellipse_parameters(),
     };
     // A named ellipsoid's flattening as published; else from its axes (PROJ keeps a and b).
@@ -2455,8 +2485,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// The world projections RustGIS computes itself and proj4rs doesn't (Natural Earth, Winkel
-    /// Tripel, Eckert IV) are written as WKT, on their datum, with their centre and offsets
+    /// The world projections proj4rs doesn't read (Natural Earth, Winkel Tripel, Eckert IV) are
+    /// written as WKT, on their datum, with their centre and offsets
     /// (#1191: a GeoPDF of a map drawn in one).
     #[test]
     fn world_projections_proj4rs_lacks_are_written() {
@@ -2476,11 +2506,26 @@ pub(crate) mod tests {
         assert!(wkt.contains("PARAMETER[\"standard_parallel_1\",50.459776252189805]"), "{wkt}");
         let wkt = proj4_to_wkt("+proj=wintri +lon_0=0 +datum=WGS84 +units=m +no_defs", "W").unwrap();
         assert!(wkt.contains("PARAMETER[\"standard_parallel_1\",0]"), "{wkt}");
+        // In degrees, minutes and seconds, as the definition is read.
+        let wkt = proj4_to_wkt("+proj=wintri +lon_0=0 +lat_1=50d30' +datum=WGS84 +units=m +no_defs", "W").unwrap();
+        assert!(wkt.contains("PARAMETER[\"standard_parallel_1\",50.5]"), "{wkt}");
+        let dms = Crs::parse("+proj=wintri +lat_1=50d30' +datum=WGS84 +units=m").unwrap();
+        let back = crs_from_wkt(&to_wkt(dms).unwrap()).unwrap().transformer().unwrap();
+        let c = Coord::new(10.0, 40.0);
+        let (a, b) = (dms.transformer().unwrap().from_lonlat(c).unwrap(), back.from_lonlat(c).unwrap());
+        assert!((a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6, "{a:?} {b:?}");
+        // A method proj4rs can't read (here Natural Earth; in the browser the azimuthal
+        // equidistant) still has its ellipsoid and datum shift read, to name its datum.
+        assert!(proj4rs::Proj::from_proj_string("+proj=natearth +ellps=intl +towgs84=1,2,3").is_err());
+        let ((a, _), shift) = earth_of("+proj=natearth +ellps=intl +towgs84=1,2,3 +units=m").unwrap();
+        assert_eq!((a, shift), (6_378_388.0, [1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0]));
+        // A definition it can't read for another reason isn't read as longitude/latitude.
+        assert!(earth_of("+proj=tmerc +k=abc +ellps=intl +towgs84=1,2,3").is_none());
         // Another projection proj4rs can't read still has none.
         assert_eq!(proj4_to_wkt("+proj=nosuch +datum=WGS84 +units=m +no_defs", "X"), None);
     }
 
-    /// The world projections RustGIS computes itself are read from WKT as GDAL (WKT1), Esri and
+    /// Natural Earth, Winkel Tripel and Eckert IV are read from WKT as GDAL (WKT1), Esri and
     /// PROJ (WKT2) write them, and from their ESRI codes (a FileGDB feature class's), not as
     /// longitude/latitude: each places a point where PROJ 9.8.1 does, within a millimetre, and
     /// back, with Winkel Tripel's standard parallel the file's. RustGIS's own WKT for its presets
@@ -2562,7 +2607,7 @@ pub(crate) mod tests {
                 assert!((a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6, "{def} {lon},{lat}: {a:?} {b:?}");
             }
         }
-        // Axes pointing west aren't read, as for the other projections RustGIS computes; a
+        // Axes pointing west aren't read, as for sinusoidal (see `wkt1`'s axes); a
         // standard parallel at a pole isn't a Winkel Tripel.
         let wkt1 = r#"PROJCS["unknown",GEOGCS["unknown",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]]],PROJECTION["Natural_Earth"],PARAMETER["central_meridian",-60],PARAMETER["false_easting",100],PARAMETER["false_northing",-200],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Easting",EAST],AXIS["Northing",NORTH]]"#;
         assert_eq!(crs_from_wkt(&wkt1.replace(r#"AXIS["Easting",EAST]"#, r#"AXIS["Easting",WEST]"#)), Err(REVERSED_AXES.into()));
@@ -2573,7 +2618,17 @@ pub(crate) mod tests {
             wkt1.replace(r#"PARAMETER["central_meridian",-60],"#, r#"PARAMETER["central_meridian",-60],PARAMETER["scale_factor",0.5],"#);
         assert!(crs_from_wkt(&scaled).unwrap_err().contains("scale factor other than 1"));
         assert!(crs_from_wkt(&scaled.replace("0.5]", "1]")).is_ok());
-        assert!(Crs::parse("+proj=natearth +k=0.5 +datum=WGS84 +units=m +no_defs").is_err());
+        // PROJ 9.8.1 ignores a PROJ string's scale in Natural Earth (pyproj 3.8.0: 10°E 40°N is
+        // 894104.51, 4501295.58 with and without `+k=0.5`): refused rather than dropped, a scale
+        // of 1 is the projection itself.
+        for name in ["natearth", "wintri", "eck4"] {
+            let def = format!("+proj={name} +k=0.5 +datum=WGS84 +units=m +no_defs");
+            assert!(Crs::parse(&def).and_then(Crs::transformer).unwrap_err().contains("scale factor"), "{name}");
+            assert!(Crs::parse(&def.replace("+k=0.5", "+k_0=2")).and_then(Crs::transformer).is_err(), "{name}");
+        }
+        let one = Crs::parse("+proj=natearth +k=1 +datum=WGS84 +units=m +no_defs").unwrap().transformer().unwrap();
+        let at = one.from_lonlat(Coord::new(10.0, 40.0)).unwrap();
+        assert!((at.x - 894_104.506_383_310_9).abs() < 1e-6 && (at.y - 4_501_295.579_974_174).abs() < 1e-6, "{at:?}");
         // Natural Earth and Eckert IV have no standard parallel: a `+lat_1` is ignored, as in PROJ,
         // where Winkel Tripel refuses one at a pole. `+geoc` changes nothing on their sphere (PROJ
         // 9.9.0's `proj` gives the same position with and without it).
@@ -2650,9 +2705,13 @@ pub(crate) mod tests {
             format!("{}My_Soldner{}", &wkt[..start], &wkt[end..]).replace("PROJECTION[\"Cassini_Soldner\"]", "PROJECTION[\"Cassini\"]");
         assert!(esri.contains("PROJECTION[\"Cassini\"]"), "{esri}");
         let crs = crs_from_wkt(&esri).unwrap_or_else(|e| panic!("{e}: {esri}"));
+        // As the same WKT under its own name: both take the WKT's datum shift, which PROJ 9.8.1
+        // doesn't for the code itself (`+datum=potsdam` is DHDN's transformations, 0.6 m apart).
+        let soldner = format!("{}My_Soldner{}", &wkt[..start], &wkt[end..]);
+        let soldner = crs_from_wkt(&soldner).unwrap_or_else(|e| panic!("{e}: {soldner}"));
         // Near the grid origin and a few degrees from it, where a spherical form would differ.
         for lonlat in [Coord::new(13.4, 52.4), Coord::new(17.5, 55.5)] {
-            let a = epsg.transformer().unwrap().from_lonlat(lonlat).unwrap();
+            let a = soldner.transformer().unwrap().from_lonlat(lonlat).unwrap();
             let b = crs.transformer().unwrap().from_lonlat(lonlat).unwrap();
             assert!((a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01, "{a:?} {b:?}");
         }
@@ -3318,7 +3377,7 @@ pub(crate) mod tests {
         let near_sphere = wkt.replace("298.257223563", "10000000000000");
         assert_ne!(wkt, near_sphere);
         assert!(read_wkt(&near_sphere).unwrap().1.is_none());
-        assert!(read_wkt(wkt).unwrap().1.unwrap().contains("differs from the ellipsoidal formula"));
+        assert!(read_wkt(wkt).unwrap().1.unwrap().contains("PROJ 9.7 and earlier"));
     }
 
     #[test]
@@ -3540,7 +3599,7 @@ pub(crate) mod tests {
         // Web Mercator, known by its name, has no PROJ definition to add `+axis` to.
         let web = ESRI_3857.replace(r#"UNIT["Meter",1.0]]"#, r#"UNIT["Meter",1.0],AXIS["X",WEST],AXIS["Y",NORTH]]"#);
         assert_eq!(crs_from_wkt(&web), Err("axes pointing west or south aren't supported".into()));
-        // RustGIS computes Sinusoidal itself, without PROJ's `+axis`.
+        // Nor is Sinusoidal with axes pointing west, as yet.
         let sinusoidal = format!(
             r#"PROJCS["x",{GEOG_4326},PROJECTION["Sinusoidal"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",0.0],UNIT["Meter",1.0],AXIS["X",WEST],AXIS["Y",NORTH]]"#
         );
@@ -3555,8 +3614,8 @@ pub(crate) mod tests {
         for wkt in [lone, twice, web_lone, south_twice] {
             assert_eq!(crs_from_wkt(&wkt), Err("axes pointing west or south aren't supported".into()), "{wkt}");
         }
-        // So does its equidistant cylindrical on an ellipsoid (`crs::ellipsoidal_eqc`); on a
-        // sphere, proj4rs computes it and reads `+axis`.
+        // So is equidistant cylindrical on an ellipsoid with axes pointing west; on a sphere,
+        // the WKT's `+axis` is kept.
         let eqc = sinusoidal.replace(r#"PROJECTION["Sinusoidal"]"#, r#"PROJECTION["Equidistant_Cylindrical"]"#);
         assert_eq!(crs_from_wkt(&eqc), Err("axes pointing west or south aren't supported".into()));
         let sphere = eqc.replace(
@@ -4294,7 +4353,15 @@ pub(crate) mod tests {
             let lonlat = Coord::new(lon, lat);
             let a = crs.transformer().unwrap().from_lonlat(lonlat).unwrap();
             let b = read.transformer().unwrap().from_lonlat(lonlat).unwrap();
-            let tolerance = if crs.is_geographic() { 1e-8 } else { 0.01 };
+            // A definition naming its datum (`+datum=potsdam`) takes that datum's transformations,
+            // as PROJ 9.8.1 does, where the WKT read back keeps the datum's TOWGS84: about 0.6 m
+            // apart in Berlin.
+            let named = epsg_proj4(code).is_some_and(|d| d.contains("+datum=") && !d.contains("+datum=WGS84"));
+            let tolerance = match (crs.is_geographic(), named) {
+                (true, _) => 1e-8,
+                (false, true) => 1.0,
+                (false, false) => 0.01,
+            };
             assert!((a.x - b.x).abs() < tolerance && (a.y - b.y).abs() < tolerance, "EPSG:{code}: {a:?} {b:?}\n{bare}");
         }
         // Each new method against PROJ (pyproj 3.8.0 on the system's own PROJ definition, from
