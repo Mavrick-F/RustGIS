@@ -887,6 +887,66 @@ struct TableEdit {
     result: Result<(Dataset, Json, Vec<crate::Notice>), String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+/// A table-write line recorded by a script worker for that same line to consume on landing.
+pub(crate) struct ScriptTableEdit {
+    command: String,
+    params: Json,
+    edit: TableEdit,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Records a table line's actual rows and notices on the worker, or invokes the live line with
+/// those rows prepared. A missing or mismatched result is refused, never recomputed on the frame.
+/// The caller still authorizes and invokes the original operation under the live script owner.
+pub(crate) fn script_table(
+    s: &mut Session,
+    command: &str,
+    p: &Json,
+    prepared: bool,
+    run: impl FnOnce(&mut Session) -> CmdResult,
+) -> CmdResult {
+    use super::gp::{Ahead, RanAhead};
+    if prepared {
+        let next = match &mut s.tools_ahead {
+            Some(Ahead::Taking(ran)) => ran.pop_front(),
+            _ => None,
+        };
+        let Some(RanAhead::Table(next)) = next else {
+            return Err("the script's table input changed: run the script again".into());
+        };
+        let ScriptTableEdit { command: given, params, edit } = *next;
+        if given != command || params != *p {
+            return Err("the script's table command changed: run the script again".into());
+        }
+        return super::reads::taking(s, command, edit, run);
+    }
+    if !matches!(s.tools_ahead, Some(Ahead::Recording(_))) {
+        return run(s);
+    }
+    rustgis_data::progress::begin(0);
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
+    let Target::Table(i) = target(s, p)? else { return run(s) };
+    let table = s.project.tables.get(i).ok_or("no such table")?;
+    let (opened, id, input, mark) = (s.opened, table.id, table.dataset.clone(), s.notice_mark());
+    let answer = run(s).and_then(|answer| {
+        rustgis_data::progress::check().map_err(|e| e.to_string())?;
+        Ok(answer)
+    });
+    let result = answer.clone().and_then(|answer| {
+        let output = s.project.table(id).ok_or("no such table")?.dataset.clone();
+        Ok((output, answer, s.notices_since(mark).to_vec()))
+    });
+    if let Some(Ahead::Recording(ran)) = &mut s.tools_ahead {
+        ran.push(RanAhead::Table(Box::new(ScriptTableEdit {
+            command: command.into(),
+            params: p.clone(),
+            edit: TableEdit { opened, id, input, result },
+        })));
+    }
+    answer
+}
+
 /// Prepares a pure table write after admission, with no caller state on the worker except the
 /// table and editing flag. Cancel is checked between rows and before/after the handler. The
 /// shared row storage's first copy and one expression evaluation cannot be interrupted.

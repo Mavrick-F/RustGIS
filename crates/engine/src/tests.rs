@@ -42365,6 +42365,21 @@ fn a_scripts_tools_run_ahead_are_taken_by_its_run() {
     assert_eq!(s.project.gp_history.len(), here.project.gp_history.len());
     assert_eq!(s.undo_depth(), depth + 1);
 
+    // Table writes keep their worker rows, so the following tool is taken as well. A table
+    // write and both tools remain one script undo step.
+    let mut s = session();
+    s.run("layer.addDataText", &json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    let depth = s.undo_depth();
+    let p = json!({"script": format!("{}\nedit.setValue {{\"table\":\"records\",\"row\":0,\"field\":\"n\",\"value\":9}}\n{}", tool(1000), tool(2000))});
+    let read = read_ahead(&mut s, "script.run", &p).unwrap().run(&Control::stoppable()).unwrap();
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.tools_taken, 2);
+    assert_eq!(s.project.tables[0].dataset.value(0, 0).as_f64(), Some(9.0));
+    assert_eq!(s.undo_depth(), depth + 1);
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.project.tables[0].dataset.value(0, 0).as_f64(), Some(1.0));
+
     // A line that may reach outside the session stops the copy: the run here runs it and what
     // follows, so the project is saved once.
     let dir = std::env::temp_dir().join(format!("rustgis-script-ahead-{}", std::process::id()));
@@ -44345,6 +44360,11 @@ fn long_commands_stop_when_cancelled_while_they_run() {
     assert_eq!(listed(&edits), crate::cmd::edit::TABLE_EDITS.iter().map(|(id, ..)| *id).collect(), "add a new table worker here");
     for (command, p) in edits {
         let read = crate::cmd::reads::read_ahead(&mut s, command, &p).unwrap();
+        assert!(read.reads());
+        let control = Control::cancelled_once_started();
+        note(command, read.run(&control).map(|_| ()), &control);
+        let script = json!({"script": format!("{command} {p}")});
+        let read = crate::cmd::reads::read_ahead(&mut s, "script.run", &script).unwrap();
         assert!(read.reads());
         let control = Control::cancelled_once_started();
         note(command, read.run(&control).map(|_| ()), &control);

@@ -54,7 +54,15 @@ Cells, new rows and Calculate Field need editing on (**Edit › Edit**); adding,
 deleting fields don't, as for a layer. Each edit is one undo step. On the desktop, table writes
 run in the background with progress or a busy indicator and **Cancel**. Queued edits run in
 order, each using the preceding edit's result. If the table changes independently while an edit
-runs, its result is refused; run the edit again to use the new values.
+runs, its result is refused; run the edit again to use the new values. A schema change clears
+the view's sort when it lands, including a sort picked while an edit waits.
+
+Desktop scripts also prepare table writes off the frame and keep the script as one undo step.
+If an earlier line cannot be prepared safely (for example, opening a file or saving a project),
+run that setup separately from the table-writing script. A script run under restricted
+permissions must dispatch the table edit commands individually. A failed worker start refuses
+the edit instead of running it on the window thread. The command line continues to run scripts
+synchronously.
 
 The `edit.*` commands take the table as `"table"` (its name or id) instead of `"layer"`:
 `edit.setValue`, `edit.addField`, `edit.deleteField`, `edit.convertField`, `edit.calculateField`,

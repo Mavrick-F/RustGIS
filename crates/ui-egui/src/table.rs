@@ -16,6 +16,8 @@ use crate::{RustGisApp, icons};
 pub struct TableState {
     pub folder: Option<std::path::PathBuf>,
     sort: Option<(usize, bool)>,
+    /// The displayed schema that gives a positional sort its meaning, until a command changes it.
+    sort_schema: Option<(ViewKey, Vec<Field>)>,
     selected_only: bool,
     editing: Option<CellEdit>,
     /// The pass the cell editor last had the focus in (see [`had_focus`]).
@@ -44,6 +46,8 @@ pub(crate) fn prune_views(app: &mut RustGisApp) {
     if app.table.opened != app.session.opened {
         app.table.views.clear();
         app.table.editing = None;
+        app.table.sort = None;
+        app.table.sort_schema = None;
         app.table.opened = app.session.opened;
     }
     let project = &app.session.project;
@@ -54,6 +58,14 @@ pub(crate) fn prune_views(app: &mut RustGisApp) {
         ViewKey::Table(id) => project.table(id).map(|t| &t.dataset.fields),
     };
     app.table.views.retain(|key, view| fields_for(*key).map(|fields| view.repair(fields)).is_some());
+    if let Some((key, schema)) = &app.table.sort_schema {
+        let current = fields_for(*key);
+        if current.is_none_or(|fields| fields != schema) {
+            let key = *key;
+            app.table.sort = None;
+            app.table.sort_schema = current.map(|fields| (key, fields.clone()));
+        }
+    }
     if app.table.editing.as_ref().is_some_and(|edit| fields_for(edit.view).is_none_or(|fields| fields != &edit.schema)) {
         app.table.editing = None;
     }
@@ -235,6 +247,10 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 };
             let is_layer = layer_id.is_some();
             prune_views(app);
+            if app.table.sort_schema.as_ref().is_none_or(|(view, fields)| *view != key || *fields != ds.fields) {
+                app.table.sort = None;
+                app.table.sort_schema = Some((key, ds.fields.clone()));
+            }
             let view = app.table.views.entry(key).or_default();
             view.repair(&ds.fields);
             let shown = view.shown(&ds.fields);
@@ -559,10 +575,10 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             if let Some(fd) = delete_field.and_then(|i| ds.fields.get(i)) {
                 // Refused (a definition query reading it): said, unless the command said so.
                 let mark = app.session.notice_mark();
-                match app.run("edit.deleteField", target(json!({"field": fd.name}))) {
-                    Ok(_) => app.table.sort = None,
-                    Err(e) if app.session.notices_since(mark).is_empty() => app.session.notify(e, true),
-                    Err(_) => {}
+                if let Err(e) = app.run("edit.deleteField", target(json!({"field": fd.name})))
+                    && app.session.notices_since(mark).is_empty()
+                {
+                    app.session.notify(e, true);
                 }
             }
             if let Some((r, add)) = clicked
@@ -934,32 +950,47 @@ mod tests {
         assert!(h.state().table.editing.is_none());
     }
 
-    /// Delete Field's real column menu clears the positional sort before a shifted index can
-    /// select another field. The schema changes through ordinary command dispatch.
+    /// Deleting through the menu clears sorting when the schema lands, including a sort picked
+    /// while the desktop worker is pending. Rendering alone deliberately does not land the job.
     #[test]
     fn deleting_a_field_from_its_menu_clears_the_sort() {
-        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
-        let added =
-            app.run("layer.addDataText", json!({"fileName": "columns.csv", "text": "alpha,beta,gamma,delta\n1,8,3,4\n2,7,4,5\n"})).unwrap();
-        app.session.table_standalone = Some(added["id"].as_u64().unwrap() as u32);
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
-            |ui, app: &mut RustGisApp| {
-                let ctx = ui.ctx().clone();
-                app.logic(&ctx);
-                app.ui(ui);
-            },
-            app,
-        );
-        h.run_steps(4);
-        h.state_mut().table.sort = Some((2, true));
-        h.run_steps(2);
-        assert_eq!(h.state().table.sort, Some((2, true)));
-        h.get_by_label("alpha").click_secondary();
-        h.run_steps(2);
-        h.get_by_label("Delete Field").click();
-        h.run_steps(4);
-        assert!(h.state().session.project.tables[0].dataset.field_index("alpha").is_none());
-        assert!(h.state().table.sort.is_none(), "the old index would now sort by delta instead of gamma");
+        for background in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let added = app
+                .run("layer.addDataText", json!({"fileName": "columns.csv", "text": "alpha,beta,gamma,delta\n1,8,3,4\n2,7,4,5\n"}))
+                .unwrap();
+            app.session.table_standalone = Some(added["id"].as_u64().unwrap() as u32);
+            app.reads_off_frame = background;
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    app.logic(&ui.ctx().clone());
+                    show(app, ui);
+                },
+                app,
+            );
+            h.run_steps(4);
+            h.state_mut().table.sort = Some((2, true));
+            h.run_steps(2);
+            h.get_by_label("alpha").click_secondary();
+            h.run_steps(2);
+            h.get_by_label("Delete Field").click();
+            h.run_steps(4);
+            if background {
+                assert!(h.state().session.project.tables[0].dataset.field_index("alpha").is_some());
+                assert_eq!(h.state().table.sort, Some((2, true)), "queuing is not a schema change");
+                h.state_mut().table.sort = Some((2, false));
+                h.run_steps(2);
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while crate::readjob::showing(h.state()) {
+                    assert!(std::time::Instant::now() < end);
+                    crate::readjob::land(h.state_mut());
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                h.run_steps(2);
+            }
+            assert!(h.state().session.project.tables[0].dataset.field_index("alpha").is_none());
+            assert!(h.state().table.sort.is_none(), "the old index would now sort by delta instead of gamma");
+        }
     }
 
     /// Typing into a cell of a reordered table, with a column hidden before it, writes the field

@@ -162,7 +162,7 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
         }
         "script.run" => {
             #[cfg(not(target_arch = "wasm32"))]
-            let work = if owner.native_tool_owner() { super::workflows::script_ahead(s, params) } else { None };
+            let work = super::workflows::script_ahead(s, params, owner.native_tool_owner())?;
             #[cfg(target_arch = "wasm32")]
             let work = None;
             ("Run Script", work, None)
@@ -202,6 +202,16 @@ pub fn archive_target(s: &Session, p: &Value) -> Option<(usize, rustgis_map::Til
 /// `work` as a read for the command to take under `key`.
 pub(crate) fn ahead<T: Send + 'static>(name: &'static str, key: String, work: impl FnOnce() -> T + Send + 'static) -> ReadWork {
     ReadWork { name, key, work: Box::new(move || Box::new(work()) as Box<dyn Any + Send>) }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Makes one script line's prepared result available only to its ordinary admitted invocation.
+/// Restore the enclosing read on every path, including a panic raised again for its caller.
+pub(crate) fn taking<T: Send + 'static>(s: &mut Session, key: &str, value: T, run: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
+    let previous = s.read_ahead.replace(Ready { key: key.into(), value: Box::new(value) });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(s)));
+    s.read_ahead = previous;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// The read placed for `key`, taken: `None` when none was, so the caller reads here.

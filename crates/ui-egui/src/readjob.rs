@@ -24,6 +24,8 @@ pub struct Reads {
     job: Option<ReadJob>,
     /// The commands waiting for the read before, in order.
     waiting: VecDeque<Asked>,
+    #[cfg(test)]
+    fail_spawn: bool,
 }
 
 /// A command asked for, with where it was asked: the project, map and layer then open.
@@ -395,17 +397,24 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
     *held.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ahead);
     let work = held.clone();
     let diagnostics = app.session.diagnostics.capture();
-    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
-        let _diagnostics = diagnostics.enter();
-        if let Some(path) = look_path {
-            *look_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::diskwatch::observe(&path));
-        }
-        let ahead = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        let read = ahead.ok_or_else(|| tl!("This read was already started").to_string()).and_then(|ahead| ahead.run(&ctl));
-        *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(read);
-    });
+    let spawn = || {
+        std::thread::Builder::new().name(name.into()).spawn(move || {
+            let _diagnostics = diagnostics.enter();
+            if let Some(path) = look_path {
+                *look_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::diskwatch::observe(&path));
+            }
+            let ahead = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            let read = ahead.ok_or_else(|| tl!("This read was already started").to_string()).and_then(|ahead| ahead.run(&ctl));
+            *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(read);
+        })
+    };
+    #[cfg(test)]
+    let spawn = || if app.reads.fail_spawn { Err(std::io::Error::other("worker start refused for test")) } else { spawn() };
+    let spawned = spawn();
     if let Err(e) = spawned {
-        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers") {
+        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers" | "script.run")
+            || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
+        {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
             app.session.notify(why.clone(), true);
             not_run_asked(app, &asked, why.clone());
@@ -1270,6 +1279,64 @@ mod tests {
         assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(9.0));
         assert_eq!(app.session.undo_depth(), depth);
         assert!(app.session.notices.iter().any(|n| n.text.contains("table changed")));
+    }
+
+    /// The Script pane dispatch prepares table writes off frame and lands them as one undo step.
+    #[test]
+    fn a_table_script_runs_off_frame() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+        app.reads_off_frame = true;
+        let before = serde_json::to_value(&app.session.project.tables).unwrap();
+        let depth = app.session.undo_depth();
+        let p = json!({"script": "edit.addField {\"table\":\"records\",\"name\":\"result\",\"type\":\"long\"}\nedit.enable {\"on\":true}\nedit.calculateField {\"table\":\"records\",\"field\":\"result\",\"expression\":\"n + 1\"}"});
+        assert_eq!(run(&mut app, "script.run", p.clone()).unwrap()["started"], "Run Script");
+        assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before);
+        landed(&mut app, 60);
+        let data = &app.session.project.tables[0].dataset;
+        assert_eq!(data.value(1, data.field_index("result").unwrap()).as_f64(), Some(3.0));
+        assert_eq!(app.session.undo_depth(), depth + 1);
+        app.run("edit.undo", Value::Null).unwrap();
+        assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before);
+        // A live edit invalidates the prepared script rather than rerunning its calculation.
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        run(&mut app, "script.run", p.clone()).unwrap();
+        app.session.run("edit.setValue", &json!({"table": "records", "row": 0, "field": "n", "value": 9})).unwrap();
+        let current = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
+        landed(&mut app, 60);
+        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), current);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("table changed")));
+        // An unsafe prefix is refused before the desktop script can reach a table write.
+        let mixed = json!({"script": "project.new {}\nedit.addField {\"table\":\"records\",\"name\":\"extra\",\"type\":\"long\"}"});
+        assert!(run(&mut app, "script.run", mixed).unwrap_err().contains("separate scripts"));
+        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), current);
+        app.reads.fail_spawn = true;
+        assert!(run(&mut app, "script.run", p).unwrap_err().contains("worker could not start"));
+        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), current);
+    }
+
+    /// A failed worker start refuses every registered table write without installing or undoing data.
+    #[test]
+    fn a_table_worker_failure_does_not_run_on_the_frame() {
+        for (command, p) in [
+            ("edit.setValue", json!({"table": "records", "row": 0, "field": "n", "value": 9})),
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 3}})),
+            ("edit.addField", json!({"table": "records", "name": "extra", "type": "text"})),
+            ("edit.deleteField", json!({"table": "records", "field": "day"})),
+            ("edit.convertField", json!({"table": "records", "field": "day", "type": "date"})),
+            ("edit.calculateField", json!({"table": "records", "field": "n", "expression": "n + 1"})),
+        ] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n,day\n1,2026-01-01\n2,2026-01-02\n"})).unwrap();
+            app.run("edit.enable", json!({"on": true})).unwrap();
+            app.reads_off_frame = true;
+            app.reads.fail_spawn = true;
+            let before = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
+            let error = app.run_by_user(command, p).unwrap_err();
+            assert!(error.contains("worker could not start"), "{command}: {error}");
+            assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), before, "{command}");
+            assert!(!showing(&app));
+        }
     }
 
     /// Waiting writes consume their predecessor's output, with one undo step per command.
