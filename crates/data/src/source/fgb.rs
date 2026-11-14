@@ -20,13 +20,13 @@ use std::sync::Arc;
 
 mod checked;
 
-/// The header's known feature count, without scanning date columns or decoding features.
-/// GDAL conversions use it to report features lost before RustGIS reads the converted file.
+/// The header's feature count, without scanning date columns or decoding features. GDAL
+/// conversions use it to report features lost before RustGIS reads the converted file; they are
+/// indexed, and an indexed FlatGeobuf always gives its count, so 0 is no features.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn header_feature_count(path: &Path) -> Result<Option<u64>> {
+pub(crate) fn header_feature_count(path: &Path) -> Result<u64> {
     let reader = open_reader(BufReader::new(std::fs::File::open(path)?))?;
-    let count = reader.header().features_count();
-    Ok((count > 0).then_some(count))
+    Ok(reader.header().features_count())
 }
 
 /// A file or an upload, read and seeked.

@@ -264,8 +264,8 @@ per type, its points on top and its polygons at the bottom. Curves become straig
 3D surfaces (an Esri multipatch, such as the buildings of swissBUILDINGS3D, is read as a TIN)
 become flat polygons, one part per face, without their heights. The conversion leaves out a
 feature it can't index, such as a polygon with no coordinates; when GDAL gives the layer's feature
-count, a notice says how many were left out, also when a conversion is reused. Projects remember
-the original file and convert it again if the cached copy is gone.
+count, adding the file says how many were left out, also when it reuses a conversion. Projects
+remember the original file and convert it again if the cached copy is gone.
 
 ## SQL queries and DuckDB databases
 

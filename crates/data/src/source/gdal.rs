@@ -282,15 +282,22 @@ fn convert_in(dir: &Path, src: &Path, layer: Option<&str>, crs: Option<&str>) ->
         }
         // Count all converted families together: splitting a mixed layer isn't a loss. Read
         // only the headers, so checking a cache hit doesn't scan its features or date columns.
-        if out.len() > before
-            && let Some(expected) = l.count.and_then(|n| u64::try_from(n).ok())
+        // A layer with nothing converted and no error lost every feature (all empty polygons,
+        // say); one that failed is said below, with why.
+        if (out.len() > before || errors.is_empty())
+            && let Some(expected) = l.count.and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0)
         {
-            let mut count = Some(0u64);
-            for converted in out.iter().skip(before) {
-                count = count.zip(super::fgb::header_feature_count(&converted.path)?).and_then(|(total, n)| total.checked_add(n));
-            }
-            if let Some(actual) = count.filter(|n| *n < expected) {
-                failed.push(format!("{}: GDAL conversion left out {} of {expected} source features", l.name, expected - actual));
+            // A part whose header can't be read leaves the count unchecked, and says so.
+            let count: std::result::Result<u64, DataError> = out
+                .iter()
+                .skip(before)
+                .try_fold(0u64, |total, converted| Ok(total.saturating_add(super::fgb::header_feature_count(&converted.path)?)));
+            match count {
+                Ok(actual) if actual < expected => {
+                    failed.push(format!("{}: GDAL conversion left out {} of {expected} source features", l.name, expected - actual));
+                }
+                Ok(_) => {}
+                Err(e) => failed.push(format!("{}: couldn't check how many features GDAL's conversion kept ({e})", l.name)),
             }
         }
         // A layer none of whose parts converted is reported, with the first reason.
@@ -833,6 +840,37 @@ mod tests {
                 }
             }
         }
+        // A layer of only empty polygons converts to nothing, beside one that converts: its
+        // whole count is said, fresh and from the cache.
+        let two = dir.path().join("two.gpkg");
+        let status = std::process::Command::new(super::program("ogr2ogr").unwrap())
+            .args(["-f", "GPKG", "-nln", "kept"])
+            .arg(&two)
+            .arg(dir.path().join("clean.geojsonl"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let empties = dir.path().join("empties.geojsonl");
+        std::fs::write(&empties, format!("{empty}\n{empty}\n")).unwrap();
+        let status = std::process::Command::new(super::program("ogr2ogr").unwrap())
+            .args(["-f", "GPKG", "-update", "-nln", "gone", "-nlt", "POLYGON"])
+            .arg(&two)
+            .arg(&empties)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        for _ in 0..2 {
+            let (converted, notes) = convert_in(&dir.path().join("cache"), &two, None, None).unwrap();
+            assert_eq!(converted.iter().map(|c| c.layer.as_str()).collect::<Vec<_>>(), ["kept"]);
+            assert_eq!(notes, vec!["gone: GDAL conversion left out 2 of 2 source features"]);
+        }
+        // A cached conversion whose header can't be read is said, and the layer still comes back.
+        let path = dir.path().join("clean.geojsonl");
+        let (converted, _) = convert_in(&dir.path().join("cache"), &path, None, None).unwrap();
+        std::fs::write(&converted[0].path, b"not a FlatGeobuf").unwrap();
+        let (again, notes) = convert_in(&dir.path().join("cache"), &path, None, None).unwrap();
+        assert_eq!(again.len(), 1);
+        assert!(notes.len() == 1 && notes[0].starts_with("clean: couldn't check how many features GDAL's conversion kept"), "{notes:?}");
     }
 
     #[test]
