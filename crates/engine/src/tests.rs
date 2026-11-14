@@ -12340,6 +12340,53 @@ fn a_scan_warped_onto_its_points_is_placed_for_real() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A one-in-one plane returns 45 degrees, with its unit in the band description through both
+/// function paths, GeoTIFF export and project reopening. A following function clears that label.
+/// The geographic case uses the documented centre-latitude approximation; zFactor scales rise.
+#[test]
+fn slope_results_describe_degrees() {
+    use base64::Engine;
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    for (crs, cell, top, rise) in [(Crs::WebMercator, 10.0, 30.0, 10.0), (Crs::LonLat, 0.001, 60.0015, 55.66)] {
+        for chain in [false, true] {
+            let mut s = world();
+            let gt = GeoTransform { origin_x: 0.0, origin_y: top, pixel_width: cell, pixel_height: -cell };
+            let pixels = (0..9).map(|i| (i % 3) as f32 * rise).collect();
+            let dem = Raster::new("plane", 3, 3, vec![pixels], gt, crs, None, ColorHint::Gray, "Float32").unwrap();
+            let data = base64::engine::general_purpose::STANDARD.encode(geotiff::write(&dem, 0).unwrap());
+            s.run("layer.addDataBytes", &json!({"fileName": "plane.tif", "data": data})).unwrap();
+            let (cmd, params, expected) = if chain {
+                ("raster.functionChain", json!({"layer": "plane", "steps": [{"function": "slope"}], "name": "S"}), 45.0)
+            } else {
+                (
+                    "raster.function",
+                    json!({"layer": "plane", "function": "slope", "zFactor": 0.5, "name": "S"}),
+                    0.5_f64.atan().to_degrees(),
+                )
+            };
+            s.run(cmd, &params).unwrap();
+            let info = s.run("raster.info", &json!({"layer": "S"})).unwrap();
+            assert_eq!(info["bands"][0]["name"], "Slope (degrees)");
+            let out = s.map().layer_by_name("S").unwrap().raster.as_ref().unwrap().data.as_ref().unwrap();
+            assert!((f64::from(out.bands[0].data[4]) - expected).abs() < 1e-4, "{crs:?} {cmd}");
+            let back = geotiff::read(std::io::Cursor::new(geotiff::write(out, 0).unwrap()), "S").unwrap();
+            assert_eq!(back.bands[0].name, "Slope (degrees)");
+            let text = serde_json::to_string(&s.project).unwrap();
+            let mut reopened = Session::new(Project::default());
+            reopened.run("project.openText", &json!({"text": text})).unwrap();
+            assert_eq!(reopened.run("raster.info", &json!({"layer": "S"})).unwrap()["bands"][0]["name"], "Slope (degrees)");
+            s.run(
+                "raster.functionChain",
+                &json!({"layer": "plane", "steps": [
+                {"function": "slope"}, {"function": "threshold", "value": 30}
+            ], "name": "mask"}),
+            )
+            .unwrap();
+            assert_ne!(s.run("raster.info", &json!({"layer": "mask"})).unwrap()["bands"][0]["name"], "Slope (degrees)");
+        }
+    }
+}
+
 /// A hillshade is made as bytes, 1–255 with 0 for no data, so it is exported as 8-bit samples (a
 /// GeoTIFF and a COG); it is still drawn as a grey stretch, even of a plane with a single shade,
 /// which as whole numbers would otherwise be drawn as classes. A chain ending in one is the same.
