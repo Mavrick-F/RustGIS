@@ -112,7 +112,8 @@ is out of scope.
 ## Quality gates
 `cargo xtask ci` (fmt, clippy -D warnings, tests, layers) before every commit.
 While you work, `cargo xtask changed` runs the same checks on only the packages your branch changes
-and those that depend on them.
+and those that depend on them, or on the whole workspace when a changed file such as `Cargo.lock` is
+outside every package and nothing includes it.
 A new dependency must have a licence `deny.toml` allows (CI runs `cargo deny check licenses`); after
 changing dependencies, run `cargo xtask notices` to refresh the `THIRD-PARTY-LICENSES.txt` files the
 packages ship (the release build fails on stale ones).

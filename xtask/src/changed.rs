@@ -7,8 +7,9 @@
 //! - A file inside a package changes that package. A file outside every package changes the
 //!   packages whose sources name it for the build to read (`include_str!`, `include_bytes!`,
 //!   `include!`, `#[path]`, `rerun-if-changed`); any other file outside them (`Cargo.lock`, a
-//!   workspace setting) changes everything. A file a test opens only at run time isn't seen: a
-//!   change to it checks what the rules above find, which may leave that test out.
+//!   workspace setting) changes everything. A file a test opens only at run time, or one a macro
+//!   names only from its argument, isn't seen: a change to it checks what the rules above find,
+//!   which may leave its reader out.
 //! - Every package that depends on a changed one, as a dependency of any kind, is checked too. So
 //!   a changed package gets the features every workspace package turns on in it; a feature that a
 //!   package left out turns on in an outside crate isn't, which can make a result differ from CI's.
@@ -98,8 +99,8 @@ fn normalize(path: &Path) -> Option<String> {
 /// read: what `include_str!`, `include_bytes!` and `include!` take from a string literal, or from
 /// a `concat!` that starts with one (its directory, when more follows) or with
 /// `env!("CARGO_MANIFEST_DIR")` and one; a `#[path]`; a build script's `rerun-if-changed`. Other
-/// forms (a macro's argument, `OUT_DIR`) are left out: they name files the package itself holds or
-/// makes.
+/// forms are left out: `OUT_DIR` holds what the build makes, and a path that is all a macro's
+/// argument isn't seen (a macro that names a file outside its package that way is missed).
 fn named_paths(text: &str, dir: &Path, package_dir: &Path) -> Vec<PathBuf> {
     /// The string literal at the start of `s`, plain or raw (`r"…"`, `r#"…"#`), and what follows it.
     fn literal(s: &str) -> Option<(&str, &str)> {
