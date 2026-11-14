@@ -111,7 +111,8 @@ struct Kept {
     secrets: usize,
     /// Readable rows whose address had a password, key or token taken out when read: saved so.
     stripped: usize,
-    /// Readable rows whose name was cut (past [`MAX_NAME`] characters, or with control characters).
+    /// Readable rows whose name or group was cut (past [`MAX_NAME`] characters, or with control
+    /// characters).
     cut: usize,
 }
 
@@ -427,9 +428,11 @@ impl Connections {
         for row in rows {
             let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| {
                 let name = r.connection.name.trim().to_string();
+                let group = r.connection.group.trim().to_string();
                 let (c, stripped) = clean(r.connection).ok()?;
-                // What reading changed in the row, to be said: a secret taken out of the address, a name cut.
-                let changed = (stripped, !name.is_empty() && c.name != name);
+                // What reading changed in the row, to be said: a secret taken out of the address, a name
+                // or group cut.
+                let changed = (stripped, (!name.is_empty() && c.name != name) || (!group.is_empty() && c.group != group));
                 Some(((c, changed), r.other))
             });
             let read = read.filter(|((c, _), _)| {
@@ -522,7 +525,8 @@ impl Connections {
         if k.cut > 0 {
             let n = k.cut;
             said.push(format!(
-                "{n} saved connection name{} cut to {MAX_NAME} characters or without control characters: saved cut",
+                "{n} saved connection name{} or group{} cut to {MAX_NAME} characters or without control characters: saved cut",
+                if n == 1 { "" } else { "s" },
                 if n == 1 { " was" } else { "s were" }
             ));
         }
@@ -1300,11 +1304,12 @@ mod tests {
         let cut = json!({"connections":[
             {"id":"c1","name":"A","kind":"wms","address":"https://a/wms?token=hidden"},
             {"id":"c2","name":"n".repeat(300),"kind":"wms","address":"https://b/wms"},
-            {"id":"c3","name":" C ","kind":"wms","address":"https://c/wms"}
+            {"id":"c3","name":" C ","kind":"wms","address":"https://c/wms"},
+            {"id":"c4","name":"D","group":"g".repeat(300),"kind":"wms","address":"https://d/wms"}
         ]});
         let s = Connections::from_json(&cut.to_string());
         assert!(s.unread().iter().any(|t| t.starts_with("1 saved connection address had a password")), "{:?}", s.unread());
-        assert!(s.unread().iter().any(|t| t.starts_with("1 saved connection name was cut")), "{:?}", s.unread());
+        assert!(s.unread().iter().any(|t| t.starts_with("2 saved connection names or groups were cut")), "{:?}", s.unread());
         assert_eq!(s.unread().len(), 2);
         // Rows past the limit are kept and said as that, not as unreadable.
         let many: Vec<Value> = (1..=MAX_CONNECTIONS + 1)
