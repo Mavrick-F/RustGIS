@@ -174,10 +174,10 @@ impl Original {
     }
 
     /// The coordinate system its `.prj` names, as the reader takes it (`None` for none, one it
-    /// can't read, or longitude/latitude).
+    /// can't read).
     fn crs(&self) -> Option<Crs> {
         let text = std::str::from_utf8(self.prj.as_deref()?).ok()?;
-        crate::raster::wkt::read_wkt(text).ok().map(|(c, _)| c).filter(|c| *c != Crs::LonLat)
+        crate::raster::wkt::read_wkt(text).ok().map(|(c, _)| c)
     }
 }
 
@@ -236,10 +236,16 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     // coordinates (the system taken for longitude/latitude, which converts nothing).
     let (as_read, _) = crate::io::read_shapefile_parts(original.parts(), &name, crs)?;
     if crate::sync::rows_digest(&as_read)? != synced.rows {
-        return Err(refused(
-            path,
-            "it reads otherwise now than when the layer was read (RustGIS reads it more fully since), so rows that weren't edited could change: add the file again to read it as it is",
-        ));
+        // Define Projection changes the layer's CRS, which is part of its digest. The
+        // unedited file must still reproduce the saved baseline in its own CRS. Keep the
+        // current-CRS read above for imports with an override and native-coordinate reuse.
+        let (baseline, _) = crate::io::read_shapefile_parts(original.parts(), &name, None)?;
+        if crate::sync::rows_digest(&baseline)? != synced.rows {
+            return Err(refused(
+                path,
+                "it reads otherwise now than at the saved sync point, even in the file's own coordinate system; the import CRS may differ or RustGIS may read it more fully now: restore the original import CRS or add the file again with the intended CRS",
+            ));
+        }
     }
     let raw = match crs {
         Some(_) => Some(crate::io::read_shapefile_parts(original.parts(), &name, Some(Crs::LonLat))?.0),
@@ -309,7 +315,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
 
     // The `.prj` and `.cpg` as the file had them, unless the layer is in another system.
     parts.retain(|(e, _)| !matches!(*e, "prj" | "cpg"));
-    if crs == original.crs() {
+    if Some(written_crs) == original.crs() || (ds.crs.is_none() && original.crs().is_none()) {
         if let Some(prj) = &original.prj {
             parts.push(("prj", prj.clone()));
         }
@@ -823,6 +829,30 @@ mod tests {
         sync.rows = crate::sync::rows_digest(&older).unwrap();
         let e = shapefile(&older, &path, &sync).err().unwrap().to_string();
         assert!(e.contains("reads otherwise now") && e.contains("nothing was written"), "{e}");
+    }
+
+    /// Defining a previously undefined source CRS publishes the definition without moving
+    /// its native coordinates, and records a sync point that permits the next publish.
+    #[test]
+    fn a_defined_projection_publishes_without_moving_native_coordinates() {
+        for crs in [Crs::WebMercator, Crs::LonLat] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("parcels.shp");
+            crate::io::write_path(&parcels(), &path).unwrap();
+            std::fs::remove_file(path.with_extension("prj")).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let (ds, sync) = read(&path);
+            let defined = crate::io::define_projection(&ds, crs).unwrap();
+            let published = shapefile(&defined, &path, &sync).unwrap();
+            assert!(same_shapes(&before, &std::fs::read(&path).unwrap(), 0.0).is_none());
+            assert!(published.notes.iter().any(|n| n.contains(".prj now says")), "{:?}", published.notes);
+            let (back, next) = read(&path);
+            assert_eq!(Original::read(&path).unwrap().crs(), Some(crs));
+            assert_eq!(back.crs, (crs != Crs::LonLat).then_some(crs));
+            assert!(same_rows(&defined, &back, PROJECTED_TOLERANCE).is_none());
+            assert_eq!(next.rows, published.rows);
+            shapefile(&back, &path, &next).unwrap();
+        }
     }
 
     /// A number past what an `f64` holds exactly, in a column that wasn't edited, is refused
