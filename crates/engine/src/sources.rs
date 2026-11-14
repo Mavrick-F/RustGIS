@@ -266,10 +266,9 @@ impl Sources {
         if k.secrets > 0 {
             let n = k.secrets;
             said.push(format!(
-                "{n} value{} in the saved data sources {} dropped because {} held a password, key or token",
+                "{n} value{} in the saved data sources {} a password, key or token: not kept, and left out the next time the sources are saved",
                 if n == 1 { "" } else { "s" },
-                if n == 1 { "was" } else { "were" },
-                if n == 1 { "it" } else { "they" }
+                if n == 1 { "holds" } else { "hold" }
             ));
         }
         said
@@ -303,7 +302,70 @@ impl Sources {
         for (list, row) in over {
             self.kept.rows.entry(list).or_default().push(row);
         }
+        // A readable row kept past a limit for a source that is listed gives it its fields.
+        for list in LISTS {
+            if self.kept.rows.contains_key(list) {
+                let ids: Vec<_> = match list {
+                    "favourites" => &self.favourites,
+                    "saved" => &self.saved,
+                    _ => &self.recent,
+                }
+                .iter()
+                .map(|s| identity(&s.kind, &s.address))
+                .collect();
+                for id in ids {
+                    self.adopt(list, &id);
+                }
+            }
+        }
+        self.recheck_fields();
         self.generation += 1;
+    }
+
+    /// Classifies the fields kept for each listed source again, against the source as it is now
+    /// (a changed `extra` or address can make a field that passed at load a secret), and drops
+    /// what is one, counted with the rest. Every change to a list that keeps fields ends here, so
+    /// [`Sources::to_json`] writes only what passed.
+    fn recheck_fields(&mut self) {
+        let keys: Vec<_> = self.kept.fields.keys().cloned().collect();
+        for key in keys {
+            let (list, kind, address) = &key;
+            let listed = match *list {
+                "favourites" => &self.favourites,
+                "saved" => &self.saved,
+                _ => &self.recent,
+            };
+            let id = (kind.clone(), address.clone());
+            let Some(source) = listed.iter().find(|s| identity(&s.kind, &s.address) == id).cloned() else { continue };
+            if let Some(fields) = self.kept.fields.remove(&key) {
+                let fields = self.kept.without_secrets(fields, &source.address, &source.extra);
+                if !fields.is_empty() {
+                    self.kept.fields.insert(key, fields);
+                }
+            }
+        }
+    }
+
+    /// Listing a source takes along the fields of a readable row of it kept past the list's limit
+    /// (the first fields of an identity win), and removes that row: it would list it twice.
+    fn adopt(&mut self, list: &'static str, id: &(String, String)) {
+        let Some(rows) = self.kept.rows.get_mut(list) else { return };
+        let mut taken = Vec::new();
+        rows.retain(|r| {
+            let ours = row_identity(r).as_ref() == Some(id);
+            if ours && let Ok(row) = serde_json::from_value::<Row>(r.clone()) {
+                taken.push(row.other);
+            }
+            !ours
+        });
+        self.kept.over = self.kept.over.saturating_sub(taken.len());
+        for other in taken {
+            let fields = self.kept.fields.entry((list, id.0.clone(), id.1.clone())).or_default();
+            for (k, v) in other {
+                fields.entry(k).or_insert(v);
+            }
+        }
+        self.kept.fields.retain(|_, f| !f.is_empty());
     }
 
     /// The `data_sources` preference: these sources, with what [`Sources::from_json`] kept
@@ -339,11 +401,14 @@ impl Sources {
         self.recent.retain(|r| !same(r, &s));
         self.recent.insert(0, s);
         self.recent.truncate(MAX_RECENT);
+        let id = identity(&self.recent[0].kind, &self.recent[0].address);
+        self.adopt("recent", &id);
         // A source no longer recent takes the fields kept for it along.
         let recent = &self.recent;
         self.kept.fields.retain(|(list, kind, address), _| {
             *list != "recent" || recent.iter().any(|r| identity(&r.kind, &r.address) == identity(kind, address))
         });
+        self.recheck_fields();
         self.generation += 1;
     }
 
@@ -351,6 +416,7 @@ impl Sources {
     /// identity ([`Source::is`]: kind and address), whose name and `extra` the new one's take over.
     pub fn keep(&mut self, list: &str, s: Source) -> Result<Source, String> {
         let s = clean(s)?;
+        let list = LISTS.into_iter().find(|l| *l == list).ok_or_else(|| format!("unknown list '{list}' (favourites, saved or recent)"))?;
         let l = self.list_mut(list)?;
         // The same source keeps its place.
         if let Some(slot) = l.iter_mut().find(|r| same(r, &s)) {
@@ -361,6 +427,8 @@ impl Sources {
             }
             l.push(s.clone());
         }
+        self.adopt(list, &identity(&s.kind, &s.address));
+        self.recheck_fields();
         self.generation += 1;
         // What was stored (cleaned): the caller reports it, wherever it sits in the list.
         Ok(s)
@@ -1039,9 +1107,7 @@ MIIE
         ]});
         let s = Sources::from_json(&secret.to_string());
         assert!(
-            s.unread()
-                .iter()
-                .any(|t| t.starts_with("3 values in the saved data sources were dropped because they held a password, key or token")),
+            s.unread().iter().any(|t| t.starts_with("3 values in the saved data sources hold a password, key or token")),
             "{:?}",
             s.unread()
         );
@@ -1056,7 +1122,7 @@ MIIE
             "{}",
             s.to_json()
         );
-        assert!(s.unread().iter().any(|t| t.starts_with("2 values in the saved data sources were dropped")), "{:?}", s.unread());
+        assert!(s.unread().iter().any(|t| t.starts_with("2 values in the saved data sources hold")), "{:?}", s.unread());
         // A key beside an address among the preference's own keys.
         let top = json!({"address": "https://api.example", "key": "abc"});
         assert!(!Sources::from_json(&top.to_string()).to_json().contains("abc"));
@@ -1084,12 +1150,22 @@ MIIE
                 {"kind": "file", "name": "A", "address": "/a.csv", "key": "abc"},
                 {"kind": "file", "name": "A", "address": "/a.csv", "endpoint": "https://api.example"}
             ]}),
+            json!({"saved": [
+                {"kind": "file", "name": "A", "address": "/a.csv", "extra": {"endpoint": "https://api.example"}},
+                {"kind": "file", "name": "A", "address": "/a.csv", "key": "abc"}
+            ]}),
+            json!({"saved": [
+                {"kind": "file", "name": "A", "address": "/a.csv", "key": "abc"},
+                {"kind": "file", "name": "A", "address": "/a.csv", "extra": {"endpoint": "https://api.example"}}
+            ]}),
         ] {
             let mut s = Sources::from_json(&twins.to_string());
             assert_eq!(s.saved.len(), 1);
             let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
             assert_eq!(saved["saved"].as_array().map(Vec::len), Some(1));
-            assert!(saved["saved"][0].get("more").is_none() && !s.to_json().contains("hidden") && !s.to_json().contains("api.example"));
+            assert!(saved["saved"][0].get("more").is_none() && !s.to_json().contains("hidden"));
+            // Nothing of a dropped row combines with the first: no key beside an endpoint.
+            assert!(!(s.to_json().contains("abc") && s.to_json().contains("api.example")), "{}", s.to_json());
             assert_eq!(
                 s.unread().first().map(String::as_str),
                 Some("1 repeated saved data source was removed (the first of each is kept, with its settings)")
@@ -1097,6 +1173,46 @@ MIIE
             s.forget("saved", "file", "/a.csv").unwrap();
             assert!(!s.to_json().contains("/a.csv"));
         }
+        // A source's known details can be changed after its fields were kept, as a key beside an
+        // endpoint it now has: checked again when it is written, by keep and by merge.
+        let a = || Source {
+            kind: "file".into(),
+            address: "/a.csv".into(),
+            extra: json!({"endpoint": "https://api.example"}),
+            ..Source::default()
+        };
+        let kept = json!({"favourites": [{"kind": "file", "name": "", "address": "/a.csv", "key": "abc", "future": 1}]}).to_string();
+        let mut s = Sources::from_json(&kept);
+        assert!(s.to_json().contains("abc"));
+        s.keep("favourites", a()).unwrap();
+        assert!(
+            !s.to_json().contains("abc") && s.to_json().contains("\"future\":1") && s.to_json().contains("api.example"),
+            "{}",
+            s.to_json()
+        );
+        assert!(s.unread().iter().any(|t| t.starts_with("1 value in the saved data sources holds")), "{:?}", s.unread());
+        let mut s = Sources::default();
+        s.keep("favourites", a()).unwrap();
+        s.merge(Sources::from_json(&kept));
+        assert!(!s.to_json().contains("abc") && s.to_json().contains("api.example"), "{}", s.to_json());
+        // A readable row kept past the limit gives its fields to the source when it is listed.
+        let recent: Vec<Value> =
+            (0..=MAX_RECENT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv"), "future": i})).collect();
+        let mut s = Sources::from_json(&json!({ "recent": recent }).to_string());
+        s.note(Source { kind: "file".into(), address: format!("/{MAX_RECENT}.csv"), ..Source::default() });
+        let mut s = Sources::from_json(&s.to_json());
+        s.note(Source { kind: "file".into(), address: format!("/{MAX_RECENT}.csv"), ..Source::default() });
+        let saved: Value = serde_json::from_str(&Sources::from_json(&s.to_json()).to_json()).unwrap();
+        assert_eq!(saved["recent"][0]["future"], json!(MAX_RECENT), "{saved}");
+        assert_eq!(saved["recent"].as_array().map(Vec::len), Some(MAX_RECENT));
+        // The same by merge: the session lists a source the stored preference kept past the limit.
+        let mut s = Sources::default();
+        s.note(Source { kind: "file".into(), address: format!("/{MAX_RECENT}.csv"), ..Source::default() });
+        let recent: Vec<Value> =
+            (0..=MAX_RECENT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv"), "future": i})).collect();
+        s.merge(Sources::from_json(&json!({ "recent": recent }).to_string()));
+        assert!(s.to_json().contains(&format!("\"future\":{MAX_RECENT}")), "{}", s.to_json());
+        assert_eq!(s.to_json().matches(&format!("/{MAX_RECENT}.csv")).count(), 1, "{}", s.to_json());
         // The row's known details count beside an unknown key, as its address does.
         let extra = json!({"saved": [{"kind": "file", "name": "A", "address": "/a.csv", "extra": {"endpoint": "https://api.example"}, "key": "abc"}]});
         let saved = Sources::from_json(&extra.to_string()).to_json();
