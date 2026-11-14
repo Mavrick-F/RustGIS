@@ -136,7 +136,10 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
             let dataset = l.dataset.clone();
             let spawned = std::thread::Builder::new().name("Edits not published".into()).spawn(move || {
                 let _probe = rustgis_engine::data::progress::install(Some(Arc::new(probe)));
-                let digest = rustgis_engine::data::sync::rows_digest(&dataset).map_err(|e| e.to_string());
+                // A panic lands as an answer too, so it never holds the turn.
+                let digest = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::data::sync::rows_digest(&dataset)))
+                    .map_err(|_| "the hash stopped".to_string())
+                    .and_then(|d| d.map_err(|e| e.to_string()));
                 *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(digest);
             });
             match spawned {

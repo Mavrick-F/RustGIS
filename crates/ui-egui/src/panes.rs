@@ -1912,7 +1912,7 @@ fn layer_note(app: &mut RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<(S
     #[cfg(not(target_arch = "wasm32"))]
     {
         use crate::diskwatch::Status;
-        if l.synced.is_none() || crate::diskwatch::reloadable(l) {
+        if !crate::diskwatch::publishes(l) || crate::diskwatch::reloadable(l) {
             return disk_note(app, Some(l), None);
         }
         let edited = crate::syncmark::edited(app, l, ctx) == Some(true);

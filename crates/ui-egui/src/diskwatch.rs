@@ -287,8 +287,14 @@ struct Found {
 /// (`source.publish`): held in memory, not read in place.
 fn published_file(l: &rustgis_engine::map::Layer) -> Option<(&str, &rustgis_engine::data::sync::Synced)> {
     let synced = l.synced.as_ref()?;
-    let path = l.dataset.source.as_deref().filter(|p| rustgis_engine::map::paths::is_local(p))?;
-    (l.source.is_none() && l.gpkg.is_none() && rustgis_engine::data::sync::is_syncable(path)).then_some((path, synced))
+    // As `source.publish` takes it: a network share isn't a file on this computer.
+    let path = l.dataset.source.as_deref().filter(|p| rustgis_engine::cmd::publish::local_file(p))?;
+    (l.source.is_none() && l.gpkg.is_none()).then_some((path, synced))
+}
+
+/// Whether the layer publishes to a file the Layers pane marks ([`published_file`]).
+pub(crate) fn publishes(l: &rustgis_engine::map::Layer) -> bool {
+    published_file(l).is_some()
 }
 
 /// The linked local sources in every map: layers Reload Data reads, layers that publish to their
@@ -1439,6 +1445,19 @@ mod tests {
         assert!(app.session.map().layer(id).unwrap().synced.is_some());
         app.watch_files = true;
         (app, id, path)
+    }
+
+    #[test]
+    fn a_layer_on_a_network_share_is_not_marked_as_publishable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, id, _) = published_layer(dir.path());
+        assert!(publishes(app.session.map().layer(id).unwrap()));
+        // Publish to Source refuses a share, so the Layers pane doesn't promise it.
+        for share in [r"\\host\share\parcels.geojson", "//host/share/parcels.geojson"] {
+            let mut l = app.session.map().layer(id).unwrap().clone();
+            l.dataset.source = Some(share.into());
+            assert!(!publishes(&l), "{share}");
+        }
     }
 
     #[test]
