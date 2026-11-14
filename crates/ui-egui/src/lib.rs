@@ -4110,7 +4110,10 @@ impl RustGisApp {
                             self.session.notify(e.clone(), true);
                         })?;
                 if self.services.download.is_some() {
-                    self.download(&name, bytes);
+                    // Not handed over (the failure is said): the area made for it goes too.
+                    if !self.download(&name, bytes) {
+                        rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
+                    }
                 } else {
                     let (ext, label) =
                         rustgis_engine::cmd::items::ITEMS.iter().find(|i| i.0 == kind).map_or(("json", "File"), |i| (i.1, i.2));
@@ -4124,6 +4127,11 @@ impl RustGisApp {
                         }
                         None => rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas),
                     }
+                }
+                // An offline area made for the package is a change to the project, to be saved:
+                // Bring Back needs it. (Saving here runs no command, so nothing else marks it.)
+                if self.session.project.offline_areas.len() > areas {
+                    self.session.mark_unsaved();
                 }
             }
             "ui.openItem" => {
@@ -4144,6 +4152,8 @@ impl RustGisApp {
                     "presentation" => ("presentation.import", &["rgispres"], "RustGIS presentation"),
                     "notebook" => ("notebook.open", &["rgisnb", "ipynb"], "RustGIS or Jupyter notebook"),
                     "dlPackage" => ("dl.import", &["rgisdlpk"], "RustGIS deep learning package"),
+                    // A field package sent back from a phone: its edits, to the area it came from.
+                    "fieldPackage" => ("offline.bringBack", &["rgisfield"], "RustGIS field package"),
                     k => return Err(format!("unknown item '{k}'")),
                 };
                 if let Some(open) = &self.services.open_async {
