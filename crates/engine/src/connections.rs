@@ -109,6 +109,10 @@ struct Kept {
     /// Rows and fields that couldn't be read and held a password, key or token: not kept, since
     /// this version can't strip it from what it doesn't understand.
     secrets: usize,
+    /// Readable rows whose address had a password, key or token taken out when read: saved so.
+    stripped: usize,
+    /// Readable rows whose name was cut (past [`MAX_NAME`] characters, or with control characters).
+    cut: usize,
 }
 
 impl Kept {
@@ -122,7 +126,11 @@ impl Kept {
             .filter(|(k, v)| {
                 let mut probe = Map::new();
                 probe.insert((*k).clone(), (*v).clone());
-                if web_address(&Value::String(address.into()), 0) || o.iter().any(|(other, v)| other != *k && web_address(v, 0)) {
+                if web_address(&Value::String(address.into()), 0)
+                    || o.iter().any(|(other, v)| {
+                        other != *k && !other.eq_ignore_ascii_case("data") && !other.eq_ignore_ascii_case("text") && web_address(v, 0)
+                    })
+                {
                     probe.insert("\u{1}beside".into(), "https://a".into());
                 }
                 sources::holds_secret(&Value::Object(probe))
@@ -417,8 +425,14 @@ impl Connections {
         s.kept.top = s.kept.without_secrets(o, "");
         let mut ids = BTreeSet::new();
         for row in rows {
-            let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| Some((clean(r.connection).ok()?.0, r.other)));
-            let read = read.filter(|(c, _)| {
+            let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| {
+                let name = r.connection.name.trim().to_string();
+                let (c, stripped) = clean(r.connection).ok()?;
+                // What reading changed in the row, to be said: a secret taken out of the address, a name cut.
+                let changed = (stripped, !name.is_empty() && c.name != name);
+                Some(((c, changed), r.other))
+            });
+            let read = read.filter(|((c, _), _)| {
                 !c.id.is_empty()
                     && c.id.len() <= 32
                     && c.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -427,11 +441,13 @@ impl Connections {
             let over_limit = read.is_some() && s.connections.len() >= MAX_CONNECTIONS;
             let read = read.filter(|_| !over_limit);
             let id = match &read {
-                Some((c, _)) => c.id.clone(),
+                Some(((c, _), _)) => c.id.clone(),
                 None => row.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
             };
             match read {
-                Some((c, other)) => {
+                Some(((c, (stripped, cut)), other)) => {
+                    s.kept.stripped += usize::from(stripped);
+                    s.kept.cut += usize::from(cut);
                     if let Some(n) = id.strip_prefix('c').and_then(|n| n.parse::<u64>().ok()) {
                         s.next = s.next.max(n.saturating_add(1));
                     }
@@ -493,6 +509,21 @@ impl Connections {
             said.push(format!(
                 "{n} saved connection{} settings this version doesn't know (from a newer RustGIS): ignored here, and kept when connections are saved",
                 if n == 1 { " has" } else { "s have" }
+            ));
+        }
+        if k.stripped > 0 {
+            let n = k.stripped;
+            said.push(format!(
+                "{n} saved connection address{} had a password, key or token removed: saved without {}",
+                if n == 1 { "" } else { "es" },
+                if n == 1 { "it" } else { "them" }
+            ));
+        }
+        if k.cut > 0 {
+            let n = k.cut;
+            said.push(format!(
+                "{n} saved connection name{} cut to {MAX_NAME} characters or without control characters: saved cut",
+                if n == 1 { " was" } else { "s were" }
             ));
         }
         if k.secrets > 0 {
@@ -1254,6 +1285,9 @@ mod tests {
         // Or beside an address among the preference's own keys.
         let top = json!({"address":"https://api.example","key":"abc","connections":[]});
         assert!(!Connections::from_json(&top.to_string()).to_json().contains("\"abc\""));
+        // A file's contents beside a field isn't an address for it.
+        let file = json!({"data":"https://example.invalid/a.csv","key":"feature_id","connections":[]});
+        assert!(Connections::from_json(&file.to_string()).to_json().contains("feature_id"));
         // Even when that address holds a secret itself.
         let top = json!({"address":"https://api.example?token=hidden","key":"abc","connections":[]});
         let saved = Connections::from_json(&top.to_string()).to_json();
@@ -1262,6 +1296,16 @@ mod tests {
         let own = json!({"connections":[{"id":"c1","name":"A","kind":"wms","address":"https://a","key":"abc","note":"n"}]});
         let s = Connections::from_json(&own.to_string());
         assert!(!s.to_json().contains("\"abc\"") && s.to_json().contains("\"note\""), "{}", s.to_json());
+        // What reading cuts from a readable row is said: a secret in the address, a long name.
+        let cut = json!({"connections":[
+            {"id":"c1","name":"A","kind":"wms","address":"https://a/wms?token=hidden"},
+            {"id":"c2","name":"n".repeat(300),"kind":"wms","address":"https://b/wms"},
+            {"id":"c3","name":" C ","kind":"wms","address":"https://c/wms"}
+        ]});
+        let s = Connections::from_json(&cut.to_string());
+        assert!(s.unread().iter().any(|t| t.starts_with("1 saved connection address had a password")), "{:?}", s.unread());
+        assert!(s.unread().iter().any(|t| t.starts_with("1 saved connection name was cut")), "{:?}", s.unread());
+        assert_eq!(s.unread().len(), 2);
         // Rows past the limit are kept and said as that, not as unreadable.
         let many: Vec<Value> = (1..=MAX_CONNECTIONS + 1)
             .map(|i| json!({"id": format!("c{i}"), "name": format!("N{i}"), "kind": "wms", "address": "https://a"}))
