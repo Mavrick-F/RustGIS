@@ -1127,6 +1127,66 @@ fn a_streamed_shapefile_says_dates_it_could_not_read_once() {
     assert!(err.contains("Load All Features"), "{err}");
 }
 
+/// Load All Features of a GeoPackage read in place says the date-times it read rounded to the
+/// microsecond; a clean one says nothing of them.
+#[test]
+fn loading_a_streamed_layer_whole_says_the_date_times_it_rounded() {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("rustgis-whole-rounded-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, stored, said) in [("fine", "2026-03-05T14:30:00.123456789Z", 1), ("clean", "2026-03-05T14:30:00.123456Z", 0)] {
+        let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new("seen", FieldType::DateTime)]);
+        ds.push(Some(Geometry::Point(rustgis_geom::Coord::new(1.0, 1.0))), vec![V::parse("2026-01-01T00:00:00Z", FieldType::DateTime)]);
+        let path = dir.join(format!("{name}.gpkg"));
+        rustgis_data::io::write_path(&ds, &path).unwrap();
+        // The spatial index's triggers call GeoPackage functions a plain connection lacks; the
+        // geometry isn't changed, so the index stays right without them.
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let triggers: Vec<String> = c
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for t in triggers {
+            c.execute(&format!("DROP TRIGGER \"{t}\""), []).unwrap();
+        }
+        c.execute(&format!("UPDATE \"{name}\" SET seen = ?1"), [stored]).unwrap();
+        let mut s = Session::new(Project::default());
+        s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap();
+        assert!(s.map().layers[0].is_streamed(), "{name} is read in place");
+        let mark = s.notice_mark();
+        s.run("layer.loadAll", &json!({"layer": name})).unwrap();
+        let rounded: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("rounded")).collect();
+        assert_eq!(rounded.len(), said, "{name}: {rounded:?}");
+        if said == 1 {
+            assert!(rounded[0].starts_with(&format!("{name}: 1 date-time was rounded to the microsecond")), "{rounded:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every export of a layer read in place, the browser's download too, says what its whole read did
+/// to dates: values read as empty and date-times rounded; a clean read says nothing.
+#[test]
+fn an_export_says_what_its_whole_read_did_to_dates() {
+    let lost = rustgis_map::Unreadable {
+        rows: 0,
+        dates: Some("1 value isn't a date and was read as empty, in 'day'".into()),
+        rounded: Some("1 date-time was rounded to the microsecond, as more digits than that aren't kept, in 'at'".into()),
+    };
+    assert_eq!(
+        crate::cmd::share::read_date_notes("out.geojson", "Sites", &lost),
+        [
+            "out.geojson: Sites: 1 value isn't a date and was read as empty, in 'day', so they're empty in the export",
+            "out.geojson: Sites: 1 date-time was rounded to the microsecond, as more digits than that aren't kept, in 'at' when read for the export",
+        ]
+    );
+    assert!(crate::cmd::share::read_date_notes("out.geojson", "Sites", &rustgis_map::Unreadable::default()).is_empty());
+}
+
 /// A polygon layer stacks fills (a colour, hatch lines, markers on a grid), for the layer or a
 /// class of its own; junk is refused and numbers held within range; each change undoes, and the
 /// project keeps them (a layer without them saves as before).

@@ -56,7 +56,7 @@ pub struct SavedRows {
     /// ([`crate::io::fine_dates`]): only values the save wrote.
     pub fine_dates: Vec<usize>,
     /// Per supplied field, date-times read back rounded to the microsecond
-    /// ([`crate::source::rounded_dates_note`]), except a value an edit submitted as it was read:
+    /// ([`crate::source::rounded_dates_note`]), except a stored value the save left as it was:
     /// the load said those.
     pub rounded_dates: Vec<usize>,
 }
@@ -313,6 +313,15 @@ impl EditTable {
                 tx.execute(&format!("UPDATE {table} SET {} WHERE {pk} = ?", sets.join(", ")), params_from_iter(args)).map_err(err)? as u64;
             saved.updated += 1;
         }
+        // What the date columns of the updated rows held before the save, to tell a value the save
+        // changed from one the load already said; the rest of the rows isn't kept.
+        let dated: Vec<usize> = snapshot_columns
+            .iter()
+            .filter(|(i, _)| fields.get(*i).is_some_and(|f| matches!(f.ty, crate::FieldType::Date | crate::FieldType::DateTime)))
+            .map(|&(_, c)| c)
+            .collect();
+        let before: std::collections::HashMap<(i64, usize), Sql> =
+            current.iter().flat_map(|(k, row)| dated.iter().filter_map(move |&c| row.get(c).map(|v| ((*k, c), v.clone())))).collect();
         drop(current);
         // Reserve the loaded baseline as well as live and historical keys. A deleted source row
         // can still be present in the layer, so SQLite's ordinary rowid allocation is not enough.
@@ -408,13 +417,14 @@ impl EditTable {
             for &(i, c) in &snapshot_columns {
                 let field = fields.get(i).ok_or_else(|| self.shape_error())?;
                 let attr = feature.attrs.get_mut(i).ok_or_else(|| self.shape_error())?;
-                // Read as the load reads it: rounded past the microsecond. Counted unless it is the
-                // value the edit submitted, which the load already said; a row only a trigger
-                // touched has none here, so its rounding is said.
+                // Read as the load reads it: rounded past the microsecond. Counted unless the stored
+                // value is the one this row held before the save, which the load already said; an
+                // inserted row, or one only a trigger touched, wasn't read before, so its rounding
+                // is said.
                 let stored = row.get(c).ok_or_else(|| self.shape_error())?;
                 let mut rounded = Vec::new();
                 let read = value(ValueRef::from(stored), field.ty, &mut Vec::new(), Some(&mut rounded), i);
-                if original.and_then(|o| o.attrs.get(i)) != Some(&read) {
+                if before.get(&(k, c)) != Some(stored) {
                     crate::source::add_unread_dates(&mut rounded_dates, &rounded);
                 }
                 *attr = read;
@@ -1550,6 +1560,31 @@ mod tests {
         assert_eq!(saved.features[0].attrs[seen], loaded.features[0].attrs[seen]);
         // Said once, when it loaded: reading it back isn't counted again.
         assert!(saved.rounded_dates.iter().all(|&n| n == 0), "{:?}", saved.rounded_dates);
+    }
+
+    /// A trigger that rewrites the edited row's own date-time with digits past the microsecond, to
+    /// one that rounds to what the row held: the value changed in the save, so its rounding is said.
+    #[test]
+    fn gpkg_a_trigger_rounding_the_edited_row_to_its_own_value_is_counted() {
+        let (_dir, path) = fixture();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE roads ADD COLUMN seen DATETIME; UPDATE roads SET seen = '2026-03-05T14:30:00.123457Z';
+             CREATE TRIGGER stamp AFTER UPDATE OF name ON roads
+             BEGIN UPDATE roads SET seen = '2026-03-05T14:30:00.123456789Z' WHERE fid = NEW.fid; END;",
+        )
+        .unwrap();
+        let table = EditTable::open(&path, "roads").unwrap();
+        let fields = table.info().fields.clone();
+        let (name, seen) = (fields.iter().position(|f| f.name == "name").unwrap(), fields.iter().position(|f| f.name == "seen").unwrap());
+        let loaded = table.read_editable(MAX_EDITABLE).unwrap();
+        assert!(loaded.rounded_dates.iter().all(|&n| n == 0), "nothing to round at load");
+        let mut feature = loaded.features[0].clone();
+        feature.attrs[name] = Value::Text("renamed".into());
+        let edits = Edits { updates: vec![(feature, loaded.versions[0].1)], ..Default::default() };
+        let saved = table.save(&edits, &fields, [1].into_iter(), &loaded.revision).unwrap().unwrap();
+        assert_eq!(saved.features[0].attrs[seen], loaded.features[0].attrs[seen], "it reads back as it was shown");
+        assert_eq!(saved.rounded_dates.get(seen), Some(&1), "{:?}", saved.rounded_dates);
     }
 
     /// A trigger that writes a date-time with digits past the microsecond into another loaded row:
