@@ -1689,7 +1689,7 @@ impl Session {
         if res.is_ok()
             && let Some(src) = sources::added_by(id, params)
         {
-            self.sources.note(src);
+            self.note_source(src);
         }
         res
     }
@@ -2339,6 +2339,17 @@ impl Session {
             }
         }
         started
+    }
+
+    /// Records `src` in the Data Sources pane's Recent list ([`sources::Sources::note`]), and says
+    /// any value it left out because, beside the source as now listed, it holds a secret.
+    pub fn note_source(&mut self, src: sources::Source) {
+        let before = self.sources.secrets_left_out();
+        self.sources.note(src);
+        let left_out = self.sources.secrets_left_out().saturating_sub(before);
+        if left_out > 0 {
+            self.notify(sources::secrets_notice(left_out), false);
+        }
     }
 
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
