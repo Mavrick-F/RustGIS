@@ -253,6 +253,7 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         let utc_dates = saved_rows.utc_dates;
         let fine_dates = saved_rows.fine_dates;
         let rounded_dates = saved_rows.rounded_dates;
+        let unread_dates = saved_rows.unread_dates;
         let mut stored: std::collections::HashMap<_, _> = saved_rows.features.into_iter().map(|f| (f.id, f)).collect();
         let versions = saved.versions.iter().copied().collect();
         if let Some(l) = s.map_mut().layer_mut(id) {
@@ -317,6 +318,9 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         }
         if let Some(note) = rustgis_data::io::fine_dates_note(&fields, &fine_dates, &super::saved_target(&name, table)) {
             s.notify(note, false);
+        }
+        if let Some(note) = rustgis_data::source::unread_dates_note(&fields, &unread_dates) {
+            s.notify(format!("{}: {note}, when read back after the save", super::saved_target(&name, table)), false);
         }
         if let Some(note) = rustgis_data::source::rounded_dates_note(&fields, &rounded_dates) {
             s.notify(format!("{}: {note}, when read back after the save", super::saved_target(&name, table)), false);

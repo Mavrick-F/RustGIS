@@ -1783,6 +1783,18 @@ pub(crate) fn read_rows(
     for (k, &i) in columns.iter().enumerate() {
         crate::source::unread_dates_by(&mut unread_dates, k, workbook.and_then(|(_, empty)| empty.get(i)).copied().unwrap_or(0));
     }
+    // The WKT column is the geometry, not a field: a workbook date there that never was is empty,
+    // so its row has no geometry, said here.
+    if let Some(w) = wkt {
+        let column = headers.get(w).map_or("", |h| h.trim());
+        match workbook.and_then(|(_, empty)| empty.get(w)).copied().unwrap_or(0) {
+            0 => {}
+            1 => report.messages.push(format!("1 value in '{column}' isn't a date and was read as empty, so its row has no geometry")),
+            n => report
+                .messages
+                .push(format!("{n} values in '{column}' aren't dates and were read as empty, so their rows have no geometry")),
+        }
+    }
     let (mut bad_wkt, mut zm_rows) = (0usize, 0usize);
     for r in rows {
         crate::progress::step(1)?;

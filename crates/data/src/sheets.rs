@@ -680,6 +680,29 @@ mod tests {
         assert_eq!(report.unread_dates, None);
     }
 
+    /// Serial 60 in the WKT column: the cell is empty, so its row has no geometry, and that is said;
+    /// a WKT column without one says nothing of it.
+    #[test]
+    fn the_phantom_leap_day_in_a_wkt_column_is_said() {
+        let book = |second: &str| {
+            let book = xlsx(&[("Places", &[&["name", "wkt"], &["a", "POINT (1 2)"], &["b", second]])]);
+            let mut entries = crate::zip::read(&book).unwrap();
+            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_vec()));
+            let opts = CsvOptions { wkt: Some("wkt".into()), ..CsvOptions::default() };
+            read(&crate::zip::write(&entries).unwrap(), "places", None, &opts).unwrap()
+        };
+        let (ds, report) = book(r#"<c s="0"><v>60</v></c>"#);
+        assert_eq!(ds.features.len(), 2);
+        assert_eq!(ds.features.iter().filter(|f| f.geometry.is_none()).count(), 1);
+        assert!(
+            report.messages.contains(&"1 value in 'wkt' isn't a date and was read as empty, so its row has no geometry".to_string()),
+            "{:?}",
+            report.messages
+        );
+        let (_, report) = book("POINT (3 4)");
+        assert!(!report.messages.iter().any(|m| m.contains("isn't a date")), "{:?}", report.messages);
+    }
+
     #[test]
     fn reads_sheets() {
         let book = xlsx(&[

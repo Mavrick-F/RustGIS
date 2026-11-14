@@ -55,6 +55,9 @@ pub struct SavedRows {
     /// Per supplied field, date-times written rounded to the millisecond
     /// ([`crate::io::fine_dates`]): only values the save wrote.
     pub fine_dates: Vec<usize>,
+    /// Per supplied field, stored values read back as null because they aren't dates
+    /// ([`crate::source::unread_dates_note`]), counted as [`SavedRows::rounded_dates`] is.
+    pub unread_dates: Vec<usize>,
     /// Per supplied field, date-times read back rounded to the microsecond
     /// ([`crate::source::rounded_dates_note`]), except a stored value an updated row held before
     /// the save: the load said those. A row only a trigger touched wasn't read before the save, so
@@ -278,7 +281,7 @@ impl EditTable {
         let mut spatial_changed = !edits.inserts.is_empty() || !edits.deletes.is_empty();
         let mut utc_dates = vec![0usize; fields.len()];
         let mut fine_dates = vec![0usize; fields.len()];
-        let mut rounded_dates = Vec::new();
+        let (mut unread_dates, mut rounded_dates) = (Vec::new(), Vec::new());
         for (f, _) in &edits.updates {
             let row = current.get(&f.id.cast_signed()).ok_or_else(|| self.shape_error())?;
             let mut sets = Vec::new();
@@ -418,14 +421,15 @@ impl EditTable {
             for &(i, c) in &snapshot_columns {
                 let field = fields.get(i).ok_or_else(|| self.shape_error())?;
                 let attr = feature.attrs.get_mut(i).ok_or_else(|| self.shape_error())?;
-                // Read as the load reads it: rounded past the microsecond. Counted unless the stored
-                // value is the one this row held before the save, which the load already said; an
-                // inserted row, or one only a trigger touched, wasn't read before, so its rounding
-                // is said.
+                // Read as the load reads it: rounded past the microsecond, and null for a stored
+                // value that isn't a date. Counted unless the stored value is the one this row held
+                // before the save, which the load already said; an inserted row, or one only a
+                // trigger touched, wasn't read before, so it is said.
                 let stored = row.get(c).ok_or_else(|| self.shape_error())?;
-                let mut rounded = Vec::new();
-                let read = value(ValueRef::from(stored), field.ty, &mut Vec::new(), Some(&mut rounded), i);
+                let (mut unread, mut rounded) = (Vec::new(), Vec::new());
+                let read = value(ValueRef::from(stored), field.ty, &mut unread, Some(&mut rounded), i);
                 if before.get(&(k, c)) != Some(stored) {
+                    crate::source::add_unread_dates(&mut unread_dates, &unread);
                     crate::source::add_unread_dates(&mut rounded_dates, &rounded);
                 }
                 *attr = read;
@@ -477,7 +481,17 @@ impl EditTable {
         .map_err(err)?;
         let revision = self.revision(&tx)?;
         tx.commit().map_err(err)?;
-        Ok(Ok(SavedRows { changes: saved, features, removed, unstored_fields, revision, utc_dates, fine_dates, rounded_dates }))
+        Ok(Ok(SavedRows {
+            changes: saved,
+            features,
+            removed,
+            unstored_fields,
+            revision,
+            utc_dates,
+            fine_dates,
+            unread_dates,
+            rounded_dates,
+        }))
     }
 
     fn revision(&self, conn: &Connection) -> Result<String> {
@@ -1619,6 +1633,21 @@ mod tests {
         assert_eq!(other.attrs[seen].to_string(), "2026-03-05T14:30:00.123457Z");
         assert_eq!(saved.rounded_dates.get(seen), Some(&1), "{:?}", saved.rounded_dates);
         assert_eq!(saved.rounded_dates.iter().sum::<usize>(), 1);
+        assert!(saved.unread_dates.iter().all(|&n| n == 0), "{:?}", saved.unread_dates);
+        // A trigger that writes text that isn't a date: it reads back null, and that is said too.
+        conn.execute_batch(
+            "DROP TRIGGER stamp; CREATE TRIGGER stamp AFTER UPDATE OF name ON roads WHEN NEW.fid = 1
+             BEGIN UPDATE roads SET seen = '2026-02-30' WHERE fid = 2; END;",
+        )
+        .unwrap();
+        let loaded = table.read_editable(MAX_EDITABLE).unwrap();
+        let k = loaded.features.iter().position(|f| f.id == 1).unwrap();
+        let mut feature = loaded.features[k].clone();
+        feature.attrs[name] = Value::Text("renamed again".into());
+        let edits = Edits { updates: vec![(feature, loaded.versions[k].1)], ..Default::default() };
+        let saved = table.save(&edits, &fields, [1, 2].into_iter(), &loaded.revision).unwrap().unwrap();
+        assert!(saved.features.iter().find(|f| f.id == 2).unwrap().attrs[seen].is_null());
+        assert_eq!(saved.unread_dates.get(seen), Some(&1), "{:?}", saved.unread_dates);
     }
 
     #[test]
