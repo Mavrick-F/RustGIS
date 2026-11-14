@@ -17,6 +17,8 @@ pub const READ_EXTENSIONS: &[&str] = &[
     "csv",
     "tsv",
     "txt",
+    "dat",
+    "gz",
     "shp",
     "zip",
     "kml",
@@ -257,7 +259,8 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<(Dataset, ReadReport)
         "json" if is_cityjson(file_name, bytes) => return first_layer(file_name, bytes),
         "json" if crate::topojson::looks_like_topojson(text()?) => return first_layer(file_name, bytes),
         "geojson" | "json" => read_geojson(text()?, &name)?,
-        "csv" | "tsv" | "txt" => read_csv_bytes(file_name, bytes, &name)?,
+        "csv" | "tsv" | "txt" | "dat" => read_delimited_bytes(file_name, bytes, &CsvOptions::default())?,
+        "gz" => read_gzip_text(bytes, file_name, &CsvOptions::default())?,
         // A MIF without its .mid (an upload of the one file): no attributes.
         "mif" => crate::mapinfo::read_bytes(bytes, None, &name)?,
         // Picked or dropped with its .dbf, a Shapefile comes zipped (`gather_shapefiles`).
@@ -316,10 +319,14 @@ pub fn read_path(path: &Path) -> Result<(Dataset, ReadReport)> {
                 read_geojson(&text, &name)?
             }
         }
-        "csv" | "tsv" | "txt" => {
+        "csv" | "tsv" | "txt" | "dat" => {
             check_size(path)?;
             let leaf = path.file_name().and_then(|n| n.to_str()).unwrap_or("layer.csv");
-            read_csv_bytes(leaf, &std::fs::read(path)?, &name)?
+            read_delimited_bytes(leaf, &std::fs::read(path)?, &CsvOptions::default())?
+        }
+        "gz" => {
+            check_size(path)?;
+            read_gzip_text(std::io::BufReader::new(std::fs::File::open(path)?), &path.display().to_string(), &CsvOptions::default())?
         }
         "shp" => {
             check_size(path)?;
@@ -1541,8 +1548,8 @@ impl<W: std::io::Write> GeoJsonWriter<W> {
 
 /// Longitude and latitude columns, recognised in any order; CSV export names its coordinate
 /// columns with the first of each that no field has.
-const LON_NAMES: &[&str] = &["longitude", "lon", "lng", "long", "x", "lon_dd", "longitude_dd"];
-const LAT_NAMES: &[&str] = &["latitude", "lat", "y", "lat_dd", "latitude_dd"];
+const LON_NAMES: &[&str] = &["longitude", "lon", "lng", "long", "x", "lon_dd", "longitude_dd", "stop_lon"];
+const LAT_NAMES: &[&str] = &["latitude", "lat", "y", "lat_dd", "latitude_dd", "stop_lat"];
 
 /// Projected coordinate columns, recognised as well as longitude/latitude ones.
 const X_NAMES: &[&str] = &["easting", "point_x", "xcoord", "x_coord"];
@@ -1688,11 +1695,131 @@ pub fn delimited_text<'a>(file_name: &str, bytes: &'a [u8]) -> Result<(std::borr
     Ok((text, Some(format!("{file_name} isn't UTF-8 text: it was read as Windows-1252 (Latin-1)"))))
 }
 
-/// Reads delimited text from its bytes, in the encoding [`delimited_text`] finds, saying which
-/// when it isn't UTF-8.
-fn read_csv_bytes(file_name: &str, bytes: &[u8], name: &str) -> Result<(Dataset, ReadReport)> {
+/// Whether a name is gzip-compressed delimited text, rather than an arbitrary gzip archive.
+pub fn is_gzip_text_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".gz") && is_delimited_name(&lower)
+}
+
+/// Whether a name is delimited text, including gzip-compressed CSV, TSV, TXT and DAT.
+pub fn is_delimited_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let plain = lower.strip_suffix(".gz").unwrap_or(&lower);
+    [".csv", ".tsv", ".txt", ".dat"].iter().any(|ext| plain.ends_with(ext))
+}
+
+/// A gzip decoder with a limit on expanded bytes. The limit is checked while reading, rather
+/// than trusting a gzip trailer's 32-bit size; concatenated members share the same budget.
+struct GzipText<R: std::io::Read> {
+    decoder: flate2::read::MultiGzDecoder<R>,
+    left: u64,
+}
+
+impl<R: std::io::Read> GzipText<R> {
+    /// Starts a streaming decode; callers still check cancellation at record boundaries.
+    fn new(reader: R) -> Self {
+        Self { decoder: flate2::read::MultiGzDecoder::new(reader), left: MAX_BYTES }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for GzipText<R> {
+    /// Reads at most the remaining budget plus one byte, refusing expansion past the limit.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        crate::progress::check().map_err(std::io::Error::other)?;
+        let size = buf.len().min(usize::try_from(self.left.saturating_add(1)).unwrap_or(usize::MAX));
+        let n = self.decoder.read(buf.get_mut(..size).unwrap_or_default())?;
+        if n as u64 > self.left {
+            return Err(std::io::Error::other(format!("expanded delimited text exceeds the {MAX_BYTES}-byte limit")));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// The first `limit` expanded bytes, for the column picker. It deliberately stops at the
+/// prefix; adding the file later validates its complete gzip stream and checksum.
+pub fn gzip_text_prefix(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let result = GzipText::new(reader).take(limit.min(MAX_BYTES as usize) as u64).read_to_end(&mut bytes);
+    crate::progress::check()?;
+    result.map_err(|e| DataError::Format(format!("gzip delimited text: {e}")))?;
+    Ok(bytes)
+}
+
+/// Reads UTF-8 gzip-compressed delimited text, streaming records without holding the whole
+/// expanded file. Other encodings can be decompressed and added as .txt. The existing table
+/// builder retains rows for type inference; this isn't a read-in-place provider.
+pub fn read_gzip_text(reader: impl std::io::Read, file_name: &str, opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
+    use std::io::Read;
+    if !is_gzip_text_name(file_name) {
+        return Err(DataError::Unsupported(format!("{file_name}: decompress it first, then add the supported file inside")));
+    }
+    let mut decoder = GzipText::new(reader);
+    let mut prefix = Vec::new();
+    let result = decoder.by_ref().take(64 << 10).read_to_end(&mut prefix);
+    crate::progress::check()?;
+    result.map_err(|e| DataError::Format(format!("{file_name}: gzip: {e}")))?;
+    if prefix.starts_with(b"\xEF\xBB\xBF") {
+        prefix.drain(..3);
+    }
+    let delimiter = opts.delimiter.unwrap_or_else(|| sniff_delimiter(&String::from_utf8_lossy(&prefix)));
+    let plain = file_name.get(..file_name.len().saturating_sub(3)).unwrap_or(file_name);
+    if plain.to_ascii_lowercase().ends_with(".dat")
+        && opts.delimiter.is_none()
+        && !looks_like_delimited_table(&String::from_utf8_lossy(&prefix))
+    {
+        return Err(DataError::Format(format!(
+            "{file_name}: not recognised as delimited text; give a delimiter, or decompress and rename to .txt"
+        )));
+    }
+    let name = Path::new(plain).file_stem().and_then(|n| n.to_str()).unwrap_or("table");
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).delimiter(delimiter).from_reader(std::io::Cursor::new(prefix).chain(decoder));
+    let result = read_csv_records(&mut rdr, name, opts);
+    crate::progress::check()?;
+    let (mut dataset, report) =
+        result.map_err(|e| DataError::Format(format!("{file_name}: {e}; if not UTF-8, decompress and add as .txt")))?;
+    dataset.source = Some(file_name.to_string());
+    Ok((dataset, report))
+}
+
+/// Collects records for the existing type-inference/table builder. Reader failures (including
+/// gzip checksum, expansion-limit and encoding errors) are errors, never skipped rows.
+fn read_csv_records(reader: &mut csv::Reader<impl std::io::Read>, name: &str, opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
+    let headers: Vec<String> = reader.headers().map_err(|e| DataError::Format(format!("CSV: {e}")))?.iter().map(str::to_string).collect();
+    let mut malformed = 0;
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        crate::progress::check()?;
+        match record {
+            Ok(r) => rows.push(r.iter().map(str::to_string).collect()),
+            Err(e) if e.is_io_error() || matches!(e.kind(), csv::ErrorKind::Utf8 { .. }) => {
+                return Err(DataError::Format(format!("CSV: {e}")));
+            }
+            Err(_) => malformed += 1,
+        }
+    }
+    read_rows(&headers, &rows, malformed, name, opts, None)
+}
+
+/// Reads delimited text with explicit columns/separator, including gzip. Uncompressed text
+/// uses [`delimited_text`]'s encoding detection. A DAT needs a delimiter or recognisable rows.
+pub fn read_delimited_bytes(file_name: &str, bytes: &[u8], opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(DataError::Format(format!("{file_name}: file exceeds the {MAX_BYTES}-byte limit")));
+    }
+    if is_gzip_text_name(file_name) {
+        return read_gzip_text(bytes, file_name, opts);
+    }
     let (text, note) = delimited_text(file_name, bytes)?;
-    let (ds, mut report) = read_csv(&text, name)?;
+    if file_name.to_ascii_lowercase().ends_with(".dat") && opts.delimiter.is_none() && !looks_like_delimited_table(&text) {
+        return Err(DataError::Format(format!(
+            "{file_name}: not recognised as delimited text; give a delimiter, or rename to .txt to read it as a table"
+        )));
+    }
+    let name = Path::new(file_name).file_stem().and_then(|n| n.to_str()).unwrap_or("table");
+    let (mut ds, mut report) = read_csv_with(&text, name, opts)?;
+    ds.source = Some(file_name.to_string());
     report.messages.extend(note);
     Ok((ds, report))
 }
@@ -1709,19 +1836,7 @@ pub fn read_csv_with(text: &str, name: &str, opts: &CsvOptions) -> Result<(Datas
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let delimiter = opts.delimiter.unwrap_or_else(|| sniff_delimiter(text));
     let mut rdr = csv::ReaderBuilder::new().flexible(true).delimiter(delimiter).from_reader(text.as_bytes());
-    let headers: Vec<String> = rdr.headers().map_err(|e| DataError::Format(format!("CSV: {e}")))?.iter().map(|s| s.to_string()).collect();
-    let mut malformed = 0usize;
-    let rows: Vec<Vec<String>> = rdr
-        .records()
-        .filter_map(|r| match r {
-            Ok(r) => Some(r.iter().map(|s| s.to_string()).collect()),
-            Err(_) => {
-                malformed += 1;
-                None
-            }
-        })
-        .collect();
-    read_rows(&headers, &rows, malformed, name, opts, None)
+    read_csv_records(&mut rdr, name, opts)
 }
 
 /// Rows of text cells under a header row (delimited text, a spreadsheet's sheet) as a dataset, as
@@ -2275,9 +2390,31 @@ pub fn shapefile_zip_lacks(bytes: &[u8]) -> Vec<(String, Vec<&'static str>)> {
 /// Most layers read from one zip archive.
 pub const MAX_ZIP_LAYERS: usize = 32;
 
+/// A text table has matching CSV records, or an identifier-only header for an empty table.
+/// Read records rather than counting separators: quoted commas and embedded newlines belong
+/// to cells. A one-line prose readme with punctuation isn't an empty GTFS table.
+fn looks_like_delimited_table(text: &str) -> bool {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if text.chars().take(4096).any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        return false;
+    }
+    let mut reader = csv::ReaderBuilder::new().delimiter(sniff_delimiter(text)).from_reader(text.as_bytes());
+    let Ok(headers) = reader.headers() else { return false };
+    let columns = headers.len();
+    if columns < 2 {
+        return false;
+    }
+    let identifiers = headers.iter().all(|name| !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'));
+    match reader.records().next() {
+        Some(Ok(row)) => row.len() == columns,
+        None => identifiers,
+        Some(Err(_)) => false,
+    }
+}
+
 /// Reads the vector data in a zip archive: each Shapefile in it (its `.shp` with the `.dbf`,
 /// `.shx` and `.prj` beside it), then every other file the readers understand (GeoJSON, CSV,
-/// GeoParquet, FlatGeobuf…; `.txt` files in archives are readmes, so they're skipped), at most
+/// GeoParquet, FlatGeobuf…; `.txt` files that sniff as delimited text become tables or points), at most
 /// [`MAX_ZIP_LAYERS`]. Folders inside are fine; macOS
 /// resource forks (`__MACOSX/`, `._*`) are ignored.
 pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>> {
@@ -2286,7 +2423,8 @@ pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadRepor
 
 /// Reads a ZIP, optionally overriding the source CRS of every Shapefile in it. Other formats
 /// retain their own coordinate systems; a CityJSON model takes it only when it names none RustGIS
-/// knows. The override is applied before reading any shapes.
+/// knows. The override is applied before reading any shapes. Cancellation is checked between
+/// archive members and records; inflating one member cannot be interrupted mid-decompression.
 pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Vec<(Dataset, ReadReport)>> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(DataError::Format(format!("file is too large ({} bytes)", bytes.len())));
@@ -2298,14 +2436,23 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     let ext_of = |n: &str| Path::new(n).extension().and_then(|e| e.to_str()).map(lower).unwrap_or_default();
     // A `.pbf` is read only as an OpenStreetMap extract (`.osm.pbf`): a vector tile set's
     // `z/x/y.pbf` files aren't extracted at all.
+    let geodatabase = std::cell::Cell::new(false);
     let wanted = |n: &str| {
+        if crate::progress::check().is_err() {
+            return false;
+        }
+        if !is_resource_fork(n) && n.split('/').any(|part| part.to_ascii_lowercase().ends_with(".gdb")) {
+            geodatabase.set(true);
+            return false;
+        }
         let e = ext_of(n);
         !is_resource_fork(n)
             && (matches!(e.as_str(), "shp" | "shx" | "dbf" | "prj" | "cpg" | "mid")
                 || (e == "pbf" && lower(n).ends_with(".osm.pbf"))
-                || (!matches!(e.as_str(), "zip" | "txt" | "pbf") && READ_EXTENSIONS.contains(&e.as_str())))
+                || (!matches!(e.as_str(), "zip" | "pbf") && READ_EXTENSIONS.contains(&e.as_str())))
     };
     let entries = crate::zip::read_matching(bytes, wanted).map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
+    crate::progress::check()?;
     // Sidecar files by their path without the extension, compared without regard to case.
     let stem = |n: &str| lower(n.get(..n.len().saturating_sub(ext_of(n).len() + 1)).unwrap_or(n));
     // Entries are taken out as they're used, so no file's bytes are copied.
@@ -2338,6 +2485,7 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
                 read.0.source = Some(format!("{file_name}/{n}"));
                 out.push(read);
             }
+            Err(DataError::Cancelled) => return Err(DataError::Cancelled),
             Err(e) => skipped.push(format!("{n} ({e})")),
         }
     }
@@ -2358,6 +2506,7 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
                 read.0.source = Some(format!("{file_name}/{n}"));
                 out.push(read);
             }
+            Err(DataError::Cancelled) => return Err(DataError::Cancelled),
             Err(e) => skipped.push(format!("{n} ({e})")),
         }
     }
@@ -2368,6 +2517,10 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
         .collect();
     others.sort_by(|a, b| a.0.cmp(&b.0));
     for (n, b) in others {
+        // Prose readmes aren't tables; optional empty GTFS tables still have headers.
+        if ext_of(&n) == "txt" && !delimited_text(&n, &b).is_ok_and(|(text, _)| looks_like_delimited_table(&text)) {
+            continue;
+        }
         if out.len() >= MAX_ZIP_LAYERS {
             skipped.push(format!("{n} (past the {MAX_ZIP_LAYERS}-layer limit)"));
             continue;
@@ -2391,6 +2544,9 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
             Err(e) => skipped.push(format!("{n} ({e})")),
         }
     }
+    if geodatabase.get() {
+        skipped.push("File Geodatabase contents (unzip the archive and add the .gdb folder on the desktop)".into());
+    }
     // At most this many skipped members are named; the rest are counted.
     const NAMED_SKIPPED: usize = 20;
     let skipped = if skipped.len() > NAMED_SKIPPED {
@@ -2403,7 +2559,12 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     };
     if out.is_empty() {
         let why = if skipped.is_empty() { String::new() } else { format!(": {}", skipped.join("; ")) };
-        return Err(DataError::Format(format!("{file_name}: no Shapefile or other vector data in the archive could be read{why}")));
+        let hint = if skipped.is_empty() {
+            "; unzip it and add a supported file (rename delimited text to .txt if it was not recognised)"
+        } else {
+            ""
+        };
+        return Err(DataError::Format(format!("{file_name}: no supported layers or tables in the archive could be read{why}{hint}")));
     }
     if let Some((_, report)) = out.first_mut()
         && !skipped.is_empty()
@@ -5010,6 +5171,97 @@ mod tests {
         let c = ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
         assert!((c.x - 9.19).abs() < 1e-7 && (c.y - 45.4642).abs() < 1e-7, "{c:?}");
         assert!(report.messages.is_empty(), "{:?}", report.messages);
+    }
+
+    /// Tiny gzip fixtures exercise the public byte/path readers, concatenation and corruption.
+    fn gzip_csv(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn published_gzip_text_imports() {
+        let bytes = gzip_csv(b"\xEF\xBB\xBFid|count\nA|12\n");
+        let (table, report) = read_bytes("SUMMARY.DAT.GZ", &bytes).unwrap();
+        assert_eq!(table.name, "SUMMARY");
+        assert_eq!(table.geometry_type, GeometryType::None);
+        assert_eq!(table.value(0, 1), &Value::Int(12));
+        assert!(report.messages.is_empty());
+        let mut members = gzip_csv(b"id,count\nA,12\n");
+        members.extend(gzip_csv(b"B,13\n"));
+        assert_eq!(read_bytes("counts.csv.gz", &members).unwrap().0.features.len(), 2);
+        for n in [0, 1, members.len() - 1] {
+            assert!(read_bytes("counts.csv.gz", &members[..n]).is_err(), "truncated at {n}");
+        }
+        let mut corrupt = gzip_csv(b"id,count\nA,12\n");
+        let crc = corrupt.len() - 8;
+        corrupt[crc] ^= 1;
+        assert!(read_bytes("counts.csv.gz", &corrupt).is_err());
+        // The checksum is also checked after records have streamed beyond the sniffed prefix.
+        let mut late = gzip_csv(format!("id,count\n{}", "A,12\n".repeat(20_000)).as_bytes());
+        let crc = late.len() - 8;
+        late[crc] ^= 1;
+        assert!(read_bytes("counts.csv.gz", &late).is_err());
+        assert!(read_bytes("counts.tar.gz", &bytes).unwrap_err().to_string().contains("decompress"));
+        let opts = CsvOptions { delimiter: Some(b'|'), ..Default::default() };
+        assert_eq!(read_delimited_bytes("one.dat.gz", &gzip_csv(b"id|count\n"), &opts).unwrap().0.fields.len(), 2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counts.csv.gz");
+        std::fs::write(&path, &members).unwrap();
+        assert_eq!(read_path(&path).unwrap().0.features.len(), 2);
+    }
+
+    #[test]
+    fn gzip_expansion_is_bounded_and_cancellable() {
+        use std::io::Read;
+        let bytes = gzip_csv(b"id,count\nA,12\n");
+        let mut limited = GzipText::new(bytes.as_slice());
+        limited.left = 4;
+        assert!(limited.read_to_end(&mut Vec::new()).is_err());
+        assert_eq!(gzip_text_prefix(bytes.as_slice(), 2).unwrap(), b"id");
+        let probe = crate::progress::tests::Counted::cancelling_after(0);
+        let _guard = crate::progress::install(Some(probe));
+        assert!(matches!(read_bytes("counts.csv.gz", &bytes), Err(DataError::Cancelled)));
+    }
+
+    #[test]
+    fn published_dat_and_gtfs_imports() {
+        let (table, report) = read_bytes("summary.dat", b"id|count\nA|12\n").unwrap();
+        assert_eq!(table.geometry_type, GeometryType::None);
+        assert_eq!(table.value(0, 1), &Value::Int(12));
+        assert!(report.messages.is_empty());
+        assert_eq!(read_bytes("quoted.dat", b"id|name\nA|\"Main|First\"\n").unwrap().0.value(0, 1), &Value::Text("Main|First".into()));
+        assert!(read_bytes("binary.dat", b"\0\x01\x02").unwrap_err().to_string().contains("rename"));
+        let zip = crate::zip::write(&[
+            ("feed/stops.txt".into(), b"stop_id,stop_name,stop_lat,stop_lon\ns1,\"Main, First\",35.1,-89.9\n".to_vec()),
+            ("feed/routes.txt".into(), b"route_id,route_short_name\nr1,Main\n".to_vec()),
+            ("feed/transfers.txt".into(), b"from_stop_id,to_stop_id,transfer_type\n".to_vec()),
+            ("README.txt".into(), b"A transit feed.\nRead the documentation.\n".to_vec()),
+        ])
+        .unwrap();
+        let layers = read_zip("transit.zip", &zip).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[2].0.name, "transfers");
+        assert!(layers[2].0.features.is_empty());
+        assert_eq!(layers[2].0.fields.len(), 3);
+        assert_eq!(layers[0].0.name, "routes");
+        assert_eq!(layers[0].0.geometry_type, GeometryType::None);
+        assert_eq!(layers[1].0.features[0].geometry, Some(Geometry::Point(Coord::new(-89.9, 35.1))));
+        assert!(layers.iter().all(|(_, r)| r.messages.is_empty()));
+    }
+
+    #[test]
+    fn zipped_geodatabase_has_actionable_refusal() {
+        let zip = crate::zip::write(&[("County.GDB/a00000001.gdbtable".into(), vec![0])]).unwrap();
+        let error = read_zip("county.zip", &zip).err().unwrap().to_string();
+        assert!(error.contains("unzip") && error.contains(".gdb folder"), "{error}");
+        let mixed =
+            crate::zip::write(&[("county.gdb/a00000001.gdbtable".into(), vec![0]), ("counts.csv".into(), b"id,n\nA,12\n".to_vec())])
+                .unwrap();
+        let layers = read_zip("mixed.zip", &mixed).unwrap();
+        assert!(layers[0].1.messages.iter().any(|m| m.contains(".gdb folder")));
     }
 
     /// Zipped Shapefiles are read from memory (the web app's way to open them), with their `.prj`,

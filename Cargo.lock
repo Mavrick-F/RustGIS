@@ -4819,6 +4819,7 @@ dependencies = [
  "crs-definitions",
  "csv",
  "encoding_rs",
+ "flate2",
  "flatgeobuf",
  "geo",
  "geozero",

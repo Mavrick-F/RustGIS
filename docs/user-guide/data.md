@@ -8,7 +8,7 @@ Formats](data-formats.md).
 | Format | Read | Write |
 | --- | --- | --- |
 | GeoJSON (`.geojson`, `.json`) | Yes | Yes |
-| Delimited text (`.csv`, `.tsv`, `.txt`) with x/y columns in a supported coordinate system, or WKT geometry | Yes | Yes |
+| Delimited text (`.csv`, `.tsv`, `.txt`, recognised `.dat`; also UTF-8 gzip-compressed text) with x/y columns in a supported coordinate system, or WKT geometry | Yes | CSV |
 | Shapefile (`.shp` + `.dbf`, or zipped in a `.zip`) | Yes (the web app also accepts sidecar files picked or dropped together) | Yes (`share.exportLayer`) |
 | GeoPackage (`.gpkg`, feature tables) | Yes | Yes (desktop) |
 | GeoParquet (`.parquet`, `.geoparquet`, WKB geometry) | Yes | Yes |
@@ -57,7 +57,7 @@ feature table explicitly adds only that table.
 On the desktop, **Home › Add › Add Data › Add Folder…** connects a folder to the Browser; the web
 app does not offer folder connections.
 On the desktop, a file Add Data reads whole (a GeoTIFF or another raster, one GDAL converts, a
-GeoJSON of up to 32 MB, delimited text or a spreadsheet) is read in the background, so the map
+GeoJSON of up to 32 MB, delimited text, a ZIP archive or a spreadsheet) is read in the background, so the map
 and the rest of the window stay in use: the status bar shows **Add Data**, how many files wait
 after it, and **Cancel**. Files dropped or added together are read one at a time and added in
 that order; one that asks which layers to add joins them once you choose. Cancel drops the file
@@ -67,6 +67,21 @@ service or a database adds as before, and scripts read the file where the comman
 **Delimited Text…**: it reads the file with the columns picked as you press **Add**, so a read
 that fails (a column that isn't in the file, a coordinate system it doesn't know) keeps the
 dialog open for another try.
+
+Published pipe-delimited `.dat` files open as tables when their header and rows reveal a
+separator; otherwise give `"delimiter":"|"` to `layer.addData`, or rename a text file to `.txt`.
+Gzip-compressed UTF-8 `.csv.gz`, `.tsv.gz`, `.txt.gz` and `.dat.gz` open directly, including by
+URL or upload. Decompression streams records, checks the gzip checksum and stops at 256 MiB of
+expanded text. Table rows are still kept in memory for type inference. For another encoding,
+decompress the file and add the `.txt` file, whose reader detects the encoding. Delimited text
+is exported as `.csv`; gzip is an input format.
+
+A GTFS zip adds its delimited `.txt` members as standalone tables; `stop_lon` and `stop_lat`
+place stops as points. This imports the tables, not a transit routing network. The archive's
+usual 32-layer/table limit applies, and skipped readable members are named in a notice. Prose
+readmes are ignored. A zipped File Geodatabase must be unzipped first: on the desktop, add the
+`.gdb` folder. The archive reader says this when it finds one, including beside readable files.
+
 **Home › Add › Add Data › Delimited Text…** asks for a CSV or a spreadsheet first, then lists its columns to pick the x and y (or WKT)
 ones from, with the coordinate system (such as `EPSG:2263`) and the separator (changing it reads
 the columns again); `info.fileColumns` lists them for scripts. Add Data finds them itself

@@ -14,6 +14,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 csv = { workspace = true }
+# Streaming gzip text imports; use the pure-Rust backend in the browser too.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 shapefile = { workspace = true }
 encoding_rs = { workspace = true }
 # Zstandard, the usual compression of COGs, is C code that compiles to WebAssembly with clang

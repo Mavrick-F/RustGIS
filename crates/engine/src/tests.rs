@@ -46999,3 +46999,64 @@ fn a_command_says_once_that_it_couldnt_zoom() {
     assert_eq!(out["zoomed"], json!(false), "{out}");
     assert_eq!(s.map().camera.center, view.center);
 }
+
+/// Compressed and DAT imports reach the same command options through files and uploads.
+#[test]
+fn published_text_import_paths() {
+    use base64::Engine as _;
+    use rustgis_data::{Coord, Geometry};
+    let encoded = "H4sIAAAAAAAC/8tMqUlNLC6pycsvKsngcqwxNKgxMuACACT4xC0WAAAA";
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+    let path = std::env::temp_dir().join(format!("rustgis-published-text-{}.csv.gz", std::process::id()));
+    std::fs::write(&path, &bytes).unwrap();
+    let mut s = Session::new(Project::default());
+    let opts = json!({"x":"east", "y":"north", "delimiter":"|"});
+    let columns = super::cmd::layer::columns_of("points.csv.gz", &bytes, &opts).unwrap();
+    assert_eq!(columns["columns"], json!(["id", "east", "north"]));
+    let mut p = opts.clone();
+    p["path"] = json!(&path);
+    assert_eq!(s.run("info.fileColumns", &p).unwrap(), columns);
+    s.run("layer.addData", &p).unwrap();
+    p = opts.clone();
+    p["fileName"] = json!("points.csv.gz");
+    p["data"] = json!(encoded);
+    s.run("layer.addDataBytes", &p).unwrap();
+    assert_eq!(s.map().layers.len(), 2);
+    for layer in &s.map().layers {
+        let ds = &layer.dataset;
+        assert_eq!(ds.features.len(), 1);
+        assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(10.0, 20.0))));
+    }
+    let mut p = opts;
+    p["fileName"] = json!("summary.dat");
+    p["text"] = json!("id|east|north\nA|10|20\n");
+    s.run("layer.addDataText", &p).unwrap();
+    assert_eq!(s.map().layers.len(), 3);
+    std::fs::remove_file(path).unwrap();
+
+    // A desktop ZIP read lands from its prepared data, even after the source is gone.
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    let zip = rustgis_data::zip::write(&[
+        ("stops.txt".into(), b"stop_id,stop_lon,stop_lat\ns1,10,20\n".to_vec()),
+        ("routes.txt".into(), b"route_id,route_short_name\nr1,Main\n".to_vec()),
+    ])
+    .unwrap();
+    let path = std::env::temp_dir().join(format!("rustgis-published-gtfs-{}.zip", std::process::id()));
+    std::fs::write(&path, zip).unwrap();
+    let p = json!({"path": &path});
+    let mut s = Session::new(Project::default());
+    let ahead = read_ahead(&mut s, "layer.addData", &p).unwrap();
+    assert!(ahead.reads());
+    let read = ahead.run(&Control::new()).unwrap();
+    let control = Control::cancelled_once_started();
+    let cancelled = read_ahead(&mut s, "layer.addData", &p).unwrap().run(&control);
+    assert!(cancelled.is_err());
+    assert!(control.looked() > 0);
+    std::fs::remove_file(path).unwrap();
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.map().layers.len(), 1);
+    assert_eq!(s.project.tables.len(), 1);
+    assert_eq!(s.project.tables[0].dataset.name, "routes");
+    assert!(s.read_ahead.is_none());
+}
