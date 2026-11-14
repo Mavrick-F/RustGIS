@@ -446,6 +446,15 @@ metadata, are left alone. The spatial indexes that would no longer match (`.qix`
 are removed where they can be; one that can't be (held open by another program) is left, and
 should be deleted before that program uses the file.
 
+This rollback needs RustGIS to keep running. Replacing several Shapefile parts is not atomic:
+a process crash or power loss between renames can leave a mixed or incomplete set. Keep an
+independent backup before publishing. After such an interruption, preserve the whole directory,
+including hidden `.<part-name>.<process-id>.<number>.tmp` files (for example,
+`.parcels.dbf.1234.5.tmp`); these can contain both staged new parts and displaced old parts.
+Restore a complete, consistent Shapefile from your backup before opening or publishing it again.
+Do not restore an arbitrary temporary file or mix parts from different versions. Temporary
+files may help with manual recovery, but are not a crash-safe backup.
+
 Once published, the layer holds its rows as the file reads them, which differs only where a
 Shapefile can't tell values apart (an empty text reads as no value, a column of whole numbers as
 integers, date-time fields as ISO 8601 text, with a notice), so it reads `inSync`; the project has
