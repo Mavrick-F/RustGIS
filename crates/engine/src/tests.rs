@@ -44833,6 +44833,28 @@ fn a_layer_publishes_its_edits_to_its_shapefile() {
     }
     s.run("source.publish", &json!({"layer":id})).unwrap();
     assert_eq!(state(&mut s), "inSync");
+    // A successful script can remove a layer after publication too. Undo restores its old
+    // rows against the committed file baseline; redo and a second undo keep that baseline.
+    let script = [
+        format!("edit.setValue {}", json!({"layer":id,"row":1,"field":"name","value":"Published and removed"})),
+        format!("source.publish {}", json!({"layer":id})),
+        format!("layer.remove {}", json!({"layer":id})),
+    ]
+    .join("\n");
+    s.run("script.run", &json!({"script":script})).unwrap();
+    assert!(s.map().layer(id as u32).is_none());
+    for again in [false, true] {
+        if again {
+            s.run("edit.redo", &Value::Null).unwrap();
+            assert!(s.map().layer(id as u32).is_none());
+        }
+        s.run("edit.undo", &Value::Null).unwrap();
+        let checked = s.run("source.syncState", &json!({"layer":id})).unwrap();
+        assert_eq!(checked["changed"], json!([]));
+        assert_eq!(checked["state"], "edited");
+        let (back, _) = rustgis_data::io::read_path(&path).unwrap();
+        assert_eq!(back.features.get(1).unwrap().attrs[name], rustgis_data::Value::Text("Published and removed".into()));
+    }
     // Changed since: refused, the file left as it was.
     s.run("edit.setValue", &json!({"layer": id, "row": 1, "field": "name", "value": "Mine"})).unwrap();
     let mut theirs = dbf();

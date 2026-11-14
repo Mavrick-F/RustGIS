@@ -38,9 +38,10 @@ const PROJECTED_TOLERANCE: f64 = 1e-11;
 
 /// A layer written back over its Shapefile: the files as they were written, and the layer as the
 /// file now reads (`read`: its rows in the same order, as a Shapefile holds them: an empty text as
-/// no value, a column of whole numbers as integers, an edited shape in another system back through
-/// its projection), to record as the layer's new sync point; the features written, and what it
-/// says (fields given other columns or left out, projection round-off, a changed `.prj`).
+/// no value, a column of whole numbers as integers, date-times as text, an edited shape in another
+/// system back through its projection), to record as the layer's new sync point; the features
+/// written, and what it says (fields given other columns or left out, projection round-off,
+/// a changed `.prj`).
 pub struct Published {
     pub files: FileSync,
     pub read: Dataset,
@@ -305,6 +306,9 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
             if gone.len() == 1 { "1 column of the file was".to_string() } else { format!("{} columns of the file were", gone.len()) },
             shown.join(", ")
         ));
+    }
+    if let Some(note) = crate::io::dates_as_text_note(&ds.fields, &path.display().to_string()) {
+        notes.push(note);
     }
     if !widened.is_empty() {
         let shown: Vec<&str> = widened.iter().take(5).map(String::as_str).collect();
@@ -1138,6 +1142,34 @@ mod tests {
         let bytes = std::fs::read(path.with_extension("dbf")).unwrap();
         let table = crate::dbf::raw_table(&bytes).unwrap();
         assert_eq!(table.columns[0].ty, b'D');
+    }
+
+    /// A date-time still fits its text column, but losing the field type must be said once.
+    #[test]
+    fn a_date_time_field_written_as_text_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let stamp = "2025-01-02T12:30:00Z";
+        let mut source = parcels();
+        let mut rows: Vec<_> = source.features.iter().cloned().collect();
+        for row in &mut rows {
+            row.attrs[0] = Value::Text(stamp.into());
+        }
+        source.features = rows.into();
+        let (mut ds, sync) = written(&source, &path);
+        ds.fields[0].ty = FieldType::DateTime;
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        for row in &mut rows {
+            row.attrs[0] = Value::DateTime(crate::DateTime::parse(stamp).unwrap());
+        }
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        assert_eq!(published.notes.len(), 1, "{:?}", published.notes);
+        let note = &published.notes[0];
+        assert!(note.contains("1 date-time field was written as text (ISO 8601)") && note.contains("'OWNER'"), "{note}");
+        assert!(note.contains(&path.display().to_string()), "{note}");
+        assert_eq!(published.read.fields[0].ty, FieldType::Text);
+        assert_eq!(published.read.features.first().unwrap().attrs[0], Value::Text(stamp.into()));
     }
 
     /// A whole-valued double reads as Integer, but its existing wide decimal column still fits.

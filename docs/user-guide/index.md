@@ -448,7 +448,8 @@ should be deleted before that program uses the file.
 
 Once published, the layer holds its rows as the file reads them, which differs only where a
 Shapefile can't tell values apart (an empty text reads as no value, a column of whole numbers as
-integers), so it reads `inSync`; the project has a change to save. Undo doesn't change the file:
+integers, date-time fields as ISO 8601 text, with a notice), so it reads `inSync`; the project has
+a change to save. Undo doesn't change the file:
 undoing an edit made before publishing shows the layer as `edited` again. A layer with no edits writes nothing. GeoJSON and layers read in place can't
 be published yet.
 
