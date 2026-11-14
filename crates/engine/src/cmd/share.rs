@@ -717,7 +717,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
                 .collect();
             dates.extend(
                 rustgis_data::source::rounded_dates_note(&layer.fields, &e.rounded_dates)
-                    .map(|n| format!("{path}: {}: {n}, so they're rounded in the export", layer.name)),
+                    .map(|n| format!("{path}: {}: {n} when read for the export", layer.name)),
             );
             dates.extend(rustgis_data::io::utc_dates_note(&layer.fields, &e.utc_dates, path));
             dates.extend(rustgis_data::io::fine_dates_note(&layer.fields, &e.fine_dates, path));
@@ -734,7 +734,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
             let csv = if ext == "csv" { rustgis_data::io::CsvLosses::of(&ds.features, ds.geometry_type) } else { Default::default() };
             let mut dates: Vec<String> =
                 unreadable.dates.iter().map(|n| format!("{path}: {}: {n}, so they're empty in the export", ds.name)).collect();
-            dates.extend(unreadable.rounded.iter().map(|n| format!("{path}: {}: {n}, so they're rounded in the export", ds.name)));
+            dates.extend(unreadable.rounded.iter().map(|n| format!("{path}: {}: {n} when read for the export", ds.name)));
             dates.extend(gpkg_dates_note(ds, &ext, path));
             (ds.features.len().saturating_sub(left_out), left_out, unread, table, unfit, null_numbers, None, csv, dates)
         }
