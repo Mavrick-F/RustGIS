@@ -2878,7 +2878,7 @@ pub fn shapefile_values_notes(ds: &Dataset, target: &str) -> Vec<String> {
                 FieldType::Date if !value.asks_null() && dbf_date(value).is_none() => loss.empty += 1,
                 FieldType::Integer | FieldType::Double => {
                     let d = decimals.get(k).copied().unwrap_or(0);
-                    match dbf_number(value, field.ty, d) {
+                    match dbf_number(value, field.ty, d, if field.ty == FieldType::Integer { 18 } else { 24 }) {
                         None => loss.empty += 1,
                         Some(number) => {
                             // The writer uses fixed decimal text, including ties rounded to even.
@@ -2970,15 +2970,15 @@ fn dbf_decimals(ds: &Dataset, k: usize) -> usize {
 }
 
 /// The number a `.dbf` numeric field of type `ty` with `d` decimals holds for `v`: none for a
-/// value that isn't a number, or one rejected by the writer's size and precision checks.
+/// value that isn't a number, or one rejected by the selected column's `width` and precision.
 /// Rejected numbers are left empty rather than cut short.
-fn dbf_number(v: &Value, ty: FieldType, d: usize) -> Option<f64> {
+fn dbf_number(v: &Value, ty: FieldType, d: usize, width: usize) -> Option<f64> {
     let x = v.as_f64().filter(|x| {
         // A whole number past 2^53 would be held only rounded (dBase's decimal text goes through
         // f64), and one too small for the field's decimals would read 0.
         let exact = !(matches!(v, Value::Int(i) if i.unsigned_abs() > 1 << 53)
             || ty == FieldType::Double && *x != 0.0 && x.abs() < 0.5 * 10f64.powi(-(d as i32)));
-        exact && format!("{x:.d$}").len() <= if ty == FieldType::Integer { 18 } else { 24 }
+        exact && format!("{x:.d$}").len() <= width
     })?;
     Some(if ty == FieldType::Integer { x.round() } else { x })
 }
@@ -3373,7 +3373,7 @@ fn kept_column(ds: &Dataset, k: usize, name: &str, style: &DbfStyle) -> (Spec, O
     let fits = match (field.ty, ty) {
         (FieldType::Integer | FieldType::Double, b'N' | b'F') => values().all(|v| {
             let d = usize::from(was.decimals);
-            dbf_number(v, field.ty, d).is_some_and(|x| {
+            dbf_number(v, field.ty, d, usize::from(was.len)).is_some_and(|x| {
                 let text = format!("{x:.d$}");
                 text.len() <= usize::from(was.len) && text.parse::<f64>().ok() == v.as_f64()
             })
@@ -3443,8 +3443,9 @@ pub(crate) fn shapefile_parts_styled(
         for (k, (f, n)) in ds.fields.iter().zip(&names).enumerate() {
             let v = r.attrs.get(k).unwrap_or(&Value::Null);
             let decimals = specs.get(k).map_or(0, |s| usize::from(s.decimals));
+            let width = specs.get(k).map_or(0, |s| usize::from(s.len));
             let value = match f.ty {
-                FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals)),
+                FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals, width)),
                 FieldType::Boolean => FieldValue::Logical(dbf_boolean(v)),
                 FieldType::Date => FieldValue::Date(dbf_date(v).and_then(|d| {
                     let (y, m, d) = d.ymd();

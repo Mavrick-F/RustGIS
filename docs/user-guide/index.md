@@ -429,7 +429,9 @@ coordinate system than its `.prj` names, including one assigned with Define Proj
 written with the coordinates the file holds, so a projected file's untouched shapes stay as they
 were to the bit. An edited shape in a projected system is converted from longitude/latitude, as
 RustGIS holds it, and read back: publishing refuses one that would move by more than one part in
-10¹¹ of its coordinates (a tenth of a millimetre at ten thousand kilometres).
+10¹¹ of its coordinates (a tenth of a millimetre at ten thousand kilometres). A notice
+names the file, counts shapes with projection round-off and identifies the first feature and
+the largest coordinate difference in degrees; exact round trips give no such notice.
 
 Publishing refuses symbolic links in any source part: add the actual source files instead.
 This keeps each link and its target unchanged.

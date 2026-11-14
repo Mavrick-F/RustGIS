@@ -36,8 +36,8 @@ pub struct Synced {
 
 /// A hash of what a dataset holds: its fields, coordinate system, and each row's geometry and
 /// attributes in order (FNV-1a over their JSON, written to the hash as it is made). Not its name
-/// or where it came from, which are no edit to the file. A number that isn't finite, which JSON
-/// writes as null, is told from an empty cell by its position and bits, as the GeoPackage edit
+/// or where it came from, or display aliases, which are no edit to the file. A number that isn't
+/// finite, which JSON writes as null, is told from an empty cell by its position and bits, as the GeoPackage edit
 /// rows are: clearing one is an edit. A project saves one as null (and says so), so a layer that
 /// held one reads as edited once its project is opened again: it no longer holds what its file
 /// does. Its work grows with the rows: each is counted as progress ([`crate::progress`]), and it
@@ -61,7 +61,13 @@ pub fn rows_digest(ds: &crate::Dataset) -> crate::Result<u64> {
         h.0 = (h.0 ^ 0xff).wrapping_mul(0x0100_0000_01b3);
     }
     let mut h = Fnv(0xcbf2_9ce4_8422_2325);
-    put(&mut h, &(&ds.fields, &ds.crs));
+    // Whole Shapefile/GeoJSON reads record fields with no aliases. Clear display-only aliases
+    // when comparing a layer, keeping the serialized form and existing saved digests unchanged.
+    let mut fields = ds.fields.clone();
+    for field in &mut fields {
+        field.alias = None;
+    }
+    put(&mut h, &(&fields, &ds.crs));
     crate::progress::begin(ds.features.len());
     for f in ds.features.iter() {
         put(&mut h, &(&f.geometry, &f.attrs));
@@ -357,6 +363,8 @@ mod tests {
         }]
         .into();
         assert_eq!(rows_digest(&ds).unwrap(), 1_724_049_670_388_433_092);
+        ds.fields[0].alias = Some("Street name".into());
+        assert_eq!(rows_digest(&ds).unwrap(), 1_724_049_670_388_433_092, "an alias changes display, not file contents");
     }
 
     #[test]

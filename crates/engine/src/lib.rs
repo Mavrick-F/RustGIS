@@ -826,6 +826,9 @@ pub struct Session {
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
+    /// File writes committed inside the outer command, retained through layer removal or a
+    /// project replacement so its rollback can restore the current source-file record.
+    published_syncs: Vec<(u64, String, rustgis_data::sync::Synced)>,
     /// Who runs commands now: `None` is the user; the MCP relay names an attached agent around
     /// its calls. Each undo step remembers who made it ([`Session::undo_actor`]).
     pub actor: Option<String>,
@@ -1205,6 +1208,7 @@ impl Session {
             depth: 0,
             diagnostic_source: None,
             restorable: 0,
+            published_syncs: Vec::new(),
             actor: None,
             back: Vec::new(),
             forward: Vec::new(),
@@ -1808,7 +1812,8 @@ impl Session {
                 let failed_history = if self.opened == opened { std::mem::take(&mut self.project.gp_history) } else { Vec::new() };
                 // The project as it was before the command, so the layout open then, whatever
                 // the command opened on the way (a task's steps).
-                self.project = snap;
+                let committed = std::mem::replace(&mut self.project, snap);
+                let sync_changed = self.keep_synced(&committed);
                 (self.trusted_tasks, self.trusted_models, self.trusted_notebooks) = trust;
                 self.active_layout = open_layout;
                 // Replaced during the command: what it held beside itself (its undo history, its
@@ -1841,7 +1846,11 @@ impl Session {
                     self.push_gp_record(record);
                     recorded_failure = true;
                 }
-                if recorded_failure {
+                if sync_changed {
+                    self.mark_unsaved();
+                    self.warn("Source-file records were kept: rolling back a command does not undo its file writes");
+                }
+                if recorded_failure || sync_changed {
                     if self.depth == 0 && self.project.gp_history.len() > 500 {
                         let excess = self.project.gp_history.len() - 500;
                         self.project.gp_history.drain(..excess);
@@ -1866,6 +1875,7 @@ impl Session {
         // The command, and those it ran, are done: a replaced project stays replaced.
         if self.depth == 0 {
             self.put_aside = None;
+            self.published_syncs.clear();
         }
         self.fix_active_layer();
         self.revision = self.revision.wrapping_add(1);
@@ -2547,16 +2557,37 @@ impl Session {
         cmd::zarr::follow_time(self);
     }
 
-    /// After undo or redo swaps the project: each layer keeps the record of its file it had
-    /// (`synced`), as undo doesn't change the file. A layer published since keeps the record of
-    /// what was written, so undoing an edit made before shows it as an edit the file holds.
-    fn keep_synced(&mut self, before: &Project) {
+    /// Remembers a physical source write only while a command can still roll its project back.
+    /// The outer guard clears these records on success or failure; they never go in a project.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remember_source_write(&mut self, instance: u64, path: String, synced: rustgis_data::sync::Synced) {
+        if self.restorable > 0 {
+            self.published_syncs.retain(|(i, p, _)| *i != instance || *p != path);
+            self.published_syncs.push((instance, path, synced));
+        }
+    }
+
+    /// After undo, redo or failed-command rollback swaps the project: each layer keeps its
+    /// file record (`synced`), as restoring the project doesn't change the file. A published
+    /// layer keeps the record of what was written, so restored edits compare with that file.
+    /// Returns whether the restored project took a different record and needs saving.
+    fn keep_synced(&mut self, before: &Project) -> bool {
+        let mut changed = false;
         for l in self.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
             let old = before.maps.iter().flat_map(|m| &m.layers).find(|o| o.instance_id() == l.instance_id());
-            if let Some(old) = old.filter(|o| o.dataset.source == l.dataset.source) {
-                l.synced = old.synced.clone();
+            let synced = old.filter(|o| o.dataset.source == l.dataset.source).map(|o| o.synced.clone()).or_else(|| {
+                self.published_syncs
+                    .iter()
+                    .rev()
+                    .find(|(i, p, _)| *i == l.instance_id() && l.dataset.source.as_deref() == Some(p.as_str()))
+                    .map(|(_, _, synced)| Some(synced.clone()))
+            });
+            if let Some(synced) = synced {
+                changed |= l.synced != synced;
+                l.synced = synced;
             }
         }
+        changed
     }
 
     /// After undo or redo swaps the project: the tile layer picked in the Layers pane stays the one

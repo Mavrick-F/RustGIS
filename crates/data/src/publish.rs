@@ -42,7 +42,7 @@ const PROJECTED_TOLERANCE: f64 = 1e-11;
 /// A layer written back to its source: the files and rows as written, to record as the new sync
 /// point. `read` holds the rows in file order, with any format normalization (such as Shapefile
 /// empty text reading as null); the engine preserves layer feature ids when adopting these rows.
-/// `notes` describes field changes and other format-specific effects.
+/// `notes` describes field changes, projection round-off and other format-specific effects.
 pub struct Published {
     pub files: FileSync,
     pub read: Dataset,
@@ -288,6 +288,12 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
         return Err(refused(path, format!("the file couldn't hold the layer as it is: {why}")));
     }
 
+    if crs.is_some()
+        && let Some(note) = projection_note(ds, &read_back)?
+    {
+        notes.push(format!("{}: {note}", path.display()));
+    }
+
     // The file's columns no field of the layer has now (deleted or renamed): left out, and said.
     let kept_names = crate::io::shapefile_column_names(&ds.fields);
     let gone: Vec<String> =
@@ -366,12 +372,25 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
         Some((read, raw)) => (read.features.iter().collect(), raw.features.iter().collect()),
         None => (Vec::new(), Vec::new()),
     };
-    let at: std::collections::HashMap<u64, usize> = read.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+    // File reads number rows anew; persistent layer ids can have gaps after a deletion.
+    // Exact geometry keys retain correspondence without trusting those regenerated ids.
+    let key = |f: &Feature| serde_json::to_vec(&f.geometry).map_err(|e| DataError::Format(e.to_string()));
+    let mut at: std::collections::HashMap<Vec<u8>, (usize, bool)> = std::collections::HashMap::new();
+    for (i, f) in read.iter().enumerate() {
+        crate::progress::check()?;
+        at.entry(key(f)?)
+            .and_modify(|(first, ambiguous)| *ambiguous |= raw.get(*first).zip(raw.get(i)).is_some_and(|(a, b)| a.geometry != b.geometry))
+            .or_insert((i, false));
+    }
     let mut rows = Vec::with_capacity(ds.features.len());
     for f in ds.features.iter() {
         // A shape taken as the file holds it is quick, but a layer of many is not.
         crate::progress::check()?;
-        let held = at.get(&f.id).and_then(|&i| read.get(i).filter(|r| r.geometry == f.geometry).and(raw.get(i)));
+        let matched = at.get(&key(f)?);
+        if matched.is_some_and(|(_, ambiguous)| *ambiguous) {
+            return Err(DataError::Format("several source shapes read as the same geometry but have different native coordinates; their correspondence is ambiguous, so nothing was written".into()));
+        }
+        let held = matched.and_then(|&(i, _)| raw.get(i));
         let mut row = f.clone();
         match held {
             Some(h) => row.geometry = h.geometry.clone(),
@@ -636,6 +655,31 @@ fn geometry_parts(g: Option<&Geometry>) -> Vec<Vec<(f64, f64)>> {
     }
 }
 
+/// Projection round-off actually present in the checked read-back: a count, the first feature
+/// and the largest coordinate difference in degrees. Exact round-trips need no notice.
+fn projection_note(ds: &Dataset, back: &Dataset) -> Result<Option<String>> {
+    let (mut count, mut first, mut largest) = (0usize, 0usize, 0.0_f64);
+    for (k, (f, g)) in ds.features.iter().zip(back.features.iter()).enumerate() {
+        crate::progress::check()?;
+        let (p, q) = (geometry_parts(f.geometry.as_ref()), geometry_parts(g.geometry.as_ref()));
+        if same_coords(&p, &q, 0.0) {
+            continue;
+        }
+        if count == 0 {
+            first = k + 1;
+        }
+        count += 1;
+        for (a, b) in p.iter().flatten().zip(q.iter().flatten()) {
+            largest = largest.max((a.0 - b.0).abs()).max((a.1 - b.1).abs());
+        }
+    }
+    Ok((count > 0).then(|| {
+        format!(
+            "shapes with projection round-off: {count} (the first, feature {first}); the largest coordinate difference is {largest:e} degrees"
+        )
+    }))
+}
+
 /// Why `back`, the layer `ds` written to a Shapefile and read again, isn't `ds`, or `None` when
 /// it is: the same fields, features, values ([`same_value`]) and shapes within `tolerance`.
 /// Counts the values and shapes that differ and names the first of each.
@@ -657,7 +701,11 @@ fn same_rows(ds: &Dataset, back: &Dataset, tolerance: f64) -> Option<String> {
         }
         // Points are compared as parts of one point each, so a point and a multipoint of one agree.
         let (p, q) = (geometry_parts(f.geometry.as_ref()), geometry_parts(g.geometry.as_ref()));
-        if !same_coords(&p, &q, tolerance) {
+        let grouping = |g: Option<&Geometry>| match g {
+            Some(Geometry::Polygon(polys)) => Some(polys.iter().map(Vec::len).collect::<Vec<_>>()),
+            _ => None,
+        };
+        if grouping(f.geometry.as_ref()) != grouping(g.geometry.as_ref()) || !same_coords(&p, &q, tolerance) {
             shapes += 1;
             first_shape.get_or_insert(k);
         }
@@ -812,6 +860,23 @@ mod tests {
         assert!(source_lock(&path).err().unwrap().to_string().contains("another RustGIS publisher"));
         drop(held);
         source_lock(&path).unwrap();
+    }
+
+    /// A collapsed hole is inferred as an outer ring on read: identical flat coordinates
+    /// must not let that topology change overwrite the source.
+    #[test]
+    fn a_polygon_hole_that_reads_as_an_outer_ring_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (mut ds, sync) = written(&parcels(), &path);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        if let Some(Geometry::Polygon(polys)) = &mut rows[0].geometry {
+            polys[0].push(vec![Coord::new(-89.98, 35.02), Coord::new(-89.96, 35.02), Coord::new(-89.98, 35.02)]);
+        }
+        ds.features = rows.into();
+        let e = shapefile(&ds, &path, &sync).err().expect("changed ring grouping must be refused").to_string();
+        assert!(e.contains("shapes would read back otherwise") && e.contains("nothing was written"), "{e}");
+        assert!(sync.files.changed(&path).unwrap().is_empty());
     }
 
     /// A layer read otherwise than the file reads now (by an older RustGIS, or saved in a
@@ -1077,6 +1142,56 @@ mod tests {
         assert_eq!(table.columns[0].ty, b'D');
     }
 
+    /// A whole-valued double reads as Integer, but its existing wide decimal column still fits.
+    #[test]
+    fn an_integral_double_keeps_its_wide_decimal_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let mut ds = parcels();
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[1] = Value::Float(100.0);
+        rows[1].attrs[1] = Value::Float(200.0);
+        ds.features = rows.into();
+        let (mut ds, sync) = written(&ds, &path);
+        assert_eq!(ds.fields[1].ty, FieldType::Integer);
+        let before = std::fs::read(path.with_extension("dbf")).unwrap();
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text("Smyth".into());
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        assert!(published.notes.is_empty(), "{:?}", published.notes);
+        let after = std::fs::read(path.with_extension("dbf")).unwrap();
+        let (a, b) = (crate::dbf::raw_table(&before).unwrap(), crate::dbf::raw_table(&after).unwrap());
+        assert_eq!(a.columns, b.columns);
+        for (a, b) in a.records.iter().zip(&b.records) {
+            assert_eq!(a[1], b[1]);
+        }
+    }
+
+    /// After deletion, persistent layer ids differ from file row numbers. An attribute-only
+    /// second publish must still copy the untouched projected coordinates to the bit.
+    #[test]
+    fn repeated_publication_keeps_native_shapes_after_deleting_a_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let crs = Crs::parse("EPSG:2274").unwrap();
+        crate::io::write_path_in(&parcels(), &path, crs).unwrap();
+        let (mut ds, sync) = read(&path);
+        let survivor = ds.features.get(1).unwrap().clone();
+        let id = survivor.id;
+        ds.features = vec![survivor].into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        ds = published.read;
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].id = id;
+        rows[0].attrs[0] = Value::Text("Smyth".into());
+        ds.features = rows.into();
+        let sync = Synced { files: published.files, rows: published.rows };
+        let before = std::fs::read(&path).unwrap();
+        shapefile(&ds, &path, &sync).unwrap();
+        assert!(same_shapes(&before, &std::fs::read(&path).unwrap(), 0.0).is_none());
+    }
+
     /// The writer uses UTF-8 name bytes even with a legacy code page: a rewrite is refused
     /// before the differing name or width can reach the source.
     #[test]
@@ -1133,7 +1248,8 @@ mod tests {
             let mut rows: Vec<_> = ds.features.iter().cloned().collect();
             rows[1].attrs[2] = Value::Int(3);
             ds.features = rows.into();
-            shapefile(&ds, &path, &sync).unwrap();
+            let published = shapefile(&ds, &path, &sync).unwrap();
+            assert!(published.notes.is_empty(), "{code}: {:?}", published.notes);
             // Every shape as it was, to the bit: none was edited.
             assert!(same_shapes(&before, &std::fs::read(&path).unwrap(), 0.0).is_none(), "{code}");
             // A shape moved is projected; the others stay as they were.
@@ -1143,7 +1259,15 @@ mod tests {
                 polys[0][0][1].y += 0.01;
             }
             ds.features = rows.into();
-            shapefile(&ds, &path, &sync).unwrap();
+            let published = shapefile(&ds, &path, &sync).unwrap();
+            if code == "EPSG:2274" {
+                assert_eq!(published.notes.len(), 1, "{:?}", published.notes);
+                let note = &published.notes[0];
+                assert!(
+                    note.contains("shapes with projection round-off: 1") && note.contains("feature 2") && note.contains("degrees"),
+                    "{note}"
+                );
+            }
             let shapes = |b: &[u8]| -> Vec<_> {
                 let mut r = shapefile::ShapeReader::new(std::io::Cursor::new(b.to_vec())).unwrap();
                 r.iter_shapes().map(|s| shape_parts(&s.unwrap()).1).collect()
