@@ -74,12 +74,12 @@ struct Kept {
     /// this version can't strip it from what it doesn't understand.
     secrets: usize,
     /// Readable sources whose name, address or details [`clean`] changed (a name too long or with
-    /// control characters, an address with a password, key, token or login binding, details that aren't short
+    /// control characters, an address with a password, key or token, details that aren't short
     /// text, more than eight, or secret-looking): saved that way.
     cut: usize,
-    /// Readable rows that repeat the kind and address of an earlier row of their list: merged
-    /// into it (a list is keyed by that identity), keeping unknown fields it lacks.
-    merged: usize,
+    /// Readable rows that repeat the identity of an earlier row of their list: dropped (the first
+    /// one wins, with its unknown fields).
+    repeated: usize,
 }
 
 impl Kept {
@@ -178,40 +178,29 @@ impl Sources {
         s.kept.top = s.kept.without_secrets(o, "", &Value::Null);
         for (list, rows) in LISTS.into_iter().zip(lists) {
             let cap = if list == "recent" { MAX_RECENT } else { MAX_KEPT };
-            let mut into = Vec::new();
+            let mut into: Vec<Source> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for row in rows {
                 // Entry by entry: one that doesn't read is kept as it was, not the whole list.
                 let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| {
                     let mut cleaned = clean(r.source.clone()).ok()?;
-                    // Preferences carry provenance, never authority from an earlier process's login;
-                    // clearing it is a change `cut` counts.
+                    let was_cut = cut(&r.source, &cleaned);
+                    // A login binding is the app's own output, never authority from an earlier
+                    // process's login: it isn't kept, and clearing it is no loss.
                     crate::s3_connections::clear_bindings(std::iter::once(&mut cleaned.address));
-                    Some((cut(&r.source, &cleaned), cleaned, r.other))
+                    Some((was_cut, cleaned, r.other))
                 });
-                // A repeat of a listed source merges even at the limit: it adds no row.
-                let repeat = read.as_ref().is_some_and(|(_, source, _)| into.iter().any(|r| same(r, source)));
                 match read {
-                    Some((was_cut, source, other)) if repeat || into.len() < cap => {
+                    // The first row of an identity wins; a repeat is dropped, and said.
+                    Some((_, source, _)) if seen.contains(&identity(&source.kind, &source.address)) => s.kept.repeated += 1,
+                    Some((was_cut, source, other)) if into.len() < cap => {
+                        seen.insert(identity(&source.kind, &source.address));
                         s.kept.cut += usize::from(was_cut);
                         let other = s.kept.without_secrets(other, &source.address, &source.extra);
-                        s.kept.merged += usize::from(repeat);
                         if !other.is_empty() {
-                            // A repeated row adds the unknown fields the first lacks; the combined
-                            // fields are classified again, since a key beside a web address
-                            // that another row held is a secret only together.
-                            let key = (list, source.kind.clone(), source.address.clone());
-                            let mut merged = s.kept.fields.remove(&key).unwrap_or_default();
-                            for (k, v) in other {
-                                merged.entry(k).or_insert(v);
-                            }
-                            let merged = if repeat { s.kept.without_secrets(merged, &source.address, &source.extra) } else { merged };
-                            if !merged.is_empty() {
-                                s.kept.fields.insert(key, merged);
-                            }
+                            s.kept.fields.insert((list, source.kind.clone(), source.address.clone()), other);
                         }
-                        if !repeat {
-                            into.push(source);
-                        }
+                        into.push(source);
                     }
                     _ if holds_secret(&row) => s.kept.secrets += 1,
                     read => {
@@ -238,11 +227,11 @@ impl Sources {
         }
         let mut said = Vec::new();
         let rows = k.rows.values().map(Vec::len).sum::<usize>().saturating_sub(k.over);
-        if k.merged > 0 {
-            let n = k.merged;
+        if k.repeated > 0 {
+            let n = k.repeated;
             said.push(format!(
-                "{n} saved data source{} another in the same list: merged into it, keeping its settings and adding the unknown ones it lacks",
-                if n == 1 { " repeats" } else { "s repeat" }
+                "{n} repeated saved data source{} removed (the first of each is kept, with its settings)",
+                if n == 1 { " was" } else { "s were" }
             ));
         }
         if k.over > 0 {
@@ -270,7 +259,7 @@ impl Sources {
         if k.cut > 0 {
             let n = k.cut;
             said.push(format!(
-                "{n} saved data source{} a name, address or details this version changes (a name too long or with control characters, an address with a password, key, token or login binding, details that aren't short text, more than eight, or secret-looking): saved changed",
+                "{n} saved data source{} a name, address or details this version changes (a name too long or with control characters, an address with a password, key or token, details that aren't short text, more than eight, or secret-looking): saved changed",
                 if n == 1 { " has" } else { "s have" }
             ));
         }
@@ -335,8 +324,8 @@ impl Sources {
     /// A source as a preference row: with the fields kept for it that this version doesn't know.
     fn row(&self, list: &'static str, source: &Source) -> Value {
         let mut row = serde_json::to_value(source).unwrap_or(Value::Null);
-        let key = (list, source.kind.clone(), source.address.clone());
-        if let (Value::Object(row), Some(other)) = (&mut row, self.kept.fields.get(&key)) {
+        let (kind, address) = identity(&source.kind, &source.address);
+        if let (Value::Object(row), Some(other)) = (&mut row, self.kept.fields.get(&(list, kind, address))) {
             for (k, v) in other {
                 row.entry(k.clone()).or_insert_with(|| v.clone());
             }
@@ -352,7 +341,9 @@ impl Sources {
         self.recent.truncate(MAX_RECENT);
         // A source no longer recent takes the fields kept for it along.
         let recent = &self.recent;
-        self.kept.fields.retain(|(list, kind, address), _| *list != "recent" || recent.iter().any(|r| r.is(kind, address)));
+        self.kept.fields.retain(|(list, kind, address), _| {
+            *list != "recent" || recent.iter().any(|r| identity(&r.kind, &r.address) == identity(kind, address))
+        });
         self.generation += 1;
     }
 
@@ -377,26 +368,24 @@ impl Sources {
 
     /// Forgets the source of `kind` at `address` from `list`; whether there was one.
     pub fn forget(&mut self, list: &str, kind: &str, address: &str) -> Result<bool, String> {
+        let id = identity(kind, address);
         let l = self.list_mut(list)?;
         let before = l.len();
-        l.retain(|r| !r.is(kind, address));
+        l.retain(|r| identity(&r.kind, &r.address) != id);
         let gone = l.len() != before;
+        let mut kept_gone = false;
         if let Some(list) = LISTS.into_iter().find(|l| *l == list) {
-            self.kept.fields.remove(&(list, kind.to_string(), address.to_string()));
-            // A readable row kept past the list's limit of the same source would be listed again
-            // by the next start.
+            self.kept.fields.retain(|(l, k, a), _| *l != list || identity(k, a) != id);
+            // A readable row kept past the list's limit with the same identity would be listed
+            // again by the next start; a row this version can't read is not this source's.
             if let Some(rows) = self.kept.rows.get_mut(list) {
-                let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(|s| s.trim().to_string());
-                let mut dropped = 0;
-                rows.retain(|r| {
-                    let same = text(r, "kind").as_deref() == Some(kind) && text(r, "address").as_deref() == Some(address.trim());
-                    dropped += usize::from(same && serde_json::from_value::<Row>(r.clone()).is_ok());
-                    !same
-                });
-                self.kept.over = self.kept.over.saturating_sub(dropped);
+                let before = rows.len();
+                rows.retain(|r| row_identity(r).as_ref() != Some(&id));
+                self.kept.over = self.kept.over.saturating_sub(before - rows.len());
+                kept_gone = rows.len() != before;
             }
         }
-        if gone {
+        if gone || kept_gone {
             self.generation += 1;
         }
         Ok(gone)
@@ -412,8 +401,22 @@ impl Sources {
     }
 }
 
+/// A source's identity, the one every list is matched by: its kind and its address with a login
+/// binding cleared, as [`Sources::from_json`] reads it.
+fn identity(kind: &str, address: &str) -> (String, String) {
+    let mut address = address.to_string();
+    crate::s3_connections::clear_bindings(std::iter::once(&mut address));
+    (kind.to_string(), address)
+}
+
+/// The identity of a saved row [`Sources::from_json`] reads (none for one it can't).
+fn row_identity(row: &Value) -> Option<(String, String)> {
+    let source = clean(serde_json::from_value::<Row>(row.clone()).ok()?.source).ok()?;
+    Some(identity(&source.kind, &source.address))
+}
+
 fn same(a: &Source, b: &Source) -> bool {
-    a.is(&b.kind, &b.address)
+    identity(&a.kind, &a.address) == identity(&b.kind, &b.address)
 }
 
 impl Source {
@@ -1070,50 +1073,30 @@ MIIE
         assert_eq!(s.favourites.len(), MAX_KEPT);
         assert!(s.unread()[0].starts_with("1 saved data source is past"), "{:?}", s.unread());
         assert!(s.to_json().contains(&format!("/{}.csv", MAX_KEPT - 1)) && s.to_json().contains(&format!("\"pinned\":{}", MAX_KEPT - 1)));
-        // Rows of one identity are one source: the first row's fields stay, a later row adds the
-        // ones it lacks (without a secret), and forgetting it leaves nothing behind.
-        let twins = json!({"saved": [
-            {"kind": "file", "name": "A", "address": "/a.csv", "future": 1},
-            {"kind": "file", "name": "A", "address": "/a.csv", "future": 2, "more": 3, "token": "hidden"}
-        ]});
-        let mut s = Sources::from_json(&twins.to_string());
-        assert_eq!(s.saved.len(), 1);
-        let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
-        assert_eq!(
-            (saved["saved"].as_array().map(Vec::len), &saved["saved"][0]["future"], &saved["saved"][0]["more"]),
-            (Some(1), &json!(1), &json!(3))
-        );
-        assert!(!s.to_json().contains("hidden"));
-        assert!(s.unread()[0].starts_with("1 saved data source repeats"), "{:?}", s.unread());
-        s.forget("saved", "file", "/a.csv").unwrap();
-        assert!(!s.to_json().contains("/a.csv"));
-        // Fields that are fine in each row but a secret together are dropped, in either order.
-        for rows in [
-            [json!({"endpoint": "https://api.example"}), json!({"key": "abc"})],
-            [json!({"key": "abc"}), json!({"endpoint": "https://api.example"})],
+        // Rows of one identity are one source: the first row wins, with its fields, a later row is
+        // dropped and said (whatever it holds), and forgetting it leaves nothing behind.
+        for twins in [
+            json!({"saved": [
+                {"kind": "file", "name": "A", "address": "/a.csv", "future": 1},
+                {"kind": "file", "name": "A", "address": "/a.csv", "future": 2, "more": 3, "token": "hidden", "endpoint": "https://api.example"}
+            ]}),
+            json!({"saved": [
+                {"kind": "file", "name": "A", "address": "/a.csv", "key": "abc"},
+                {"kind": "file", "name": "A", "address": "/a.csv", "endpoint": "https://api.example"}
+            ]}),
         ] {
-            let rows: Vec<Value> = rows
-                .into_iter()
-                .map(|mut r| {
-                    r.as_object_mut().into_iter().for_each(|o| {
-                        o.extend([("kind".into(), json!("file")), ("name".into(), json!("A")), ("address".into(), json!("/a.csv"))])
-                    });
-                    r
-                })
-                .collect();
-            let saved = Sources::from_json(&json!({"saved": rows}).to_string()).to_json();
-            assert!(!saved.contains("abc") && saved.contains("api.example"), "{saved}");
+            let mut s = Sources::from_json(&twins.to_string());
+            assert_eq!(s.saved.len(), 1);
+            let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
+            assert_eq!(saved["saved"].as_array().map(Vec::len), Some(1));
+            assert!(saved["saved"][0].get("more").is_none() && !s.to_json().contains("hidden") && !s.to_json().contains("api.example"));
+            assert_eq!(
+                s.unread().first().map(String::as_str),
+                Some("1 repeated saved data source was removed (the first of each is kept, with its settings)")
+            );
+            s.forget("saved", "file", "/a.csv").unwrap();
+            assert!(!s.to_json().contains("/a.csv"));
         }
-        // A readable row past the limit is kept raw; once the source is listed and forgotten it
-        // doesn't come back with the next start.
-        let recent: Vec<Value> = (0..=MAX_RECENT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
-        let mut s = Sources::from_json(&json!({ "recent": recent }).to_string());
-        assert!(s.to_json().contains(&format!("/{MAX_RECENT}.csv")));
-        s.forget("recent", "file", "/0.csv").unwrap();
-        s.note(Source { kind: "file".into(), address: format!("/{MAX_RECENT}.csv"), ..Source::default() });
-        s.forget("recent", "file", &format!("/{MAX_RECENT}.csv")).unwrap();
-        assert!(!s.to_json().contains(&format!("/{MAX_RECENT}.csv")), "{}", s.to_json());
-        assert!(s.unread().iter().all(|t| !t.contains("past the lists' limits")), "{:?}", s.unread());
         // The row's known details count beside an unknown key, as its address does.
         let extra = json!({"saved": [{"kind": "file", "name": "A", "address": "/a.csv", "extra": {"endpoint": "https://api.example"}, "key": "abc"}]});
         let saved = Sources::from_json(&extra.to_string()).to_json();
@@ -1124,19 +1107,40 @@ MIIE
         let stored: Vec<Value> = (0..MAX_KEPT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
         s.merge(Sources::from_json(&json!({ "favourites": stored }).to_string()));
         assert!(s.unread().iter().any(|t| t.contains("past the lists' limits")), "{:?}", s.unread());
-        // A repeat past the limit merges into its source, whether or not it holds a secret.
-        let mut full: Vec<Value> = (0..MAX_KEPT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
-        full.push(json!({"kind": "file", "name": "", "address": "/0.csv", "token": "hidden", "future": 1}));
-        full.push(json!({"kind": "file", "name": "", "address": "/1.csv"}));
-        let mut s = Sources::from_json(&json!({"saved": full}).to_string());
-        assert!(!s.to_json().contains("hidden") && s.to_json().contains("\"future\":1"), "{}", s.to_json());
-        assert_eq!(s.kept.over, 0);
-        s.forget("saved", "file", "/1.csv").unwrap();
-        assert!(!s.to_json().contains("/1.csv"));
-        // A login binding removed from an address is said.
+        // A repeat past the limit is dropped, not kept as an overflow row. A bound address is the
+        // bare one's identity: forgetting by either form removes a kept over-limit row of it, never
+        // an unreadable row that merely shares the address.
         let bound = rustgis_data::s3_address::bind("0123456789abcdef", "https://s3.example.org", "s3://data/a.fgb").unwrap();
+        let mut full: Vec<Value> = (0..MAX_KEPT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
+        full.push(json!({"kind": "file", "name": "", "address": "/0.csv", "token": "hidden"}));
+        let s = Sources::from_json(&json!({"saved": full.clone()}).to_string());
+        assert!(!s.to_json().contains("hidden") && s.kept.over == 0 && s.kept.repeated == 1);
+        full.truncate(MAX_KEPT);
+        full.push(json!({"kind": "url", "name": "", "address": bound}));
+        let twin = rustgis_data::s3_address::bind("fedcba9876543210", "https://s3.example.org", "s3://data/a.fgb").unwrap();
+        full.push(json!({"kind": "url", "name": "", "address": twin, "gcs": 1}));
+        full.push(json!({"kind": "gcs", "name": "", "address": "gs://b/a.tif"}));
+        full.push(json!({"kind": "future", "name": "", "address": twin}));
+        full.push(json!({"kind": " url ", "name": 5, "address": twin}));
+        let mut s = Sources::from_json(&json!({"saved": full}).to_string());
+        assert_eq!(s.kept.over, 2, "{:?}", s.unread());
+        let generation = s.generation;
+        // Only kept rows go: the pane must still save.
+        assert!(!s.forget("saved", "url", &twin).unwrap() && s.generation != generation);
+        assert!(
+            s.to_json().contains("gs://b/a.tif")
+                && s.to_json().contains("\"future\"")
+                && !s.to_json().contains("\"gcs\":1")
+                && s.to_json().contains("\"name\":5")
+        );
+        assert_eq!(s.kept.over, 0);
+        // A login binding is the app's own output: cleared on read without a notice.
         let s = Sources::from_json(&json!({"saved": [{"kind": "url", "name": "B", "address": bound}]}).to_string());
-        assert!(matches!(s.unread().as_slice(), [one] if one.starts_with("1 saved data source has")), "{:?}", s.unread());
+        assert!(
+            s.unread().is_empty() && rustgis_data::s3_address::parse(&s.saved[0].address).unwrap().unwrap().binding.is_empty(),
+            "{:?}",
+            s.unread()
+        );
         // A file's contents beside a field isn't an address for it.
         let file = json!({"data": "https://example.invalid/a.csv", "key": "feature_id"});
         assert!(Sources::from_json(&file.to_string()).to_json().contains("feature_id"));
