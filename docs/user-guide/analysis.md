@@ -1332,9 +1332,10 @@ click them on the map:
 
 Slope, in Raster Functions and the Function Editor, is in degrees, from 0 (flat) to 90
 (vertical), from Horn's 3 × 3 gradient; there is no percent option. Percent slope is
-`100 × tan(slope)`, so 45° is 100%: convert each cell before averaging, since a converted mean
-angle isn't the mean percent. The result's band is named **Slope (degrees)**, which `raster.info`
-shows and a saved project or GeoTIFF export keeps; a later step in a chain names it again.
+`100 × tan(slope × π / 180)` (the angle in radians, as `tan` takes it), so 45° is 100%: convert
+each cell before averaging, since a converted mean angle isn't the mean percent. The result's
+band is named **Slope (degrees)**, which `raster.info` shows and a saved project or GeoTIFF
+export keeps; a later step in a chain names it again.
 
 Slope, aspect and hillshade need the cell size in the elevation's unit. On a projected DEM the
 cell size is taken as it is, so elevations must be in the same unit as the coordinates (feet
