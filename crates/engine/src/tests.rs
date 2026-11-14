@@ -45486,6 +45486,7 @@ fn long_commands_stop_when_cancelled_while_they_run() {
         ("share.exportLayer", json!({"layer": "Cities", "path": out("cities.geojson")})),
         ("share.exportRaster", json!({"layer": dem, "path": out("dem.tif")})),
         ("share.exportMap", json!({"path": out("map.png"), "width": 320, "height": 200})),
+        ("map.exportOrbit", json!({"path": out("orbit.zip"), "frames": 3, "width": 96, "height": 64})),
         ("layout.export", json!({"path": out("layout.pdf"), "dpi": 72})),
         ("report.export", json!({"path": out("report.pdf"), "dpi": 72})),
         ("source.publish", json!({"layer": "towns"})),
@@ -47560,12 +47561,56 @@ fn an_orbit_is_exported_as_png_frames_or_a_gif_and_the_view_comes_back() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A run asked to stop ends an orbit, and a time animation, between frames: nothing is written
-/// and the view is back where it was.
+/// The app draws an orbit on a thread of its own: its progress counts the frames, and Cancel
+/// stops it between them with nothing written, not even a temporary file, the view untouched.
+#[test]
+fn an_orbit_drawn_on_another_thread_counts_its_frames_and_stops_on_cancel() {
+    use rustgis_analysis::control::Control;
+    let mut s = world();
+    s.run("map.setBearing", &json!({"bearing": 30})).unwrap();
+    let before = s.map().camera;
+    let dir = std::env::temp_dir().join(format!("rustgis-orbit-thread-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("orbit.zip");
+    let params = |frames: u32| json!({"path": path.display().to_string(), "frames": frames, "width": 96, "height": 64});
+    // Run to its end: every frame counted, the file written and said.
+    let run = crate::cmd::exports::export_start(&mut s, "map.exportOrbit", &params(4)).unwrap();
+    let (started, control) = (run.started(), Control::stoppable());
+    let wrote = run.run(&control);
+    assert_eq!(control.progress(), Some((4, 4)));
+    let r = crate::cmd::exports::export_land(&mut s, started, wrote).unwrap();
+    assert_eq!(r["frames"], 4);
+    assert_eq!(rustgis_data::zip::read(&std::fs::read(&path).unwrap()).unwrap().len(), 4);
+    assert!(s.notices.iter().any(|n| n.text == format!("Exported {}", path.display())));
+    std::fs::remove_file(&path).unwrap();
+    // Cancelled once its first frames are counted, far from its last.
+    let run = crate::cmd::exports::export_start(&mut s, "map.exportOrbit", &params(1000)).unwrap();
+    let control = Control::stoppable();
+    let on = control.clone();
+    let drawing = std::thread::spawn(move || run.run(&on).map(|_| ()));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while control.progress().is_none_or(|(done, _)| done < 2) {
+        assert!(std::time::Instant::now() < end, "no frame was counted");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    control.cancel();
+    let e = drawing.join().unwrap().unwrap_err();
+    let (done, total) = control.progress().unwrap();
+    assert!(e.contains("cancelled") && done < total && total == 1000, "{e}: {done} of {total}");
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(s.map().camera, before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A run asked to stop ends a time animation between frames: nothing is written and the slider
+/// is back where it was.
 #[test]
 fn a_stopped_run_ends_an_animation_export_with_nothing_written() {
     /// Asked to stop once it was asked `0` times whether it was: 0 stops a run before its first
-    /// frame, 2 one that has drawn a frame, 3 one that has drawn two.
+    /// frame, 3 one that has drawn a frame (looked before it, after it and as it counted it), 4 one
+    /// that has drawn two.
     struct Stopped(u32, std::sync::atomic::AtomicU32);
     impl rustgis_data::progress::Probe for Stopped {
         fn cancelled(&self) -> bool {
@@ -47581,22 +47626,20 @@ fn a_stopped_run_ends_an_animation_export_with_nothing_written() {
     let date = s.run("time.info", &Value::Null).unwrap()["date"].clone();
     let dir = std::env::temp_dir().join(format!("rustgis-orbit-stopped-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    for command in ["map.exportOrbit", "time.export"] {
-        let path = dir.join(format!("{command}.zip"));
-        let params = json!({"path": path.display().to_string(), "width": 96, "height": 64});
-        s.run(command, &params).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        // Stopped at once, before the second frame, and after it: an orbit's second frame has
-        // turned the camera, so it is the restore that brings the view back.
-        for after in [0, 2, 3] {
-            let stopped = rustgis_data::progress::install(Some(std::sync::Arc::new(Stopped(after, 0.into()))));
-            let e = s.run(command, &params).unwrap_err();
-            drop(stopped);
-            assert!(e.contains("cancel"), "{command} after {after}: {e}");
-            assert!(!path.exists(), "{command} after {after} wrote a file");
-            assert_eq!(s.map().camera, before, "{command} after {after}");
-            assert_eq!(s.run("time.info", &Value::Null).unwrap()["date"], date, "{command} after {after}");
-        }
+    let path = dir.join("time.zip");
+    let params = json!({"path": path.display().to_string(), "width": 96, "height": 64});
+    s.run("time.export", &params).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    // Stopped at once, before the second frame, and after it: the second frame has moved the
+    // slider, so it is the restore that brings it back.
+    for after in [0, 3, 4] {
+        let stopped = rustgis_data::progress::install(Some(std::sync::Arc::new(Stopped(after, 0.into()))));
+        let e = s.run("time.export", &params).unwrap_err();
+        drop(stopped);
+        assert!(e.contains("cancel"), "after {after}: {e}");
+        assert!(!path.exists(), "after {after} wrote a file");
+        assert_eq!(s.map().camera, before, "after {after}");
+        assert_eq!(s.run("time.info", &Value::Null).unwrap()["date"], date, "after {after}");
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

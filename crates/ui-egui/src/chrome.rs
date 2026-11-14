@@ -921,6 +921,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "map.package" => SaveItem("mapPackage"),
         "map.rename" => Dialog("renameMap"),
         "map.goToXY" => Dialog("goToXY"),
+        "map.exportOrbit" => Dialog("exportOrbit"),
         "map.findPlace" => Dialog("findPlace"),
         "map.camera" | "map.setScale" => Dialog("camera"),
         "map.basemap" => Dialog("basemap"),

@@ -252,7 +252,7 @@ pub(crate) fn shadow_warnings(what: &str, said: &rustgis_render::ShadowsSaid) ->
 }
 
 /// Renders `map` at its camera in a view of `(vw, vh)` points (or a requested size) to PNG bytes.
-fn png_of(
+pub(super) fn png_of(
     map: &mut rustgis_map::Map,
     view_size: (f64, f64),
     width: Option<f64>,

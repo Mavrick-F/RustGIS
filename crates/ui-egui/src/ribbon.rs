@@ -2128,6 +2128,18 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 json!({"mode": if v.fast { "quality" } else { "speed" }}),
                 v.fast,
             );
+            // Drawn and written by the desktop app only: the browser's `ui.dialog` refuses it.
+            #[cfg(not(target_arch = "wasm32"))]
+            small(
+                ui,
+                app,
+                "maneuver_roundabout",
+                "Export Orbit…",
+                "Write a turn of the view about its centre as an animated GIF or PNG frames.",
+                "ui.dialog",
+                json!({"name": "exportOrbit"}),
+                false,
+            );
         });
     });
     group(ui, "Windows", |ui| {
