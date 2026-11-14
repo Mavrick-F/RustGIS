@@ -955,9 +955,6 @@ impl MysqlSource {
         };
         let limit = clamp_limit(req.limit);
         let mut out = Batch::default();
-        if limit == 0 {
-            return Ok(out);
-        }
         // A geographic table has nothing past ±180°/±90° (a view panned off the world).
         if self.reproject.is_lonlat()
             && let Some(e) = req.extent
@@ -966,6 +963,9 @@ impl MysqlSource {
             return Ok(out);
         }
         let window = native_window(req, self.info.extent, &self.reproject)?;
+        if limit == 0 {
+            return Ok(out);
+        }
         let filter = self.filter(window.as_deref());
         let from = self.table.sql_from();
         let cols: Vec<String> = self.select.iter().enumerate().map(|(i, e)| format!("{e} AS c{i}")).collect();

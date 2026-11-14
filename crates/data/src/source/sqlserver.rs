@@ -836,9 +836,6 @@ impl SqlServerSource {
     fn read_within(&self, req: &Request, timeout: Option<u64>) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let mut out = Batch::default();
-        if limit == 0 {
-            return Ok(out);
-        }
         if self.reproject.is_lonlat()
             && let Some(e) = req.extent
             && !e.intersects(&Extent::new(-180.0, -90.0, 180.0, 90.0))
@@ -848,6 +845,9 @@ impl SqlServerSource {
         let secs = timeout.unwrap_or(STATEMENT_TIMEOUT);
         let query = |sql: &str| self.conn.query_within(sql, &[], secs)?.ok_or_else(|| timed_out(secs));
         let window = native_window(req, self.info.extent, &self.reproject, self.geography, self.conn.compatibility)?;
+        if limit == 0 {
+            return Ok(out);
+        }
         let filter = self.filter(window.as_deref());
         let from = self.table.sql_from();
         let cols = self.projection.select.iter().enumerate().map(|(i, e)| format!("{e} AS c{i}")).collect::<Vec<_>>().join(", ");

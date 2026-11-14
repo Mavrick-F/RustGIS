@@ -1461,10 +1461,10 @@ impl FeatureSource for PostgisSource {
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let mut out = Batch::default();
+        let native = req.extent.map(|e| self.lonlat_to_native(&e)).transpose()?;
         if limit == 0 {
             return Ok(out);
         }
-        let native = req.extent.map(|e| self.lonlat_to_native(&e)).transpose()?;
         let filter = self.filter(native.is_some());
         let args: Vec<f64> = native.map(|e| vec![e.min_x, e.min_y, e.max_x, e.max_y]).unwrap_or_default();
         let params: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
@@ -1568,10 +1568,14 @@ mod tests {
     fn refused_database_view_does_not_reach_the_connection() {
         let mut source = source("POINT");
         source.reproject = Some(Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new()));
-        let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
-        let error = source.read(&req).unwrap_err().to_string();
-        assert!(error.contains("can't be bounded in the database"), "{error}");
-        assert!(source.lonlat_to_native(&Extent::new(-84.0, 30.0, -78.0, 40.0)).is_ok());
+        for limit in [0, 10] {
+            let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit };
+            let error = source.read(&req).unwrap_err().to_string();
+            assert!(error.contains("can't be bounded in the database"), "{error}");
+        }
+        let clean = Request { extent: Some(Extent::new(-84.0, 30.0, -78.0, 40.0)), limit: 0 };
+        assert!(source.read(&clean).unwrap().features.is_empty());
+        assert!(source.read(&Request { extent: None, limit: 0 }).is_ok());
     }
 
     #[test]
