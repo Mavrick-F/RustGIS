@@ -384,7 +384,8 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
 
 /// `ds` in the file's coordinate system `crs` (`None`: longitude/latitude, as it is held). Given
 /// the file as read and in its own coordinates (`as_held`, the same rows), a feature whose shape
-/// is the one read takes the file's coordinates as they are; any other is projected.
+/// is the one read takes the file's coordinates as they are; any other is projected. A native
+/// shape that failed conversion is refused: missing geometry cannot identify its source shape.
 fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Dataset)>) -> Result<std::borrow::Cow<'a, Dataset>> {
     let Some(c) = crs else { return Ok(std::borrow::Cow::Borrowed(ds)) };
     let t = c.transformer().map_err(DataError::Format)?;
@@ -398,6 +399,12 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
     let mut at: std::collections::HashMap<Vec<u8>, (usize, bool)> = std::collections::HashMap::new();
     for (i, f) in read.iter().enumerate() {
         crate::progress::check()?;
+        if f.geometry.is_none() && raw.get(i).is_some_and(|f| f.geometry.is_some()) {
+            return Err(DataError::Format(format!(
+                "source shape {} couldn't be converted to longitude/latitude, so its native geometry can't be matched safely; check the source projection and add the file again; nothing was written",
+                i + 1
+            )));
+        }
         at.entry(key(f)?)
             .and_modify(|(first, ambiguous)| *ambiguous |= raw.get(*first).zip(raw.get(i)).is_some_and(|(a, b)| a.geometry != b.geometry))
             .or_insert((i, false));
@@ -1258,6 +1265,25 @@ mod tests {
         for (a, b) in a.records.iter().zip(&b.records) {
             assert_eq!(a[1], b[1]);
         }
+    }
+
+    /// An unconverted source shape cannot supply geometry to a new geometry-less feature.
+    #[test]
+    fn an_unconverted_shape_cannot_be_copied_to_a_geometryless_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let mut native = Dataset::new("parcels", GeometryType::Point, vec![Field::new("OWNER", FieldType::Text)]);
+        native.push(Some(Geometry::Point(Coord::new(1e30, 1e30))), vec![Value::Text("old".into())]);
+        native.push(Some(Geometry::Point(Coord::new(500_000.0, 0.0))), vec![Value::Text("kept".into())]);
+        crate::io::write_path(&native, &path).unwrap();
+        let crs = Crs::parse("EPSG:32616").unwrap();
+        std::fs::write(path.with_extension("prj"), crate::raster::wkt::to_wkt(crs).unwrap()).unwrap();
+        let (mut ds, sync) = read(&path);
+        assert_eq!(ds.features.iter().filter(|f| f.geometry.is_none()).count(), 1);
+        ds.push(None, vec![Value::Text("new".into())]);
+        let error = shapefile(&ds, &path, &sync).err().expect("unconverted shapes must not be assigned to new features").to_string();
+        assert!(error.contains("source shape 1") && error.contains("converted") && error.contains("nothing was written"), "{error}");
+        assert!(sync.files.changed(&path).unwrap().is_empty());
     }
 
     /// After deletion, persistent layer ids differ from file row numbers. An attribute-only
