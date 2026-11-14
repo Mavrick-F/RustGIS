@@ -1780,7 +1780,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         return add_gdal(s, p, path);
     }
     if rustgis_data::dxf::is_dxf_name(path) {
-        let (full, reads) = match super::reads::take::<CityRead>(s, &whole_key(path)) {
+        let (full, reads) = match super::reads::take::<LayersRead>(s, &whole_key(path)) {
             Some(read) => read,
             None => read_dxf_file(p, path),
         }?;
@@ -1891,7 +1891,7 @@ fn read_layers_file(p: &Value, path: &str) -> LayersRead {
 
 /// A DXF drawing read whole with its import options. Parsing checks Cancel between entities;
 /// decoding and the bounded file read complete before cancellation can be observed.
-fn read_dxf_file(p: &Value, path: &str) -> CityRead {
+fn read_dxf_file(p: &Value, path: &str) -> LayersRead {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut bytes = Vec::new();
