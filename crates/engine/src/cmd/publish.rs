@@ -96,6 +96,11 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 .collect::<Vec<_>>()
                 .into();
             held.fields = published.read.fields.clone();
+            for field in &mut held.fields {
+                if let Some(was) = dataset.fields.iter().find(|was| was.name == field.name) {
+                    field.alias = was.alias.clone();
+                }
+            }
             held.crs = published.read.crs;
             // Already hashed before the files were placed: Cancel must not leave a successful
             // write without its sync record. Feature ids do not contribute to the digest.
@@ -105,6 +110,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             let new = rustgis_data::sync::Synced { files: published.files, rows: read };
             let (said, written_path) = (path.clone(), Some(path.clone()));
             let then: Then = Box::new(move |s: &mut Session, _: &mut Value| {
+                s.remember_source_write(instance, said.clone(), new.clone());
                 // The record follows the file: the layer read from it takes the record of what
                 // was written, unless it was read again or its record changed meanwhile.
                 let live = s.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()).find(|l| l.instance_id() == instance);

@@ -44760,12 +44760,17 @@ fn a_layer_publishes_its_edits_to_its_shapefile() {
     assert_eq!(state(&mut s), "inSync");
     // An empty text, which the file holds as no value: the layer takes it as the file reads it,
     // and is in step with it.
+    {
+        let l = s.map_mut().layer_mut(id as u32).unwrap();
+        l.dataset.fields.iter_mut().find(|f| f.name == "name").unwrap().alias = Some("Town name".into());
+    }
     s.run("edit.setValue", &json!({"layer": id, "row": 2, "field": "name", "value": ""})).unwrap();
     s.run("source.publish", &json!({"layer": id})).unwrap();
     assert_eq!(state(&mut s), "inSync");
     let l = s.map().layer(id as u32).unwrap();
     let name = l.dataset.fields.iter().position(|f| f.name == "name").unwrap();
     assert!(l.dataset.features.get(2).unwrap().attrs[name].is_null());
+    assert_eq!(l.dataset.fields[name].alias.as_deref(), Some("Town name"));
     // Cancel arriving after the final .shp rename cannot turn a committed publish into an
     // error or leave its old sync record. The probe observes the real file, not an internal hook.
     struct CancelAfterPlacement {
@@ -44799,6 +44804,35 @@ fn a_layer_publishes_its_edits_to_its_shapefile() {
     assert_eq!(s.run("source.publish", &json!({"layer": id})).unwrap()["published"], true);
     assert_eq!(state(&mut s), "inSync");
     assert_eq!(s.run("source.publish", &json!({"layer": id})).unwrap()["published"], false);
+    // A later script failure rolls project edits back, but not its committed file or baseline,
+    // including when the script removed the published layer before failing.
+    for (n, (edited_inside, removed)) in [(false, false), (true, false), (true, true)].into_iter().enumerate() {
+        if !edited_inside {
+            s.run("edit.setValue", &json!({"layer": id, "row": 1, "field": "name", "value": "Committed"})).unwrap();
+        }
+        s.mark_saved();
+        let undo = s.undo_depth();
+        let mut lines = Vec::new();
+        let value = if edited_inside { format!("In script {n}") } else { "Committed".into() };
+        if edited_inside {
+            lines.push(format!("edit.setValue {}", json!({"layer":id,"row":1,"field":"name","value":value})));
+        }
+        lines.push(format!("source.publish {}", json!({"layer":id})));
+        if removed {
+            lines.push(format!("layer.remove {}", json!({"layer":id})));
+        }
+        lines.push("layer.remove {\"layer\":\"missing-layer\"}".into());
+        assert!(s.run("script.run", &json!({"script":lines.join("\n")})).is_err());
+        let checked = s.run("source.syncState", &json!({"layer":id})).unwrap();
+        assert_eq!(checked["changed"], json!([]), "the committed file retains its current baseline");
+        assert_eq!(checked["state"], if edited_inside { "edited" } else { "inSync" });
+        assert!(s.dirty(), "the committed baseline still needs saving after rollback");
+        assert_eq!(s.undo_depth(), undo, "a failed script adds no undo step");
+        let (back, _) = rustgis_data::io::read_path(&path).unwrap();
+        assert_eq!(back.features.get(1).unwrap().attrs[name], rustgis_data::Value::Text(value));
+    }
+    s.run("source.publish", &json!({"layer":id})).unwrap();
+    assert_eq!(state(&mut s), "inSync");
     // Changed since: refused, the file left as it was.
     s.run("edit.setValue", &json!({"layer": id, "row": 1, "field": "name", "value": "Mine"})).unwrap();
     let mut theirs = dbf();
