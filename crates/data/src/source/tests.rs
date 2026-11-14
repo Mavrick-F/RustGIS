@@ -3946,6 +3946,18 @@ fn flatgeobuf_classifies_fine_date_times_as_date_times() {
     assert_eq!(batch.rounded_dates, [1]);
 }
 
+/// Date-time text a read takes (digits past the microsecond) is exported to FlatGeobuf as it is,
+/// not refused as an invalid date; reading it back rounds it and says so.
+#[test]
+fn flatgeobuf_exports_fine_date_time_text_as_it_is() {
+    let mut ds = Dataset::new("fine", GeometryType::Point, vec![Field::new("at", FieldType::DateTime)]);
+    ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text("2026-03-05T14:30:00.1234567Z".into())]);
+    let bytes = fgb::write(&ds).unwrap();
+    let batch = open_bytes("fine.fgb", bytes, None).unwrap().read(&Request::all()).unwrap();
+    assert_eq!(batch.features[0].attrs[0].to_string(), "2026-03-05T14:30:00.123457Z");
+    assert_eq!(batch.rounded_dates, [1]);
+}
+
 /// A readable size prefix can contain invalid UTF-8 properties. Classification ignores
 /// that row just as whole and streamed reads do, and the read reports the skipped feature.
 #[test]

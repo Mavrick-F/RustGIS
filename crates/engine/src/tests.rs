@@ -1163,8 +1163,7 @@ fn loading_a_streamed_layer_whole_says_the_date_times_it_rounded() {
         // A tool reading the layer whole, and a share of it, say it too.
         let mark = s.notice_mark();
         let out = s.run("gp.run", &json!({"tool": "buffer", "params": {"input": name, "distance": 10}})).unwrap();
-        let in_result = out.to_string().matches("rounded to the microsecond").count();
-        assert_eq!(rounded(&s, mark).len().max(in_result.min(1)), said, "{name} buffer: {out}");
+        assert_eq!(rounded(&s, mark).len(), said, "{name} buffer: {out}");
         let mark = s.notice_mark();
         crate::cmd::sharing::share_bytes(&mut s, "webLayer", &json!({"layer": name})).unwrap();
         assert_eq!(rounded(&s, mark).len(), said, "{name} share");

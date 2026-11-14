@@ -1002,8 +1002,10 @@ fn write_run(
             }
             // Refuse an invalid date before writing its native column: otherwise another reader
             // could replace it with null, while this writer reported a successful, lossless export.
+            // A date is what a read takes as one (digits past the microsecond included: the text
+            // is written as it is, and a read rounds it and says so).
             for (field, value) in fields.iter().zip(&feat.attrs) {
-                if field.ty.is_temporal() && !value.is_null() && Value::parse_source(&value.to_string(), field.ty).is_null() {
+                if field.ty.is_temporal() && !value.is_null() && Value::parse_stored_counted(&value.to_string(), field.ty).0.is_null() {
                     return Err(DataError::Format(format!(
                         "FlatGeobuf: feature {} has an invalid date in '{}'",
                         feat.id,
