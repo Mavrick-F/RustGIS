@@ -57,6 +57,19 @@ impl rustgis_engine::data::progress::Probe for Stop {
 }
 
 impl Entry {
+    /// Takes in its hash if it has landed: the answer, when it hashed the layer as the entry has it.
+    fn land(&mut self) {
+        let Some(job) = &self.job else { return };
+        let landed = job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(digest) = landed {
+            let current = job.current;
+            self.job = None;
+            if current {
+                self.digest = Some(digest);
+            }
+        }
+    }
+
     /// Whether it answers for `l` as it is now.
     fn of(&self, l: &Layer) -> bool {
         Weak::ptr_eq(&self.rows, &l.dataset.features.allocation_key())
@@ -102,18 +115,15 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
         };
         app.syncmark.entries.insert(id, entry);
     }
+    // Every finished hash is taken in, whether its row is drawn or not (another map, a filtered
+    // or collapsed list), so one that landed never holds a turn another layer is waiting for.
+    for e in app.syncmark.entries.values_mut() {
+        e.land();
+    }
     let running = app.syncmark.entries.values().filter(|e| e.job.is_some()).count();
     let entry = app.syncmark.entries.get_mut(&id)?;
     let now = web_time::Instant::now();
-    if let Some(job) = &entry.job {
-        let landed = job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        let current = job.current;
-        if let Some(digest) = landed {
-            entry.job = None;
-            if current {
-                entry.digest = Some(digest);
-            }
-        }
+    if entry.job.is_some() {
         // Looked at again soon: either it lands, or the next hash starts once it has.
         ctx.request_repaint_after(web_time::Duration::from_millis(100));
     } else if entry.digest.is_none() && entry.retry.is_none_or(|at| now >= at) {
@@ -160,4 +170,38 @@ pub(crate) fn retain(app: &mut crate::RustGisApp) {
     let live: std::collections::HashSet<(u64, u64)> =
         app.session.project.maps.iter().flat_map(|m| m.layers.iter().map(move |l| (m.instance_id(), l.instance_id()))).collect();
     app.syncmark.entries.retain(|id, _| live.contains(id));
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use rustgis_engine::data::sync::FileSync;
+
+    /// An entry whose hash, for the layer as it has it or an earlier state, has landed.
+    fn landed(current: bool) -> Entry {
+        let slot = crate::Slot::default();
+        *slot.lock().unwrap() = Some(Ok(7));
+        Entry {
+            rows: Weak::new(),
+            fields: Vec::new(),
+            crs: None,
+            synced: Synced { files: FileSync { files: Vec::new() }, rows: 7 },
+            digest: None,
+            job: Some(Job { slot, stop: Arc::new(AtomicBool::new(false)), current }),
+            retry: None,
+        }
+    }
+
+    #[test]
+    fn a_landed_hash_frees_its_turn_and_answers_only_for_the_state_it_hashed() {
+        let mut e = landed(true);
+        e.land();
+        assert!(e.job.is_none(), "no longer counted as running");
+        assert_eq!(e.digest, Some(Ok(7)));
+        let mut e = landed(false);
+        e.land();
+        assert!(e.job.is_none());
+        assert_eq!(e.digest, None, "an earlier state's hash doesn't answer");
+    }
 }
