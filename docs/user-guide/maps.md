@@ -100,10 +100,16 @@ ending in `.gif` gives an animated GIF that loops, each frame shown for `"speed"
 (default 50; a GIF keeps times to the hundredth of a second, so 55 shows as 50 or 60); one ending in `.zip` gives the frames as PNGs (`frame_0001.png`…), to build a video
 with another tool, since a GIF's 256 colours can band a smooth relief. A turn of 360° stops one
 step short of where it began, so the loop has no frame twice; a part of a turn ends on its last
-bearing. The light of a shaded relief stays with the ground, not the camera. The view comes back
-to where it was afterwards. The export runs to its end before the command answers; the frames
-count against a limit of 300 million pixels in all (170 frames at 1600 × 1100, say), and a size
-past it is refused:
+bearing. The light of a shaded relief stays with the ground, not the camera. The frames are drawn
+from a copy of the map, so the view doesn't move. The frames count against a limit of 300 million
+pixels in all (170 frames at 1600 × 1100, say), and a size past it is refused.
+
+In the desktop app, **View › Scene › Export Orbit…** opens a dialog with the frames, the turn,
+the size and a GIF's frame time (an empty box keeps the default); **Export…** checks them and
+only then asks where to write the file. The frames are then drawn in the background, so the window stays free: the status bar
+shows the export, how many frames it has drawn, and **Cancel**, which stops it between frames
+and writes nothing. From a script or the command line the command runs to its end before it
+answers:
 
 ```bash
 rustgis-cli run --cmd 'project.open={"path":"massif.rgis"}' --cmd 'map.setPitch={"pitch":60}' --cmd 'map.exportOrbit={"path":"massif.gif","frames":72,"width":800,"height":500}'
@@ -556,8 +562,12 @@ projection, and clicking the coordinate system in the status bar opens the **Coo
 System** dialog, which also takes a projected EPSG code (such as `3035`, `32633` for UTM zone
 33N or `2056` for Switzerland) or an ESRI code, the one `.prj` files and ArcGIS name (such as
 `ESRI:102033` for South America Albers Equal Area Conic, or `ESRI:54030` for World Robinson). A
-code whose projection method or datum grid RustGIS can't use (Laborde such as `8441`, or a NAD27
-code that needs a grid) is refused with the reason, rather than drawn in another projection.
+code whose projection method RustGIS can't compute is refused with the reason, rather than drawn
+in another projection. Projections and datum transformations are computed by
+[terrio-crs](https://github.com/opengeos/terrio), as PROJ 9.8 computes them. Datum shift grids
+aren't used yet, neither those installed for PROJ nor downloaded: a datum whose most accurate
+transformation needs one takes the next PROJ lists (a NAD27 code: NAD27 to WGS 84 (4), about
+10 m), and says so once.
 RustGIS supports a subset of Esri's projected systems, checked against
 PROJ at representative points; unsupported codes such as World Miller (`ESRI:54003`) and the
 two-point oblique Mercators (`ESRI:53025`, `ESRI:54025`) are refused as unknown codes. The presets:

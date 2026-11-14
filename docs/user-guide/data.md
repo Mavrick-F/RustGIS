@@ -44,6 +44,10 @@ double-clicked in the Browser: **Choose Layers** lists them, all ticked, with **
 **Select None** and a filter for a long list. Turn **Ask Which Layers to Add** off in the Add Data
 menu to add every layer, as before. Scripts pick one with `layer.addData`'s `"layer"`;
 `info.fileLayers` lists them.
+A DXF drawing opens **Import DXF** when it is picked, dropped or double-clicked: it asks for the
+coordinate system the drawing's coordinates are in (the map's, to start with; blank keeps them as
+they are) and whether its blocks (图块) are drawn. Drawings dropped together ask one after the
+other, so each keeps its own answers.
 A KML, KMZ, GPX, OpenStreetMap, DXF, LandXML or GeoRSS file, a zip of Shapefiles or a File
 Geodatabase that RustGIS reads itself, with layers of several geometry types, adds its polygons
 first and its points last, so its points are drawn on top, and a KML's ground overlays go under
@@ -194,22 +198,15 @@ instead). The map's Winkel Tripel is at Winkel's own, acos(2/π) (about 50.46°)
 definition and WKT say so. A parameter that isn't a finite number, or a scale factor other than
 1, is refused rather than left out. Esri's orthographic is a spherical projection:
 on an ellipsoid it is refused, with a notice, rather than computed as EPSG's ellipsoidal one.
-The equidistant cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
-semi-major axis, matching legacy PROJ/GDAL coordinates (verified with PROJ 9.7.1), both for data
-and for a map drawn in it (including the
-Equirectangular preset). This also applies to planetary Equirectangular systems and definitions
-that name EPSG method 1028. Shapefile and ASCII-grid `.prj` files and GeoPackage WKT definitions
-whose method is interpreted as EPSG 1028 on an ellipsoid report the formula difference,
-without assuming how the producer computed its coordinates. Effectively spherical definitions
-need no warning. Code-only CRS identifiers use the same compatibility formula without a method
-warning, since no explicit WKT method is being read. Typed WKT inputs also report the method
-difference: Add Data overrides, Define Projection, CSV imports, measured layout grids, Zarr
-inputs, vector exports, XY Table To Point and Kernel Density. ASCII-grid sidecars retain
-datum warnings as well as the projection warning. RustGIS applies the same compatibility formula to GeoTIFF CT 17;
-this key identifies a GeoTIFF transformation, rather than explicitly declaring EPSG method 1028.
-[PROJ 9.9](https://proj.org/en/stable/operations/projections/eqc.html) supports the ellipsoidal
-formula instead. RustGIS preserves coordinates for files created with the legacy spherical formula. Files created with an ellipsoidal EQC formula, including PROJ 9.9 output, can be misplaced by kilometres; check which formula the producer used.
-The datum's ellipsoid is retained for datum transformations and
+The equidistant cylindrical projection (EPSG:4087, World Equidistant Cylindrical) is computed on its
+datum's ellipsoid (EPSG method 1028), as [PROJ 9.8](https://proj.org/en/stable/operations/projections/eqc.html)
+computes it, both for data and for a map drawn in it (including the Equirectangular preset); on
+a sphere it is the spherical formula. PROJ 9.7 and earlier, and so files they wrote, used a
+sphere of the semi-major axis on an ellipsoid too: such coordinates are placed up to tens of
+kilometres away from where that software put them (about 25 km at 55°N). Shapefile and ASCII-grid
+`.prj` files and GeoPackage WKT definitions that name EPSG method 1028 on an ellipsoid say so;
+code-only identifiers and GeoTIFF's coordinate transformation 17 don't name the method and say
+nothing. The datum's ellipsoid is retained for datum transformations and
 exported coordinate system definitions.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as
@@ -1258,7 +1255,9 @@ Exported to a file, a cloud-optimised one is written tile by tile, never held wh
 browser builds it in memory to download it).
 GeoTIFFs may be regular or cloud-optimised: grey, RGB(A), palette (coloured by the file's colour
 table, as land cover such as the NLCD is) or multiband, of any pixel type, tiled or striped, and
-compressed with Deflate, LZW, PackBits, JPEG or Zstandard. JPEG-compressed YCbCr images are shown
+compressed with Deflate, LZW, PackBits, JPEG, Zstandard or LERC (alone, or wrapped in Deflate or
+Zstandard, as GDAL writes it; samples LERC marks invalid are no-data, and an alpha GDAL kept as
+LERC's mask is put back). JPEG-compressed YCbCr images are shown
 as RGB; other YCbCr and CMYK images aren't read. A rotated or skewed image is resampled to a
 north-up grid as it is read. The coordinate system is an EPSG code,
 or the file's own projection described in its GeoKeys (Albers, Lambert conformal conic, transverse
@@ -1330,10 +1329,32 @@ exports, and said when it can't be drawn (in the browser over 500,000 cells, or 
 GeoTIFF read in place) as cast shadows are. Terrain outside the raster, or farther than 100 cells,
 hides none of its sky.
 
-With **Resampling** set to bilinear, a Shaded Relief layer's light (its hillshade, cast shadows and
-sky visibility) is blended between the cells' centres, as its values are, so a cell drawn over many
-pixels shades smoothly instead of in squares; nearest keeps one light per cell, as before. A cell
-with no data, or masked, is left out of the blend, so it doesn't darken the relief next to it.
+**Fill light**, on a Shaded Relief layer (`raster.symbology` `"fill"`, 0 to 1), opens the slopes
+turned away from the sun without lifting the rest of the map: a second, weaker light from the
+opposite side (the sun's azimuth plus 180°), 55° up, adds `fill × max(0, L − sin 55°)` of the
+colour to each cell, where `L` is how squarely the cell faces that light (the same slopes as the
+hillshade). Flat ground gets exactly `sin 55°` of it and so gains nothing, nor does a slope turned
+to the sun; the more a slope turns toward the fill, the more it gains, up to 0.18 of its colour
+with a fill of 1. Nothing shadows it, and it is drawn at once (nothing to work out). 0, the
+default, draws the relief as before, and it is saved with the project only when it isn't 0.
+
+**Rock on steep slopes**, on a Shaded Relief layer (`raster.symbology`
+`"rock": {"from": 25, "to": 40, "color": "#B2ACA4"}`), tints steep ground toward a rock colour,
+so cliffs and scarps stand out from the gentle slopes of the same height. Below **From** degrees
+of slope the ramp's colour is kept, above **To** the rock colour is used, and between them the two
+are blended on a smooth step. The lights (hillshade, cast shadows, sky visibility and fill light)
+then shade that colour as they shade the ramp. The slope is the ground's own, worked out from the
+same 3 × 3 window as the hillshade but without the Z factor, so 35° means 35° whatever the
+exaggeration (metres at the cell's latitude for a geographic raster). A 30 m DEM averages a cliff
+with its foot, so its walls come out gentler than they are: 25° to 40° suits it, and a finer DEM
+can start higher. Missing keys keep the current rock's (or those defaults), and `"rock": false`
+removes it; it is off by default and saved with the project only when set.
+
+With **Resampling** set to bilinear, a Shaded Relief layer's light (its hillshade, cast shadows,
+sky visibility and fill light) and its rock tint are blended between the cells' centres, as its
+values are, so a cell drawn over many pixels shades smoothly instead of in squares; nearest keeps
+one light per cell, as before. A cell with no data, or masked, is left out of the blend, so it
+doesn't darken the relief next to it.
 
 **Masking**, at the foot of the Symbology pane (`raster.mask`), hides pixel values from view without
 changing the data: values to draw as no data (a background of 0 or −9999 the file doesn't flag, QA
@@ -1385,7 +1406,7 @@ a few at a time, in the background.
 Stores are read in pure Rust, in the web app as well as on the desktop: Zarr 2 with consolidated
 metadata (`.zmetadata`, as xarray writes) and Zarr 3 (`zarr.json`, sharded arrays too), chunks
 compressed with blosc (LZ4, zlib or zstd, byte- or bit-shuffled), zlib, gzip, zstd or LZ4, of
-integer or float values, in C or Fortran order. A sharded array's shards are fetched whole.
+integer or float values, in C or Fortran order. A sharded array's shards are fetched whole, except in a window (below).
 `_FillValue`, `missing_value` and a Zarr 2 array's fill value are no data; a Zarr 3 array's fill
 value isn't: chunks never written are left empty, but chunks missing from inside a shard show the
 fill value. `scale_factor` and `add_offset` are applied. The coordinates must be evenly spaced (a curvilinear grid isn't read);
@@ -1402,7 +1423,9 @@ rustgis-cli run --cmd 'layer.addZarr={"url":"https://storage.googleapis.com/gcp-
 **A window** of the map (`layer.addZarr` with `"cells": [first column, first row, end column, end
 row]`, the ends not included, or `"bbox": [west, south, east, north]` in the grid's coordinates,
 degrees for a longitude/latitude grid) reads only the chunks it touches, and only its part of the
-coordinates (by byte range when they are stored uncompressed). A box is placed by the variable's
+coordinates (by byte range when they are stored uncompressed). In a sharded array it reads each
+shard's index by range, then only the shard's chunks the window needs, one range each; a window
+over more than 4,096 of the shards' chunks reads its shards whole instead. A box is placed by the variable's
 coordinates, read whole, so it takes grids of up to 4,000,000 cells a side; a longer one takes
 `"cells"`. A box reaching past the grid is read within it, and says so; one over a longitude grid's
 edge (0°/360°, or ±180°) is refused: give a box on each side (one round the whole globe is the

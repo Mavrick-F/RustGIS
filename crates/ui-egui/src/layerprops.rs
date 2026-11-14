@@ -505,7 +505,6 @@ fn query(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use egui::accesskit::Role;
     use egui_kittest::kittest::Queryable;

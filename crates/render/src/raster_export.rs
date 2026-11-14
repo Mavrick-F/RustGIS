@@ -170,7 +170,6 @@ mod tests {
 
     /// A raster read in place whose image can't be read isn't exported from its overview.
     #[test]
-    #[allow(clippy::panic)]
     fn an_in_place_raster_unread_is_not_exported_from_its_overview() {
         let mut overview = Raster::new(
             "gone",
@@ -198,6 +197,8 @@ mod tests {
             z_factor: 1.0,
             shadow: 1.0,
             sky: 0.0,
+            fill: 0.0,
+            rock: None,
         };
         let e = export(&layer, 2, 2, 1.0).err().unwrap_or_else(|| panic!("an archive without its shadows"));
         assert!(e.contains("cast shadows") && e.contains("read in place"), "{e}");
@@ -205,7 +206,6 @@ mod tests {
 
     /// An export cancelled while it waits for a layer's cast shadows writes nothing, and says why.
     #[test]
-    #[allow(clippy::panic)]
     fn a_cancelled_wait_for_cast_shadows_writes_no_archive() {
         struct Cancelled;
         impl rustgis_data::progress::Probe for Cancelled {
@@ -229,6 +229,8 @@ mod tests {
             z_factor: 1.0,
             shadow: 1.0,
             sky: 0.0,
+            fill: 0.0,
+            rock: None,
         };
         let _cancelled = rustgis_data::progress::install(Some(std::sync::Arc::new(Cancelled)));
         let e = export(&layer, 0, 0, 1.0).err().unwrap_or_else(|| panic!("an archive without its shadows"));
@@ -236,7 +238,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::panic)]
     fn exports_png_tiles_and_rejects_unbounded_or_unsupported_requests() {
         let raster = Raster::new(
             "test",

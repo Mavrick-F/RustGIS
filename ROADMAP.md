@@ -177,8 +177,7 @@ What plugin authors have asked for. An addition that plugins declare through
   5,000 nodes, or a notice when cut ([#1546](https://github.com/opengeos/RustGIS/issues/1546)); a
   command that asks for its parameters in a dialog
   ([#1547](https://github.com/opengeos/RustGIS/issues/1547)).
-- Host requests: settings kept between sessions
-  ([#1261](https://github.com/opengeos/RustGIS/issues/1261)), `host.fetch` without the parsed
+- Host requests: `host.fetch` without the parsed
   copy ([#1265](https://github.com/opengeos/RustGIS/issues/1265)), a file or folder chosen by the
   user ([#1438](https://github.com/opengeos/RustGIS/issues/1438)); for session plugins,
   symbology and raster tile requests and a view in a page layout (asked on
@@ -243,8 +242,6 @@ And alongside it:
   [#596](https://github.com/opengeos/RustGIS/issues/596)).
 
 ### Edit
-- Save edits back to Shapefile and GeoJSON layers, as GeoPackage and PostGIS do
-  ([#1385](https://github.com/opengeos/RustGIS/issues/1385)). _Coordinate first._
 - Selecting and deleting rows of a standalone table (its cells, rows and fields are editable).
 - Shared edges, so that moving one polygon boundary moves its neighbour's too
   ([#872](https://github.com/opengeos/RustGIS/issues/872)). Coincident vertices already move

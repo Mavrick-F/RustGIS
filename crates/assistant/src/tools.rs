@@ -310,7 +310,6 @@ fn run_read(s: &mut Session, call: &ToolCall, tokens: usize) -> Result<String, S
         }
         // Fails the way a bug in RustGIS would, for the agent's panic guard.
         #[cfg(test)]
-        #[allow(clippy::panic)]
         "test_panic" => panic!("a test tool panicked"),
         other => return Err(format!("unknown tool '{other}'")),
     };
@@ -331,12 +330,12 @@ const MAX_DEPTH: usize = 16;
 /// to use a connection's login; the model and MCP clients get only the public ones. Active
 /// raw secrets are scrubbed too, including an echo with no wrapper in the result.
 fn public_text(text: String) -> String {
-    rustgis_engine::render::rustgis_tiles::logins::scrub(&text)
+    rustgis_engine::sources::scrub_s3_wrappers(&rustgis_engine::render::rustgis_tiles::logins::scrub(&text))
 }
 
 /// Generated errors may quote arbitrary addresses; successful values remain data.
 fn public_error(text: &str) -> String {
-    rustgis_engine::render::rustgis_tiles::logins::scrub_error(text)
+    rustgis_engine::sources::scrub_s3_wrappers(&rustgis_engine::render::rustgis_tiles::logins::scrub_error(text))
 }
 
 /// Publishes a completed result, reporting withheld subtrees before enforcing the response budget.
@@ -940,7 +939,6 @@ pub fn context(s: &Session) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     /// Returned tool and fetch errors are cleaned before active patterns can damage URLs;
     /// successful values and the original call remain outside the generated-error projection.

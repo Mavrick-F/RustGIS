@@ -1216,7 +1216,6 @@ fn locate(info: &Info, level: usize, native: &[Option<Coord>]) -> Vec<Option<(u3
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw(info: Arc<Info>, url: String, look: &Look, stretch: &[(f32, f32)], z: u8, x: u32, y: u32, done: Done) {
     let n = (1u64 << z) as f64;
     let size = 2.0 * HALF / n;
@@ -1571,7 +1570,6 @@ pub fn read_values_counted_blocking(
 /// band, as AlphaEarth's 64) overlap instead of following one another. It waits up to `wait` for
 /// them all.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::too_many_arguments)]
 pub fn read_bands_counted_blocking(
     info: &Arc<Info>,
     url: &str,

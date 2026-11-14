@@ -731,7 +731,7 @@ fn main() -> eframe::Result {
         let env = std::env::var("WGPU_BACKEND").ok();
         setup.instance_descriptor.backends = backends(backend, env.as_deref(), cfg!(windows));
     }
-    #[allow(unused_mut)]
+    #[cfg_attr(not(target_os = "macos"), expect(unused_mut, reason = "only macOS sets its own menu bar"))]
     let mut options = eframe::NativeOptions { viewport, wgpu_options, ..Default::default() };
     // macOS: the app's own menu bar (menu.rs) in place of winit's minimal one.
     #[cfg(target_os = "macos")]
@@ -767,7 +767,6 @@ fn main() -> eframe::Result {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::{backends, crash, flag, prefs, running};
     use eframe::wgpu::Backends;

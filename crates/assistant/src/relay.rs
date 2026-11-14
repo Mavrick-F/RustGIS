@@ -469,7 +469,7 @@ pub fn read_token_file(path: &std::path::Path) -> Result<String, String> {
 pub(crate) fn private_dir() -> Result<PathBuf, String> {
     let dir = token_dir();
     // Only Unix sets a mode on the builder; elsewhere it stays as created.
-    #[cfg_attr(not(unix), allow(unused_mut))]
+    #[cfg_attr(not(unix), expect(unused_mut, reason = "only Unix sets a mode on the builder"))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
@@ -1649,7 +1649,6 @@ impl Revocation for GrantLive {
 mod archive_tests;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     /// Only prompt requests read the skill folders (on the app's thread); a batch with one does.
     #[test]

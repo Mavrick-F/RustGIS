@@ -23,6 +23,10 @@ pub struct Wrote {
     /// Authority retained for delivery from the native export worker.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) owner: Option<crate::policy::Continuation>,
+    /// The coordinate systems the worker thread used, as (definition, label), for the session to
+    /// say which needed a missing datum grid (`Session::say_grid_notes`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) crs_used: Vec<(String, String)>,
 }
 
 /// What an export does to the session once its file is written, and adds to its answer; or the
@@ -42,6 +46,7 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str, Start)] = &[
     ("share.exportLayer", "Export Features", super::share::layer_work),
     ("share.exportRaster", "Export Raster", super::raster::export_work),
     ("share.exportMap", "Export Map", super::share::map_work),
+    ("map.exportOrbit", "Export Orbit", super::view::orbit_work),
     ("layout.export", "Export Layout", super::layout::export_work),
     ("report.export", "Export Report", super::report::export_work),
     ("source.publish", "Publish to Source", super::publish::publish_work),
@@ -178,6 +183,8 @@ pub(crate) fn drawn(
         then: Some(then),
         #[cfg(not(target_arch = "wasm32"))]
         owner: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        crs_used: Vec::new(),
     })
 }
 
@@ -259,7 +266,7 @@ impl ExportRun {
             crate::render::rustgis_tiles::cache::with_still(still, || written_under(name, control, work))
         }))
         .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")))
-        .map(|w| Wrote { owner: Some(owner), ..w })
+        .map(|w| Wrote { owner: Some(owner), crs_used: rustgis_data::raster::crs::take_used(), ..w })
     }
 }
 
@@ -303,10 +310,16 @@ pub fn export_land(s: &mut Session, started: Started, done: Result<Wrote, String
             }
         }
         let written_path = done.as_ref().ok().and_then(|wrote| wrote.written_path.clone());
+        if let Ok(wrote) = &done {
+            s.crs_used_elsewhere.extend(wrote.crs_used.iter().cloned());
+        }
         let notes = done.as_ref().ok().filter(|_| command == "source.publish").map(|wrote| wrote.notes.clone()).unwrap_or_default();
         s.finish_export(&owner, |s| done.and_then(|wrote| said(s, wrote)))
             .map_err(|why| completion_with_notes(command, written_path.as_deref(), &notes, why))?
     })();
+    // The coordinate systems its worker used that needed a missing datum grid, as the command
+    // run here says them after it.
+    s.say_grid_notes();
     // Its failure said once, under the command, as `Session::run` says one.
     if let Err(e) = &landed {
         let text = Session::redacted(e);
@@ -324,7 +337,6 @@ pub fn export_land(s: &mut Session, started: Started, done: Result<Wrote, String
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use rustgis_analysis::control::Control;
@@ -343,6 +355,8 @@ mod tests {
                 then: None,
                 #[cfg(not(target_arch = "wasm32"))]
                 owner: None,
+                #[cfg(not(target_arch = "wasm32"))]
+                crs_used: Vec::new(),
             })
         });
         let wrote = written_under("Export Raster", &control, work).unwrap();

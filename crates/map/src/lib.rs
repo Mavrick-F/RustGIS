@@ -35,7 +35,6 @@ pub mod tiles;
 pub mod time;
 pub mod view;
 mod view_memory;
-pub mod world;
 
 pub use camera::Camera;
 pub use color::{Ramp, RampGroup, Rgba};
@@ -3157,6 +3156,7 @@ impl Layer {
             LayerRole::Streamed
             | LayerRole::GdalPath
             | LayerRole::DuckDbDatabase
+            | LayerRole::DuckDbSql
             | LayerRole::PostgisDatabase
             | LayerRole::MysqlDatabase
             | LayerRole::SqlServerDatabase => self.source.as_mut()?.output_slot_mut(role),

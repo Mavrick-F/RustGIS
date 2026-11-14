@@ -111,7 +111,7 @@ pub fn with_progress<T>(progress: Option<Arc<Progress>>, f: impl FnOnce() -> T) 
 }
 
 /// What downloads started here count into ([`with_progress`]).
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "only native downloads count progress"))]
 fn current_progress() -> Option<Arc<Progress>> {
     PROGRESS.with(|p| p.borrow().clone())
 }

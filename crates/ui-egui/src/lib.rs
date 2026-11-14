@@ -22,6 +22,7 @@ mod bookmarkpane;
 mod catalogsui;
 mod chrome;
 mod comets;
+mod completion;
 mod connectiontree;
 mod connectionui;
 #[cfg(not(target_arch = "wasm32"))]
@@ -85,6 +86,7 @@ pub enum Landed {
     Ran(Result<Value, String>),
     NotRun(String),
 }
+mod boxedit;
 #[cfg(not(target_arch = "wasm32"))]
 mod relayshot;
 #[cfg(not(target_arch = "wasm32"))]
@@ -175,6 +177,10 @@ pub const DELIMITED_PICK: &str = "\u{1}delimited:";
 /// Marks files returned by the source-CRS picker, so its override never applies to a drop or
 /// another picker. Several selected Shapefiles share the same import options.
 pub const SHAPEFILE_PICK: &str = "\u{1}shapefile:";
+
+/// Starts the name of a drawing the web shell's `"dxf"` picker put in the inbox, so Import DXF
+/// opens for it and no other dropped file.
+pub const DXF_PICK: &str = "\u{1}dxf:";
 
 /// The `open_async` purpose for a tool's file parameter, followed by the extensions it offers
 /// (`toolfile:nc,nc4`; none for any file).
@@ -361,6 +367,9 @@ pub struct Services {
     /// Opens a file picker for `"data"`, `"project"`, or `"shapefile"`; results land in `inbox`.
     /// Shapefile picks carry [`SHAPEFILE_PICK`] after sidecars are gathered into ZIPs.
     pub open_async: Option<Box<dyn Fn(&str)>>,
+    /// Asks the device's camera for a photo (a phone's shell): the photo arrives in
+    /// [`RustGisApp::photos`]. `None` where there is no camera to ask.
+    pub take_photo: Option<Box<dyn Fn() -> Result<(), String>>>,
     /// Offers bytes as a download named `file_name`; success means submission to the host's
     /// download mechanism. Browsers do not expose confirmation that the file was saved.
     pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
@@ -415,7 +424,7 @@ fn print_dir() -> Result<std::path::PathBuf, String> {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let dir = tmp.join(format!("{prefix}{nanos}"));
     // Only Unix sets a mode on it.
-    #[allow(unused_mut)]
+    #[cfg_attr(not(unix), expect(unused_mut, reason = "only Unix sets a mode on the builder"))]
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
@@ -814,8 +823,16 @@ pub struct UiState {
     /// Add Delimited Text, for the file being picked (web): `null` opens its dialog for the file,
     /// a script's options are read with it.
     pub pending_csv: Option<Value>,
+    /// Import DXF options by picker request (web): `null` opens the dialog; a script's options
+    /// are read with its drawing even when other pickers finish first.
+    pub pending_dxf: std::collections::BTreeMap<u64, Value>,
+    /// Monotonic identifier keeps concurrently open DXF pickers distinct.
+    pub next_dxf: u64,
     /// CRS override for the next Shapefile picked by Import Shapefile with Projection.
     pub pending_shapefile: Option<Value>,
+    /// Drawings picked while Import DXF was open for one (several dropped together): each opens
+    /// its dialog after the one before it closes.
+    pub dxf_waiting: std::collections::VecDeque<dialogs::DxfFile>,
     /// Data downloading from web addresses (Home › Add › Add Data › From URL).
     pub downloads: Vec<Download>,
     /// A project downloading from its web address (`ui.openUrl`, a `?project=` link): the
@@ -1023,7 +1040,10 @@ impl Default for UiState {
             pending_open: None,
             web_file: None,
             pending_csv: None,
+            pending_dxf: Default::default(),
+            next_dxf: 0,
             pending_shapefile: None,
+            dxf_waiting: std::collections::VecDeque::new(),
             downloads: Vec::new(),
             project_download: None,
             sql: Default::default(),
@@ -1113,8 +1133,28 @@ const CAPTURE_PIXELS: f64 = 16_000_000.0;
 /// The lowest dpi a layout is copied at: a page that would need less is an error.
 const CAPTURE_MIN_DPI: f64 = 36.0;
 
+/// The most positions [`RustGisApp::fixes`] keeps for an interface to take: more than two days of
+/// one a second, as many as a phone's shell keeps out of sight (its `MOST_EVENTS`), so a batch it
+/// hands over on coming back is taken whole into a track.
+pub const FIXES_KEPT: usize = 200_000;
+
+impl RustGisApp {
+    /// Keeps a position the shell reported: the last one in [`RustGisApp::position`], and each in
+    /// [`RustGisApp::fixes`] until an interface takes them (the oldest dropped past
+    /// [`FIXES_KEPT`]).
+    pub fn report_position(&mut self, fix: rustgis_engine::platform::Fix) {
+        self.position = Some(fix);
+        if self.fixes.len() >= FIXES_KEPT {
+            self.fixes.pop_front();
+            self.fixes_dropped += 1;
+        }
+        self.fixes.push_back(fix);
+    }
+}
+
 pub struct RustGisApp {
     pub session: Session,
+    pub(crate) boxes: boxedit::State,
     pub ui: UiState,
     pub map: mapview::MapView,
     pub dialogs: dialogs::Dialogs,
@@ -1144,6 +1184,20 @@ pub struct RustGisApp {
     /// Where the device is, as the shell last reported it; `None` until it has, and again once
     /// positioning is off. An interface draws it on the map and can capture at it.
     pub position: Option<rustgis_engine::platform::Fix>,
+    /// Every position the shell reported since an interface last took them, oldest first (at most
+    /// [`FIXES_KEPT`]: the oldest go first). [`RustGisApp::position`] is only the last: a track
+    /// or an average needs each, including those that arrived together after the app was out of
+    /// sight.
+    pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
+    /// Whether the interface wants positions while the app is out of sight too (a track being
+    /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
+    pub keep_locating: bool,
+    /// Photos the camera took ([`Services::take_photo`]), by where they were written, until an
+    /// interface takes them.
+    pub photos: Vec<std::path::PathBuf>,
+    /// How many positions were dropped from [`RustGisApp::fixes`] past [`FIXES_KEPT`] since an
+    /// interface last took them: the interface says so when a track or an average missed them.
+    pub fixes_dropped: usize,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1396,6 +1450,7 @@ impl RustGisApp {
         };
         RustGisApp {
             session: s,
+            boxes: boxedit::State::default(),
             ui,
             map: mapview::MapView::default(),
             dialogs: dialogs::Dialogs::default(),
@@ -1413,6 +1468,10 @@ impl RustGisApp {
             chrome: None,
             locate: false,
             position: None,
+            fixes: std::collections::VecDeque::new(),
+            keep_locating: false,
+            photos: Vec::new(),
+            fixes_dropped: 0,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1792,7 +1851,8 @@ impl RustGisApp {
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
     /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`];
-    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview.
+    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview; DXF picks
+    /// carry [`DXF_PICK`] and open Import DXF.
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
         if name.starts_with(SHORTCUT_PICK) {
             return shortcutfile::picked(self, bytes);
@@ -1814,6 +1874,19 @@ impl RustGisApp {
             };
             return self.open_bytes_with(name, bytes, Some(options));
         }
+        if let Some(picked) = name.strip_prefix(DXF_PICK) {
+            let (id, name) = picked.split_once(':').ok_or(tl!("Invalid DXF picker request"))?;
+            let id = id.parse::<u64>().map_err(|_| tl!("Invalid DXF picker request"))?;
+            let options = self.ui.pending_dxf.remove(&id).ok_or(tl!("DXF picker request is no longer available"))?;
+            if name.is_empty() {
+                return Ok(Value::Null);
+            }
+            return if options.is_null() {
+                dialogs::open_dxf(self, name, dialogs::DxfSource::Bytes(bytes.to_vec()))
+            } else {
+                self.import_dxf_bytes(name, bytes, options)
+            };
+        }
         match name.strip_prefix(DELIMITED_PICK) {
             Some(name) => match self.ui.pending_csv.take() {
                 Some(Value::Null) => dialogs::open_csv(self, name, dialogs::CsvSource::Bytes(bytes.to_vec())),
@@ -1823,8 +1896,17 @@ impl RustGisApp {
         }
     }
 
-    /// Opens file bytes with picker options, forwarding source CRS overrides before ZIP parsing.
-    fn open_bytes_with(&mut self, name: &str, bytes: &[u8], csv: Option<Value>) -> Result<Value, String> {
+    /// Imports a DXF drawing with its own options, leaving unrelated picker commands intact.
+    fn import_dxf_bytes(&mut self, name: &str, bytes: &[u8], mut options: Value) -> Result<Value, String> {
+        use base64::Engine;
+        options["fileName"] = json!(name);
+        options["data"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+        self.run("layer.addDataBytes", options)
+    }
+
+    /// Opens file bytes with picker options (import options, a source CRS), forwarding them before
+    /// ZIP parsing.
+    fn open_bytes_with(&mut self, name: &str, bytes: &[u8], opts: Option<Value>) -> Result<Value, String> {
         let lower = name.to_ascii_lowercase();
         // A plugin package: ask before installing it.
         if lower.ends_with(".rgplugin") {
@@ -1882,6 +1964,10 @@ impl RustGisApp {
             }
             return r;
         }
+        // A field package's basemaps are files beside its project, which a page has no folder for.
+        if lower.ends_with(".rgisfield") {
+            return Err(tl!("A field package opens on a computer or a phone, which have a folder for its basemaps: open it there. Bring Back (Data › Offline) takes its edits into the project here.").to_string());
+        }
         if lower.ends_with(".rgispkg") {
             let text = rustgis_engine::cmd::items::package_text(bytes)?;
             let r = self.run("project.openText", json!({"text": text, "package": true}));
@@ -1906,6 +1992,11 @@ impl RustGisApp {
             use base64::Engine;
             return self.add_picture(json!({"image": base64::engine::general_purpose::STANDARD.encode(bytes)}));
         }
+        // A drawing asks for its coordinate system and whether its blocks are drawn first. Picker
+        // and script options (`crs`, `blocks`) add it straight away, as the branch below does.
+        if opts.is_none() && rustgis_engine::data::dxf::is_dxf_name(name) {
+            return dialogs::open_dxf(self, name, dialogs::DxfSource::Bytes(bytes.to_vec()));
+        }
         if rustgis_engine::data::raster::is_raster_name(name)
             || rustgis_engine::data::source::is_source_name(name)
             || rustgis_engine::data::io::is_multi_layer_name(name)
@@ -1914,9 +2005,11 @@ impl RustGisApp {
             use base64::Engine;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut p = json!({"fileName": name, "data": data});
-            // A picked spreadsheet or Shapefile ZIP takes its import options.
-            if let Some(Value::Object(opts)) = csv.filter(|_| rustgis_engine::data::sheets::is_sheet_name(name) || lower.ends_with(".zip"))
-            {
+            // A picked spreadsheet, Shapefile ZIP or DXF takes its import options.
+            let takes_options = rustgis_engine::data::sheets::is_sheet_name(name)
+                || lower.ends_with(".zip")
+                || rustgis_engine::data::dxf::is_dxf_name(name);
+            if let Some(Value::Object(opts)) = opts.filter(|_| takes_options) {
                 for (k, v) in opts {
                     p[k] = v;
                 }
@@ -1937,7 +2030,7 @@ impl RustGisApp {
             r
         } else {
             let mut p = json!({"fileName": name, "text": text});
-            if let Some(Value::Object(opts)) = csv.filter(|_| [".csv", ".tsv", ".txt"].iter().any(|e| lower.ends_with(e))) {
+            if let Some(Value::Object(opts)) = opts.filter(|_| [".csv", ".tsv", ".txt"].iter().any(|e| lower.ends_with(e))) {
                 for (k, v) in opts {
                     p[k] = v;
                 }
@@ -2628,6 +2721,7 @@ impl RustGisApp {
         // Nested commands (including scripts) can replace rows too; never retarget a chosen
         // vertex or held gesture to the replacement feature at the same row.
         crate::vertexedit::cancel_stale_drag(self);
+        crate::boxedit::cancel_stale(self);
         if let Err(e) = &r {
             self.command_failed(id, e, notice_mark);
         }
@@ -3603,6 +3697,33 @@ impl RustGisApp {
                     };
                 }
             }
+            // A DXF drawing: the file, then Import DXF to pick its coordinate system and whether
+            // its blocks are drawn. With options (a script's), the file is read with them instead.
+            "ui.addDxf" => {
+                let opts = p.is_object().then(|| p.clone());
+                if let Some(open) = &self.services.open_async {
+                    self.ui.pending_layout_picture = false;
+                    self.ui.pending_picture = None;
+                    self.ui.pending_open = None;
+                    self.ui.pending_csv = None;
+                    // `null`: the dialog, for the file picked.
+                    if self.ui.pending_dxf.len() >= 64 {
+                        return Err(tl!("Too many DXF pickers are open; close one before choosing another drawing").into());
+                    }
+                    self.ui.next_dxf = self.ui.next_dxf.checked_add(1).ok_or(tl!("DXF picker request limit reached"))?;
+                    let id = self.ui.next_dxf;
+                    self.ui.pending_dxf.insert(id, opts.unwrap_or(Value::Null));
+                    open(&format!("dxf:{id}"));
+                } else if let Some(path) = dialogs::pick_open(&["dxf"], tl!("DXF drawing")) {
+                    return match opts {
+                        Some(mut q) => {
+                            q["path"] = json!(path);
+                            dialogs::add_dxf_file(self, q)
+                        }
+                        None => dialogs::open_dxf_path(self, &path),
+                    };
+                }
+            }
             // A project by its web address (a `?project=` link): downloaded off the frame, opened
             // when it lands: native projects replace it; GeoLibre imports add a map (see `poll_downloads`).
             "ui.openUrl" => {
@@ -3830,7 +3951,7 @@ impl RustGisApp {
                     open("project");
                     self.ui.backstage = false;
                 } else if let Some(path) = dialogs::pick_open(
-                    &["rgis", "rgisx", "rgispkg", "qgs", "qgz", "geolibre", "json"],
+                    &["rgis", "rgisx", "rgispkg", "rgisfield", "qgs", "qgz", "geolibre", "json"],
                     tl!("Projects and JSON data (RustGIS, QGIS, GeoLibre)"),
                 ) {
                     // A QGIS project opens as a new map of this one.
@@ -3981,20 +4102,40 @@ impl RustGisApp {
             // Project items: save (a file dialog, or a download on the web) and open.
             "ui.saveItem" => {
                 let kind = p.get("kind").and_then(Value::as_str).ok_or("kind is required")?;
+                // A field package makes an offline area first: one not saved after all goes again.
+                let areas = self.session.project.offline_areas.len();
                 let session = &mut self.session;
                 let (name, bytes) =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::items::item_bytes(session, kind, p)))
                         .unwrap_or_else(|_| Err("saving failed unexpectedly".into()))
-                        .inspect_err(|e| self.session.notify(e.clone(), true))?;
+                        .inspect_err(|e| {
+                            // An area a field package made before it failed goes too.
+                            rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
+                            self.session.notify(e.clone(), true);
+                        })?;
                 if self.services.download.is_some() {
-                    self.download(&name, bytes);
+                    // Not handed over (the failure is said): the area made for it goes too.
+                    if !self.download(&name, bytes) {
+                        rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
+                    }
                 } else {
                     let (ext, label) =
                         rustgis_engine::cmd::items::ITEMS.iter().find(|i| i.0 == kind).map_or(("json", "File"), |i| (i.1, i.2));
-                    if let Some(path) = dialogs::pick_save(&name, &[ext], tl!(label)) {
-                        rustgis_engine::data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| e.to_string())?;
-                        self.session.notify(i18n::fmt("Saved {name}", &[("name", &path)]), false);
+                    match dialogs::pick_save(&name, &[ext], tl!(label)) {
+                        Some(path) => {
+                            if let Err(e) = rustgis_engine::data::io::write_atomic(std::path::Path::new(&path), &bytes) {
+                                rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
+                                return Err(e.to_string());
+                            }
+                            self.session.notify(i18n::fmt("Saved {name}", &[("name", &path)]), false);
+                        }
+                        None => rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas),
                     }
+                }
+                // An offline area made for the package is a change to the project, to be saved:
+                // Bring Back needs it. (Saving here runs no command, so nothing else marks it.)
+                if self.session.project.offline_areas.len() > areas {
+                    self.session.mark_unsaved();
                 }
             }
             "ui.openItem" => {
@@ -4015,6 +4156,8 @@ impl RustGisApp {
                     "presentation" => ("presentation.import", &["rgispres"], "RustGIS presentation"),
                     "notebook" => ("notebook.open", &["rgisnb", "ipynb"], "RustGIS or Jupyter notebook"),
                     "dlPackage" => ("dl.import", &["rgisdlpk"], "RustGIS deep learning package"),
+                    // A field package sent back from a phone: its edits, to the area it came from.
+                    "fieldPackage" => ("offline.bringBack", &["rgisfield"], "RustGIS field package"),
                     k => return Err(format!("unknown item '{k}'")),
                 };
                 if let Some(open) = &self.services.open_async {
@@ -4360,6 +4503,30 @@ impl RustGisApp {
                 let name = format!("{} animation.zip", self.session.map().name);
                 if let Some(path) = dialogs::pick_save(&name, &["zip"], tl!("PNG frames (zip)")) {
                     return self.run("animation.export", json!({"path": path}));
+                }
+            }
+            // Export Orbit's dialog, its parameters in `p`: the file picked, then the frames drawn
+            // on a thread of their own, with progress and Cancel in the status bar.
+            // The browser has no file to write to (its stub picker answers none): said, not left
+            // as a click that does nothing.
+            #[cfg(target_arch = "wasm32")]
+            "ui.exportOrbit" => return Err("exporting an orbit needs the desktop app".into()),
+            #[cfg(not(target_arch = "wasm32"))]
+            "ui.exportOrbit" => {
+                // Refused before the file is picked: parameters that aren't an object, a number
+                // out of its range, or another export still running.
+                let mut args = match p {
+                    Value::Null => json!({}),
+                    Value::Object(_) => p.clone(),
+                    _ => return Err("Export Orbit takes an object of parameters".into()),
+                };
+                rustgis_engine::cmd::view::check_orbit_params(&args)?;
+                exportjob::idle(self)?;
+                let name = format!("{} orbit.gif", self.session.map().name);
+                // No file picked answers null, and the dialog stays open.
+                if let Some(path) = dialogs::pick_save(&name, &["gif", "zip"], tl!("Animated GIF or PNG frames (zip)")) {
+                    args["path"] = json!(path);
+                    return exportjob::start(self, "map.exportOrbit", args);
                 }
             }
             "ui.magnifier" => self.map.magnifier = p.get("on").and_then(Value::as_bool).unwrap_or(!self.map.magnifier),
@@ -4779,6 +4946,9 @@ impl RustGisApp {
             self.map.invalidate();
             return result;
         }
+        if file.is_some_and(|f| f.to_ascii_lowercase().ends_with(".rgisfield")) {
+            return Err(tl!("A field package opens on a computer or a phone, which have a folder for its basemaps: open it there. Bring Back (Data › Offline) takes its edits into the project here.").to_string());
+        }
         let package = file.is_some_and(|f| f.to_ascii_lowercase().ends_with(".rgispkg"));
         let text = if package {
             rustgis_engine::cmd::items::package_text(bytes)?
@@ -4923,7 +5093,7 @@ impl RustGisApp {
             }
             // How the bytes are read, as `layer.addData` takes it (a command asking by
             // address, such as a plugin's: the dialog gives none of these).
-            for k in ["x", "y", "wkt", "delimiter", "paperSpace", "stream", "as"] {
+            for k in ["x", "y", "wkt", "delimiter", "paperSpace", "blocks", "stream", "as"] {
                 if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
                     q[k] = v.clone();
                 }
@@ -6172,7 +6342,6 @@ pub(crate) mod fetching {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
 mod start_with_tests {
     use super::StartWith;
     use serde_json::json;
@@ -6271,7 +6440,6 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
 ];
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod record_tests {
     use super::{DEFAULTS_TO_ACTIVE_LAYER, RustGisApp};
     use serde_json::json;
@@ -7036,7 +7204,6 @@ mod record_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod vertex_undo_tests {
     use super::RustGisApp;
     use rustgis_engine::data::VertexId;
@@ -7739,7 +7906,6 @@ mod peer_output_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod look_tests {
     use super::RustGisApp;
     use crate::theme;

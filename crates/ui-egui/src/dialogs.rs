@@ -63,6 +63,8 @@ pub struct Dialogs {
     pub listed: Option<String>,
     /// Add Delimited Text's file, picked before the dialog opens.
     pub csv: Option<CsvFile>,
+    /// Import DXF's file, picked before the dialog opens.
+    pub dxf: Option<DxfFile>,
     /// Reset collapsed then closed dialogs when reopening
     pub reset_collapse: bool,
 }
@@ -76,6 +78,19 @@ pub struct CsvFile {
 /// Where a file picked for Add Delimited Text is: on disk, or (in the browser) its bytes, kept
 /// until it is added.
 pub enum CsvSource {
+    Path(String),
+    Bytes(Vec<u8>),
+}
+
+/// A drawing picked for Import DXF.
+pub struct DxfFile {
+    pub name: String,
+    pub source: DxfSource,
+}
+
+/// Where a drawing picked for Import DXF is: on disk, or (in the browser) its bytes, kept until it
+/// is added.
+pub enum DxfSource {
     Path(String),
     Bytes(Vec<u8>),
 }
@@ -138,6 +153,7 @@ impl Dialogs {
             "layerTemplate" => "layerTemplate",
             "addPolyline" => "addPolyline",
             "addCsv" => "addCsv",
+            "addDxf" => "addDxf",
             "findPlace" => "findPlace",
             "geocode" => "geocode",
             "addUrl" => "addUrl",
@@ -155,6 +171,7 @@ impl Dialogs {
             "zarr" => "zarr",
             "exportLayer" => "exportLayer",
             "saveProject" => "saveProject",
+            "exportOrbit" => "exportOrbit",
             other => return Err(format!("unknown dialog '{other}'")),
         };
         if matches!(name, "addField" | "calculateField" | "renameLayer" | "exportLayer" | "defineProjection") && active.is_none() {
@@ -168,6 +185,9 @@ impl Dialogs {
         }
         if matches!(name, "gpkgSave" | "gpkgDiscard") && !s.map().layers.iter().any(|l| l.gpkg.is_some()) {
             return Err(tl!("the map has no GeoPackage layer loaded for editing (Home › Add Data › Edit GeoPackage Table…)").into());
+        }
+        if name == "exportOrbit" && cfg!(target_arch = "wasm32") {
+            return Err("exporting an orbit needs the desktop app".into());
         }
         if name == "selectByAttributes" && s.map().layers.is_empty() {
             return Err("the map has no layers".into());
@@ -189,6 +209,12 @@ impl Dialogs {
                 let is_code = self.text.to_ascii_lowercase().starts_with("epsg");
                 self.a = if is_code { self.text.trim_start_matches(|c: char| !c.is_ascii_digit()).to_string() } else { String::new() };
             }
+            "addDxf" => {
+                // A drawing never says its coordinate system: the map's, where it is drawn.
+                self.text = map_crs(&s.map().projection);
+                // Its blocks (图块) are drawn unless the user says otherwise.
+                self.flag = true;
+            }
             "goToXY" => {
                 let c = s.map().center_lonlat();
                 self.a = format!("{:.4}", c.x);
@@ -202,6 +228,8 @@ impl Dialogs {
                 self.c = format!("{:.0}", s.scale());
             }
             "addField" => self.b = "Double".into(),
+            // The command's defaults: 60 frames once round, 640 × 400 points, 50 ms a frame.
+            "exportOrbit" => [self.a, self.b, self.c, self.d, self.e] = ["60", "360", "640", "400", "50"].map(String::from),
             "calculateField" => {
                 self.a = active.and_then(|l| calculation_fields(&l.dataset).last()).map(|f| f.name.clone()).unwrap_or_default()
             }
@@ -304,6 +332,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "layerTemplate" => "Layer Template",
         "addPolyline" => "Add Encoded Polyline",
         "addCsv" => "Add Delimited Text",
+        "addDxf" => "Import DXF",
         "findPlace" => "By Place or Address",
         "geocode" => "Geocode Addresses",
         "addUrl" => "Add Data From URL",
@@ -322,6 +351,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "zarr" => "Add Zarr Variable",
         "exportLayer" => "Export Features",
         "saveProject" => "Save Project As",
+        "exportOrbit" => "Export Orbit",
         "renameMap" => "Rename Map",
         "renameLayout" => "Rename Layout",
         "renameServiceGroup" => "Rename Service Group",
@@ -449,6 +479,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             "addTiles" => close = add_tiles(app, ui),
             "addCsv" => close = add_csv(app, ui),
+            "addDxf" => close = add_dxf(app, ui),
             "findPlace" => close = crate::geocodeui::find_place(app, ui),
             "geocode" => close = crate::geocodeui::geocode(app, ui),
             "addUrl" => close = add_url(app, ui),
@@ -488,6 +519,41 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     let (lon, lat, scale) = (n(&app.dialogs.a, "Longitude")?, n(&app.dialogs.b, "Latitude")?, n(&app.dialogs.c, "Scale")?);
                     app.run("map.camera", json!({"lon": lon, "lat": lat, "scale": scale})).map(|_| ())
                 });
+            }
+            "exportOrbit" => {
+                ui.label(tl!("Turns the view about its centre, keeping its scale and pitch, and writes a frame a step: a .gif loops, a .zip holds the frames as PNGs."));
+                egui::Grid::new("orbit").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+                    let d = &mut app.dialogs;
+                    for (label, v) in [
+                        ("Frames", &mut d.a),
+                        ("Turn (degrees)", &mut d.b),
+                        ("Width (points)", &mut d.c),
+                        ("Height (points)", &mut d.d),
+                        ("Frame time (ms, GIF)", &mut d.e),
+                    ] {
+                        let input_label = ui.label(tl!(label));
+                        ui.add(egui::TextEdit::singleline(v).desired_width(120.0)).labelled_by(input_label.id);
+                        ui.end_row();
+                    }
+                });
+                // A file picker cancelled keeps the dialog open, the values typed still in it:
+                // `ui.exportOrbit` answers null when no file was picked.
+                let mut picked = true;
+                close = buttons(app, ui, "Export…", |app| {
+                    // Empty keeps the command's default; anything else must be a number, which
+                    // the command checks against its range.
+                    let mut p = json!({});
+                    let d = &app.dialogs;
+                    for (key, label, v) in [("frames", "Frames", &d.a), ("turn", "Turn", &d.b), ("width", "Width", &d.c), ("height", "Height", &d.d), ("speed", "Frame time", &d.e)] {
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            let n = v.parse::<f64>().ok().filter(|n| n.is_finite());
+                            p[key] = json!(n.ok_or_else(|| crate::i18n::fmt("{what} must be a number", &[("what", tl_raw!(label))]))?);
+                        }
+                    }
+                    picked = !app.run("ui.exportOrbit", p)?.is_null();
+                    Ok(())
+                }) && picked;
             }
             "bookmark" => {
                 let input_label = ui.label(tl!("Name"));
@@ -616,6 +682,16 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     });
     if (!open || close) && app.dialogs.open == Some(which) {
         app.dialogs.open = None;
+        if which == "addDxf" {
+            app.dialogs.dxf = None;
+        }
+        // Drawings picked or dropped together: the next opens as one closes.
+        if which == "addDxf"
+            && let Some(next) = app.ui.dxf_waiting.pop_front()
+            && app.dialogs.open("addDxf", &app.session).is_ok()
+        {
+            app.dialogs.dxf = Some(next);
+        }
     }
 }
 
@@ -743,6 +819,100 @@ pub fn open_csv(app: &mut RustGisApp, name: &str, source: CsvSource) -> Result<V
     show_columns(&mut app.dialogs, csv_columns(&file, "auto"));
     app.dialogs.csv = Some(file);
     Ok(Value::Null)
+}
+
+/// Opens Import DXF for a drawing picked: its coordinate system (the map's, to start with) and
+/// whether its blocks (图块) are drawn. A drawing picked while another waits opens after it, so
+/// neither is lost.
+pub fn open_dxf(app: &mut RustGisApp, name: &str, source: DxfSource) -> Result<Value, String> {
+    let file = DxfFile { name: name.to_string(), source };
+    if app.dialogs.open == Some("addDxf") && app.dialogs.dxf.is_some() {
+        app.ui.dxf_waiting.push_back(file);
+        return Ok(Value::Null);
+    }
+    app.run("ui.dialog", json!({"name": "addDxf"}))?;
+    app.dialogs.dxf = Some(file);
+    Ok(Value::Null)
+}
+
+/// Opens Import DXF for a drawing on disk (a drop, Add Data, the Browser pane, `ui.addFile`).
+pub fn open_dxf_path(app: &mut RustGisApp, path: &str) -> Result<Value, String> {
+    open_dxf(app, path, DxfSource::Path(path.to_string()))
+}
+
+/// The current map's coordinate system, as a DXF import can be given it: Web Mercator and the
+/// globe as their EPSG codes; another flat projection as its EPSG code or, for a preset, what the
+/// map projects with, which is the map's exactly (a definition `Crs::parse` reads).
+fn map_crs(p: &rustgis_engine::map::Projection) -> String {
+    use rustgis_engine::map::Projection;
+    match p {
+        Projection::WebMercator => "EPSG:3857".into(),
+        Projection::Globe => "EPSG:4326".into(),
+        Projection::Custom(code) => {
+            let up = code.trim().to_ascii_uppercase();
+            if up.starts_with("EPSG:") {
+                up
+            } else {
+                rustgis_engine::map::projection::lookup(code).map(|(def, _)| def).unwrap_or_else(|_| code.trim().to_string())
+            }
+        }
+    }
+}
+
+/// Import DXF, for the drawing picked: the coordinate system its coordinates are in (blank keeps
+/// them as they are) and whether its blocks (图块) are drawn.
+fn add_dxf(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    let Some(name) = app.dialogs.dxf.as_ref().map(|f| f.name.clone()) else {
+        // Opened without a file (`ui.dialog`): the file first.
+        ui.label(tl!("Choose a DXF drawing, then set its coordinate system and whether its blocks are drawn."));
+        let close = buttons(app, ui, "Choose File…", |app| app.run("ui.addDxf", Value::Null).map(|_| ()));
+        return close && app.dialogs.dxf.is_none();
+    };
+    let shown = std::path::Path::new(&name).file_name().and_then(|n| n.to_str()).unwrap_or(&name).to_string();
+    ui.label(egui::RichText::new(shown).strong());
+    ui.label(
+        egui::RichText::new(tl!(
+            "A drawing never says its coordinate system: its coordinates are read in this one. Leave it blank to keep them as they are."
+        ))
+        .weak(),
+    );
+    egui::Grid::new("dxf").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+        let input_label = ui.label(tl!("Coordinate system"));
+        let response = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:3857").desired_width(260.0));
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Coordinate system")));
+        response.labelled_by(input_label.id);
+        ui.end_row();
+    });
+    ui.add_space(4.0);
+    ui.checkbox(&mut app.dialogs.flag, tl!("Import block contents"));
+    buttons(app, ui, "Add", |app| {
+        let mut p = json!({"blocks": app.dialogs.flag});
+        if !app.dialogs.text.trim().is_empty() {
+            p["crs"] = json!(app.dialogs.text.trim());
+        }
+        let file = app.dialogs.dxf.take().ok_or("choose a file first")?;
+        let r = match &file.source {
+            DxfSource::Path(path) => {
+                p["path"] = json!(path);
+                add_dxf_file(app, p)
+            }
+            DxfSource::Bytes(bytes) => app.import_dxf_bytes(&file.name, bytes, p),
+        };
+        // Kept for another try.
+        if r.is_err() {
+            app.dialogs.dxf = Some(file);
+        }
+        r.map(|_| ())
+    })
+}
+
+/// Adds a drawing on disk, read as Add Data reads a file (on a thread of its own when the desktop
+/// app reads it so, [`crate::readjob`]).
+pub(crate) fn add_dxf_file(app: &mut RustGisApp, p: Value) -> Result<Value, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return crate::readjob::run(app, "layer.addData", p);
+    #[cfg(target_arch = "wasm32")]
+    app.run("layer.addData", p)
 }
 
 /// The columns of a file picked for Add Delimited Text, split at `separator` (a code of
@@ -2208,7 +2378,7 @@ pub fn pick_open(_: &[&str], _: &str) -> Option<String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "the browser has no folder picker; kept beside the desktop one")]
 pub fn pick_folder() -> Option<String> {
     None
 }
@@ -2217,9 +2387,6 @@ pub fn pick_folder() -> Option<String> {
 pub fn pick_save(_: &str, _: &[&str], _: &str) -> Option<String> {
     None
 }
-
-#[allow(dead_code)]
-fn unused(_: Value) {}
 
 /// The map's coordinate system: Web Mercator, the globe, a preset, or any projected EPSG code. The
 /// list is on the left; the right shows what the selection is, where it can be used, its PROJ

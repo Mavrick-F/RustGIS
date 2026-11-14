@@ -727,6 +727,8 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
             }
         }
         unstage(staged);
+        // The old parts put back, durably too.
+        sync_folder(path);
         let e = DataError::from(e);
         if kept.is_empty() {
             return Err(e);
@@ -748,7 +750,26 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
             let _ = std::fs::remove_file(path.with_extension(extension));
         }
     }
+    // Every part is renamed within `path`'s folder.
+    sync_folder(path);
     Ok(())
+}
+
+/// Makes a rename into `path`'s folder survive a power cut: on Linux and macOS a synced file can
+/// still come back under its old name until the folder itself is synced. Best effort, after the
+/// rename: the file is written either way, so a folder that can't be opened (writable but not
+/// readable) or synced (some network and FUSE mounts refuse it) leaves the rename to land when
+/// the system writes it, as every rename did before, and the write still succeeds. Windows can't
+/// open a folder this way without unsafe code, so there NTFS's own journal decides when it lands;
+/// the browser has no folders to sync.
+pub(crate) fn sync_folder(path: &Path) {
+    #[cfg(unix)]
+    {
+        let folder = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let _ = std::fs::File::open(folder).and_then(|f| f.sync_all());
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// A new temporary name beside `path`, unique per call, so concurrent writes to the same target
@@ -892,6 +913,7 @@ fn atomic_write_at<T, E: From<std::io::Error>>(
     }
     std::fs::rename(&tmp, path)?;
     std::mem::forget(staged);
+    sync_folder(path);
     Ok(value)
 }
 
@@ -2023,6 +2045,19 @@ fn has_leading_zero(v: &str) -> bool {
     d.len() > 1 && d.starts_with('0') && d.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit())
 }
 
+/// A number with more than 15 significant digits (e.g. an account or card number, or a decimal
+/// such as `+1234567890123456.5`); spreadsheets retain only 15, so these must be apostrophe-guarded in CSV export.
+/// Redundant fractional trailing zeros (e.g. `+35.13294600000000`) do not count towards precision loss.
+fn is_long_number(v: &str) -> bool {
+    let mantissa = v.split(['e', 'E']).next().unwrap_or_default();
+    let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let frac = frac.trim_end_matches('0');
+    let mut digits = String::new();
+    digits.extend(whole.chars().filter(char::is_ascii_digit));
+    digits.extend(frac.chars().filter(char::is_ascii_digit));
+    digits.trim_start_matches('0').len() > 15
+}
+
 /// Undoes the export formula guard: `'=x` reads back as `=x`.
 fn unguard(cell: &str) -> std::borrow::Cow<'_, str> {
     match cell.strip_prefix('\'') {
@@ -2034,9 +2069,16 @@ fn unguard(cell: &str) -> std::borrow::Cow<'_, str> {
 const FORMULA_START: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
 
 /// A cell's text; text that a spreadsheet would run as a formula is prefixed with `'`.
+/// Valid numbers whose digits fit in Double precision without loss, without leading zeros,
+/// and with at most 15 significant digits (to avoid truncation in spreadsheets) are exported bare.
 fn csv_cell(v: &Value) -> String {
     match v {
-        Value::Text(t) if t.starts_with(FORMULA_START) => format!("'{t}"),
+        Value::Text(t)
+            if t.starts_with(FORMULA_START)
+                && !(t.parse::<f64>().is_ok_and(|f| f.is_finite()) && double_holds(t) && !has_leading_zero(t) && !is_long_number(t)) =>
+        {
+            format!("'{t}")
+        }
         other => other.to_file_text(),
     }
 }
@@ -4909,6 +4951,84 @@ mod tests {
         assert_eq!(out.lines().next(), Some("lng,latitude,lon,lat,longitude,note"), "{out}");
         let (ds, _) = read_csv("a\nNaN\nx\n", "t").unwrap();
         assert_eq!(ds.fields[0].ty, FieldType::Text);
+    }
+
+    #[test]
+    fn csv_export_does_not_escape_valid_signed_numbers() {
+        let mut ds =
+            Dataset::new("tiger", GeometryType::None, vec![Field::new("INTPTLAT", FieldType::Text), Field::new("note", FieldType::Text)]);
+        ds.push(None, vec![Value::Text("+35.1329460".into()), Value::Text("=SUM(A1)".into())]);
+        ds.push(None, vec![Value::Text("-90.1234567".into()), Value::Text("+cmd|' /C calc'!A0".into())]);
+        ds.push(None, vec![Value::Text("+447700900123".into()), Value::Text("-12345678901234567890".into())]);
+        ds.push(None, vec![Value::Text("-007".into()), Value::Text("-123456789012345678".into())]);
+        ds.push(None, vec![Value::Text("-1234567890123456".into()), Value::Text("+1234567890123456".into())]);
+        ds.push(None, vec![Value::Text("+1234567890123456.5".into()), Value::Text("+1.234567890123456e5".into())]);
+        ds.push(None, vec![Value::Text("-1152921504606846976".into()), Value::Text("-9007199254740992".into())]);
+        ds.push(None, vec![Value::Text("+987654321098765".into()), Value::Text("+0.00001234".into())]);
+        ds.push(None, vec![Value::Text("+35.13294600000000".into()), Value::Text("-90.12345670000000".into())]);
+        let out = to_csv(&ds).unwrap();
+        assert!(out.contains("+35.1329460"), "{out}");
+        assert!(!out.contains("'+35.1329460"), "{out}");
+        assert!(out.contains("+35.13294600000000"), "{out}");
+        assert!(!out.contains("'+35.13294600000000"), "{out}");
+        assert!(out.contains("-90.12345670000000"), "{out}");
+        assert!(!out.contains("'-90.12345670000000"), "{out}");
+        assert!(out.contains("-90.1234567"), "{out}");
+        assert!(!out.contains("'-90.1234567"), "{out}");
+        assert!(out.contains("+447700900123"), "{out}");
+        assert!(!out.contains("'+447700900123"), "{out}");
+        assert!(out.contains("+987654321098765"), "{out}");
+        assert!(!out.contains("'+987654321098765"), "{out}");
+        assert!(out.contains("+0.00001234"), "{out}");
+        assert!(!out.contains("'+0.00001234"), "{out}");
+        assert!(out.contains("'-007,"), "{out}");
+        assert!(out.contains("'-1234567890123456,"), "{out}");
+        assert!(out.contains(",'+1234567890123456\n"), "{out}");
+        assert!(out.contains("'+1234567890123456.5,"), "{out}");
+        assert!(out.contains(",'+1.234567890123456e5\n"), "{out}");
+        assert!(out.contains("'-1152921504606846976,"), "{out}");
+        assert!(out.contains(",'-9007199254740992\n"), "{out}");
+        assert!(out.contains(",'-123456789012345678\n"), "{out}");
+        assert!(out.contains(",'-12345678901234567890\n"), "{out}");
+        assert!(out.contains("'=SUM(A1)"), "{out}");
+        assert!(out.contains("'+cmd"), "{out}");
+    }
+
+    #[test]
+    fn csv_signed_numbers_and_text_round_trip() {
+        let mut ds = Dataset::new(
+            "test",
+            GeometryType::None,
+            vec![
+                Field::new("coord", FieldType::Text),
+                Field::new("phone", FieldType::Text),
+                Field::new("code", FieldType::Text),
+                Field::new("long_id", FieldType::Text),
+                Field::new("formula", FieldType::Text),
+            ],
+        );
+        ds.push(
+            None,
+            vec![
+                Value::Text("+35.1329460".into()),
+                Value::Text("+447700900123".into()),
+                Value::Text("-007".into()),
+                Value::Text("-123456789012345678".into()),
+                Value::Text("=SUM(A1)".into()),
+            ],
+        );
+        let csv_text = to_csv(&ds).unwrap();
+        let (reimported, _) = read_csv(&csv_text, "test").unwrap();
+        assert_eq!(reimported.fields[0].ty, FieldType::Double);
+        assert_eq!(reimported.features[0].attrs[0], Value::Float(35.132946));
+        assert_eq!(reimported.fields[1].ty, FieldType::Integer);
+        assert_eq!(reimported.features[0].attrs[1], Value::Int(447700900123));
+        assert_eq!(reimported.fields[2].ty, FieldType::Text);
+        assert_eq!(reimported.features[0].attrs[2], Value::Text("-007".into()));
+        assert_eq!(reimported.fields[3].ty, FieldType::Text);
+        assert_eq!(reimported.features[0].attrs[3], Value::Text("-123456789012345678".into()));
+        assert_eq!(reimported.fields[4].ty, FieldType::Text);
+        assert_eq!(reimported.features[0].attrs[4], Value::Text("=SUM(A1)".into()));
     }
 
     #[test]

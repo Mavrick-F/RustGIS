@@ -225,7 +225,7 @@ fn run(app: &mut RustGisApp, id: &str, p: Value) {
 /// in the background, the pane opened at `section` to show its progress, Cancel and result; one
 /// that can't start (another is under way) is said in the status bar too. The rest run here, a
 /// failure said in the status bar.
-#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+#[cfg_attr(target_arch = "wasm32", expect(unused_variables, reason = "the browser has no background runs"))]
 pub fn run_elsewhere(app: &mut RustGisApp, section: &str, id: &str, p: Value) {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some((command, name)) = background(id) {
@@ -618,6 +618,9 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     _ => {}
                 }
             });
+            if app.workflow.function == "slope" {
+                ui.label(egui::RichText::new(tl!("Slope is in degrees (0–90), not percent.")).small().weak());
+            }
             let step = json!({"function": app.workflow.function, "expression": app.workflow.text, "value": num(&app.workflow.number, 0.0)});
             if app.workflow.section == "rasterFunctions" {
                 if ui.button(tl!("Apply")).clicked() {

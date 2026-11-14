@@ -600,12 +600,14 @@ Inside a request, `host::call(op, params)` sends one of these to RustGIS:
 | Request | Answer |
 |---|---|
 | `host.info` | `{rustgis, abi, plugin, permissions}`: version, ABI, plugin id and permissions |
-| `host.layers` | `[{id, name, raster, visible, geometry, features, selected, active, extent, transparency, group, fields: [{name, type}]}]`, top first: `extent` is `[west, south, east, north]` in longitude/latitude (`null` when empty or a raster not yet read), `transparency` the layer's own, 0 (opaque) to 100 (its groups' transparency applies on top), `group` the name of the group it is in or `null`. The web tile layers, groups, tables and layouts (with their page size) are in `info.project` |
-| `host.features` `{layer, selected?, limit?}` | the layer's features as GeoJSON; each feature has its `row` |
+| `host.layers` | `[{id, name, raster, visible, geometry, features, selected, active, extent, transparency, group, crs, fields: [{name, type}]}]`, top first: `crs` is the layer's own coordinate system, `"EPSG:32637"` (its WKT when it has no EPSG code, else its PROJ definition; `null` only for a raster not yet read), the one `share.exportLayer` keeps. A vector layer that carries no coordinate system is reported as `"EPSG:4326"`: RustGIS assumes WGS 84 for it, as it does everywhere, so that is a fallback, not a system the file declared; `extent` is `[west, south, east, north]` in longitude/latitude (`null` when empty or a raster not yet read), `transparency` the layer's own, 0 (opaque) to 100 (its groups' transparency applies on top), `group` the name of the group it is in or `null`. The web tile layers, groups, tables and layouts (with their page size) are in `info.project` |
+| `host.features` `{layer, selected?, limit?, crs?}` | the layer's features as GeoJSON; each feature has its `row`. With `crs` omitted, null or empty, coordinates retain the default longitude/latitude response without a `crs` member: WGS 84 for Earth layers, but the source body’s degrees for planetary layers. An explicit `"EPSG:4326"` (or `"4326"`), or `"layer"` resolving to WGS 84, also uses that response without a `crs` member. This preserves the existing numeric coordinates for planetary layers; it does not convert them to Earth’s WGS 84. Other `crs` values ask for: `"layer"` (the layer's own, as `host.layers` gives it: metres for a UTM layer), `"map"` (the map's projection; Web Mercator on the globe) or an EPSG code (`"EPSG:32637"`, or `"32637"`; WKT and PROJ text are refused, so a plugin can't add coordinate systems to the session). A non-default answer then has a GeoJSON `crs` member (`{"type": "name", "properties": {"name": "EPSG:32637"}}`), which `host.addLayer` reads back. A `crs` that is unknown, not text (except null), an unsupported form, has no EPSG code (a layer or map in a custom system), is geocentric, belongs to another body than the layer, or can't hold a feature (outside its area, or beyond Web Mercator's latitude of 85.05°) is an error starting with `crs:` (naming the feature count where it applies); nothing is dropped silently or moved. The request runs on the calling thread (the window's, in the app) like every host request |
 | `host.view` | `{center: [lon, lat], scale, projection, bearing, pitch}` (bearing and pitch in degrees, 0 for a flat north-up map) |
 | `host.notify` `{text, error?}` | shows a message in the status bar |
 | `host.addLayer` `{name, geojson}` | adds a layer (`edit`) |
 | `host.fetch` `{url, json?}` | `{url, text, json?}`: the document at a web address; `json: false` leaves out `json` (`network`; see [Fetching a document](#fetching-a-document)) |
+| `host.settings` | the plugin's saved settings as an object, `{}` when it has none (commands only, no permission; see [Remembering settings](#remembering-settings)) |
+| `host.setSettings` `{values}` | merges `values` into the saved settings and answers the whole object; a `null` value removes its key (commands only, no permission; see [Remembering settings](#remembering-settings)) |
 | `map.addTiles` `{url, kind?, name?, attribution?, maxZoom?, overlay?, replace?, blend?, …}` | adds a tile layer (`edit` and `network`); accepts the built-in command's parameters |
 | any command id (`layer.zoomTo`, `select.byAttributes`, `layer.symbology`…) | what the command returns, within the plugin's permissions |
 
@@ -712,6 +714,52 @@ that needs it left out.
 
 Use `host::call("host.fetch", json!({"url": url}))` in the Rust SDK, or
 `host::call("host.fetch", json!({"url": url, "json": false}))` for the text only.
+
+#### Remembering settings
+
+`host.settings` and `host.setSettings` let a plugin keep its choices (a unit, favourites, the layer
+it used last) between calls and between runs of RustGIS. They need no permission, and a plugin
+sees only its own settings: they are kept under its `id`, and no request can name another plugin's.
+A plugin's commands have them: a WebAssembly module's, a process plugin's, and a session plugin's
+program, also between its commands. Tools don't: they run off the UI thread, in models and on a
+copy of the project, so a tool's output must not depend on what was saved.
+
+- `host.settings` answers the saved object, `{}` when nothing was saved.
+- `host.setSettings {"values": {…}}` merges `values` into it at the top level and answers the whole
+  object. A value that isn't `null` replaces the whole value saved under its key (objects inside it
+  aren't merged); `null` removes the key; keys it doesn't name stay. `values` must be an object
+  (an empty one is fine). A `null` inside an array or an object is data.
+- A plugin's settings take at most 64 KiB (65,536 bytes) as compact JSON, keys included. A change
+  that would pass that is an error, and nothing changes.
+- A change holds as soon as the request succeeds. It is not part of the project: Undo doesn't
+  revert a saved setting, and it stays if the command fails later. A command of a plugin with
+  `edit` is still one undo step, as ever, whatever it asks for.
+- They survive restarts, a new version of the plugin and turning it off and on. They are erased
+  only when the user uninstalls the plugin (in the web app, also by **Remove** on one that
+  couldn't be loaded): one installed again starts with none. Removing a development folder that
+  shadows an installed copy leaves the copy's settings.
+- The desktop app, the command line and Python keep them in `settings/<id>.json` in the plugins
+  folder (`RUSTGIS_PLUGINS_DIR`, or `plugins` in the data folder; see
+  [Installation](installation.md)), so they move with it: a plugins folder that several users
+  share shares the settings too, and a read-only one makes `host.setSettings` fail (reading still
+  works). Within one RustGIS process, each change is read, merged and written under one lock.
+  RustGIS processes running at once (the desktop app and the command line) share the files: the
+  last write wins.
+- The web app keeps them in the browser's localStorage (`rustgis.plugin-settings.<id>`); embedded
+  in another page, in memory for the visit. Tabs of the same site share it: the last write wins.
+- Each is saved as `{"version": 1, "values": {...}}`. A RustGIS refuses settings saved by a newer
+  one that it can't read (the request is an error) and never writes over them.
+- Settings are stored unencrypted, readable by anyone who can open the plugins folder or the
+  browser profile: keep choices in them, never passwords or tokens. Secrets belong in the
+  system's keychain.
+- Settings that can't be read or saved (a damaged file, a full or blocked browser storage) make
+  the request an error that names the plugin, never an empty answer, and a failed change leaves
+  what was saved as it was.
+- A panel's widgets aren't saved for the plugin: save the values worth keeping.
+- A RustGIS without these requests answers `unknown request 'host.settings'`, which a plugin can
+  use to tell.
+
+Use `host::call("host.setSettings", json!({"values": {"unit": "m"}}))` in the Rust SDK.
 
 Tools work differently. A tool receives its layer parameters' features as GeoJSON (only the
 selected features when a layer has a selection), and its `file` parameters' files. It returns

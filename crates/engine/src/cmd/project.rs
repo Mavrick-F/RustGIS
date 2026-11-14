@@ -28,7 +28,7 @@ pub fn commands() -> Vec<C> {
             .when(|s| if s.can_redo() { None } else { Some("nothing to redo") }),
         C::new("tool.set", "Set Map Tool", "Home › Navigate", set_tool).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
-            .params(r#"{"tool": "explore"|"select"|"selectPolygon"|"selectLasso"|"selectRadius"|"zoomIn"|"measure"|"measureArea"|"createPoint"|"createLine"|"createPolygon"|"editVertices"|"cutPolygon"|"reshape"|"graphicPoint"|"graphicText"|"graphicLine"|"graphicCurve"|"graphicFreehand"|"graphicPolygon"|"graphicLasso"|"graphicRectangle"|"graphicCircle"|"graphicEllipse"|"graphicPicture"}"#),
+            .params(r#"{"tool": "explore"|"select"|"selectPolygon"|"selectLasso"|"selectRadius"|"zoomIn"|"measure"|"measureArea"|"createPoint"|"createLine"|"createPolygon"|"editVertices"|"rotatedBox"|"cutPolygon"|"reshape"|"graphicPoint"|"graphicText"|"graphicLine"|"graphicCurve"|"graphicFreehand"|"graphicPolygon"|"graphicLasso"|"graphicRectangle"|"graphicCircle"|"graphicEllipse"|"graphicPicture"}"#),
         C::new("info.project", "Project Info", "Project", info).inputs(super::tiles::listing_inputs).roles(&[]).effects(crate::policy::Effects::NONE).view().params(r#"{"nameFilter"?: string, "includeFields"?: bool}"#),
         C::new("info.commands", "List Commands", "Help", list).roles(&[]).effects(crate::policy::Effects::NONE).view(),
         // The session log (#797): read, written out, emptied, turned on or off. It sits outside
@@ -377,16 +377,27 @@ fn sample(s: &mut Session, _: &Value) -> CmdResult {
 /// Largest project package opened (1 GiB).
 const MAX_PACKAGE: u64 = 1 << 30;
 
-/// `project.open`: a project file, or a package (`.rgispkg`) opened unsaved; either must be a
-/// regular file within its limit.
+/// `project.open`: a project file, or a package (`.rgispkg`, or a field package, `.rgisfield`)
+/// opened unsaved; either must be a regular file within its limit.
+///
+/// It runs on the window's thread, as opening a project does: a package is one read, and a field
+/// package's unpacking one write of each file it holds (its tile archives, up to its limit), with
+/// no Cancel between them.
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let path = PathBuf::from(super::ps(p, "path").ok_or("path is required")?);
-    let is_package = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rgispkg"));
+    // A field package opens as a package does, from where it is unpacked.
+    let is_field = super::field::is_field_package(&path.to_string_lossy());
+    let is_package = is_field || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rgispkg"));
     let origin = if is_package { path.canonicalize() } else { std::path::absolute(&path) }
         .map_err(|error| format!("{}: {error}", path.display()))?;
     super::connections::clear_active();
     let proj = (|| {
-        if is_package {
+        if is_field {
+            let bytes = crate::project::read_file(&path, MAX_PACKAGE)?;
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let (dir, text) = super::field::unpack(&bytes, &stem)?;
+            super::field::project_in(&text, &dir)
+        } else if is_package {
             let bytes = crate::project::read_file(&path, MAX_PACKAGE)?;
             Project::from_import_json(&super::items::package_text(&bytes)?, None)
         } else {
@@ -519,6 +530,9 @@ fn set_tool(s: &mut Session, p: &Value) -> CmdResult {
     }
     if matches!(t, Tool::EditVertices | Tool::CutPolygon | Tool::Reshape) && !s.map().editing.settings.enabled {
         return Err("editing is turned off (Edit › Edit)".into());
+    }
+    if t == Tool::RotatedBox {
+        crate::box_edit::check_tool(s, s.layer_id(&Value::Null)?)?;
     }
     s.tool = t;
     Ok(Value::Null)

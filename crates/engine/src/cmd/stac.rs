@@ -1452,7 +1452,6 @@ mod tests {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-#[allow(clippy::unwrap_used)]
 mod deferred_asset_tests {
     use super::*;
 

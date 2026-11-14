@@ -32,6 +32,12 @@ pub fn install(probe: Option<Arc<dyn Probe>>) -> Installed {
     Installed(CURRENT.with(|c| c.replace(probe)))
 }
 
+/// The calling thread's probe, for installing on workers of the same run.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn current() -> Option<Arc<dyn Probe>> {
+    CURRENT.with(|c| c.borrow().clone())
+}
+
 /// Puts back the probe before when dropped (see [`install`]).
 pub struct Installed(Option<Arc<dyn Probe>>);
 
@@ -91,7 +97,6 @@ pub fn check() -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

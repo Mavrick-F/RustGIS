@@ -790,7 +790,6 @@ pub fn fields_of_the_world(app: &mut RustGisApp, ui: &mut egui::Ui) {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

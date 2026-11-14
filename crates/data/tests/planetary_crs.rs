@@ -148,9 +148,9 @@ fn planetographic_systems_without_east_axes_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let r = 3_396_190.0f64;
     let metres = LONLAT.map(|(lon, lat)| (r * lon.to_radians(), r * lat.to_radians()));
-    // PROJ 9.7.1: +proj=eqc +a=3396190 +rf=169.894447223612.
-    // The projection uses the semi-major axis as its radius even on a planetographic datum.
-    let proj_metres = [(-7_930_954.528_618_374, 1_105_473.108_809_661), (4_590_825.323_180_067, 1_093_025.422_329_766_7)];
+    // PROJ 9.8.1 (pyproj 3.8.0), from +proj=longlat to +proj=eqc, both +a=3396190
+    // +rf=169.894447223612: the ellipsoidal formula, on a planetographic datum too.
+    let proj_metres = [(-7_930_954.528_618_374, 1_093_163.433_158_274), (4_590_825.323_180_067, 1_080_839.908_550_262_2)];
     let with_axes = |wkt: &str, axes: &str| format!("{},{axes}]", wkt.strip_suffix(']').unwrap());
     let east_north = r#"AXIS["Lon",EAST],AXIS["Lat",NORTH]"#;
     let unnamed = MARS_OGRAPHIC_ESRI.replace("GCS_Mars_2015_Ographic", "GCS_Mars");
@@ -249,7 +249,8 @@ fn planetographic_systems_without_east_axes_are_refused() {
     assert!(planetary_notes(&report.messages).is_empty(), "{:?}", report.messages);
     let src = source::open_path(&path, None).unwrap();
     assert_eq!(said(&src.info().notes), 1, "{:?}", src.info().notes);
-    let earth_metres = LONLAT.map(|(lon, lat)| (6_378_137.0 * lon.to_radians(), 6_378_137.0 * lat.to_radians()));
+    // PROJ 9.8.1 (pyproj 3.8.0) from EPSG:4326 to EPSG:4087: ellipsoidal.
+    let earth_metres = [(-14_894_547.868_140_006, 2_062_926.622_674_482_9), (8_621_694.561_939_038, 2_039_682.418_029_185_6)];
     let earth_eqc = eqc_on(&west, "World_Equidistant_Cylindrical");
     assert!(earth_eqc.contains("WGS_1984") && earth_eqc.contains("WEST"), "{earth_eqc}");
     let path = shapefile(dir.path(), "earth_eqc_west", earth_metres, &earth_eqc);

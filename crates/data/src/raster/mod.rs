@@ -17,6 +17,7 @@ mod esri;
 pub mod gdal;
 pub mod geotiff;
 mod image_grid;
+mod lerc;
 mod lzw;
 mod mask;
 pub mod pam;
@@ -731,7 +732,6 @@ pub fn gdal_metadata_changed(r: &Raster, bands: &[usize]) -> usize {
 
 impl Raster {
     /// Builds a raster from bands of `width × height` pixels and computes statistics.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: impl Into<String>,
         width: u32,
@@ -748,7 +748,6 @@ impl Raster {
 
     /// [`Raster::new`] without statistics (each band's are empty): a part of a larger raster,
     /// drawn with the whole's (a cloud-optimised GeoTIFF's view, read in place).
-    #[allow(clippy::too_many_arguments)]
     pub fn unmeasured(
         name: impl Into<String>,
         width: u32,
@@ -763,7 +762,6 @@ impl Raster {
         Raster::build(name, width, height, bands, transform, crs, nodata, color, data_type, false)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build(
         name: impl Into<String>,
         width: u32,
@@ -968,7 +966,7 @@ impl Raster {
             let (lo, hi) = (e.min_x - shift, e.max_x - shift);
             (e.min_x, e.max_x) = if lo >= -180.0 && hi <= 180.0 { (lo, hi) } else { (-180.0, 180.0) };
         }
-        // A whole world in a world projection RustGIS computes reaches the antimeridian and the
+        // A whole world in Natural Earth, Winkel Tripel or Eckert IV reaches the antimeridian and the
         // poles at its outline's edge, which samples miss when the grid's edges are a little past
         // it (its corners are off the outline): whatever of them is in the grid is in its extent
         // (#1701).

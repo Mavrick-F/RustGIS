@@ -1218,7 +1218,6 @@ fn fit(mb: &mut ModelBuilder, rect: Rect) {
     mb.pan = (rect.size() / zoom - bounds.size()) / 2.0 - bounds.min.to_vec2();
 }
 
-#[allow(clippy::too_many_arguments)]
 fn paint_node(
     painter: &egui::Painter,
     t: &Tokens,
@@ -1846,7 +1845,6 @@ pub fn follow_view(app: &mut RustGisApp) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use egui::{Event, Key, Modifiers};
 

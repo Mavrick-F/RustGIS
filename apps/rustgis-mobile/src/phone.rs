@@ -31,7 +31,7 @@ impl Phone {
                     // SAFETY: `android-activity` keeps this global reference to the activity alive
                     // for as long as `android_main` runs, and it is only borrowed here to make a
                     // global reference of our own.
-                    #[allow(unsafe_code)]
+                    #[expect(unsafe_code, reason = "see SAFETY above")]
                     let activity = unsafe { JObject::from_raw(env, raw) };
                     let held = env.new_global_ref(&activity);
                     // The borrowed reference is `android-activity`'s to delete, not ours.
@@ -50,10 +50,11 @@ impl Phone {
             .map_err(|e| i18n::fmt("Android refused: {error}", &[("error", &e.to_string())]))
     }
 
-    /// The room the system's bars and a camera cutout take at the window's edges, in pixels:
-    /// left, top, right, bottom. `None` before the window is laid out, or when the activity
-    /// can't be asked.
-    pub fn insets(&self) -> Option<[f32; 4]> {
+    /// The room the system's bars, a camera cutout and the soft keyboard take at the window's
+    /// edges, in pixels (left, top, right, bottom), and whether the keyboard is up where Android
+    /// says (11 and later). `None` before the window is laid out, or when the activity can't be
+    /// asked.
+    pub fn insets(&self) -> Option<([f32; 4], Option<bool>)> {
         let text = self
             .java(|env, activity| {
                 let taken = env.call_method(activity, jni_str!("insets"), jni_sig!(() -> JString), &[])?.l()?;
@@ -63,8 +64,9 @@ impl Phone {
                 env.cast_local::<JString>(taken)?.try_to_string(env)
             })
             .ok()?;
-        let edges: Vec<f32> = text.split(' ').filter_map(|edge| edge.parse().ok()).collect();
-        <[f32; 4]>::try_from(edges).ok()
+        let fields: Vec<f32> = text.split(' ').filter_map(|edge| edge.parse().ok()).collect();
+        let edges = <[f32; 4]>::try_from(fields.get(..4)?).ok()?;
+        Some((edges, fields.get(4).map(|up| *up > 0.5)))
     }
 
     /// Draws the system bars' icons dark (`light` ground under them) or light (a dark one).
@@ -107,6 +109,16 @@ impl Platform for Phone {
 
     fn locate(&self, on: bool) -> Result<(), String> {
         self.java(|env, activity| env.call_method(activity, jni_str!("locate"), jni_sig!((on: boolean) -> void), &[JValue::Bool(on)])?.v())
+    }
+
+    fn keep_locating(&self, on: bool) -> Result<(), String> {
+        self.java(|env, activity| {
+            env.call_method(activity, jni_str!("keepLocating"), jni_sig!((on: boolean) -> void), &[JValue::Bool(on)])?.v()
+        })
+    }
+
+    fn take_photo(&self) -> Result<(), String> {
+        self.java(|env, activity| env.call_method(activity, jni_str!("takePhoto"), jni_sig!(() -> void), &[])?.v())
     }
 
     fn take_events(&self) -> Vec<Event> {

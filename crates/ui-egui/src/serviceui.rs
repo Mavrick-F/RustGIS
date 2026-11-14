@@ -163,7 +163,6 @@ pub(crate) fn add_layer(
 
 /// [`add_layer`] for a saved connection: `connection` is its id, recorded on the resulting layer;
 /// `origin` is its display name for Recent. Both survive deferred documents and downloads.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn add_layer_from(
     app: &mut RustGisApp,
     src: &ServiceSource,

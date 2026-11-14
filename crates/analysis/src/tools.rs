@@ -4785,6 +4785,9 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         ));
     };
 
+    if crs.is_geocentric() {
+        return Err("kernel density requires a projected coordinate system with linear units (such as UTM or State Plane), not a geocentric one (X, Y and Z from the Earth's centre). Provide a projected system under 'crs' (e.g. EPSG:32618)".into());
+    }
     if crs.is_geographic() {
         if !crs_text.is_empty() {
             return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618), not geographic coordinates (degrees)".into());
@@ -10950,6 +10953,31 @@ mod tests {
     }
 
     #[test]
+    fn kernel_density_refuses_explicit_and_inherited_geocentric_systems() {
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        // At the equator, dropping geocentric Z can even round-trip these points, so the
+        // existing unplaceable-point check alone cannot refuse this three-dimensional CRS.
+        pts.push(Some(Geometry::Point(Coord::new(-75.0, 0.0))), vec![]);
+        pts.push(Some(Geometry::Point(Coord::new(-74.99, 0.0))), vec![]);
+        let mut m = Map(HashMap::from([("pts".to_string(), pts)]));
+        let projected = serde_json::json!({"input": "pts", "crs": "EPSG:32618", "radius": 1000.0, "pixelSize": 250.0});
+        crate::run("kernelDensity", &m, &projected).unwrap();
+        for text in ["EPSG:4978", "+proj=geocent +datum=WGS84 +units=m +no_defs"] {
+            let mut explicit = projected.clone();
+            explicit["crs"] = serde_json::json!(text);
+            let error = crate::run("kernelDensity", &m, &explicit).unwrap_err();
+            assert!(error.contains("geocentric") && error.contains("projected") && error.contains("EPSG:32618"), "{error}");
+            m.0.get_mut("pts").unwrap().crs = Some(Crs::parse(text).unwrap());
+            let mut inherited = projected.clone();
+            inherited.as_object_mut().unwrap().remove("crs");
+            let error = crate::run("kernelDensity", &m, &inherited).unwrap_err();
+            assert!(error.contains("geocentric") && error.contains("projected"), "{error}");
+            // An explicit projected target still overrides the layer's default system.
+            crate::run("kernelDensity", &m, &projected).unwrap();
+        }
+    }
+
+    #[test]
     fn kernel_density_skips_points_its_system_cant_hold() {
         // In Web Mercator, points past 85.05° would land on the map's edge: they're left out and
         // counted, not piled up on the raster's top row (#1033), a multipoint's members each, and
@@ -11471,7 +11499,7 @@ mod tests {
             .unwrap();
         let mut table =
             Dataset::new("Coordinates", GeometryType::None, vec![Field::new("x", FieldType::Double), Field::new("y", FieldType::Double)]);
-        table.push(None, vec![Value::Float(0.0), Value::Float(5_009_377.085_697_311)]);
+        table.push(None, vec![Value::Float(0.0), Value::Float(4_984_944.377_977_743)]);
         let mut points = Dataset::new("Density points", GeometryType::Point, vec![]);
         points.push(Some(Geometry::Point(Coord::new(0.0, 45.0))), vec![]);
         points.push(Some(Geometry::Point(Coord::new(0.01, 45.01))), vec![]);

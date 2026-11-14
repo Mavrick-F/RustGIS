@@ -121,7 +121,7 @@ pub fn selected() -> Option<(PathBuf, String)> {
 
 /// A command for the runner, without a console window on Windows.
 fn command(exe: &Path) -> Command {
-    #[allow(unused_mut)]
+    #[cfg_attr(not(windows), expect(unused_mut, reason = "only Windows sets creation flags"))]
     let mut c = Command::new(exe);
     #[cfg(windows)]
     {

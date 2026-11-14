@@ -385,7 +385,6 @@ fn encoded_matches(actual: &[u8], expected: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

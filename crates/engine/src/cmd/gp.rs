@@ -1724,7 +1724,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut seen_outputs = std::collections::HashSet::new();
     let mut collisions = 0;
     let mut first_collision = None;
-    #[allow(unused_mut)]
+    #[cfg_attr(target_arch = "wasm32", expect(unused_mut, reason = "batch inputs are read from files on the desktop only"))]
     let mut reader_warnings: Vec<(String, String)> = Vec::new();
     let mut items_reporting_messages = 0;
     let mut distinct_tool_messages: Vec<(String, usize)> = Vec::new();
@@ -2778,7 +2778,6 @@ fn apply_with(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod file_tests {
     use super::*;
 
@@ -3651,7 +3650,6 @@ mod file_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod file_permission_tests {
     use super::*;
 
@@ -3700,7 +3698,6 @@ mod file_permission_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod batch_tests {
     use super::*;
 
