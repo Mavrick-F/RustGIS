@@ -2820,9 +2820,9 @@ pub fn offset_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, 
 /// GeoPackage's DATETIME doesn't keep (text that reads as a date-time counts as that, digits past
 /// the microsecond included).
 pub(crate) fn past_millisecond(v: &Value, ty: FieldType) -> bool {
-    // Only a date-time field is written to the millisecond: a moment in a date field is written as
-    // it is, and reads as null ([`text_in_dates`] counts it).
-    if ty != FieldType::DateTime {
+    // A moment in a date field is written as it is, and reads as null ([`text_in_dates`] counts
+    // it); in any other field a date-time is written to the millisecond.
+    if ty == FieldType::Date {
         return false;
     }
     let fine = |v: &Value| matches!(v, Value::DateTime(t) if t.micros().rem_euclid(1000) != 0);
