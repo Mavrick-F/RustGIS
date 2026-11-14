@@ -2384,6 +2384,8 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
     };
     let (mut converted, mut unconverted, mut zm_shapes) = (0usize, 0usize, 0usize);
     let mut unread_dates = vec![0usize; ds.fields.len()];
+    // Numbers that aren't finite (`nan`, `inf`), read as empty and counted for a notice.
+    let mut nonfinite = vec![0usize; ds.fields.len()];
     let mut source_kind = GeometryType::None;
     let pt = |x: f64, y: f64| Coord::new(x, y);
     for item in reader.iter_shapes_and_records() {
@@ -2439,8 +2441,8 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
         let attrs = ds
             .fields
             .iter()
-            .zip(&mut unread_dates)
-            .map(|(f, unread)| match record.get(&f.name) {
+            .zip(unread_dates.iter_mut().zip(nonfinite.iter_mut()))
+            .map(|(f, (unread, nonfinite))| match record.get(&f.name) {
                 Some(FieldValue::Character(Some(s))) if f.ty == FieldType::Date => match crate::dbf::date(s.as_bytes()) {
                     Ok(d) => d.map_or(Value::Null, Value::Date),
                     Err(()) => {
@@ -2450,6 +2452,10 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
                 },
                 Some(FieldValue::Character(Some(s))) => Value::Text(s.trim().to_string()),
                 Some(FieldValue::Numeric(Some(n))) if n.is_finite() => Value::Float(*n),
+                Some(FieldValue::Numeric(Some(_))) => {
+                    *nonfinite += 1;
+                    Value::Null
+                }
                 Some(FieldValue::Integer(i)) => Value::Int(i64::from(*i)),
                 Some(FieldValue::Double(d)) => Value::Float(*d),
                 Some(FieldValue::Currency(d)) => Value::Float(*d),
@@ -2463,6 +2469,15 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
     ds.drop_zm(&mut report, zm_shapes);
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
     report.messages.extend(report.unread_dates.iter().map(|n| format!("{name}: {n}")));
+    let nonfinite_total: usize = nonfinite.iter().sum();
+    if nonfinite_total > 0 {
+        let what = if nonfinite_total == 1 {
+            "1 number isn't finite (nan or inf) and was".to_string()
+        } else {
+            format!("{nonfinite_total} numbers aren't finite (nan or inf) and were")
+        };
+        report.messages.push(format!("{name}: {what} read as empty, in {}", named_fields(&ds.fields, &nonfinite)));
+    }
     ds.geometry_type = dominant_type(&ds);
     // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
     // conversion warning. Its shapes can be recovered by importing with an override.
@@ -4630,6 +4645,26 @@ mod tests {
         exact(&read_zip("parcels.zip", &crate::zip::write(&entries).unwrap()).unwrap()[0].0);
         let src = crate::source::shp::ShpSource::open_path(&shp, "parcels").unwrap();
         exact(&crate::source::materialize(&src).unwrap().0);
+
+        // A value that isn't finite is read as empty, and a notice counts it.
+        let odd = dir.path().join("odd.shp");
+        {
+            let table = TableWriterBuilder::new().add_numeric_field("lat".try_into().unwrap(), 19, 9);
+            let mut w = shapefile::Writer::from_path(&odd, table).unwrap();
+            for v in [f64::NAN, 1.5] {
+                let mut r = Record::default();
+                r.insert("lat".into(), FieldValue::Numeric(Some(v)));
+                w.write_shape_and_record(&shapefile::Point::new(1.0, 2.0), &r).unwrap();
+            }
+        }
+        let dbf = odd.with_extension("dbf");
+        let mut bytes = std::fs::read(&dbf).unwrap();
+        bytes[32 + 11] = b'F';
+        std::fs::write(&dbf, &bytes).unwrap();
+        let (ds, rep) = read_path(&odd).unwrap();
+        assert_eq!(ds.value(0, 0), &Value::Null);
+        assert_eq!(ds.value(1, 0).as_f64(), Some(1.5));
+        assert!(rep.messages.iter().any(|m| m.contains("1 number isn't finite") && m.contains("'lat'")), "{:?}", rep.messages);
     }
 
     /// A projected Shapefile is converted to longitude/latitude by its `.prj` (issue #84).
