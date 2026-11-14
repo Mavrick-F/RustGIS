@@ -22,6 +22,9 @@ fn max_file() -> u64 {
     crate::project::max_bytes()
 }
 
+/// The most steps a task takes (`task.new`).
+const MAX_TASK_STEPS: usize = 200;
+
 /// What an item past [`max_file`] is told.
 fn too_large() -> String {
     format!("the file is too large (maximum {})", crate::project::limit_said(max_file()))
@@ -208,6 +211,8 @@ pub fn commands() -> Vec<C> {
         .view()
         .params(r#"{"path": "*.rgistemplate", "name"?: template name}"#),
         C::new("project.fromTemplate", "Open Custom Template", "Command Search", |s, p| {
+            let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Untitled");
+            let name = super::within("name", "a project's name", name, 200)?;
             let text = read_text(p)?;
             super::connections::clear_active();
             let mut proj = match Project::from_import_json(&text, None) {
@@ -217,7 +222,7 @@ pub fn commands() -> Vec<C> {
                     return Err(error.replace("RustGIS project", "RustGIS template").replace("this project ", "this template "));
                 }
             };
-            proj.name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Untitled").chars().take(200).collect();
+            proj.name = name;
             super::project::reset_to(s, proj);
             s.path = None;
             super::connections::resolve_project(s);
@@ -242,19 +247,27 @@ pub fn commands() -> Vec<C> {
         // Tasks.
         C::new("task.new", "New Task", "Analyze › Tasks", |s, p| {
             let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Task");
+            let name = super::within("name", "a task's name", name, 200)?;
+            let description = super::within("description", "a task's description", ps(p, "description").unwrap_or(""), 2000)?;
+            // The successful runs in the history left out for a tool that isn't available.
+            let mut unavailable = 0;
             let steps: Vec<TaskStep> = match p.get("steps") {
-                Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("steps: {e}"))?,
+                Some(v) => {
+                    let steps: Vec<TaskStep> = serde_json::from_value(v.clone()).map_err(|e| format!("steps: {e}"))?;
+                    super::at_most("steps", "a task", &steps, MAX_TASK_STEPS)?;
+                    steps
+                }
                 // A task can replay the geoprocessing history, one step per successful run.
-                None if b(p, "fromHistory").unwrap_or(false) => s
-                    .project
-                    .gp_history
-                    .iter()
-                    .filter(|r| r.ok)
-                    .filter_map(|r| {
-                        let tool = super::gp::tool_id(&r.tool)?;
-                        Some(TaskStep { title: r.tool.clone(), instructions: r.messages.first().cloned().unwrap_or_default(), command: "gp.run".into(), params: json!({"tool": tool, "params": r.params}) })
-                    })
-                    .collect(),
+                None if b(p, "fromHistory").unwrap_or(false) => {
+                    let mut steps = Vec::new();
+                    for r in s.project.gp_history.iter().filter(|r| r.ok) {
+                        match super::gp::tool_id(&r.tool) {
+                            Some(tool) => steps.push(TaskStep { title: r.tool.clone(), instructions: r.messages.first().cloned().unwrap_or_default(), command: "gp.run".into(), params: json!({"tool": tool, "params": r.params}) }),
+                            None => unavailable += 1,
+                        }
+                    }
+                    steps
+                }
                 None => Vec::new(),
             };
             for st in &steps {
@@ -262,14 +275,36 @@ pub fn commands() -> Vec<C> {
                     return Err(format!("step '{}' runs an unknown command '{}'", st.title, st.command));
                 }
             }
-            let mut name = name.chars().take(200).collect::<String>();
+            // A task from the history leaves out the runs it can't replay, and keeps its first
+            // runs when there are more than a task takes; each is said, with its count.
+            if unavailable > 0 {
+                let said = if unavailable == 1 {
+                    "1 successful run in the history uses a tool that isn't available, so it's left out".to_string()
+                } else {
+                    format!("{unavailable} successful runs in the history use a tool that isn't available, so they're left out")
+                };
+                s.notify(format!("{name}: {said}"), false);
+            }
+            let mut steps = steps;
+            if steps.len() > MAX_TASK_STEPS {
+                s.notify(format!("{name}: the task takes the first {MAX_TASK_STEPS} of the {} successful runs it can replay from the history", steps.len()), false);
+                steps.truncate(MAX_TASK_STEPS);
+            }
+            let mut name = name;
             let base = name.clone();
             let mut i = 1;
             while s.project.tasks.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
                 i += 1;
-                name = format!("{base} {i}");
+                // The suffix that tells it apart fits within the name's 200 characters: the name
+                // given gives way to it, and that is said.
+                let suffix = format!(" {i}");
+                name = base.chars().take(200 - suffix.chars().count()).chain(suffix.chars()).collect();
             }
-            s.project.tasks.push(Task { name: name.clone(), description: ps(p, "description").unwrap_or("").chars().take(2000).collect(), steps: steps.into_iter().take(200).collect() });
+            let kept = name.chars().count() - if i > 1 { format!(" {i}").chars().count() } else { 0 };
+            if kept < base.chars().count() {
+                s.notify(format!("New Task: a task has that name already, so the name given is cut to {kept} characters to fit \" {i}\""), false);
+            }
+            s.project.tasks.push(Task { name: name.clone(), description, steps });
             Ok(json!({"task": name}))
         }).roles(&[crate::ParamRole { key: "steps", role: crate::Role::TaskSteps }]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name"?: string, "description"?: string, "steps"?: [{"title", "instructions"?, "command": id, "params"?: {}}], "fromHistory"?: bool (one step per geoprocessing run), "imported"?: bool (from a file: its steps may not touch files)}"#),
@@ -293,6 +328,8 @@ pub fn commands() -> Vec<C> {
             if title.is_some_and(|t| t.trim().is_empty()) {
                 return Err("a step needs a title".into());
             }
+            let title = title.map(|t| super::within("title", "a step's title", t.trim(), 200)).transpose()?;
+            let instructions = instructions.map(|t| super::within("instructions", "a step's instructions", t, 4000)).transpose()?;
             if title.is_none() && instructions.is_none() {
                 return Err("title or instructions is required".into());
             }
@@ -300,8 +337,8 @@ pub fn commands() -> Vec<C> {
             let t = task_mut(s, p)?;
             let n = t.steps.len();
             let st = t.steps.get_mut(step).ok_or_else(|| format!("{} has {n} steps", t.name))?;
-            let title = title.map_or_else(|| st.title.clone(), |t| t.trim().chars().take(200).collect());
-            let instructions = instructions.map_or_else(|| st.instructions.clone(), |t| t.chars().take(4000).collect());
+            let title = title.unwrap_or_else(|| st.title.clone());
+            let instructions = instructions.unwrap_or_else(|| st.instructions.clone());
             // Changing nothing would still leave an undo step.
             if title == st.title && instructions == st.instructions {
                 return Err(format!("step {step} already reads so"));
@@ -1577,7 +1614,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             s.project.ensure_imports_complete()?;
             let (mut t, TemplateLosses { label_moves, offline_areas, archived_edits, source_references }) = template(&s.project);
             if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
-                t.name = n.chars().take(200).collect();
+                t.name = super::within("name", "a template's name", n, 200)?;
             }
             let name = t.name.clone();
             let bytes = durable_bytes(s, t)?;
