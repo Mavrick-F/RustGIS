@@ -266,12 +266,20 @@ fn band_math_on(threads: Option<usize>, r: &Raster, expr: &str) -> Result<Vec<f3
     Ok(out)
 }
 
+/// A remap's cells, and notices for ranges that can match nothing and a result with no values.
+pub struct Remap {
+    pub cells: Vec<f32>,
+    pub messages: Vec<String>,
+}
+
 /// Remaps value ranges `[lo, hi)` to new values; other values become no-data unless `keep`.
-pub fn remap(r: &Raster, b: usize, ranges: &[(f64, f64, f64)], keep: bool) -> Result<Vec<f32>, String> {
+/// Its notices name ranges whose low end isn't below the high end, which match nothing (saved
+/// scripts and models rely on what a range matches), and a result with no values.
+pub fn remap(r: &Raster, b: usize, ranges: &[(f64, f64, f64)], keep: bool) -> Result<Remap, String> {
     let d = band(r, b)?;
     let n = r.width as usize * r.height as usize;
     // A lookup in the ranges: about a unit a cell.
-    per_index(
+    let cells = per_index(
         n,
         r.width as usize,
         1,
@@ -285,7 +293,33 @@ pub fn remap(r: &Raster, b: usize, ranges: &[(f64, f64, f64)], keep: bool) -> Re
                 None => NODATA,
             }
         },
-    )
+    )?;
+    let mut messages = Vec::new();
+    let empty: Vec<_> = ranges.iter().filter(|(lo, hi, _)| lo >= hi).collect();
+    if let Some((lo, _, _)) = empty.first() {
+        let listed: Vec<_> = empty.iter().map(|(lo, hi, _)| format!("[{lo}, {hi}]")).collect();
+        let what = if empty.len() == 1 { "1 remap range matches".to_string() } else { format!("{} remap ranges match", empty.len()) };
+        // A class code is the usual reason for equal ends: show the range that picks it.
+        let pick = if lo.fract() == 0.0 { format!(", so [{lo}, {}] picks {lo}", lo + 1.0) } else { String::new() };
+        messages.push(format!(
+            "{}: {what} nothing ({}): a range takes values from its low end up to, but not including, its high end{pick}",
+            r.name,
+            listed.join(", ")
+        ));
+    }
+    // Check by row so an entirely empty large result still responds to Cancel.
+    let mut valid = false;
+    for row in cells.chunks((r.width as usize).max(1)) {
+        crate::control::check()?;
+        if row.iter().any(|v| v.is_finite() && *v != NODATA) {
+            valid = true;
+            break;
+        }
+    }
+    if !valid {
+        messages.push(format!("{}: the remap left no cells with values (all {} are no data)", r.name, cells.len()));
+    }
+    Ok(Remap { cells, messages })
 }
 
 /// `band`'s values resampled (nearest neighbour) onto `target`'s grid, through longitude/latitude.
@@ -2026,7 +2060,7 @@ mod tests {
         let ranges = [(0.0, 50.0, 1.0), (50.0, 100.0, 2.0)];
         let passes = |r: &Raster| -> Vec<Result<usize, String>> {
             vec![
-                remap(r, 0, &ranges, false).map(|v| v.len()),
+                remap(r, 0, &ranges, false).map(|v| v.cells.len()),
                 weighted_overlay(&[(r.bands[0].data.clone(), 1.0)]).map(|v| v.len()),
                 classify_min_distance(r, &[0, 1], &means).map(|v| v.len()),
                 class_means(r, &[0, 1], &polygons).map(|c| c.len()),
@@ -2587,7 +2621,7 @@ mod tests {
         let m = band_math(&r, "(b1 - b2) / (b1 + b2 + 1) * 2").unwrap_or_default();
         assert!((m[20 + 3] - ((30.0 - 1.0) / 32.0 * 2.0)).abs() < 1e-5);
         assert!(band_math(&r, "b3 + 1").is_err() && band_math(&r, "(b1").is_err() && band_math(&r, "b1 $ 2").is_err());
-        let rm = remap(&r, 0, &[(0.0, 100.0, 1.0), (100.0, 1000.0, 2.0)], false).unwrap_or_default();
+        let rm = remap(&r, 0, &[(0.0, 100.0, 1.0), (100.0, 1000.0, 2.0)], false).unwrap().cells;
         assert_eq!((rm[5], rm[15]), (1.0, 2.0));
         let o = weighted_overlay(&[(rm.clone(), 3.0), (vec![1.0; 400], 1.0)]).unwrap_or_default();
         assert!((o[15] - 1.75).abs() < 1e-6);

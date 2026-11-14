@@ -11458,6 +11458,76 @@ fn the_graticule_takes_a_type_and_a_measured_grids_system() {
     assert!(!text.contains("graticule_type") && !text.contains("graticule_crs"));
 }
 
+/// Empty/reversed ranges remain half-open, say which ranges cannot match, and report an
+/// all-no-data result through every shared command path, including background completion.
+#[test]
+fn remap_reports_empty_ranges_and_no_valid_cells() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let mut s = Session::new(Project::default());
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.1, pixel_height: -0.1 };
+    let r = Raster::new("classes", 3, 1, vec![vec![20.0, 21.0, 22.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    let bytes = geotiff::write(&r, 0).unwrap();
+    crate::cmd::raster::add_raster(&mut s, "classes", rustgis_map::RasterLayer::from_bytes(r, "classes.tif", bytes)).unwrap();
+    for background in [false, true] {
+        if background && cfg!(target_arch = "wasm32") {
+            continue;
+        }
+        for command in ["raster.function", "raster.functionChain", "analysis.suitability"] {
+            for (ranges, keep, expected, notices) in [
+                (json!([[21, 21, 1], [23, 22, 2]]), false, vec![None, None, None], 2),
+                (json!([[21, 21, 1]]), true, vec![Some(20.0), Some(21.0), Some(22.0)], 1),
+                (json!([[21, 22, 1]]), false, vec![None, Some(1.0), None], 0),
+                (json!([[30, 31, 1]]), false, vec![None, None, None], 1),
+            ] {
+                // Suitability always discards unmatched cells; it has no keep parameter.
+                if keep && command == "analysis.suitability" {
+                    continue;
+                }
+                let step = json!({"function": "remap", "ranges": ranges, "keep": keep});
+                let mut p = match command {
+                    "raster.functionChain" => json!({"layer": "classes", "steps": [step]}),
+                    "analysis.suitability" => json!({"criteria": [{"layer": "classes", "ranges": ranges, "weight": 1}]}),
+                    _ => {
+                        let mut p = step;
+                        p["layer"] = json!("classes");
+                        p
+                    }
+                };
+                let mark = s.notice_mark();
+                #[cfg(not(target_arch = "wasm32"))]
+                if background {
+                    use crate::cmd::workflows::{raster_land, raster_start};
+                    let run = raster_start(&mut s, command, &p).unwrap();
+                    let id = run.id;
+                    let made = std::thread::spawn(move || run.run(&rustgis_analysis::control::Control::new())).join().unwrap().unwrap();
+                    assert_eq!(raster_land(&mut s, id, made), Ok(true));
+                    assert!(s.notices_since(mark).is_empty(), "delivered only when the result is added");
+                    p["ran"] = json!(id);
+                }
+                let result = s.run(command, &p).unwrap();
+                let layer = s.map().layer(result["layer"].as_u64().unwrap() as u32).unwrap();
+                let r = layer.raster.as_ref().unwrap().data.as_ref().unwrap();
+                let got: Vec<_> = r.bands[0].data.iter().map(|v| r.is_valid(*v).then_some(*v)).collect();
+                assert_eq!(got, expected, "{command}, background={background}, {ranges}");
+                let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+                assert_eq!(said.len(), notices, "{command}: {said:?}");
+                if ranges[0][0] == ranges[0][1] {
+                    assert!(said[0].contains("classes:"), "{said:?}");
+                    assert!(said[0].contains("up to, but not including, its high end, so [21, 22] picks 21"), "{said:?}");
+                    if ranges.as_array().unwrap().len() == 2 {
+                        assert!(said[0].contains("2 remap ranges match nothing ([21, 21], [23, 22])"), "{said:?}");
+                    } else {
+                        assert!(said[0].contains("1 remap range matches nothing ([21, 21])"), "{said:?}");
+                    }
+                }
+                if expected.iter().all(Option::is_none) {
+                    assert!(said.last().unwrap().contains("the remap left no cells with values (all 3 are no data)"), "{said:?}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn analysis_workflows_models_scripts_and_raster_functions() {
     let mut s = world();

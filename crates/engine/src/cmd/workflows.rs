@@ -52,12 +52,12 @@ pub fn commands() -> Vec<C> {
         C::new("script.run", "Run Script", "Analyze › Geoprocessing", run_script).roles(&[crate::ParamRole { key: "script", role: crate::Role::Script }]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Automation))
             .params(r#"{"script": "one command per line: id {json}; # comments"}"#),
         C::new("raster.function", "Raster Functions", "Analyze › Raster", raster_function).inputs(function_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample", "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]], "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
+            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample", "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]] (lo inclusive, hi exclusive; [21, 22, 1] maps integer class 21 to 1), "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("raster.functionChain", "Function Editor", "Analyze › Raster", function_chain).inputs(chain_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"layer": raster, "steps": [{"function", …}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
         C::new("analysis.suitability", "Suitability Modeler", "Analyze › Workflows", suitability).inputs(suitability_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]], "weight": number}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
+            r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]] (lo inclusive, hi exclusive; [21, 22, 1] scores integer class 21 as 1), "weight": number}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("analysis.viewshed", "Visibility Analysis", "Analyze › Workflows", viewshed).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"layer": elevation raster, "lon", "lat", "band"?: 1-based, "height"?: observer metres, 0 to 10,000 (default 1.7), "radius"?: metres (default: the whole raster), "heights"?: "nearest" (default) | "bilinear" (the ground along each ray), "name"?: output, "ran"?: (internal: a viewshed the app has worked out)}"#),
@@ -178,6 +178,20 @@ pub(crate) fn add_made(s: &mut Session, m: Made) -> CmdResult {
         then(s, &mut v);
     }
     Ok(v)
+}
+
+/// Delivers shared raster-operation diagnostics only when the successful result is added.
+fn notify_messages(messages: Vec<String>) -> Then {
+    Box::new(move |s, _| {
+        for message in messages {
+            s.notify(message, false);
+        }
+    })
+}
+
+/// Embeds a raster and carries its diagnostics across background completion to the session.
+fn made_with_messages(raster: Raster, messages: Vec<String>) -> Result<Made, String> {
+    made_then(raster, None, Some(notify_messages(messages)))
 }
 
 /// What a command that makes its raster on another thread reads of the session, and the work
@@ -1036,8 +1050,8 @@ pub fn script_commands(script: &str) -> Result<Vec<(usize, String, Value)>, Stri
 }
 
 /// One raster function's output pixels on `r`'s grid, or a resample's on `target`'s (from
-/// [`resample_target`]).
-fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>) -> Result<Vec<f32>, String> {
+/// [`resample_target`]). Remap diagnostics are collected for delivery when the result is added.
+fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>, messages: &mut Vec<String>) -> Result<Vec<f32>, String> {
     let band = band_of(p, r)?;
     let zf = f(p, "zFactor").unwrap_or(1.0).clamp(0.0001, 100_000.0);
     match ps(p, "function").ok_or("function is required")? {
@@ -1070,7 +1084,9 @@ fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>) -> Result<Vec<
                     })
                     .collect::<Result<_, _>>()?
             };
-            rasterops::remap(r, band, &ranges, b(p, "keep").unwrap_or(false))
+            let remap = rasterops::remap(r, band, &ranges, b(p, "keep").unwrap_or(false))?;
+            messages.extend(remap.messages);
+            Ok(remap.cells)
         }
         "resample" => rasterops::resample_to(r, band, target.ok_or("target (a raster to match) is required")?),
         other => Err(format!("unknown raster function '{other}'")),
@@ -1106,12 +1122,13 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
         super::settle_bool(&mut p, "keep");
     }
     Ok(Box::new(move || {
-        let pixels = apply_function(&src, &p, target.as_deref())?;
+        let mut messages = Vec::new();
+        let pixels = apply_function(&src, &p, target.as_deref(), &mut messages)?;
         if is_hillshade(&p) {
             return made_hillshade(rasterops::derive_hillshade(&src, &name, pixels)?, &defaults);
         }
         // Only a resample takes another raster's grid.
-        made(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, None)
+        made_with_messages(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, messages)
     }))
 }
 
@@ -1161,9 +1178,10 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
     Ok(Box::new(move || {
         let mut cur: Raster = (*src).clone();
         let mut names = Vec::new();
+        let mut messages = Vec::new();
         for (i, (st, target)) in steps.iter().zip(&targets).enumerate() {
             let f = func(st);
-            let pixels = apply_function(&cur, st, target.as_deref()).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
+            let pixels = apply_function(&cur, st, target.as_deref(), &mut messages).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             // Only a resample takes another raster's grid; otherwise the grid is the current one.
             cur = if is_hillshade(st) {
                 rasterops::derive_hillshade(&cur, &cur.name, pixels)?
@@ -1174,10 +1192,12 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
         }
         cur.name = named.unwrap_or_else(|| format!("{}_{}", cur.name, names.join("_")));
         // A chain that ends in a hillshade is drawn as one.
-        match steps.last() {
-            Some(last) if is_hillshade(last) => made_hillshade(cur, &defaults),
-            _ => made(cur, None),
-        }
+        let mut m = match steps.last() {
+            Some(last) if is_hillshade(last) => made_hillshade(cur, &defaults)?,
+            _ => made(cur, None)?,
+        };
+        m.then = Some(notify_messages(messages));
+        Ok(m)
     }))
 }
 
@@ -1215,13 +1235,16 @@ fn suitability_work(s: &Session, p: &Value) -> Result<Work, String> {
     let name = out_name(p, "Suitability".into());
     Ok(Box::new(move || {
         let mut scored = Vec::new();
+        let mut messages = Vec::new();
         for (r, band, ranges, weight) in &criteria {
             let on_grid = rasterops::resample_to(r, *band, &first)?;
-            let grid = rasterops::derive(&first, "c", vec![on_grid])?;
-            scored.push((rasterops::remap(&grid, 0, ranges, false)?, *weight));
+            let grid = rasterops::derive(&first, &r.name, vec![on_grid])?;
+            let remap = rasterops::remap(&grid, 0, ranges, false)?;
+            messages.extend(remap.messages);
+            scored.push((remap.cells, *weight));
         }
         let out = rasterops::weighted_overlay(&scored)?;
-        made(rasterops::derive(&first, &name, vec![out])?, None)
+        made_with_messages(rasterops::derive(&first, &name, vec![out])?, messages)
     }))
 }
 
