@@ -748,6 +748,26 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
             let _ = std::fs::remove_file(path.with_extension(extension));
         }
     }
+    // Every part is renamed within `path`'s folder.
+    sync_folder(path)?;
+    Ok(())
+}
+
+/// Makes a rename into `path`'s folder survive a power cut: on Linux and macOS a synced file can
+/// still come back under its old name until the folder itself is synced. Called after the rename,
+/// so an error means the new file is in place but may not yet be on disk. Windows can't open a
+/// folder this way without unsafe code, so there NTFS's own journal decides when it lands; the
+/// browser has no folders to sync.
+pub(crate) fn sync_folder(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let folder = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::File::open(folder).and_then(|f| f.sync_all()).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("{} was written, but its folder couldn't be synced to disk: {e}", path.display()))
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -892,6 +912,7 @@ fn atomic_write_at<T, E: From<std::io::Error>>(
     }
     std::fs::rename(&tmp, path)?;
     std::mem::forget(staged);
+    sync_folder(path)?;
     Ok(value)
 }
 
