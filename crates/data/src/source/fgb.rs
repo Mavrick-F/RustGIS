@@ -20,6 +20,15 @@ use std::sync::Arc;
 
 mod checked;
 
+/// The header's known feature count, without scanning date columns or decoding features.
+/// GDAL conversions use it to report features lost before RustGIS reads the converted file.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn header_feature_count(path: &Path) -> Result<Option<u64>> {
+    let reader = open_reader(BufReader::new(std::fs::File::open(path)?))?;
+    let count = reader.header().features_count();
+    Ok((count > 0).then_some(count))
+}
+
 /// A file or an upload, read and seeked.
 trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
