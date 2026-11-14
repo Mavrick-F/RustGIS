@@ -689,6 +689,7 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
         copy.view_size = view_size;
         copy.active_layer = active_layer;
         copy.opened = opened;
+        copy.sync_policy_generation();
         copy.tools_ahead = Some(super::gp::Ahead::Recording(Vec::new()));
         copy.files_ahead = Some(super::gp::FilesAhead::Recording(Vec::new()));
         copy.zones_ahead = Some(super::imagery::ZonesAhead::Recording(Vec::new()));

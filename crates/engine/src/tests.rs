@@ -42368,6 +42368,9 @@ fn a_scripts_tools_run_ahead_are_taken_by_its_run() {
     // Table writes keep their worker rows, so the following tool is taken as well. A table
     // write and both tools remain one script undo step.
     let mut s = session();
+    let text = serde_json::to_string(&s.project).unwrap();
+    s.run("project.openText", &json!({"text": text})).unwrap();
+    assert_ne!(s.opened, 0, "the worker must preserve an actual project opening and its policy epoch");
     s.run("layer.addDataText", &json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
     s.run("edit.enable", &json!({"on": true})).unwrap();
     let depth = s.undo_depth();
