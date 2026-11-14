@@ -126,11 +126,18 @@ impl Monitor {
     /// Forgets what `target` was read with, so the first readable scan numbered `next_scan` or
     /// later is its baseline: its data was brought in step with its file some other way, and a
     /// scan already under way may have looked before that. `true`, as a scan is then wanted.
+    /// An earlier publish's acknowledgment still pending for it no longer applies: what it wrote
+    /// was replaced.
     pub(crate) fn rebaseline(&mut self, target: &Target, next_scan: u64) -> bool {
         if let Some(t) = self.targets.get_mut(target) {
             t.baseline = None;
             t.dismissed = None;
             t.from_scan = next_scan;
+            if let Some(source) = self.sources.get_mut(&t.key)
+                && source.verified.as_ref() == Some(target)
+            {
+                source.verified = None;
+            }
         }
         true
     }
@@ -1284,6 +1291,21 @@ mod tests {
     }
 
     #[test]
+    fn a_rebaseline_drops_an_earlier_publish_still_to_be_acknowledged() {
+        let [v0, v1, v2] = observations(3).try_into().unwrap();
+        let (mut m, scan) = monitor(&v0);
+        // Published in the app (v0 to v1), then again through the session alone (v2) before any
+        // scan acknowledged the first.
+        m.wrote("b", v0.clone(), v1.clone(), HashSet::new(), Some(&layer(3)), scan);
+        m.verified("b", &layer(3));
+        m.rebaseline(&layer(3), scan);
+        for next in [scan, scan + 1] {
+            m.observed("b", v2.clone(), next);
+        }
+        assert_eq!(m.status(&layer(3)), Status::Unchanged, "the second publish's file is the baseline");
+    }
+
+    #[test]
     fn two_tile_layers_on_one_archive_are_separate_targets() {
         use rustgis_engine::map::{Map, TileKind, TileLayer};
         let path = std::env::temp_dir().join("rustgis-diskwatch-same.pmtiles").display().to_string();
@@ -1557,6 +1579,29 @@ mod tests {
         app.session.run("source.publish", &json!({"layer": id})).unwrap();
         scan(&mut app, &ctx, 3);
         assert_eq!(status_of(&app, id), Status::Unchanged, "the new record says the file was published");
+    }
+
+    #[test]
+    fn a_scan_left_unread_across_a_session_publish_does_not_become_the_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id, _) = published_layer(dir.path());
+        let ctx = egui::Context::default();
+        scan(&mut app, &ctx, 2);
+        // A scan looks at the file as it is, and its answer waits, untaken.
+        app.diskwatch.wanted = true;
+        tick(&mut app, &ctx);
+        let slot = app.diskwatch.scan.as_ref().map(|(_, slot, _)| slot.clone()).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while slot.lock().unwrap().is_none() {
+            assert!(std::time::Instant::now() < end, "the scan never answered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Published through the session alone, then that old answer lands with later scans.
+        app.session.run("edit.enable", &json!({"on": true})).unwrap();
+        app.session.run("edit.setValue", &json!({"layer": id, "row": 0, "field": "owner", "value": "Jones"})).unwrap();
+        app.session.run("source.publish", &json!({"layer": id})).unwrap();
+        scan(&mut app, &ctx, 3);
+        assert_eq!(status_of(&app, id), Status::Unchanged, "the answer from before the publish isn't the baseline");
     }
 
     #[test]
