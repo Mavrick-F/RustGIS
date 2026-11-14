@@ -52,7 +52,11 @@ fuzz_target!(|data: &[u8]| {
     // Where clauses: the input as a quoted literal (quotes doubled) and as a whole clause, over a
     // date field and a date-time field.
     let mut ds = Dataset::new("t", GeometryType::None, vec![Field::new("d", FieldType::Date), Field::new("ts", FieldType::DateTime)]);
-    for (d, t) in [("2026-01-01", "2026-03-05T09:00:00+02:00"), ("0001-01-01", "9999-12-31T23:59:59.999999Z"), ("9999-12-31", "0001-01-01T00:00:00-18:00")] {
+    for (d, t) in [
+        ("2026-01-01", "2026-03-05T09:00:00+02:00"),
+        ("0001-01-01", "9999-12-31T23:59:59.999999Z"),
+        ("9999-12-31", "0001-01-01T00:00:00-18:00"),
+    ] {
         ds.push(None, vec![Value::parse(d, FieldType::Date), Value::parse(t, FieldType::DateTime)]);
     }
     ds.push(None, vec![Value::Null, Value::Null]);

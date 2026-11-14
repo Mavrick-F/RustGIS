@@ -1,6 +1,7 @@
 //! Writes the seed corpus into `corpus/<target>/`: well-formed files made by RustGIS's own writers
-//! from the sample project's layers, so fuzzing starts from real files rather than guessing each
-//! format's magic bytes. The repository commits no data files; run this before fuzzing:
+//! from the sample project's layers and a layer of dates built here, so fuzzing starts from real
+//! files rather than guessing each format's magic bytes. The repository commits no data files; run
+//! this before fuzzing:
 //!
 //! ```sh
 //! cargo run --release --bin seeds
@@ -122,7 +123,7 @@ fn dated() -> Dataset {
 fn layers() -> Result<(Project, Vec<Dataset>)> {
     let mut s = Session::new(Project::new("seeds"));
     s.run("project.sample", &serde_json::Value::Null)?;
-    let layers = s
+    let mut layers: Vec<Dataset> = s
         .map()
         .layers
         .iter()
@@ -132,7 +133,6 @@ fn layers() -> Result<(Project, Vec<Dataset>)> {
             ds
         })
         .collect();
-    let mut layers: Vec<Dataset> = layers;
     layers.push(dated());
     Ok((s.project.clone(), layers))
 }
@@ -311,9 +311,7 @@ fn main() -> Result<()> {
     }
     seed(&dir, &mut n, serde_json::to_string(&small).map_err(|e| e.to_string())?.as_bytes())?;
     // A project whose first layer holds dates.
-    if let Some(layer) = small.map_mut().layers.first_mut() {
-        layer.dataset = dated();
-    }
+    small.map_mut().layers.first_mut().ok_or_else(|| "the sample project has no layers".to_string())?.dataset = dated();
     seed(&dir, &mut n, serde_json::to_string(&small).map_err(|e| e.to_string())?.as_bytes())?;
     seed(&dir, &mut n, serde_json::to_string(&Project::new("empty")).map_err(|e| e.to_string())?.as_bytes())?;
 
