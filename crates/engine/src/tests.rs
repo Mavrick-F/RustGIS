@@ -4456,6 +4456,67 @@ fn shaded_relief_keeps_its_fill_light() {
     assert_eq!(fill(&t), 0.45, "back when opened");
 }
 
+/// Shaded Relief's rock on steep slopes (#1913): an object turns it on, its missing keys from the
+/// current rock or the defaults; kept when left out; `false` removes it; a `from` not below `to`
+/// or a bad colour is refused; saved with the project only when set.
+#[test]
+fn shaded_relief_keeps_its_rock_on_steep_slopes() {
+    use rustgis_map::raster::Rock;
+    let mut s = with_raster();
+    let rock = |s: &Session| match s.map().layers.first().and_then(|l| l.raster.as_ref()).map(|r| &r.style.renderer) {
+        Some(rustgis_map::RasterRenderer::ShadedRelief { rock, .. }) => *rock,
+        other => panic!("{other:?}"),
+    };
+    let rocks_saved = |s: &mut Session| s.project.saved_text(None).unwrap().0.matches("\"rock\"").count();
+    s.run("raster.symbology", &json!({"type": "shadedRelief"})).unwrap();
+    assert_eq!(rock(&s), None, "off by default");
+    let before = rocks_saved(&mut s);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "rock": {}})).unwrap();
+    assert_eq!(rock(&s), Some(Rock::DEFAULT));
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "rock": {"to": 50, "color": "#806040"}})).unwrap();
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "azimuth": 200})).unwrap();
+    let want = Rock { from: 25.0, to: 50.0, color: rustgis_map::Rgba::rgb(0x80, 0x60, 0x40) };
+    assert_eq!(rock(&s), Some(want), "left out, kept; its missing keys too");
+    assert_eq!(rocks_saved(&mut s), before + 1, "saved when set");
+    for bad in
+        [json!({"from": 40, "to": 30}), json!({"from": 30, "to": 30}), json!({"color": "rock"}), json!({"color": "#B2ACA480"}), json!(3)]
+    {
+        assert!(s.run("raster.symbology", &json!({"type": "shadedRelief", "rock": bad})).is_err(), "{bad}");
+        assert_eq!(rock(&s), Some(want), "{bad}: refused, the rock kept");
+    }
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "rock": false})).unwrap();
+    assert_eq!(rock(&s), None);
+    assert_eq!(rocks_saved(&mut s), before, "not saved once removed");
+}
+
+/// An export draws the rock on steep slopes: a grey relief whose east half is a 63° wall turns
+/// red there with a red rock, and keeps the same pixels on the flat west half.
+#[test]
+fn an_export_draws_the_rock_on_steep_slopes() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let mut s = world();
+    // 41 cells of 30 m a side: flat to column 20, then rising 60 m a cell eastward.
+    let wall: Vec<f32> = (0..41 * 41).map(|i| ((i % 41 - 20).max(0) * 60) as f32).collect();
+    let gt = GeoTransform { origin_x: 500_000.0, origin_y: 7_000_000.0, pixel_width: 30.0, pixel_height: -30.0 };
+    let r = Raster::new("wall", 41, 41, vec![wall], gt, Crs::from_epsg(31983).unwrap(), None, ColorHint::Gray, "Float32").unwrap();
+    let bytes = geotiff::write(&r, 0).unwrap();
+    crate::cmd::raster::add_raster(&mut s, "wall", rustgis_map::RasterLayer::from_bytes(r, "wall.tif".to_string(), bytes)).unwrap();
+    s.run("layer.zoomTo", &json!({"layer": "wall"})).unwrap();
+    let drawn = |s: &mut Session, rock: Value| {
+        s.run("raster.symbology", &json!({"layer": "wall", "type": "shadedRelief", "grey": true, "azimuth": 270, "rock": rock})).unwrap();
+        let png = crate::cmd::share::map_png(s, Some(200.0), Some(200.0), None).unwrap();
+        crate::render::decode_png(&png).unwrap()
+    };
+    let plain = drawn(&mut s, json!(false));
+    let rocky = drawn(&mut s, json!({"from": 10, "to": 20, "color": "#FF0000"}));
+    let px = |p: &tiny_skia::Pixmap, x: u32| p.pixel(x, 100).map(|c| [c.red(), c.green(), c.blue()]).unwrap();
+    // The flat west half: the same grey. The wall: grey without the rock, red with it.
+    assert_eq!(px(&rocky, 70), px(&plain, 70));
+    let ([r0, g0, b0], [r1, g1, b1]) = (px(&plain, 130), px(&rocky, 130));
+    assert!(r0 == g0 && g0 == b0 && r0 > 0, "a grey wall: {:?}", [r0, g0, b0]);
+    assert!(r1 > 0 && g1 == 0 && b1 == 0, "a red wall: {:?}", [r1, g1, b1]);
+}
+
 /// An export draws the sky a pit hides: its floor darker with `sky` 1 than with 0, the ground
 /// around it (which sees the whole sky) the same. The first export with the sky, from a cold
 /// cache, waits for the grid: it is the same image as one drawn once the grid is kept.
