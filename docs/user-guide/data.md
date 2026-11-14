@@ -95,10 +95,14 @@ FlatGeobuf, FileGDB, workbook date cells and GPX timestamps. Ordinary spreadshee
 looks like a date stays text. A workbook column mixing date cells with ordinary text is read
 entirely as text; clean that column in the workbook before using date operations.
 Invalid dates become empty values with a notice naming the fields
-and counting the values; dates cover years 1–9999. Fractional seconds are kept to microseconds.
-Floating-point serial dates in workbooks and FileGDB are rounded to the nearest microsecond,
-with a notice when rounding is needed. Parquet timestamps with finer nonzero precision are
-read as empty with a notice. Times without a day stay text; Parquet clocks retain `Z` when declared UTC.
+and counting the values; dates cover years 1–9999. Fractional seconds are kept to microseconds:
+digits past the sixth (nanosecond timestamps in Parquet, text read from a GeoPackage or FlatGeobuf, or
+converted by Convert Field) are rounded to the nearest microsecond, and a read says how many values it
+rounded and in which fields. Text typed in, kept in a project, read from GPX or compared in a
+where clause isn't rounded: with more digits than that it isn't a date. Floating-point serial dates in workbooks and FileGDB are rounded
+the same way, with a notice when rounding is needed. A workbook's 1900-02-29 (serial 60, a day
+that never existed) is read as empty and counted, in a column of dates or any other.
+Times without a day stay text; Parquet clocks retain `Z` when declared UTC.
 
 GeoParquet exports use native dates and microsecond timestamps. Zoned date-times are written
 as UTC instants, with a notice when their displayed offsets change; unzoned times stay unzoned.
@@ -111,7 +115,8 @@ again to use its current schema; the saved fields are kept unchanged. Saved GeoP
 again. Their saved fields, filters and styles are kept unchanged rather than partially migrated. An old integer field that
 now reads as time-only text is refused in the same way.
 FlatGeobuf exports use its native DateTime column type for both dates and date-times. Local
-files are scanned to distinguish date-only columns, date-times and time-only text. Reopening
+files are scanned to distinguish date-only columns, date-times and time-only text. With no value
+to scan, a date field comes back as a date-time field, and the export says which fields. Reopening
 a saved desktop layer runs that scan off the window thread, with progress and Cancel in the
 status bar. Remote
 FlatGeobuf date/time columns stay ISO text with a notice so opening them can keep reading by
@@ -281,8 +286,8 @@ WHERE bbox.xmin BETWEEN -83.95 AND -83.89 AND bbox.ymin BETWEEN 35.94 AND 35.98
 
 The first geometry column becomes the layer's geometry; other columns become its attributes (types
 RustGIS doesn't read, such as lists, as text). `DATE` columns become dates, `TIMESTAMP` columns
-date-times without a zone and `TIMESTAMPTZ` columns instants in UTC; a `TIMESTAMP_NS` stays text,
-which keeps its nanoseconds. A geometry that says its coordinate system
+date-times without a zone and `TIMESTAMPTZ` columns instants in UTC; a `TIMESTAMP_NS` is a
+date-time too, rounded to the microsecond, with a notice. A geometry that says its coordinate system
 is converted to longitude/latitude; give `"crs"` (such as `EPSG:2263`) for one that doesn't. A
 result mixing geometry types becomes a layer per type (points on top, polygons at the bottom), and
 rows without a geometry are left out.
@@ -433,8 +438,9 @@ trigger failure also rolls everything back; pending edits remain in the layer. N
 get source-assigned keys that cannot alias loaded rows, and unrelated columns and tables remain
 intact. The saved rows are read back within the transaction, so the layer keeps values assigned
 by defaults and triggers before it starts tracking its next edits. Dates are saved as a
-GeoPackage export writes them: a date-time with another offset than UTC's is saved in UTC, and a
-notice says so. A stored date that isn't one loads as empty, with a notice, and is left as it is
+GeoPackage export writes them: a date-time with another offset than UTC's is saved in UTC, and one
+with digits past the millisecond (a GeoPackage DATETIME holds milliseconds, `YYYY-MM-DDTHH:MM:SS.SSSZ`)
+is rounded to the nearest millisecond, and a notice says each. A stored date that isn't one loads as empty, with a notice, and is left as it is
 unless that value is edited. If a DELETE trigger recreates
 a target row, that stored row reappears in the layer and is not counted as deleted. If triggers
 change or remove other rows already loaded in the layer, those rows are refreshed or removed

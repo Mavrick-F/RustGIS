@@ -1649,16 +1649,18 @@ pub fn read_csv_with(text: &str, name: &str, opts: &CsvOptions) -> Result<(Datas
 }
 
 /// Rows of text cells under a header row (delimited text, a spreadsheet's sheet) as a dataset, as
-/// [`read_csv_with`] describes; `malformed` rows were already passed over. Workbook cell types
-/// may override text inference by source column, before removing the geometry column.
+/// [`read_csv_with`] describes; `malformed` rows were already passed over. A workbook gives its
+/// cell types, which may override text inference by source column, and the dates it already read
+/// as empty (the cells counted for each source column), before removing the geometry column.
 pub(crate) fn read_rows(
     headers: &[String],
     rows: &[Vec<String>],
     malformed: usize,
     name: &str,
     opts: &CsvOptions,
-    types: Option<&[Option<FieldType>]>,
+    workbook: Option<(&[Option<FieldType>], &[usize])>,
 ) -> Result<(Dataset, ReadReport)> {
+    let types = workbook.map(|(types, _)| types);
     let named = |n: &Option<String>, what: &str| -> Result<Option<usize>> {
         match n.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
             Some(n) => headers
@@ -1702,6 +1704,9 @@ pub(crate) fn read_rows(
     let mut ds = Dataset::new(name, gt, fields);
     let mut srid: Option<u32> = None;
     let mut unread_dates = Vec::new();
+    for (k, &i) in columns.iter().enumerate() {
+        crate::source::unread_dates_by(&mut unread_dates, k, workbook.and_then(|(_, empty)| empty.get(i)).copied().unwrap_or(0));
+    }
     let (mut bad_wkt, mut zm_rows) = (0usize, 0usize);
     for r in rows {
         crate::progress::step(1)?;
@@ -2360,6 +2365,8 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
     crate::dbf::floats_as_numeric(&mut parts.dbf);
     let dbf = shapefile::dbase::ReaderBuilder::new()
         .with_encoding(encoding.decoder())
+        // A date's year may be padded with spaces on the left (`   10101`): keep them.
+        .with_options(shapefile::dbase::ReadingOptions::default().character_trim(shapefile::dbase::TrimOption::End))
         .build(Cursor::new(parts.dbf))
         .map_err(|e| DataError::Format(format!("Shapefile: the .dbf: {e}")))?;
     // Field order comes from the .dbf header (records are unordered maps).
@@ -2697,6 +2704,37 @@ pub fn offset_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, 
     counts
 }
 
+/// Whether a value written to a date field of type `ty` has digits past the millisecond, which a
+/// GeoPackage's DATETIME doesn't keep (text that reads as a date-time counts as that).
+pub(crate) fn past_millisecond(v: &Value, ty: FieldType) -> bool {
+    let fine = |v: &Value| matches!(v, Value::DateTime(t) if t.micros().rem_euclid(1000) != 0);
+    fine(v) || matches!(v, Value::Text(t) if ty.is_temporal() && fine(&Value::parse_stored(t, ty)))
+}
+
+/// Counts, for each field, the date-times with digits past the millisecond, which a GeoPackage
+/// holds rounded to the millisecond.
+pub fn fine_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, fields: &[Field]) -> Vec<usize> {
+    let mut counts = vec![0usize; fields.len()];
+    for f in features {
+        for ((n, field), v) in counts.iter_mut().zip(fields).zip(&f.attrs) {
+            *n += usize::from(past_millisecond(v, field.ty));
+        }
+    }
+    counts
+}
+
+/// What a GeoPackage export to `target` says of the date-times it rounded to the millisecond
+/// ([`fine_dates`]). `None` when there were none.
+pub fn fine_dates_note(fields: &[Field], counts: &[usize], target: &str) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
+    Some(format!("{target}: {what} rounded to the millisecond, as GeoPackage stores them, in {}", named_fields(fields, counts)))
+}
+
 /// What a GeoPackage export to `target` says of the date-times it wrote in UTC ([`offset_dates`]).
 /// `None` when there were none.
 pub fn utc_dates_note(fields: &[Field], counts: &[usize], target: &str) -> Option<String> {
@@ -2709,6 +2747,36 @@ pub fn utc_dates_note(fields: &[Field], counts: &[usize], target: &str) -> Optio
     Some(format!(
         "{target}: {what} written in UTC, as GeoPackage stores them, without their own offsets, in {}",
         named_fields(fields, counts)
+    ))
+}
+
+/// Counts, for each field, the values a FlatGeobuf export writes: non-null ones of features that
+/// have geometry (the others aren't in the file).
+pub fn written_values<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, fields: &[Field]) -> Vec<usize> {
+    let mut counts = vec![0usize; fields.len()];
+    for f in features.into_iter().filter(|f| f.geometry.is_some()) {
+        for (n, v) in counts.iter_mut().zip(&f.attrs) {
+            *n += usize::from(!v.is_null());
+        }
+    }
+    counts
+}
+
+/// What a FlatGeobuf export to `target` says of its date fields with no values written
+/// ([`written_values`]): the format has no date type, so a reader tells dates from date-times by
+/// the values, and these come back as date-time fields. `None` when there were none.
+pub fn fgb_empty_dates_note(fields: &[Field], written: &[usize], target: &str) -> Option<String> {
+    let empty: Vec<usize> =
+        fields.iter().enumerate().map(|(i, f)| usize::from(f.ty == FieldType::Date && written.get(i).copied().unwrap_or(0) == 0)).collect();
+    let total: usize = empty.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let what = if total == 1 { "1 date field has".to_string() } else { format!("{total} date fields have") };
+    Some(format!(
+        "{target}: {what} no values, and FlatGeobuf can't tell a date from a date-time, so it reads back as a date-time field, in {}",
+        named_fields(fields, &empty)
     ))
 }
 
@@ -5047,7 +5115,7 @@ mod tests {
 
     /// A Shapefile's date fields are written as `.dbf` dates and read back as dates, whole and
     /// streamed; its date-times as text. A date that isn't one (`20260230`) is null and said, and
-    /// its shape is kept; a blank or zero date is just null.
+    /// its shape is kept; a blank or zero date is just null; a year padded with spaces is read.
     #[test]
     fn shapefile_dates_are_written_and_read_as_dates() {
         let fields = vec![Field::new("issued", FieldType::Date), Field::new("ts", FieldType::DateTime)];
@@ -5082,6 +5150,8 @@ mod tests {
         };
         replace(&mut table, b"19991231", b"20260230");
         replace(&mut table, b"20000101", b"00000000");
+        // GDAL pads a year below 1000 with spaces (`%4d%02d%02d`): still year 1.
+        replace(&mut table, b"00010101", b"   10101");
         std::fs::write(&dbf, table).unwrap();
         let whole = read_shapefile_in(&shp, "permits", None).unwrap();
         let streamed = crate::source::materialize(&crate::source::shp::ShpSource::open_path(&shp, "permits").unwrap()).unwrap();

@@ -2630,8 +2630,14 @@ fn add_source_with(
                 l.renderer = r;
             }
             ids.push(id);
+            // The source names itself by its file (a DuckDB result's cache file); the layer has the
+            // name the user knows.
+            let shown = s.map().layer(id).map_or_else(|| info.name.clone(), |l| l.name.clone());
             for m in report.messages {
-                s.notify(m, false);
+                match m.strip_prefix(&format!("{}: ", info.name)) {
+                    Some(rest) => s.notify(format!("{shown}: {rest}"), false),
+                    None => s.notify(m, false),
+                }
             }
         }
     }

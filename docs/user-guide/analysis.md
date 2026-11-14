@@ -42,7 +42,8 @@ A text column's menu also has **Convert to Date** and **Convert to Date and Time
 (`edit.convertField`, `"type"`: `date` or `datetime`): the field becomes a date field and each
 value is read as ISO 8601 (`2026-03-05`; `2026-03-05T14:30:00+02:00`, or with a space for the
 `T`). Text that isn't a date becomes empty, and a notice counts those rows and shows the first
-few; undo brings the text back. Use it for dates from CSV, GeoJSON or other files that hold them as
+few; undo brings the text back. Digits past the microsecond are rounded to it, and a notice counts
+those. A field with text and none of it a date is refused and stays text. Use it for dates from CSV, GeoJSON or other files that hold them as
 text. A field with a domain, subtypes or contingent values, or one a definition query or display
 filter would no longer read as dates (comparing it with a number), is refused.
 

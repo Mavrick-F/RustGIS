@@ -3406,7 +3406,7 @@ fn geopackage_dates_are_written_and_read_as_dates() {
     let (day, at) = (|d| Value::parse(d, FieldType::Date), |t| Value::parse(t, FieldType::DateTime));
     let rows = [
         [day("2026-03-05"), at("2026-03-05T14:30:00+02:00")],
-        [day("1999-12-31"), at("2026-03-05T14:30:00.000250")],
+        [day("1999-12-31"), at("2026-03-05T14:30:00.250")],
         [Value::Null, Value::Null],
         // What another program may leave: text that isn't a date, a number, and empty text (no loss).
         [Value::Text("2026-02-30".into()), Value::Int(1_772_700_000)],
@@ -3423,6 +3423,27 @@ fn geopackage_dates_are_written_and_read_as_dates() {
             .as_deref(),
         Some("permits.gpkg: 1 date-time was written in UTC, as GeoPackage stores them, without their own offsets, in 'seen'")
     );
+    // Milliseconds are all a DATETIME holds: finer digits are rounded, and said; none lost, none said.
+    assert_eq!(crate::io::fine_dates(permits.features.iter(), &permits.fields), [0, 0]);
+    let mut fine = Dataset::new("fine", GeometryType::Point, permits.fields.clone());
+    for t in ["2026-03-05T14:30:00.000750+02:00", "2026-03-05T14:30:00.000400", "9999-12-31T23:59:59.999999Z", "2026-03-05T14:30:00.5"] {
+        fine.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Null, at(t)]);
+    }
+    assert_eq!(
+        crate::io::fine_dates_note(&fine.fields, &crate::io::fine_dates(fine.features.iter(), &fine.fields), "fine.gpkg").as_deref(),
+        Some("fine.gpkg: 3 date-times were rounded to the millisecond, as GeoPackage stores them, in 'seen'")
+    );
+    let rounded = workspace.path().join("fine.gpkg");
+    crate::io::write_path(&fine, &rounded).unwrap();
+    let stored: Vec<String> = rusqlite::Connection::open(&rounded)
+        .unwrap()
+        .prepare("SELECT seen FROM fine ORDER BY fid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(stored, ["2026-03-05T12:30:00.001Z", "2026-03-05T14:30:00.000", "9999-12-31T23:59:59.999Z", "2026-03-05T14:30:00.500"]);
     let c = rusqlite::Connection::open(&path).unwrap();
     let declared: Vec<String> = c
         .prepare("SELECT type FROM pragma_table_info('permits') WHERE name IN ('issued', 'seen') ORDER BY cid")
@@ -3442,7 +3463,7 @@ fn geopackage_dates_are_written_and_read_as_dates() {
     let text = |s: &str| Some(s.to_string());
     assert_eq!(
         stored,
-        [(text("2026-03-05"), text("2026-03-05T12:30:00.000Z")), (text("1999-12-31"), text("2026-03-05T14:30:00.000250")), (None, None)]
+        [(text("2026-03-05"), text("2026-03-05T12:30:00.000Z")), (text("1999-12-31"), text("2026-03-05T14:30:00.250")), (None, None)]
     );
     drop(c);
     let desktop = open_path(&path, None).unwrap();
@@ -3904,7 +3925,7 @@ fn flatgeobuf_dates_skip_malformed_properties() {
 }
 
 /// Independently authored Arrow columns exercise units, UTC flags, pre-epoch values, nulls,
-/// out-of-range dates and sub-microsecond values in both whole and streamed reads.
+/// out-of-range dates and nanosecond values in both whole and streamed reads.
 #[test]
 fn parquet_date_units_invalid_values_and_nulls() {
     use arrow_array::{
@@ -3932,12 +3953,16 @@ fn parquet_date_units_invalid_values_and_nulls() {
     w.close().unwrap();
     let source = open_bytes("units.parquet", bytes, None).unwrap();
     let batch = source.read(&Request::all()).unwrap();
-    assert_eq!(batch.unread_dates, [1, 1, 1, 1]);
+    // Three out-of-range values are read as empty; 1001 ns is rounded to a microsecond, and counted.
+    assert_eq!(batch.unread_dates, [1, 1, 1]);
+    assert_eq!(batch.rounded_dates, [0, 0, 0, 1]);
     assert_eq!(
         batch.features[0].attrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
         ["1969-12-31", "1969-12-31T23:59:59.999Z", "1969-12-31T23:59:59.999999", "1969-12-31T23:59:59.999999"]
     );
-    assert!(batch.features[1..].iter().all(|f| f.attrs.iter().all(Value::is_null)));
+    assert!(batch.features[1].attrs[..3].iter().all(Value::is_null));
+    assert_eq!(batch.features[1].attrs[3].to_string(), "1970-01-01T00:00:00.000001");
+    assert!(batch.features[2].attrs.iter().all(Value::is_null));
     let extent = Extent::new(-0.1, -0.1, 0.1, 0.1);
     let filtered = source.read(&Request { extent: Some(extent), limit: usize::MAX }).unwrap();
     assert_eq!(filtered.features.len(), 1);
@@ -3956,7 +3981,7 @@ fn parquet_date_units_invalid_values_and_nulls() {
 }
 
 /// INT96 stores Julian days and nanoseconds of day with no UTC flag. Negative epochs must use
-/// the day plus its positive time, and finer-than-microsecond input is reported rather than cut.
+/// the day plus its positive time, and finer-than-microsecond input is rounded and counted.
 #[test]
 fn parquet_int96_is_unzoned_and_checks_submicroseconds() {
     use ::parquet::basic::{LogicalType, Repetition, TimeUnit, Type as Physical};
@@ -4000,8 +4025,10 @@ fn parquet_int96_is_unzoned_and_checks_submicroseconds() {
     let src = open_bytes("legacy.parquet", bytes, None).unwrap();
     let batch = src.read(&Request::all()).unwrap();
     assert_eq!(batch.features[0].attrs[0].to_string(), "1969-12-31T23:59:59.999999");
-    assert!(batch.features[1].attrs[0].is_null());
-    assert_eq!(batch.unread_dates, [1]);
+    // One nanosecond is rounded to the microsecond, and counted.
+    assert_eq!(batch.features[1].attrs[0].to_string(), "1970-01-01T00:00:00");
+    assert!(batch.unread_dates.is_empty());
+    assert_eq!(batch.rounded_dates, [1]);
     assert_eq!(batch.features[0].attrs[1].to_string(), "00:00:00");
     assert_eq!(batch.features[1].attrs[1].to_string(), "00:00:00.000001");
     assert_eq!(batch.features[0].attrs[2].to_string(), "00:00:00.000000Z");
@@ -4090,6 +4117,9 @@ fn database_date_text_reads_as_dates_and_counts_the_rest() {
         assert_eq!(server_date(Some(text), FieldType::DateTime, &mut unread, 1).to_string(), "<Null>", "{text}");
     }
     assert_eq!(unread, [0, 7]);
+    // A server gives at most microseconds: more digits aren't rounded, so it isn't a date.
+    assert_eq!(server_date(Some("2026-03-05 14:30:00.1234567"), FieldType::DateTime, &mut unread, 1).to_string(), "<Null>");
+    assert_eq!(unread, [0, 8]);
 }
 
 /// A read of a view whose box the layer's system can't bound (#1925) still matches the view: a

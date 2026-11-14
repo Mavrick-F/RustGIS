@@ -96,6 +96,9 @@ pub struct SourceLayer {
     /// said by [`SourceLayer::take_unread_dates`]; once said, later reads aren't counted again.
     #[serde(skip)]
     unread_dates: Option<Vec<usize>>,
+    /// Date-times a view read rounded to the microsecond ([`Batch::rounded_dates`]), likewise.
+    #[serde(skip)]
+    rounded_dates: Option<Vec<usize>>,
     #[serde(skip)]
     unread_dates_said: bool,
     #[serde(skip)]
@@ -708,20 +711,32 @@ impl SourceLayer {
     /// Keeps what view reads found of values in date fields that weren't dates, until
     /// [`SourceLayer::take_unread_dates`] says it. Once said, later reads aren't counted: they
     /// read the same features again, and the notice says Load All Features counts them all.
-    pub fn saw_unread_dates(&mut self, counts: &[usize]) {
-        if self.unread_dates_said || !counts.iter().any(|n| *n > 0) {
+    pub fn saw_unread_dates(&mut self, unread: &[usize], rounded: &[usize]) {
+        if self.unread_dates_said {
             return;
         }
-        rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), counts);
+        if unread.iter().any(|n| *n > 0) {
+            rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), unread);
+        }
+        if rounded.iter().any(|n| *n > 0) {
+            rustgis_data::source::add_unread_dates(self.rounded_dates.get_or_insert_with(Vec::new), rounded);
+        }
     }
 
     /// What view reads found of values in date fields that weren't dates
-    /// ([`rustgis_data::source::unread_dates_note`]), once for the source.
-    pub fn take_unread_dates(&mut self) -> Option<String> {
-        let fields = self.info()?.fields.clone();
-        let counts = self.unread_dates.take()?;
+    /// ([`rustgis_data::source::unread_dates_note`]) and of date-times rounded to the microsecond
+    /// ([`rustgis_data::source::rounded_dates_note`]), once for the source.
+    pub fn take_unread_dates(&mut self) -> (Option<String>, Option<String>) {
+        let Some(fields) = self.info().map(|i| i.fields.clone()) else { return (None, None) };
+        let (unread, rounded) = (self.unread_dates.take(), self.rounded_dates.take());
+        if unread.is_none() && rounded.is_none() {
+            return (None, None);
+        }
         self.unread_dates_said = true;
-        rustgis_data::source::unread_dates_note(&fields, &counts)
+        (
+            unread.and_then(|c| rustgis_data::source::unread_dates_note(&fields, &c)),
+            rounded.and_then(|c| rustgis_data::source::rounded_dates_note(&fields, &c)),
+        )
     }
 
     /// Whether another installed window needs its retained display expressions checked.
@@ -1392,6 +1407,7 @@ impl SourceLayer {
         self.login = false;
         // A new opening may hold other values: what was said of the last one doesn't hold.
         self.unread_dates = None;
+        self.rounded_dates = None;
         self.unread_dates_said = false;
         self.reset();
         self.open()
@@ -1709,6 +1725,7 @@ impl SourceLayer {
             conversion_fallback: _,
             conversion_notes_unsaid: _,
             unread_dates: _,
+            rounded_dates: _,
             unread_dates_said: _,
             gdal,
             duckdb,

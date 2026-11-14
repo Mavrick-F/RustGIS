@@ -39,13 +39,6 @@ const LIMITS: &[(&str, &str, &str)] = &[
     ("csv", "text became a number", "a column of numbers is a number column"),
     ("csv", "infinity or NaN became text", "inf and NaN aren't read as numbers"),
     ("csv", "not read back: nothing", "a layer without geometry or values is an empty file"),
-    // KNOWN BUG, see `a_date_column_of_nulls_stays_a_date_in_a_flatgeobuf` (ignored) in
-    // `crates/data/tests/date_properties.rs`: a Date column with no value to read comes back as DateTime.
-    (
-        "fgb",
-        "field of nulls type changed Date → DateTime",
-        "a FlatGeobuf date column is typed again from its values (known bug, no notice)",
-    ),
     // GeoJSON types a property from its values.
     ("geojson", "field of nulls type changed", "a property that is null everywhere has no type"),
     ("geojson", "field type changed Date → Text", "a date is written as ISO 8601 text and stays text on read (#853)"),

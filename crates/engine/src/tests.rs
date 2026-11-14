@@ -1029,6 +1029,30 @@ fn text_fields_convert_to_dates() {
     s.run("edit.convertField", &json!({"layer": "Cities", "field": "founded", "type": "date"})).unwrap();
     assert!(s.notices_since(mark).is_empty());
 
+    // A field with text and none of it a date is refused, and stays text; digits past the
+    // microsecond are rounded and said, none said for fewer.
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "us", "type": "text"})).unwrap();
+    for (row, text) in ["03/05/2026", "05.03.2026", "", "<null>"].into_iter().enumerate() {
+        s.run("edit.setValue", &json!({"layer": "Cities", "row": row, "field": "us", "value": text})).unwrap();
+    }
+    let mark = s.notice_mark();
+    let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "us", "type": "date"})).unwrap_err();
+    assert_eq!(err, "'us' stays text: none of its values is a date (ISO 8601, like 2026-03-05), first '03/05/2026'");
+    assert_eq!(column(&s, "us").0, FieldType::Text);
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.starts_with("Convert Field")));
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "fine", "type": "text"})).unwrap();
+    for (row, text) in
+        ["2026-03-05T14:30:00.123456789Z", "2026-03-05T14:30:00.5Z", "2026-03-05T14:30:00.000000400Z", ""].into_iter().enumerate()
+    {
+        s.run("edit.setValue", &json!({"layer": "Cities", "row": row, "field": "fine", "value": text})).unwrap();
+    }
+    let mark = s.notice_mark();
+    let out = s.run("edit.convertField", &json!({"layer": "Cities", "field": "fine", "type": "datetime"})).unwrap();
+    assert_eq!((out["converted"].as_u64(), out["null"].as_u64()), (Some(3), Some(0)));
+    let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(notices, ["Convert Field: 2 values were rounded to the microsecond in 'fine', as more digits than that aren't kept"]);
+    assert_eq!(column(&s, "fine").1[0], at("2026-03-05T14:30:00.123457Z"));
+
     let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "founded", "type": "date"})).unwrap_err();
     assert_eq!(err, "'founded' is a Date field: only a text field converts to dates");
     let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "name", "type": "long"})).unwrap_err();
@@ -46618,4 +46642,67 @@ fn an_animation_export_says_its_missing_cast_shadows_once() {
         assert!(said.len() == 1 && said[0].starts_with(what), "{command}: {said:?}");
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A FlatGeobuf has no date type, so a date field with no values in the export reads back as a
+/// date-time field: the export says so, for a layer held whole and one read in place. A date
+/// field with a value, and one only in features without geometry (not written), are the other
+/// two cases.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_flatgeobuf_export_says_which_empty_date_fields_read_back_as_date_times() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let dir = std::env::temp_dir().join(format!("rustgis-fgb-dates-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fields = vec![Field::new("empty", FieldType::Date), Field::new("full", FieldType::Date), Field::new("lost", FieldType::Date)];
+    let day = V::parse("2026-03-05", FieldType::Date);
+    let mut ds = Dataset::new("days", GeometryType::Point, fields);
+    ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![V::Null, day.clone(), V::Null]);
+    ds.push(None, vec![V::Null, V::Null, day.clone()]);
+    let gpkg = dir.join("days.gpkg");
+    rustgis_data::io::write_path(&ds, &gpkg).unwrap();
+    for stream in [false, true] {
+        let mut s = Session::new(Project::default());
+        s.run("layer.addData", &json!({"path": gpkg.display().to_string(), "stream": stream})).unwrap();
+        let (mark, fgb) = (s.notice_mark(), dir.join(format!("days-{stream}.fgb")));
+        s.run("share.exportLayer", &json!({"layer": "days", "path": fgb.display().to_string()})).unwrap();
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("date field")).collect();
+        assert_eq!(said.len(), 1, "stream {stream}: {said:?}");
+        assert!(said[0].ends_with("2 date fields have no values, and FlatGeobuf can't tell a date from a date-time, so it reads back as a date-time field, in 'empty', 'lost'"), "{said:?}");
+        // The other formats say nothing of it.
+        let (mark, shp) = (s.notice_mark(), dir.join(format!("days-{stream}.gpkg")));
+        s.run("share.exportLayer", &json!({"layer": "days", "path": shp.display().to_string()})).unwrap();
+        assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("FlatGeobuf")));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A save to a table names the layer and the table in its notices, and once when they're the same.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_save_names_a_layer_and_its_table_once_when_they_are_the_same() {
+    assert_eq!(crate::cmd::saved_target("wells", "wells"), "wells");
+    assert_eq!(crate::cmd::saved_target("Wells", "wells"), "Wells: wells");
+}
+
+/// What reading a DuckDB result says of its dates names the layer the user knows, not the cache
+/// file it was converted into. Runs only when DuckDB is installed (`RUSTGIS_DUCKDB_BIN`).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_duckdb_result_names_its_layer_in_its_date_notices() {
+    if !rustgis_data::source::duckdb::available() {
+        eprintln!("skipped: DuckDB isn't installed");
+        return;
+    }
+    let mut s = Session::new(Project::default());
+    let sql = "SELECT 1 AS id, DATE 'infinity' AS day, TIMESTAMP_NS '2026-03-05 12:34:56.123456789' AS at, ST_Point(1, 2) AS geom";
+    let mark = s.notice_mark();
+    s.run("layer.addSql", &json!({"sql": sql, "name": "Chosen", "stream": false})).unwrap();
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.contains(&"Chosen: 1 value isn't a date and was read as empty, in 'day'".to_string()), "{said:?}");
+    assert!(
+        said.contains(&"Chosen: 1 date-time was rounded to the microsecond, as more digits than that aren't kept, in 'at'".to_string()),
+        "{said:?}"
+    );
+    assert!(said.iter().all(|n| !n.contains(".points")), "{said:?}");
 }

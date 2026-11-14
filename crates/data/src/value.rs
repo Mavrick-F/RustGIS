@@ -191,6 +191,22 @@ impl Value {
         }
     }
 
+    /// [`parse_stored`](Value::parse_stored), but digits past the microsecond of a date-time are
+    /// rounded off, and the boolean says they were ([`DateTime::parse_rounding`]), for a reader to count.
+    pub fn parse_stored_counted(text: &str, ty: FieldType) -> (Value, bool) {
+        let t = text.trim();
+        match ty {
+            FieldType::DateTime => DateTime::parse_rounding(t).map_or((Value::Null, false), |(d, r)| (Value::DateTime(d), r)),
+            FieldType::Date => match Date::parse(t) {
+                Some(d) => (Value::Date(d), false),
+                None => DateTime::parse_rounding(t)
+                    .filter(|(d, _)| d.is_date())
+                    .map_or((Value::Null, false), |(d, r)| (Value::Date(d.date()), r)),
+            },
+            _ => (Value::parse(text, ty), false),
+        }
+    }
+
     /// Parses user text into a value of `ty` (empty → Null). Text a number field can't hold,
     /// including a non-finite Double (`NaN`, `inf`), is Null. Dates are ISO 8601: `YYYY-MM-DD`
     /// for a date; that, a time and an optional zone for a date-time. Text that isn't one is Null.

@@ -2087,9 +2087,16 @@ impl Session {
         for map in &mut self.project.maps {
             for layer in &mut map.layers {
                 // Values in date fields that weren't dates, once for a layer read in place.
-                if let Some(note) = layer.source.as_mut().and_then(|source| source.take_unread_dates()) {
+                let (unread, rounded) = layer.source.as_mut().map(|source| source.take_unread_dates()).unwrap_or_default();
+                if let Some(note) = unread {
                     dates.push(format!(
                         "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
+                        layer.name
+                    ));
+                }
+                if let Some(note) = rounded {
+                    dates.push(format!(
+                        "{}: some date-times in it have digits past the microsecond and are rounded (Load All Features counts them all); so far, {note}",
                         layer.name
                     ));
                 }

@@ -36,10 +36,12 @@ fn check<S: Strategy>(strategy: S, default_cases: u32, test: impl Fn(S::Value) -
 
 // ---- The oracle: proleptic Gregorian days from a closed-form count of years. ----
 
+/// Whether `y` is a leap year in the proleptic Gregorian calendar (the century rules, from the definition).
 fn leap(y: i64) -> bool {
     y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
 
+/// Days in month `m` of year `y`, from the calendar's definition, independent of the code under test.
 fn month_len(y: i64, m: i64) -> i64 {
     [31, if leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31].get((m - 1) as usize).copied().unwrap_or(0)
 }
@@ -74,14 +76,17 @@ fn civil(n: i64) -> (i64, i64, i64) {
     (y, m, left + 1)
 }
 
+/// The first microsecond of year 1 since 1970, the oracle's lower range end.
 fn min_us() -> i64 {
     days(1, 1, 1).unwrap_or(0) * DAY_US
 }
 
+/// One past the last microsecond of year 9999 since 1970, the oracle's upper range end.
 fn max_us() -> i64 {
     (days(9999, 12, 31).unwrap_or(0) + 1) * DAY_US
 }
 
+/// Whether `us` microseconds since 1970 fall in years 1 to 9999.
 fn in_range(us: i64) -> bool {
     (min_us()..max_us()).contains(&us)
 }
@@ -132,6 +137,7 @@ struct Spec {
 }
 
 impl Spec {
+    /// The text this spec writes: date, clock, fraction and zone in one of the accepted shapes.
     fn text(&self) -> String {
         let mut s = format!("{:04}-{:02}-{:02}", self.y, self.m, self.d);
         let Some(c) = &self.clock else { return s };
@@ -179,6 +185,7 @@ impl Spec {
     }
 }
 
+/// Years to try: the whole range, calendar edge cases, and a few outside it.
 fn year() -> impl Strategy<Value = i64> {
     prop_oneof![
         3 => 1..=9999i64,
@@ -188,6 +195,7 @@ fn year() -> impl Strategy<Value = i64> {
     ]
 }
 
+/// Zone offsets in minutes: ordinary ones, the extremes, and a few past the accepted range.
 fn offset() -> impl Strategy<Value = i64> {
     prop_oneof![
         2 => -MAX_OFFSET..=MAX_OFFSET,
@@ -195,6 +203,7 @@ fn offset() -> impl Strategy<Value = i64> {
     ]
 }
 
+/// A clock with edge hours, minutes and seconds (24, 60), a fraction of up to nine digits and an offset.
 fn clock() -> impl Strategy<Value = Clock> {
     let fraction = prop_oneof![
         1 => Just(String::new()),
@@ -222,6 +231,7 @@ fn clock() -> impl Strategy<Value = Clock> {
         })
 }
 
+/// A date or date-time text spec built from the generators above.
 fn spec() -> impl Strategy<Value = Spec> {
     (
         year(),
@@ -237,6 +247,7 @@ fn valid_spec() -> impl Strategy<Value = Spec> {
     spec().prop_filter("a moment the model holds", |s| s.expected().is_some())
 }
 
+/// Turns a failed property into the test runner's failure with its message.
 fn fail(msg: String) -> Result<(), TestCaseError> {
     Err(TestCaseError::fail(msg))
 }
@@ -462,6 +473,7 @@ enum Lit {
     Text(&'static str),
 }
 
+/// A where-clause literal: a date, a date-time, or text that isn't a full date.
 fn lit() -> impl Strategy<Value = Lit> {
     prop_oneof![
         4 => valid_spec().prop_map(Lit::Moment),
@@ -471,6 +483,7 @@ fn lit() -> impl Strategy<Value = Lit> {
 }
 
 impl Lit {
+    /// The literal as it is written in a clause, quoted.
     fn sql(&self) -> String {
         match self {
             Lit::Moment(s) => format!("'{}'", s.text()),
@@ -514,6 +527,7 @@ fn compare(c: &Cell, op: &str, l: &Lit) -> Option<bool> {
     })
 }
 
+/// A one-column-pair dataset of Date and DateTime fields holding `rows`, for the where-clause tests.
 fn dataset(rows: &[(Cell, Cell)]) -> Dataset {
     let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new("d", FieldType::Date), Field::new("t", FieldType::DateTime)]);
     for (d, t) in rows {
@@ -610,20 +624,27 @@ fn null_dates_never_match_and_is_null_finds_them() {
     assert_eq!(query::select("d IS NOT NULL", &ds), Ok(vec![0]));
 }
 
-/// KNOWN BUG (found by `an_export_that_changes_a_layer_says_so`): a FlatGeobuf writes a Date
-/// column as its native date-time column, and the reader types it again from the values: with no
-/// value to look at (every cell null, or the only valued features left out for having no
-/// geometry) the column comes back as DateTime, with no notice. Ignored until fixed.
+/// A FlatGeobuf writes a Date column as its native date-time column, and the reader types it again
+/// from the values: a Date column with no value to look at (every cell null, or the only valued
+/// features left out for having no geometry) comes back as DateTime, and the export says so.
 #[test]
-#[ignore = "a Date column of nulls comes back as DateTime from a FlatGeobuf, without a notice"]
-fn a_date_column_of_nulls_stays_a_date_in_a_flatgeobuf() {
-    let mut ds = Dataset::new("layer", GeometryType::Point, vec![Field::new("a", FieldType::Date)]);
-    ds.push(Some(rustgis_data::Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Null]);
+fn a_date_column_of_nulls_in_a_flatgeobuf_comes_back_as_a_date_time_and_is_said() {
+    let mut ds = Dataset::new("layer", GeometryType::Point, vec![Field::new("a", FieldType::Date), Field::new("b", FieldType::Date)]);
+    ds.push(Some(rustgis_data::Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Null, Value::parse("2026-03-05", FieldType::Date)]);
+    let note = |ds: &Dataset| {
+        let written = rustgis_data::io::written_values(ds.features.iter(), &ds.fields);
+        rustgis_data::io::fgb_empty_dates_note(&ds.fields, &written, "out.fgb")
+    };
+    let said = note(&ds).unwrap_or_default();
+    assert!(said.starts_with("out.fgb: 1 date field has no values") && said.ends_with("in 'a'"), "{said}");
     let path = std::env::temp_dir().join(format!("date-props-{}.fgb", std::process::id()));
     std::fs::write(&path, rustgis_data::source::fgb::write(&ds).unwrap_or_default()).unwrap_or_default();
     let back = rustgis_data::io::read_path(&path);
     let _ = std::fs::remove_file(&path);
-    let (back, report) = back.unwrap_or_else(|e| panic!("read back: {e}"));
-    let ty = back.fields.first().map(|f| f.ty);
-    assert!(ty == Some(FieldType::Date) || !report.messages.is_empty(), "type {ty:?}, no notice");
+    let (back, _) = back.unwrap_or_else(|e| panic!("read back: {e}"));
+    let types: Vec<_> = back.fields.iter().map(|f| f.ty).collect();
+    assert_eq!(types, [FieldType::DateTime, FieldType::Date]);
+    // A value in every date field: nothing to say.
+    ds.features[0].attrs[0] = Value::parse("2026-03-06", FieldType::Date);
+    assert_eq!(note(&ds), None);
 }

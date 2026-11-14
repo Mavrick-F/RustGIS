@@ -387,6 +387,9 @@ pub struct ReadReport {
     /// What a read of a source says of values in date fields that weren't dates
     /// ([`source::unread_dates_note`]), also in `messages`: for a caller that says only this.
     pub unread_dates: Option<String>,
+    /// What it says of date-times it rounded to the microsecond ([`source::rounded_dates_note`]),
+    /// also in `messages`.
+    pub rounded_dates: Option<String>,
 }
 
 /// What a read says when it drops Z or M values (see [`Dataset::zm_dropped`]): from `features` of

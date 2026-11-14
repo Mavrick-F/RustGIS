@@ -246,6 +246,7 @@ impl FgbSource {
                 slots: &self.slots,
                 values: vec![Value::Null; self.info.fields.len()],
                 unread_dates: Vec::new(),
+                rounded_dates: Vec::new(),
             };
             // Reads skip a feature with unreadable properties and report it in Batch::skipped.
             // Such a feature must not influence the inferred date type either.
@@ -342,12 +343,14 @@ impl FgbSource {
                 slots: &self.slots,
                 values: vec![Value::Null; self.info.fields.len()],
                 unread_dates: Vec::new(),
+                rounded_dates: Vec::new(),
             };
             if f.process_properties(&mut props).is_err() {
                 out.skipped += 1;
                 continue;
             }
             super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
+            super::add_unread_dates(&mut out.rounded_dates, &props.rounded_dates);
             sample.keep(Feature { id, geometry: Some(geometry), attrs: props.values });
         }
         out.matched = if late || matched == 0 { sample.seen() } else { matched };
@@ -405,12 +408,14 @@ impl FgbSource {
                 slots: &self.slots,
                 values: vec![Value::Null; self.info.fields.len()],
                 unread_dates: Vec::new(),
+                rounded_dates: Vec::new(),
             };
             if f.process_properties(&mut props).is_err() {
                 out.skipped += 1;
                 continue;
             }
             super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
+            super::add_unread_dates(&mut out.rounded_dates, &props.rounded_dates);
             out.matched += 1;
             chunks.push(Feature { id, geometry: Some(geometry), attrs: props.values })?;
         }
@@ -714,12 +719,14 @@ impl FgbSource {
                 slots: &self.slots,
                 values: vec![Value::Null; self.info.fields.len()],
                 unread_dates: Vec::new(),
+                rounded_dates: Vec::new(),
             };
             if feat.process_properties(&mut props).is_err() {
                 out.skipped += 1;
                 continue;
             }
             super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
+            super::add_unread_dates(&mut out.rounded_dates, &props.rounded_dates);
             let feature = Feature { id, geometry: Some(geometry), attrs: props.values };
             if late {
                 sample.keep(feature);
@@ -829,6 +836,7 @@ struct Props<'a> {
     slots: &'a [Option<usize>],
     values: Vec<Value>,
     unread_dates: Vec<usize>,
+    rounded_dates: Vec<usize>,
 }
 
 impl PropertyProcessor for Props<'_> {
@@ -854,9 +862,11 @@ impl PropertyProcessor for Props<'_> {
         let value = match (self.fields.get(idx).map(|f| f.ty), value) {
             (Some(FieldType::Double), Value::Int(i)) => Value::Float(i as f64),
             (Some(ty @ (FieldType::Date | FieldType::DateTime)), Value::Text(s)) => {
-                let value = Value::parse_source(&s, ty);
+                let (value, rounded) = Value::parse_stored_counted(&s, ty);
                 if !s.trim().is_empty() && value.is_null() {
                     super::unread_date(&mut self.unread_dates, idx);
+                } else if rounded {
+                    super::unread_date(&mut self.rounded_dates, idx);
                 }
                 value
             }
