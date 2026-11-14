@@ -3965,11 +3965,13 @@ fn flatgeobuf_exports_a_midnight_in_a_date_field_as_its_day() {
     let mut ds = Dataset::new("days", GeometryType::Point, vec![Field::new("day", FieldType::Date)]);
     ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text("2026-03-05T00:00:00".into())]);
     ds.push(Some(Geometry::Point(Coord::new(2.0, 2.0))), vec![Value::parse("2026-03-06", FieldType::Date)]);
+    // A date-time value that is a midnight too.
+    ds.push(Some(Geometry::Point(Coord::new(3.0, 2.0))), vec![Value::parse("2026-03-07T00:00:00", FieldType::DateTime)]);
     let src = open_bytes("days.fgb", fgb::write(&ds).unwrap(), None).unwrap();
     assert_eq!(src.info().fields[0].ty, FieldType::Date);
     let mut days: Vec<String> = src.read(&Request::all()).unwrap().features.iter().map(|f| f.attrs[0].to_string()).collect();
     days.sort();
-    assert_eq!(days, ["2026-03-05", "2026-03-06"]);
+    assert_eq!(days, ["2026-03-05", "2026-03-06", "2026-03-07"]);
 }
 
 /// A moment in a GeoPackage date field isn't rounded into a midnight: it reads back as null, as

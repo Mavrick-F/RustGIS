@@ -1030,6 +1030,10 @@ fn write_run(
                         },
                         Value::Text(x) if f.ty == FieldType::DateTime => out.property(i, &f.name, &ColumnValue::DateTime(x)),
                         Value::Text(x) => out.property(i, &f.name, &ColumnValue::String(x)),
+                        // A midnight in a date field as its day, as text that is one.
+                        Value::DateTime(t) if f.ty == FieldType::Date && t.is_date() => {
+                            out.property(i, &f.name, &ColumnValue::DateTime(&t.date().to_string()))
+                        }
                         Value::Date(_) | Value::DateTime(_) => out.property(i, &f.name, &ColumnValue::DateTime(&v.to_string())),
                     };
                     if let Err(e) = r {
