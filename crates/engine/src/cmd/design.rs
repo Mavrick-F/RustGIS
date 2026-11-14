@@ -135,6 +135,21 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
     if !s.map().editing.settings.enabled {
         return Err("editing is turned off (Edit › Edit)".into());
     }
+    // Construction belongs to an object, not a reusable numeric id. Each removed or inserted
+    // feature that passes here (cut/paste, split pieces, edits) forgets its construction. Some
+    // row changes don't (GeoPackage and offline-area syncs, archive restore): there a feature
+    // keeps its construction only while its geometry still equals it (see `box_spec`). Undo
+    // keeps its own cache snapshot.
+    for change in &changes {
+        let feature = match (&change.before, change.row) {
+            (Some(before), None) => Some(before.id),
+            (None, Some(row)) => s.map().layer(id).and_then(|l| l.dataset.features.get(row)).map(|f| f.id),
+            _ => None,
+        };
+        if let Some(feature) = feature {
+            crate::box_edit::forget_feature(s, id, feature);
+        }
+    }
     let elevation = s.map().editing.settings.elevation.clone();
     // Elevation from a surface: sampled before the layer is borrowed mutably.
     let z_of = |s: &Session, g: &Geometry| -> Option<f64> {
@@ -1126,7 +1141,7 @@ fn edit_vertex(s: &mut Session, p: &Json) -> CmdResult {
 }
 
 /// Replaces a feature's shape with one of the layer's kind, as one edit.
-fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry) -> Result<(), String> {
+pub(crate) fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry) -> Result<(), String> {
     super::edit::validate(&g)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     if l.geometry_type() != GeometryType::None && l.geometry_type() != g.kind() {
