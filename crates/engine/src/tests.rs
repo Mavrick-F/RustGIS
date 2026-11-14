@@ -1157,12 +1157,23 @@ fn loading_a_streamed_layer_whole_says_the_date_times_it_rounded() {
         let mut s = Session::new(Project::default());
         s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap();
         assert!(s.map().layers[0].is_streamed(), "{name} is read in place");
+        let rounded = |s: &Session, mark| -> Vec<String> {
+            s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("rounded to the microsecond")).collect()
+        };
+        // A tool reading the layer whole, and a share of it, say it too.
+        let mark = s.notice_mark();
+        let out = s.run("gp.run", &json!({"tool": "buffer", "params": {"input": name, "distance": 10}})).unwrap();
+        let in_result = out.to_string().matches("rounded to the microsecond").count();
+        assert_eq!(rounded(&s, mark).len().max(in_result.min(1)), said, "{name} buffer: {out}");
+        let mark = s.notice_mark();
+        crate::cmd::sharing::share_bytes(&mut s, "webLayer", &json!({"layer": name})).unwrap();
+        assert_eq!(rounded(&s, mark).len(), said, "{name} share");
         let mark = s.notice_mark();
         s.run("layer.loadAll", &json!({"layer": name})).unwrap();
-        let rounded: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("rounded")).collect();
-        assert_eq!(rounded.len(), said, "{name}: {rounded:?}");
+        let said_now = rounded(&s, mark);
+        assert_eq!(said_now.len(), said, "{name}: {said_now:?}");
         if said == 1 {
-            assert!(rounded[0].starts_with(&format!("{name}: 1 date-time was rounded to the microsecond")), "{rounded:?}");
+            assert!(said_now[0].starts_with(&format!("{name}: 1 date-time was rounded to the microsecond")), "{said_now:?}");
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
