@@ -268,13 +268,15 @@ pub fn choose(exe: Option<PathBuf>) -> Result<Option<(PathBuf, String)>, String>
             return Err(e);
         }
     }
-    set_passed_over(None);
     if let Ok(mut c) = CHOSEN.lock() {
         *c = exe;
     }
     if let Ok(mut f) = FOUND.lock() {
         f.generation = f.generation.saturating_add(1);
         f.value = None;
+        // Cleared under the lock `find` records its note with, so a discovery that started
+        // before this choice can't record a stale note after it.
+        set_passed_over(None);
     }
     Ok(find())
 }
