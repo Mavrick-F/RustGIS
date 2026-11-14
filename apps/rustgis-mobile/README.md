@@ -4,7 +4,7 @@ RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). I
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
 saving, and the touch interface (`rustgis-ui-touch`) around its map, which can capture points,
 lines and polygons with their attributes, edit their shapes, snap, and show where the device is.
-It is not a field app yet: positions aren't averaged or logged as a track, and there are no photos.
+It averages positions, records tracks (also out of sight) and attaches photos to features.
 
 ## Build
 
@@ -51,8 +51,8 @@ of the app.
 ## The phone, from Rust
 
 `rustgis_engine::platform::Platform` is what a front end asks a phone for: files from the system's
-picker, a place to save, and the device's position. The camera is added to it with its first
-implementation. `src/phone.rs` implements it for Android by calling the activity's Java half,
+picker, a place to save, the device's position, positions kept coming out of sight, and the
+camera. `src/phone.rs` implements it for Android by calling the activity's Java half,
 `java/org/rustgis/mobile/MainActivity.java`, which is the only code that can show the picker (the
 Storage Access Framework) and receive its answer.
 
@@ -111,6 +111,28 @@ sheet and at the top of the Capture sheet, moves the map so the capture cross is
 or a vertex added then is at the device's position. **Hide My Position** stops asking, which
 spares the battery.
 
+**Average Position**, beside Go to My Position in the Capture sheet, averages the positions that
+come while it runs: each weighted by how exact Android says it is (one over its accuracy squared),
+and the sheet says how many and how far they lie from their average. **Use Average** puts the
+cross there, for a point or a vertex more exact than one position.
+
+**Record a Track**, in the More sheet with the position shown, draws where the device goes as it
+goes, with a bar over the buttons that counts its positions and has **Stop**. Stopping (or Hide My
+Position) adds the track as one line to the map's **Tracks** layer, made when the map has none,
+named for when it started, with its count and length in minutes. A position less exact than 50 m
+is left out, and the notice says how many were. Every position Android reports reaches the track,
+not only the last one each frame (`RustGisApp::fixes`). The track is kept in memory until it is
+stopped: an app the system ends loses it.
+
+A track goes on while the app is out of sight (the Home button, the screen off). Recording one
+starts `TrackService`, a foreground service of the location type, with the notice Android requires:
+"RustGIS is recording a track", which brings the app back when tapped. The activity's location
+listener then keeps receiving positions after the activity stops, and they wait in its events
+(at most 200,000; past that the oldest go, and the app says how many) until the app is back in
+sight and takes them all into the track. The first track asks for leave to show notifications
+(Android 13 and later); refused, the service still runs, its notice unseen. Stopping the track
+stops the service. Ending the app (swiping it away), or Android ending its activity, ends the track with it: the session goes with the process (see below).
+
 **Edit**, beside **Add** at the top of the Capture sheet, changes the shapes already on the
 map, the same way: the map is moved under the cross. **Pick Feature at Cross** picks the layer's
 feature drawn on top under it (within half a finger) and draws its vertices. For a line or polygon,
@@ -119,6 +141,18 @@ where the cross is next, **Add After** puts a new vertex there after it, and **D
 removes it (a line keeps two, a ring three). For a point, **Move Point Here** moves it. **Delete
 Feature** deletes it (only it: the map's other selections are kept), and **Done** lets
 it go. Each change is one edit, undone by Undo in the More sheet.
+
+**Take Photo**, over the Capture sheet's fields, asks the device's camera app for a photo
+(`Platform::take_photo`). The camera writes it to the app's photos folder (`files/photos`) through
+a content address the activity's `PhotoProvider` offers, so RustGIS needs no camera permission. Each
+photo taken shows as a chip (a tap takes it off again; the file stays), and the next feature added
+names them in its layer's photos field: a text field `photos` (or `photo`) listing each photo's
+path, separated by `;`, as a report's attachments field does. A layer without one gets one when its
+first photo is attached, and the sheet says so; the form doesn't offer that field for typing. In Edit
+mode, **Add Photo** attaches a photo to the feature picked, after the ones it has (one edit, which
+undoes; a layer's first photo also adds its photos field, an edit of its own). A photos field the
+layer already has stays in the form: the photos go after what is typed in it. A field named
+`photos` that isn't text can't list them, and the sheet says so.
 
 **Snap** turns the map's snapping on and off (its settings are the desktop's: Edit › Snapping).
 With it on, the cross's place snaps to a vertex, a line's end or an edge in reach, for adding and

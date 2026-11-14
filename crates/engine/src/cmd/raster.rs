@@ -34,7 +34,7 @@ pub(crate) fn need_raster(s: &Session) -> Option<&'static str> {
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k (JPEG 2000: desktop, through GDAL)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData)}"#),
+            .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k|.dxf (JPEG 2000: desktop, through GDAL)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData)}"#),
         C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "grey"?: bool (shadedRelief without its colour ramp)}"#,
         ),
@@ -649,9 +649,22 @@ fn add_jpeg2000_bytes(s: &mut Session, p: &Value, name: &str, bytes: Vec<u8>, zo
     add_raster_after(s, &title, RasterLayer::from_bytes(r, file_name, c.tif), zoom)
 }
 
+/// Strips directory components from an uploaded/text `fileName`, keeping only a plain file name.
+pub(crate) fn bytes_file_name(raw: &str) -> Option<&str> {
+    let leaf = raw.trim().rsplit(['/', '\\']).next()?.trim();
+    let leaf = std::path::Path::new(leaf).file_name().and_then(|n| n.to_str()).unwrap_or(leaf).trim();
+    (!leaf.is_empty() && leaf != "." && leaf != "..").then_some(leaf)
+}
+
+/// Whether `layer.addDataBytes` names a JPEG 2000 upload (which runs `gdal_translate` via temp files).
+pub(crate) fn bytes_is_jpeg2000(p: &Value) -> bool {
+    ps(p, "fileName").is_some_and(|raw| raster::is_jpeg2000_name(raw.trim()) || bytes_file_name(raw).is_some_and(raster::is_jpeg2000_name))
+}
+
 fn add_bytes(s: &mut Session, p: &Value) -> CmdResult {
     use base64::Engine;
-    let name = ps(p, "fileName").ok_or("fileName is required")?.to_string();
+    let raw_name = ps(p, "fileName").ok_or("fileName is required")?;
+    let name = bytes_file_name(raw_name).ok_or("fileName is required")?.to_string();
     let data = ps(p, "data").ok_or("data is required")?;
     // Base64 is 4 characters per 3 bytes; refuse files past the upload limit before decoding.
     if data.len() / 4 * 3 > MAX_UPLOAD_BYTES {
@@ -700,7 +713,7 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     }
     // Files of several layers: zipped Shapefiles, KML/KMZ, GPX, GeoRSS, LandXML, CityJSON.
     if rustgis_data::io::is_multi_layer_name(&name) {
-        return super::layer::add_layers(s, p, &name, &bytes, zoom);
+        return super::layer::add_layers(s, p, &name, &bytes, zoom, false);
     }
     // GeoParquet and FlatGeobuf uploads (binary vector files).
     if rustgis_data::source::is_source_name(&name) {
@@ -716,7 +729,7 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     let text = String::from_utf8(bytes).map_err(|_| format!("{name} is not a text file"))?;
     // The delimited-text and naming parameters carry over (not the data, already decoded).
     let mut q = json!({"fileName": name, "text": text});
-    for k in ["name", "x", "y", "wkt", "crs", "delimiter", "layer", "paperSpace"] {
+    for k in ["name", "x", "y", "wkt", "crs", "delimiter", "layer", "paperSpace", "blocks"] {
         if let Some(v) = p.get(k) {
             q[k] = v.clone();
         }
@@ -947,10 +960,15 @@ fn bands(s: &mut Session, p: &Value) -> CmdResult {
 fn info(s: &mut Session, p: &Value) -> CmdResult {
     let (id, r) = get(s, p)?;
     let rl = s.map().layer(id).and_then(|l| l.raster.as_ref()).ok_or("no layer")?;
+    let source = match rl.path.as_deref() {
+        Some(path) if !s.policy_user() && rustgis_map::tiles::is_local_archive(path) => rl.file_name.clone(),
+        Some(path) => Some(crate::sources::redact_output(path)),
+        None => rl.file_name.clone(),
+    };
     let (cx, cy) = r.cell_size();
     Ok(json!({
         "name": r.name,
-        "source": rl.path.clone().or(rl.file_name.clone()),
+        "source": source,
         "width": r.width, "height": r.height,
         "overviewOf": r.overview.map(|(w, h)| json!([w, h])),
         "bands": r.bands.iter().map(|b| json!({

@@ -844,6 +844,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.customizeShortcuts", "Keyboard Shortcuts", "Settings › Customize"),
     ("ui.addData", "Add Data…", "Home › Add"),
     ("ui.addDelimited", "Add Delimited Text…", "Home › Add › Add Data"),
+    ("ui.addDxf", "Import DXF…", "Home › Add › Add Data"),
     ("ui.addUrl", "Add Data From URL…", "Home › Add › Add Data"),
     ("ui.addZarr", "Add Zarr Variable…", "Home › Add › Add Data"),
     ("ui.addService", "Add From Service…", "Home › Add › Add Data"),

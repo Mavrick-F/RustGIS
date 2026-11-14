@@ -502,6 +502,7 @@ fn home_tab(app: &mut RustGisApp, ui: &mut Ui) {
             true,
             |ui, app| {
                 menu_item(ui, app, "", "Delimited Text…", "ui.addDelimited", Value::Null);
+                menu_item(ui, app, "", "DXF…", "ui.addDxf", Value::Null);
                 menu_item(ui, app, "", "Geocode Addresses…", "ui.dialog", json!({"name": "geocode"}));
                 menu_item(ui, app, "", "From URL…", "ui.addUrl", Value::Null);
                 menu_item(ui, app, "", "From Service…", "ui.addService", Value::Null);

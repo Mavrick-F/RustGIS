@@ -1770,14 +1770,16 @@ pub fn read_gzip_text(reader: impl std::io::Read, file_name: &str, opts: &CsvOpt
     // The sample can end inside a record. Parse the complete header from the stream before
     // deciding whether an ambiguous DAT is delimited text.
     if plain.to_ascii_lowercase().ends_with(".dat") && opts.delimiter.is_none() {
-        let headers = rdr.headers().map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
+        let headers = rdr.headers();
+        crate::progress::check()?;
+        let headers = headers.map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
         if headers.len() < 2 || headers.iter().any(|h| h.chars().any(char::is_control)) {
             return Err(DataError::Format(format!(
                 "{file_name}: not recognised as delimited text; give a delimiter, or decompress and rename to .txt"
             )));
         }
     }
-    let result = read_csv_records(&mut rdr, name, opts);
+    let result = read_csv_records(&mut rdr, name, opts, csv_memory_budget());
     crate::progress::check()?;
     let (mut dataset, report) =
         result.map_err(|e| DataError::Format(format!("{file_name}: {e}; if not UTF-8, decompress and add as .txt")))?;
@@ -1785,16 +1787,42 @@ pub fn read_gzip_text(reader: impl std::io::Read, file_name: &str, opts: &CsvOpt
     Ok((dataset, report))
 }
 
-/// Collects records for the existing type-inference/table builder. Reader failures (including
-/// gzip checksum, expansion-limit and encoding errors) are errors, never skipped rows.
-fn read_csv_records(reader: &mut csv::Reader<impl std::io::Read>, name: &str, opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
-    let headers: Vec<String> = reader.headers().map_err(|e| DataError::Format(format!("CSV: {e}")))?.iter().map(str::to_string).collect();
+/// Estimated memory for retained CSV rows and the dataset built alongside them: a quarter
+/// of physical memory, between 256 MiB (also the browser limit) and 4 GiB.
+fn csv_memory_budget() -> usize {
+    let ceiling = usize::try_from(4u64 << 30).unwrap_or(usize::MAX);
+    crate::memory::scaled(crate::memory::physical(), 256 << 20, ceiling, 1)
+}
+
+/// Collects records for type inference, charging text and row/cell objects before copying.
+/// The estimate includes the dataset built while these rows remain alive and room for vector
+/// capacity. Reader failures and a spent memory budget refuse the whole import.
+fn read_csv_records(
+    reader: &mut csv::Reader<impl std::io::Read>,
+    name: &str,
+    opts: &CsvOptions,
+    budget: usize,
+) -> Result<(Dataset, ReadReport)> {
+    let cost = |r: &csv::StringRecord| {
+        r.as_slice()
+            .len()
+            .saturating_mul(2)
+            .saturating_add(r.len().saturating_mul(2 * (std::mem::size_of::<String>() + std::mem::size_of::<Value>())))
+            .saturating_add(2 * (std::mem::size_of::<Vec<String>>() + std::mem::size_of::<crate::Feature>()))
+    };
+    let too_large = || DataError::Format(format!("CSV retained table exceeds the {budget}-byte memory budget; import a smaller file"));
+    let header = reader.headers().map_err(|e| DataError::Format(format!("CSV: {e}")))?;
+    let mut left = budget.checked_sub(cost(header)).ok_or_else(too_large)?;
+    let headers: Vec<String> = header.iter().map(str::to_string).collect();
     let mut malformed = 0;
     let mut rows = Vec::new();
     for record in reader.records() {
         crate::progress::check()?;
         match record {
-            Ok(r) => rows.push(r.iter().map(str::to_string).collect()),
+            Ok(r) => {
+                left = left.checked_sub(cost(&r)).ok_or_else(too_large)?;
+                rows.push(r.iter().map(str::to_string).collect());
+            }
             Err(e) if e.is_io_error() || matches!(e.kind(), csv::ErrorKind::Utf8 { .. }) => {
                 return Err(DataError::Format(format!("CSV: {e}")));
             }
@@ -1838,7 +1866,7 @@ pub fn read_csv_with(text: &str, name: &str, opts: &CsvOptions) -> Result<(Datas
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let delimiter = opts.delimiter.unwrap_or_else(|| sniff_delimiter(text));
     let mut rdr = csv::ReaderBuilder::new().flexible(true).delimiter(delimiter).from_reader(text.as_bytes());
-    read_csv_records(&mut rdr, name, opts)
+    read_csv_records(&mut rdr, name, opts, csv_memory_budget())
 }
 
 /// Rows of text cells under a header row (delimited text, a spreadsheet's sheet) as a dataset, as
@@ -2423,8 +2451,8 @@ pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadRepor
     read_zip_in(file_name, bytes, None)
 }
 
-/// Reads a ZIP, optionally overriding the source CRS of every Shapefile in it. Other formats
-/// retain their own coordinate systems; a CityJSON model takes it only when it names none RustGIS
+/// Reads a ZIP, optionally overriding the source CRS of its Shapefiles and delimited text.
+/// Other formats retain their own coordinate systems; a CityJSON model takes it only when it names none RustGIS
 /// knows. The override is applied before reading any shapes. Cancellation is checked between
 /// archive members and records; inflating one member cannot be interrupted mid-decompression.
 pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Vec<(Dataset, ReadReport)>> {
@@ -2520,9 +2548,13 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     others.sort_by(|a, b| a.0.cmp(&b.0));
     for (n, b) in others {
         // Prose readmes aren't tables; optional empty GTFS tables still have headers.
-        if ext_of(&n) == "txt" && !delimited_text(&n, &b).is_ok_and(|(text, _)| delimited_table_columns(&text) > 0) {
-            skipped.push(format!("{n} (not recognised as delimited text; extract it and add as .txt)"));
-            continue;
+        if ext_of(&n) == "txt" {
+            let columns = delimited_text(&n, &b).map_or(0, |(text, _)| delimited_table_columns(&text));
+            let readme = n.rsplit('/').next().is_some_and(|leaf| leaf.eq_ignore_ascii_case("readme.txt"));
+            if columns == 0 || (columns == 1 && readme) {
+                skipped.push(format!("{n} (not recognised as a data table; extract it and open separately to read as text)"));
+                continue;
+            }
         }
         if out.len() >= MAX_ZIP_LAYERS {
             skipped.push(format!("{n} (past the {MAX_ZIP_LAYERS}-layer limit)"));
@@ -2530,7 +2562,13 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
         }
         let leaf = n.rsplit('/').next().unwrap_or(&n);
         // A city model has many layers.
-        let read = if is_city_model(leaf, &b) { read_city_member(leaf, &b, crs) } else { read_bytes(leaf, &b).map(|r| vec![r]) };
+        let read = if is_city_model(leaf, &b) {
+            read_city_member(leaf, &b, crs)
+        } else if is_delimited_name(leaf) {
+            read_delimited_bytes(leaf, &b, &CsvOptions { crs, ..Default::default() }).map(|r| vec![r])
+        } else {
+            read_bytes(leaf, &b).map(|r| vec![r])
+        };
         match read {
             Ok(layers) => {
                 for (mut ds, report) in layers {
@@ -5220,6 +5258,49 @@ mod tests {
         assert_eq!(read_path(&path).unwrap().0.features.len(), 2);
     }
 
+    /// Short repeated cells cost more as owned cells than as compressed or expanded text.
+    #[test]
+    fn gzip_retained_cells_have_a_memory_budget() {
+        let bytes = gzip_csv(format!("a,b,c,d\n{}", ",,,\n".repeat(1000)).as_bytes());
+        assert!(bytes.len() < 100);
+        let mut reader = csv::ReaderBuilder::new().from_reader(GzipText::new(bytes.as_slice()));
+        let error = read_csv_records(&mut reader, "small", &CsvOptions::default(), 4096).unwrap_err();
+        assert!(error.to_string().contains("memory budget"), "{error}");
+        let mut reader = csv::ReaderBuilder::new().from_reader(GzipText::new(bytes.as_slice()));
+        let (table, report) = read_csv_records(&mut reader, "small", &CsvOptions::default(), 1 << 20).unwrap();
+        assert_eq!(table.features.len(), 1000);
+        assert!(report.messages.is_empty());
+    }
+
+    /// Cancellation while the CSV parser asks for more of a long DAT header stays cancellation.
+    #[test]
+    fn gzip_long_dat_header_preserves_cancellation() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, atomic::Ordering};
+        struct HeaderRead {
+            bytes: std::io::Cursor<Vec<u8>>,
+            probe: Arc<crate::progress::tests::Counted>,
+        }
+        impl Read for HeaderRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let limit = buf.len().min(4096);
+                let n = self.bytes.read(&mut buf[..limit])?;
+                if self.bytes.position() >= 96 << 10 {
+                    self.probe.cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(n)
+            }
+        }
+        // Stored blocks ensure decoding the first 64 KiB cannot consume the cancellation point.
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        encoder.write_all(format!("{},value\nA,1\n", "h".repeat(200_000)).as_bytes()).unwrap();
+        let probe = Arc::new(crate::progress::tests::Counted::default());
+        let reader = HeaderRead { bytes: std::io::Cursor::new(encoder.finish().unwrap()), probe: probe.clone() };
+        let _guard = crate::progress::install(Some(probe.clone()));
+        assert!(matches!(read_gzip_text(reader, "long.dat.gz", &CsvOptions::default()), Err(DataError::Cancelled)));
+        assert!(probe.cancel.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn gzip_expansion_is_bounded_and_cancellable() {
         use std::io::Read;
@@ -5257,6 +5338,15 @@ mod tests {
         assert_eq!(layers[0].0.geometry_type, GeometryType::None);
         assert_eq!(layers[1].0.features[0].geometry, Some(Geometry::Point(Coord::new(-89.9, 35.1))));
         assert!(layers[0].1.messages.iter().any(|m| m.contains("README.txt")));
+        let readme = crate::zip::write(&[
+            ("nested/README.txt".into(), b"README\nA transit feed.\nRead the documentation.\n".to_vec()),
+            ("ids.txt".into(), b"id\nA\n".to_vec()),
+        ])
+        .unwrap();
+        let layers = read_zip("readme.zip", &readme).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].0.name, "ids");
+        assert!(layers[0].1.messages.iter().any(|m| m.contains("nested/README.txt")));
         let clean = crate::zip::write(&[("ids.txt".into(), b"id\nA\n".to_vec())]).unwrap();
         let layers = read_zip("ids.zip", &clean).unwrap();
         assert_eq!(layers[0].0.value(0, 0), &Value::Text("A".into()));
@@ -5265,6 +5355,22 @@ mod tests {
             crate::zip::write(&[("ids.txt".into(), b"id\nA\n".to_vec()), ("ragged.txt".into(), b"id,n\nA,1,extra\n".to_vec())]).unwrap();
         let layers = read_zip("ragged.zip", &ragged).unwrap();
         assert!(layers[0].1.messages.iter().any(|m| m.contains("ragged.txt") && m.contains("extract")));
+    }
+
+    /// A supplied ZIP CRS also places coordinates from its delimited members.
+    #[test]
+    fn zip_text_tables_use_the_supplied_crs() {
+        let bytes = b"id,easting,northing\nA,500000,4649776.22482\n";
+        let zip = crate::zip::write(&[("projected.txt".into(), bytes.to_vec()), ("projected.csv.gz".into(), gzip_csv(bytes))]).unwrap();
+        let crs = Crs::from_epsg(32633).unwrap();
+        let layers = read_zip_in("projected.zip", &zip, Some(crs)).unwrap();
+        assert_eq!(layers.len(), 2);
+        for (table, report) in layers {
+            let point = table.features[0].geometry.as_ref().unwrap().label_point().unwrap();
+            assert!((point.x - 15.0).abs() < 1e-6 && (point.y - 42.0).abs() < 1e-6, "{point:?}");
+            assert_eq!(table.crs, Some(crs));
+            assert!(report.messages.is_empty(), "{:?}", report.messages);
+        }
     }
 
     #[test]

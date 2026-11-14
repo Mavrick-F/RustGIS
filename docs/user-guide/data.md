@@ -44,6 +44,10 @@ double-clicked in the Browser: **Choose Layers** lists them, all ticked, with **
 **Select None** and a filter for a long list. Turn **Ask Which Layers to Add** off in the Add Data
 menu to add every layer, as before. Scripts pick one with `layer.addData`'s `"layer"`;
 `info.fileLayers` lists them.
+A DXF drawing opens **Import DXF** when it is picked, dropped or double-clicked: it asks for the
+coordinate system the drawing's coordinates are in (the map's, to start with; blank keeps them as
+they are) and whether its blocks (图块) are drawn. Drawings dropped together ask one after the
+other, so each keeps its own answers.
 A KML, KMZ, GPX, OpenStreetMap, DXF, LandXML or GeoRSS file, a zip of Shapefiles or a File
 Geodatabase that RustGIS reads itself, with layers of several geometry types, adds its polygons
 first and its points last, so its points are drawn on top, and a KML's ground overlays go under
@@ -72,14 +76,18 @@ Published pipe-delimited `.dat` files open as tables when their header and rows 
 separator; otherwise give `"delimiter":"|"` to `layer.addData`, or rename a text file to `.txt`.
 Gzip-compressed UTF-8 `.csv.gz`, `.tsv.gz`, `.txt.gz` and `.dat.gz` open directly, including by
 URL or upload. Decompression streams records, checks the gzip checksum and stops at 256 MiB of
-expanded text. Table rows are still kept in memory for type inference. For another encoding,
-decompress the file and add the `.txt` file, whose reader detects the encoding. Delimited text
+expanded text. Table rows are still kept in memory for type inference; CSV imports also refuse
+a retained-table estimate above a quarter of physical memory, between 256 MiB (the browser
+budget) and 4 GiB. This estimate includes cell objects and the dataset built alongside the rows.
+For another encoding, decompress the file and add the `.txt` file, whose reader detects the encoding. Delimited text
 is exported as `.csv`; gzip is an input format.
 
 A GTFS zip adds its delimited `.txt` members as standalone tables; `stop_lon` and `stop_lat`
 place stops as points. This imports the tables, not a transit routing network. The archive's
-usual 32-layer/table limit applies, and skipped readable members are named in a notice. Prose
-readmes are skipped with a notice. A zipped File Geodatabase must be unzipped first: on the desktop, add the
+usual 32-layer/table limit applies, and skipped readable members are named in a notice. Text
+members that do not resemble tables, including single-column `README.txt` documentation, are
+skipped with a notice. Give `"crs"` when the archive's text tables use projected coordinates.
+A zipped File Geodatabase must be unzipped first: on the desktop, add the
 `.gdb` folder. The archive reader says this when it finds one, including beside readable files.
 
 **Home › Add › Add Data › Delimited Text…** asks for a CSV or a spreadsheet first, then lists its columns to pick the x and y (or WKT)

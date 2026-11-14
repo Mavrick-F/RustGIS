@@ -177,6 +177,10 @@ pub const DELIMITED_PICK: &str = "\u{1}delimited:";
 /// another picker. Several selected Shapefiles share the same import options.
 pub const SHAPEFILE_PICK: &str = "\u{1}shapefile:";
 
+/// Starts the name of a drawing the web shell's `"dxf"` picker put in the inbox, so Import DXF
+/// opens for it and no other dropped file.
+pub const DXF_PICK: &str = "\u{1}dxf:";
+
 /// The `open_async` purpose for a tool's file parameter, followed by the extensions it offers
 /// (`toolfile:nc,nc4`; none for any file).
 pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
@@ -362,6 +366,9 @@ pub struct Services {
     /// Opens a file picker for `"data"`, `"project"`, or `"shapefile"`; results land in `inbox`.
     /// Shapefile picks carry [`SHAPEFILE_PICK`] after sidecars are gathered into ZIPs.
     pub open_async: Option<Box<dyn Fn(&str)>>,
+    /// Asks the device's camera for a photo (a phone's shell): the photo arrives in
+    /// [`RustGisApp::photos`]. `None` where there is no camera to ask.
+    pub take_photo: Option<Box<dyn Fn() -> Result<(), String>>>,
     /// Offers bytes as a download named `file_name`; success means submission to the host's
     /// download mechanism. Browsers do not expose confirmation that the file was saved.
     pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
@@ -815,8 +822,16 @@ pub struct UiState {
     /// Add Delimited Text, for the file being picked (web): `null` opens its dialog for the file,
     /// a script's options are read with it.
     pub pending_csv: Option<Value>,
+    /// Import DXF options by picker request (web): `null` opens the dialog; a script's options
+    /// are read with its drawing even when other pickers finish first.
+    pub pending_dxf: std::collections::BTreeMap<u64, Value>,
+    /// Monotonic identifier keeps concurrently open DXF pickers distinct.
+    pub next_dxf: u64,
     /// CRS override for the next Shapefile picked by Import Shapefile with Projection.
     pub pending_shapefile: Option<Value>,
+    /// Drawings picked while Import DXF was open for one (several dropped together): each opens
+    /// its dialog after the one before it closes.
+    pub dxf_waiting: std::collections::VecDeque<dialogs::DxfFile>,
     /// Data downloading from web addresses (Home › Add › Add Data › From URL).
     pub downloads: Vec<Download>,
     /// A project downloading from its web address (`ui.openUrl`, a `?project=` link): the
@@ -1024,7 +1039,10 @@ impl Default for UiState {
             pending_open: None,
             web_file: None,
             pending_csv: None,
+            pending_dxf: Default::default(),
+            next_dxf: 0,
             pending_shapefile: None,
+            dxf_waiting: std::collections::VecDeque::new(),
             downloads: Vec::new(),
             project_download: None,
             sql: Default::default(),
@@ -1114,6 +1132,25 @@ const CAPTURE_PIXELS: f64 = 16_000_000.0;
 /// The lowest dpi a layout is copied at: a page that would need less is an error.
 const CAPTURE_MIN_DPI: f64 = 36.0;
 
+/// The most positions [`RustGisApp::fixes`] keeps for an interface to take: more than two days of
+/// one a second, as many as a phone's shell keeps out of sight (its `MOST_EVENTS`), so a batch it
+/// hands over on coming back is taken whole into a track.
+pub const FIXES_KEPT: usize = 200_000;
+
+impl RustGisApp {
+    /// Keeps a position the shell reported: the last one in [`RustGisApp::position`], and each in
+    /// [`RustGisApp::fixes`] until an interface takes them (the oldest dropped past
+    /// [`FIXES_KEPT`]).
+    pub fn report_position(&mut self, fix: rustgis_engine::platform::Fix) {
+        self.position = Some(fix);
+        if self.fixes.len() >= FIXES_KEPT {
+            self.fixes.pop_front();
+            self.fixes_dropped += 1;
+        }
+        self.fixes.push_back(fix);
+    }
+}
+
 pub struct RustGisApp {
     pub session: Session,
     pub ui: UiState,
@@ -1145,6 +1182,20 @@ pub struct RustGisApp {
     /// Where the device is, as the shell last reported it; `None` until it has, and again once
     /// positioning is off. An interface draws it on the map and can capture at it.
     pub position: Option<rustgis_engine::platform::Fix>,
+    /// Every position the shell reported since an interface last took them, oldest first (at most
+    /// [`FIXES_KEPT`]: the oldest go first). [`RustGisApp::position`] is only the last: a track
+    /// or an average needs each, including those that arrived together after the app was out of
+    /// sight.
+    pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
+    /// Whether the interface wants positions while the app is out of sight too (a track being
+    /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
+    pub keep_locating: bool,
+    /// Photos the camera took ([`Services::take_photo`]), by where they were written, until an
+    /// interface takes them.
+    pub photos: Vec<std::path::PathBuf>,
+    /// How many positions were dropped from [`RustGisApp::fixes`] past [`FIXES_KEPT`] since an
+    /// interface last took them: the interface says so when a track or an average missed them.
+    pub fixes_dropped: usize,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1414,6 +1465,10 @@ impl RustGisApp {
             chrome: None,
             locate: false,
             position: None,
+            fixes: std::collections::VecDeque::new(),
+            keep_locating: false,
+            photos: Vec::new(),
+            fixes_dropped: 0,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1793,7 +1848,8 @@ impl RustGisApp {
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
     /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`];
-    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview.
+    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview; DXF picks
+    /// carry [`DXF_PICK`] and open Import DXF.
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
         if name.starts_with(SHORTCUT_PICK) {
             return shortcutfile::picked(self, bytes);
@@ -1815,6 +1871,19 @@ impl RustGisApp {
             };
             return self.open_bytes_with(name, bytes, Some(options));
         }
+        if let Some(picked) = name.strip_prefix(DXF_PICK) {
+            let (id, name) = picked.split_once(':').ok_or(tl!("Invalid DXF picker request"))?;
+            let id = id.parse::<u64>().map_err(|_| tl!("Invalid DXF picker request"))?;
+            let options = self.ui.pending_dxf.remove(&id).ok_or(tl!("DXF picker request is no longer available"))?;
+            if name.is_empty() {
+                return Ok(Value::Null);
+            }
+            return if options.is_null() {
+                dialogs::open_dxf(self, name, dialogs::DxfSource::Bytes(bytes.to_vec()))
+            } else {
+                self.import_dxf_bytes(name, bytes, options)
+            };
+        }
         match name.strip_prefix(DELIMITED_PICK) {
             Some(name) => match self.ui.pending_csv.take() {
                 Some(Value::Null) => dialogs::open_csv(self, name, dialogs::CsvSource::Bytes(bytes.to_vec())),
@@ -1824,8 +1893,17 @@ impl RustGisApp {
         }
     }
 
-    /// Opens file bytes with picker options, forwarding source CRS overrides before ZIP parsing.
-    fn open_bytes_with(&mut self, name: &str, bytes: &[u8], csv: Option<Value>) -> Result<Value, String> {
+    /// Imports a DXF drawing with its own options, leaving unrelated picker commands intact.
+    fn import_dxf_bytes(&mut self, name: &str, bytes: &[u8], mut options: Value) -> Result<Value, String> {
+        use base64::Engine;
+        options["fileName"] = json!(name);
+        options["data"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+        self.run("layer.addDataBytes", options)
+    }
+
+    /// Opens file bytes with picker options (import options, a source CRS), forwarding them before
+    /// ZIP parsing.
+    fn open_bytes_with(&mut self, name: &str, bytes: &[u8], opts: Option<Value>) -> Result<Value, String> {
         let lower = name.to_ascii_lowercase();
         // A plugin package: ask before installing it.
         if lower.ends_with(".rgplugin") {
@@ -1907,6 +1985,11 @@ impl RustGisApp {
             use base64::Engine;
             return self.add_picture(json!({"image": base64::engine::general_purpose::STANDARD.encode(bytes)}));
         }
+        // A drawing asks for its coordinate system and whether its blocks are drawn first. Picker
+        // and script options (`crs`, `blocks`) add it straight away, as the branch below does.
+        if opts.is_none() && rustgis_engine::data::dxf::is_dxf_name(name) {
+            return dialogs::open_dxf(self, name, dialogs::DxfSource::Bytes(bytes.to_vec()));
+        }
         if rustgis_engine::data::raster::is_raster_name(name)
             || rustgis_engine::data::source::is_source_name(name)
             || rustgis_engine::data::io::is_multi_layer_name(name)
@@ -1917,12 +2000,12 @@ impl RustGisApp {
             use base64::Engine;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut p = json!({"fileName": name, "data": data});
-            // A picked spreadsheet or Shapefile ZIP takes its import options.
-            if let Some(Value::Object(opts)) = csv.filter(|_| {
-                rustgis_engine::data::sheets::is_sheet_name(name)
-                    || lower.ends_with(".zip")
-                    || rustgis_engine::data::io::is_delimited_name(name)
-            }) {
+            // Picked vector files and delimited tables retain their import options.
+            let takes_options = rustgis_engine::data::sheets::is_sheet_name(name)
+                || lower.ends_with(".zip")
+                || rustgis_engine::data::dxf::is_dxf_name(name)
+                || rustgis_engine::data::io::is_delimited_name(name);
+            if let Some(Value::Object(opts)) = opts.filter(|_| takes_options) {
                 for (k, v) in opts {
                     p[k] = v;
                 }
@@ -1943,7 +2026,7 @@ impl RustGisApp {
             r
         } else {
             let mut p = json!({"fileName": name, "text": text});
-            if let Some(Value::Object(opts)) = csv.filter(|_| rustgis_engine::data::io::is_delimited_name(name)) {
+            if let Some(Value::Object(opts)) = opts.filter(|_| rustgis_engine::data::io::is_delimited_name(name)) {
                 for (k, v) in opts {
                     p[k] = v;
                 }
@@ -3610,6 +3693,33 @@ impl RustGisApp {
                     };
                 }
             }
+            // A DXF drawing: the file, then Import DXF to pick its coordinate system and whether
+            // its blocks are drawn. With options (a script's), the file is read with them instead.
+            "ui.addDxf" => {
+                let opts = p.is_object().then(|| p.clone());
+                if let Some(open) = &self.services.open_async {
+                    self.ui.pending_layout_picture = false;
+                    self.ui.pending_picture = None;
+                    self.ui.pending_open = None;
+                    self.ui.pending_csv = None;
+                    // `null`: the dialog, for the file picked.
+                    if self.ui.pending_dxf.len() >= 64 {
+                        return Err(tl!("Too many DXF pickers are open; close one before choosing another drawing").into());
+                    }
+                    self.ui.next_dxf = self.ui.next_dxf.checked_add(1).ok_or(tl!("DXF picker request limit reached"))?;
+                    let id = self.ui.next_dxf;
+                    self.ui.pending_dxf.insert(id, opts.unwrap_or(Value::Null));
+                    open(&format!("dxf:{id}"));
+                } else if let Some(path) = dialogs::pick_open(&["dxf"], tl!("DXF drawing")) {
+                    return match opts {
+                        Some(mut q) => {
+                            q["path"] = json!(path);
+                            dialogs::add_dxf_file(self, q)
+                        }
+                        None => dialogs::open_dxf_path(self, &path),
+                    };
+                }
+            }
             // A project by its web address (a `?project=` link): downloaded off the frame, opened
             // when it lands: native projects replace it; GeoLibre imports add a map (see `poll_downloads`).
             "ui.openUrl" => {
@@ -4933,7 +5043,7 @@ impl RustGisApp {
             }
             // How the bytes are read, as `layer.addData` takes it (a command asking by
             // address, such as a plugin's: the dialog gives none of these).
-            for k in ["x", "y", "wkt", "delimiter", "paperSpace", "stream", "as"] {
+            for k in ["x", "y", "wkt", "delimiter", "paperSpace", "blocks", "stream", "as"] {
                 if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
                     q[k] = v.clone();
                 }
