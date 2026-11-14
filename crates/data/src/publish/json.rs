@@ -107,9 +107,19 @@ fn document(ds: &Dataset, original: &Json) -> std::result::Result<Json, String> 
         _ => Vec::new(),
     };
     let has_ids = originals.iter().any(|f| f.get("id").is_some());
-    if has_ids && (ds.features.len() != originals.len() || ds.features.iter().enumerate().any(|(i, f)| f.id != i as u64 + 1)) {
+    let rows_changed = ds.features.len() != originals.len() || ds.features.iter().enumerate().any(|(i, f)| f.id != i as u64 + 1);
+    if has_ids && rows_changed {
         return Err(
             "it has feature ids; publishing added, removed or reordered rows couldn't preserve their identities; export a copy instead"
+                .into(),
+        );
+    }
+    // Without fields, each row keeps its original's absent, null or object `properties`, found by
+    // position; a changed row set would move those onto other rows.
+    let shapes: std::collections::HashSet<Option<bool>> = originals.iter().map(|f| f.get("properties").map(Json::is_null)).collect();
+    if ds.fields.is_empty() && shapes.len() > 1 && rows_changed {
+        return Err(
+            "its features mix absent, null and empty properties; publishing added, removed or reordered rows couldn't keep each one's; export a copy instead"
                 .into(),
         );
     }
@@ -482,6 +492,17 @@ mod tests {
         let error = geojson(&ds, &path, &sync).err().unwrap().to_string();
         assert!(error.contains("feature ids"), "{error}");
         assert_eq!(std::fs::read_to_string(path).unwrap(), written);
+    }
+
+    #[test]
+    fn mixed_property_shapes_refuse_row_changes() {
+        let text = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]}},{"type":"Feature","properties":null,"geometry":{"type":"Point","coordinates":[3,4]}}]}"#;
+        let (_dir, path, mut ds, sync) = loaded(text);
+        assert!(ds.fields.is_empty());
+        ds.features = ds.features.iter().skip(1).cloned().collect::<Vec<_>>().into();
+        let error = geojson(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(error.contains("mix absent, null and empty properties"), "{error}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), text);
     }
 
     #[test]

@@ -481,19 +481,23 @@ a geometry the reader simplifies, nested properties it reads as text, duplicate 
 or number text the writer would spell differently (such as `1.00` or `1E3`). The message says
 why; the original file stays unchanged. A file with feature ids requires the same internal row
 ids in the same order: adding, deleting or reordering rows is refused when their external ids
-couldn't be preserved. Use Export Features for a different document structure. A single Feature
-can't become a collection, a bare geometry can't gain attributes, and an empty collection can't
-retain a field schema.
+couldn't be preserved, and the same holds for a layer without fields whose features mix absent,
+null and object `properties`. Absent or null `properties` are kept only in a layer without fields:
+a collection that mixes them with attributed features is refused. Use Export Features for a
+different document structure. A single Feature can't become a collection, a bare geometry can't
+gain attributes, and an empty collection can't retain a field schema.
 
 The new file is written beside the source with its existing permissions, synced and read back.
 The source is checked again immediately before the atomic replacement; cancellation or failure
 before replacement leaves it unchanged. The same OS lock as for Shapefile prevents concurrent
 RustGIS publishers; its empty `.filename.geojson.rustgis-lock` sidecar stays for reuse. Other
 programs do not follow this lock: changes they make after RustGIS's final source check can be
-overwritten by the publish. Stop other writers before publishing. A field
-removed or renamed in the layer produces a notice naming the properties left out. Afterward the
+overwritten by the publish. Stop other writers before publishing. A field removed or renamed in
+the layer produces a notice naming the properties left out. Afterward the
 layer takes the file's read-back values and its new sync point, without changing the project
 format. Undo changes the layer, and shows it as edited; it does not undo a write to the file.
+
+#### Running a publish
 
 On the desktop, make the layer active and choose **Publish to Source** in Command Search; it runs
 in the background, with progress and Cancel in the status bar. CLI and Python: `source.publish`
