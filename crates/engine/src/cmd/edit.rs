@@ -62,12 +62,12 @@ fn target(s: &Session, p: &Json) -> Result<Target, String> {
     s.table_index(p).map(Target::Table)
 }
 
-/// A synchronous edit's target. Native scoped callers must supply an owned worker result,
+/// A synchronous edit's target. Native scoped callers and notebooks need an owned worker result,
 /// which handlers land before reaching here; an unprepared call must never scan live rows.
 fn write_target(s: &Session, p: &Json) -> Result<Target, String> {
     let target = target(s, p)?;
     #[cfg(not(target_arch = "wasm32"))]
-    if matches!(target, Target::Table(_)) && !s.policy_user() {
+    if matches!(target, Target::Table(_)) && (!s.policy_user() || s.notebook_running) {
         return Err("this caller must prepare the table edit on a worker; run it from the table view instead of synchronously".into());
     }
     Ok(target)

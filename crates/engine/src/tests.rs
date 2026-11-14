@@ -259,6 +259,26 @@ fn table_remove_takes_a_standalone_table_out_of_the_project() {
     assert!(undone["id"].as_u64() < next["id"].as_u64(), "{undone} then {next}");
 }
 
+/// Trusted notebook cells also run inline; a failed cell must preserve rows and release its guard.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn notebook_table_writes_are_refused_before_rows_change() {
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName": "records.csv", "text": format!("n\n{}", "1\n".repeat(20_000))})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    s.run("notebook.new", &json!({"name": "Edit records"})).unwrap();
+    let p = json!({"table": "records", "field": "n", "expression": "n + 1"});
+    let cell = s.run("notebook.addCell", &json!({"source": format!("edit.calculateField {p}")})).unwrap()["cell"].clone();
+    let before = serde_json::to_value(&s.project.tables).unwrap();
+    let result = s.run("notebook.run", &json!({"cell": cell})).unwrap();
+    assert_eq!(result["error"], cell);
+    assert_eq!(serde_json::to_value(&s.project.tables).unwrap(), before);
+    let at = usize::try_from(cell.as_u64().unwrap()).unwrap();
+    assert!(s.project.notebooks[0].cells[at].output.as_deref().is_some_and(|text| text.contains("prepare the table edit on a worker")));
+    s.run("edit.calculateField", &p).unwrap();
+    assert_eq!(s.project.tables[0].dataset.value(0, 0), &rustgis_data::Value::Int(2));
+}
+
 /// Native scoped callers must prepare table work; owned results still land under that scope.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]

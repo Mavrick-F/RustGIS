@@ -66,8 +66,9 @@ write are checked for file-producing and plugin tools too; those steps must run 
 Native restricted callers must prepare table writes in the background; synchronous table writes
 are refused. Run those edits from the table view or an ordinary Script pane script instead.
 A failed worker start refuses the edit instead of running it on the window thread. The command
-line continues to run scripts synchronously. Native tasks cannot write standalone tables, including through a script step:
-run those edits directly or as a separate script so the desktop can offer progress and Cancel.
+line continues to run scripts synchronously. Native tasks and notebooks cannot write standalone
+tables, including through script steps: run those edits directly or as a separate script so the
+desktop can offer progress and Cancel.
 Calculate Field lists only columns reachable by name; a later column whose name differs only
 by case cannot be changed there.
 
