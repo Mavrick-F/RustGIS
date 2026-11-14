@@ -1751,13 +1751,34 @@ pub fn gzip_text_prefix(reader: impl std::io::Read, limit: usize) -> Result<Vec<
 /// expanded file. Other encodings can be decompressed and added as .txt. The existing table
 /// builder retains rows for type inference; this isn't a read-in-place provider.
 pub fn read_gzip_text(reader: impl std::io::Read, file_name: &str, opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
-    use std::io::Read;
+    use std::io::{BufRead, Read};
     if !is_gzip_text_name(file_name) {
         return Err(DataError::Unsupported(format!("{file_name}: decompress it first, then add the supported file inside")));
     }
-    let mut decoder = GzipText::new(reader);
+    let mut decoder = std::io::BufReader::new(GzipText::new(reader));
     let mut prefix = Vec::new();
-    let result = decoder.by_ref().take(64 << 10).read_to_end(&mut prefix);
+    let result = (|| -> std::io::Result<()> {
+        decoder.by_ref().take(64 << 10).read_to_end(&mut prefix)?;
+        if opts.delimiter.is_none() {
+            // The existing sniffer compares physical lines. Finish its sampled line and include
+            // a data line even when the header or first row exceeds the usual prefix size.
+            if prefix.last().is_some_and(|c| *c != b'\n') {
+                decoder.read_until(b'\n', &mut prefix)?;
+            }
+            let mut lines = prefix.split(|b| *b == b'\n').filter(|line| !line.iter().all(u8::is_ascii_whitespace)).count();
+            while lines < 2 {
+                let start = prefix.len();
+                if decoder.read_until(b'\n', &mut prefix)? == 0 {
+                    break;
+                }
+                if prefix.get(start..).is_some_and(|line| !line.iter().all(u8::is_ascii_whitespace)) {
+                    lines += 1;
+                }
+                crate::progress::check().map_err(std::io::Error::other)?;
+            }
+        }
+        Ok(())
+    })();
     crate::progress::check()?;
     result.map_err(|e| DataError::Format(format!("{file_name}: gzip: {e}")))?;
     if prefix.starts_with(b"\xEF\xBB\xBF") {
@@ -1803,16 +1824,17 @@ fn read_csv_records(
     opts: &CsvOptions,
     budget: usize,
 ) -> Result<(Dataset, ReadReport)> {
-    let cost = |r: &csv::StringRecord| {
+    let cost = |r: &csv::StringRecord, columns: usize| {
         r.as_slice()
             .len()
             .saturating_mul(2)
-            .saturating_add(r.len().saturating_mul(2 * (std::mem::size_of::<String>() + std::mem::size_of::<Value>())))
+            .saturating_add(r.len().saturating_mul(2 * std::mem::size_of::<String>()))
+            .saturating_add(columns.saturating_mul(2 * std::mem::size_of::<Value>()))
             .saturating_add(2 * (std::mem::size_of::<Vec<String>>() + std::mem::size_of::<crate::Feature>()))
     };
     let too_large = || DataError::Format(format!("CSV retained table exceeds the {budget}-byte memory budget; import a smaller file"));
     let header = reader.headers().map_err(|e| DataError::Format(format!("CSV: {e}")))?;
-    let mut left = budget.checked_sub(cost(header)).ok_or_else(too_large)?;
+    let mut left = budget.checked_sub(cost(header, header.len())).ok_or_else(too_large)?;
     let headers: Vec<String> = header.iter().map(str::to_string).collect();
     let mut malformed = 0;
     let mut rows = Vec::new();
@@ -1820,7 +1842,7 @@ fn read_csv_records(
         crate::progress::check()?;
         match record {
             Ok(r) => {
-                left = left.checked_sub(cost(&r)).ok_or_else(too_large)?;
+                left = left.checked_sub(cost(&r, headers.len())).ok_or_else(too_large)?;
                 rows.push(r.iter().map(str::to_string).collect());
             }
             Err(e) if e.is_io_error() || matches!(e.kind(), csv::ErrorKind::Utf8 { .. }) => {
@@ -5234,6 +5256,11 @@ mod tests {
         let (table, report) = read_bytes("long.dat.gz", &gzip_csv(long.as_bytes())).unwrap();
         assert_eq!(table.value(0, 1), &Value::Int(1));
         assert!(report.messages.is_empty());
+        let ambiguous = format!("label, description;value\n{};1\n", "A".repeat(70_000));
+        let plain = read_bytes("ambiguous.csv", ambiguous.as_bytes()).unwrap().0;
+        let zipped = read_bytes("ambiguous.csv.gz", &gzip_csv(ambiguous.as_bytes())).unwrap().0;
+        assert_eq!(zipped.fields, plain.fields);
+        assert_eq!(zipped.value(0, 1), &Value::Int(1));
         let mut members = gzip_csv(b"id,count\nA,12\n");
         members.extend(gzip_csv(b"B,13\n"));
         assert_eq!(read_bytes("counts.csv.gz", &members).unwrap().0.features.len(), 2);
@@ -5270,6 +5297,12 @@ mod tests {
         let (table, report) = read_csv_records(&mut reader, "small", &CsvOptions::default(), 1 << 20).unwrap();
         assert_eq!(table.features.len(), 1000);
         assert!(report.messages.is_empty());
+        // Missing fields still become dataset attributes, so charge the complete header width.
+        let header = (0..100).map(|i| format!("f{i}")).collect::<Vec<_>>().join(",");
+        let bytes = gzip_csv(format!("{header}\n{}", "x\n".repeat(100)).as_bytes());
+        let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(GzipText::new(bytes.as_slice()));
+        let error = read_csv_records(&mut reader, "short", &CsvOptions::default(), 64 << 10).unwrap_err();
+        assert!(error.to_string().contains("memory budget"), "{error}");
     }
 
     /// Cancellation while the CSV parser asks for more of a long DAT header stays cancellation.
