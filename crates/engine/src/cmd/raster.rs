@@ -709,7 +709,7 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     if name.to_ascii_lowercase().ends_with(".gz") && !rustgis_data::io::is_gzip_text_name(&name) {
         return Err(format!("{name}: decompress it first, then add the supported file inside"));
     }
-    if rustgis_data::io::is_delimited_name(&name) {
+    if rustgis_data::io::is_gzip_text_name(&name) {
         let read = super::layer::read_delimited_bytes(p, &name, &bytes)?;
         return super::layer::add_read(s, p, read, zoom);
     }
