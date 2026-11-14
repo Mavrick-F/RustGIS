@@ -2582,6 +2582,8 @@ fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut
     let mut entries: Vec<Option<(String, Vec<u8>)>> = entries.into_iter().map(Some).collect();
     let mut shps: Vec<String> = entries.iter().flatten().filter(|(n, _)| ext_of(n) == "shp").map(|(n, _)| n.clone()).collect();
     shps.sort();
+    // Keep the original paths: sidecars of Shapefiles past the limit aren't standalone tables.
+    let shp_stems: std::collections::HashSet<String> = shps.iter().map(|n| stem(n)).collect();
     let take = |entries: &mut Vec<Option<(String, Vec<u8>)>>, base: &str, ext: &str| -> Option<(String, Vec<u8>)> {
         entries.iter_mut().find(|e| e.as_ref().is_some_and(|(n, _)| ext_of(n) == ext && stem(n) == base))?.take()
     };
@@ -2636,10 +2638,16 @@ fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut
     let mut others: Vec<(String, Vec<u8>)> = entries
         .into_iter()
         .flatten()
-        .filter(|(n, _)| !matches!(ext_of(n).as_str(), "shp" | "shx" | "dbf" | "prj" | "cpg" | "mid"))
+        .filter(|(n, _)| {
+            !matches!(ext_of(n).as_str(), "shp" | "shx" | "prj" | "cpg" | "mid") && (ext_of(n) != "dbf" || !shp_stems.contains(&stem(n)))
+        })
         .collect();
     others.sort_by(|a, b| a.0.cmp(&b.0));
     for (n, b) in others {
+        if ext_of(&n) == "dbf" {
+            skipped.push(format!("{n} (a .dbf table without a .shp is not read)"));
+            continue;
+        }
         // Prose readmes aren't tables; optional empty GTFS tables still have headers.
         if ext_of(&n) == "txt" {
             let columns = delimited_text(&n, &b).map_or(0, |(text, _)| delimited_table_columns(&text));
@@ -5585,6 +5593,37 @@ mod tests {
         let mixed = crate::zip::write(&entries).unwrap();
         let layers = read_zip("mixed.zip", &mixed).unwrap();
         assert!(layers[0].1.messages.iter().any(|m| m.contains(".gdb folder")));
+    }
+
+    /// A DBF in another folder isn't a Shapefile sidecar, even with the same base name. Name
+    /// the unsupported table instead of losing it silently; paired sidecars need no notice.
+    #[test]
+    fn zipped_standalone_dbf_is_named_in_notice() {
+        let mut ds = Dataset::new("places", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        ds.push_next(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text("one".into())]);
+        ds.push_next(Some(Geometry::Point(Coord::new(3.0, 4.0))), vec![Value::Text("two".into())]);
+        let (parts, lost) = shapefile_parts(&ds).unwrap();
+        assert_eq!(lost, 0);
+        let dbf = parts.iter().find(|(e, _)| *e == "dbf").unwrap().1.clone();
+        let mut entries: Vec<_> = parts.into_iter().map(|(e, b)| (format!("shapes/Places.{}", e.to_ascii_uppercase()), b)).collect();
+        // Pairing ignores case, including the folder name.
+        entries.iter_mut().find(|(n, _)| n.ends_with(".DBF")).unwrap().0 = "SHAPES/places.dbf".into();
+        let clean = read_zip("county.zip", &crate::zip::write(&entries).unwrap()).unwrap();
+        assert_eq!(clean.len(), 1);
+        assert_eq!(clean[0].0.features.len(), 2);
+        assert!(clean[0].1.messages.is_empty(), "{:?}", clean[0].1.messages);
+
+        entries.push(("tables/Places.DBF".into(), dbf.clone()));
+        entries.push(("__MACOSX/._table.dbf".into(), dbf.clone()));
+        let mixed = read_zip("county.zip", &crate::zip::write(&entries).unwrap()).unwrap();
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].0.features.len(), 2);
+        assert_eq!(mixed[0].0.value(1, 0), &Value::Text("two".into()));
+        assert_eq!(mixed[0].1.messages, ["county.zip: skipped tables/Places.DBF (a .dbf table without a .shp is not read)"]);
+        // With only an unsupported table, the archive refuses to open and names it too.
+        let only_table = crate::zip::write(&[("tables/Places.DBF".into(), dbf)]).unwrap();
+        let error = read_zip("county.zip", &only_table).unwrap_err().to_string();
+        assert!(error.contains("tables/Places.DBF") && error.contains("a .dbf table without a .shp"), "{error}");
     }
 
     /// Zipped Shapefiles are read from memory (the web app's way to open them), with their `.prj`,
