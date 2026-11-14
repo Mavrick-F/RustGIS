@@ -1883,11 +1883,16 @@ fn plugin_state_keeps_what_this_version_cannot_read() {
         std::fs::write(&state, r#"{"disabled": ["state-test"]}"#).unwrap();
         assert!(crate::store::load_installed().is_empty());
     }
-    std::fs::remove_file(&state).unwrap();
-    // No file is nothing disabled, with no notice.
-    crate::unload("state-test");
-    assert!(crate::store::load_installed().is_empty());
-    assert!(crate::get("state-test").is_some_and(|p| p.enabled));
+    // No file, or an empty one, is nothing disabled, with no notice.
+    for empty in [None, Some("  \n")] {
+        match empty {
+            Some(text) => std::fs::write(&state, text).unwrap(),
+            None => std::fs::remove_file(&state).unwrap(),
+        }
+        crate::unload("state-test");
+        assert!(crate::store::load_installed().is_empty(), "{empty:?}");
+        assert!(crate::get("state-test").is_some_and(|p| p.enabled), "{empty:?}");
+    }
     crate::store::uninstall("state-test").unwrap();
     let _ = std::fs::remove_dir_all(&plugins);
 }

@@ -63,13 +63,16 @@ fn state_path() -> Option<PathBuf> {
     dir().map(|d| d.join("state.json"))
 }
 
-/// `state.json`: none is no plugin disabled or added from a folder. One that can't be read (or that
-/// a newer RustGIS wrote in a shape this one doesn't know) is said by [`load_installed`], which then
-/// loads no plugin, and kept as it is: [`write_state`] refuses to write over it.
+/// `state.json`: none, or an empty one, is no plugin disabled or added from a folder. One that can't
+/// be read (or that a newer RustGIS wrote in a shape this one doesn't know) is said by
+/// [`load_installed`], which then loads no plugin, and kept as it is: [`write_state`] refuses to
+/// write over it.
 fn read_state() -> State {
     let Some(path) = state_path() else { return State::default() };
     let read = match std::fs::read_to_string(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
+        // Written whole each time, so an empty file was made empty on purpose, not cut short.
+        Ok(text) if text.trim().is_empty() => return State::default(),
         Err(e) => Err(e.to_string()),
         Ok(text) => serde_json::from_str(&text).map_err(|e| e.to_string()),
     };
