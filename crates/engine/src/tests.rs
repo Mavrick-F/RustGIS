@@ -31,13 +31,26 @@ mod service_logins;
 #[path = "tests/scopes_and_redaction.rs"]
 mod scopes_and_redaction;
 
-/// Keeps tests away from the user's installed plugins.
+/// Where the tests' plugins folder keeps what plugins remember: not the user's.
+fn plugin_settings_dir() -> std::path::PathBuf {
+    rustgis_plugins::store::dir().unwrap().join("settings")
+}
+
+/// Keeps tests away from the user's installed plugins, and so from what they remember (it is kept
+/// in the plugins folder).
 fn isolate_plugins() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let dir = std::env::temp_dir().join(format!("rustgis-test-plugins-{}", std::process::id()));
         rustgis_plugins::store::set_dir(Some(dir));
     });
+}
+
+/// Held by the tests that install and uninstall: reloading what is installed (`load_installed`)
+/// in one would load another's plugin between its install and its uninstall.
+fn plugin_store_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn world() -> Session {
@@ -12866,6 +12879,115 @@ fn plugin_commands_run_like_commands() {
 }
 
 #[test]
+fn plugin_settings_are_kept_per_plugin_across_sessions_updates_and_toggles() {
+    let mut s = world();
+    plugin("eng-set-a", &[]);
+    plugin("eng-set-b", &["edit"]);
+    let read = |s: &mut Session, id: &str| forward(s, id, "host.settings", json!({}));
+    let write = |s: &mut Session, id: &str, values: Value| forward(s, id, "host.setSettings", json!({"values": values}));
+    // A run before this one with the same process id may have left them.
+    for id in ["eng-set-a", "eng-set-b", "eng-set-bad"] {
+        let _ = std::fs::remove_file(plugin_settings_dir().join(format!("{id}.json")));
+    }
+    assert_eq!(read(&mut s, "eng-set-a").unwrap(), json!({}));
+    let saved = json!({"favourites": ["l:123", "l:456"], "unit": "m", "nested": {"x": null}});
+    assert_eq!(write(&mut s, "eng-set-a", saved.clone()).unwrap(), saved);
+    let kept = json!({"favourites": ["l:123", "l:456"], "nested": {"x": null}, "limit": 5});
+    assert_eq!(write(&mut s, "eng-set-a", json!({"unit": null, "limit": 5})).unwrap(), kept);
+    assert!(!s.can_undo() && !s.dirty(), "no 'edit' permission: no project step, and settings need none");
+    // A plugin that may edit has its own settings too. Its command is a project step like any,
+    // but its settings aren't part of the project: undoing the step leaves them.
+    assert_eq!(read(&mut s, "eng-set-b").unwrap(), json!({}));
+    write(&mut s, "eng-set-b", json!({"unit": "ft"})).unwrap();
+    assert!(s.undo(), "its command was a step");
+    assert_eq!(read(&mut s, "eng-set-b").unwrap(), json!({"unit": "ft"}));
+    assert_eq!(read(&mut s, "eng-set-a").unwrap(), kept);
+
+    // Another session reads them; so does the plugin after a new version, and turned off and on.
+    let mut again = world();
+    assert_eq!(read(&mut again, "eng-set-a").unwrap(), kept);
+    plugin("eng-set-a", &[]);
+    s.run("plugin.enable", &json!({"id": "eng-set-a", "enabled": false})).unwrap();
+    s.run("plugin.enable", &json!({"id": "eng-set-a", "enabled": true})).unwrap();
+    assert_eq!(read(&mut s, "eng-set-a").unwrap(), kept);
+
+    // Bad values and a value too large are errors that change nothing.
+    for bad in [json!({}), json!({"values": null}), json!({"values": [1]})] {
+        let e = forward(&mut s, "eng-set-a", "host.setSettings", bad).unwrap_err();
+        assert!(e.contains("values must be a JSON object"), "{e}");
+    }
+    let e = write(&mut s, "eng-set-a", json!({"big": "a".repeat(rustgis_plugins::settings::MAX_BYTES)})).unwrap_err();
+    assert!(e.contains("plugin settings exceed 65536 bytes"), "{e}");
+    assert_eq!(read(&mut s, "eng-set-a").unwrap(), kept);
+
+    // Settings that can't be read are an error the plugin sees, not `{}`, and are never overwritten.
+    plugin("eng-set-bad", &[]);
+    let record = plugin_settings_dir().join("eng-set-bad.json");
+    std::fs::create_dir_all(plugin_settings_dir()).unwrap();
+    std::fs::write(&record, "{").unwrap();
+    let e = read(&mut s, "eng-set-bad").unwrap_err();
+    assert!(e.contains("damaged"), "{e}");
+    assert!(write(&mut s, "eng-set-bad", json!({"a": 1})).is_err());
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), "{");
+    for id in ["eng-set-a", "eng-set-b", "eng-set-bad"] {
+        rustgis_plugins::unload(id);
+        let _ = std::fs::remove_file(plugin_settings_dir().join(format!("{id}.json")));
+    }
+}
+
+#[test]
+fn plugin_settings_are_erased_by_uninstalling_the_plugin() {
+    let _turn = plugin_store_turn();
+    let mut s = world();
+    let dir = std::env::temp_dir().join(format!("rustgis-test-settings-pkg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("eng-set-install.rgplugin");
+    std::fs::write(&file, rustgis_plugins::testing::package("eng-set-install", &[])).unwrap();
+    let install = |s: &mut Session| s.run("plugin.install", &json!({"path": file.display().to_string()})).unwrap();
+    let read = |s: &mut Session| forward(s, "eng-set-install", "host.settings", json!({}));
+    let write = |s: &mut Session, favourite: &str| {
+        forward(s, "eng-set-install", "host.setSettings", json!({"values": {"favourites": [favourite]}}))
+    };
+    let record = plugin_settings_dir().join("eng-set-install.json");
+    install(&mut s);
+    write(&mut s, "l:1").unwrap();
+    assert!(record.is_file());
+    // A new version keeps them; uninstalling erases them, and an install after that starts bare.
+    install(&mut s);
+    assert_eq!(read(&mut s).unwrap(), json!({"favourites": ["l:1"]}));
+    s.run("plugin.uninstall", &json!({"id": "eng-set-install"})).unwrap();
+    assert!(!record.exists());
+    install(&mut s);
+    assert_eq!(read(&mut s).unwrap(), json!({}));
+
+    // Settings that can't be erased once the plugin is gone: said, with where they are.
+    write(&mut s, "l:2").unwrap();
+    std::fs::remove_file(&record).unwrap();
+    std::fs::create_dir(&record).unwrap();
+    let e = s.run("plugin.uninstall", &json!({"id": "eng-set-install"})).unwrap_err();
+    assert!(e.contains("couldn't erase the saved settings of 'eng-set-install'") && e.contains("by hand"), "{e}");
+    assert!(rustgis_plugins::get("eng-set-install").is_none());
+    std::fs::remove_dir(&record).unwrap();
+
+    // A development folder that shadows an installed copy: removing it leaves the copy, and what
+    // the copy remembered.
+    install(&mut s);
+    write(&mut s, "l:3").unwrap();
+    let folder = dir.join("eng-set-dev");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("plugin.json"), rustgis_plugins::testing::manifest("eng-set-install", &[])).unwrap();
+    std::fs::write(folder.join("plugin.wasm"), rustgis_plugins::testing::wasm()).unwrap();
+    s.run("plugin.install", &json!({"path": folder.display().to_string()})).unwrap();
+    s.run("plugin.uninstall", &json!({"id": "eng-set-install"})).unwrap();
+    assert!(record.is_file(), "the installed copy's settings stay");
+    assert!(crate::cmd::plugins::load_installed().iter().all(|e| !e.contains("eng-set-install")));
+    assert_eq!(read(&mut s).unwrap(), json!({"favourites": ["l:3"]}));
+    s.run("plugin.uninstall", &json!({"id": "eng-set-install"})).unwrap();
+    assert!(!record.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn plugin_host_gives_layer_crs_and_features_in_it() {
     let mut s = world();
     plugin("eng-crs", &["edit"]);
@@ -14228,6 +14350,9 @@ fn process_plugins_reach_the_project_like_modules() {
     assert!(s.map().layer_by_name("From Process").is_none());
     let e = forward(&mut s, "eng-proc", "layer.addData", json!({"path": "/etc/passwd"})).unwrap_err();
     assert!(e.contains("'files' permission"), "{e}");
+    // So are its settings, and no permission is needed.
+    assert_eq!(forward(&mut s, "eng-proc", "host.setSettings", json!({"values": {"a": [1]}})).unwrap(), json!({"a": [1]}));
+    assert_eq!(forward(&mut s, "eng-proc", "host.settings", json!({})).unwrap(), json!({"a": [1]}));
     // Its tools run in the Geoprocessing pane.
     s.run("gp.run", &json!({"tool": "plugin:eng-proc/m", "params": {"input": "Cities"}})).unwrap();
     assert_eq!(s.map().layer_by_name("Made").map(|l| l.dataset.features.len()), Some(1));
@@ -14293,6 +14418,12 @@ fn session_plugins_ask_between_commands_and_hear_the_map() {
     // A fetch would wait on the app's thread: only during commands.
     s.run("plugin:eng-sess/k", &json!({"op": "host.fetch", "params": {"url": "https://example.org/a.json"}})).unwrap();
     settle(&mut s);
+    // Settings asked for between commands are kept under its own id, and are no undo step.
+    s.run("plugin:eng-sess/k", &json!({"op": "host.setSettings", "params": {"values": {"between": 1}}})).unwrap();
+    let (steps, state) = (s.undo_depth(), s.state());
+    settle(&mut s);
+    assert_eq!(rustgis_plugins::settings::read("eng-sess").unwrap(), json!({"between": 1}));
+    assert_eq!((s.undo_depth(), s.state()), (steps, state));
     // Told what changed: the layers (the one it added), the view, the selection.
     s.map_mut().camera.pan_px(40.0, 0.0);
     s.run("select.rows", &json!({"layer": "Cities", "rows": [0]})).unwrap();
@@ -14504,6 +14635,7 @@ fn session_plugin_downloads_between_commands_are_left_to_the_app() {
 
 #[test]
 fn plugins_install_and_uninstall_from_files() {
+    let _turn = plugin_store_turn();
     isolate_plugins();
     let mut s = Session::new(Project::default());
     let dir = std::env::temp_dir().join(format!("rustgis-test-pkg-{}", std::process::id()));
@@ -14545,6 +14677,7 @@ fn plugins_install_and_uninstall_from_files() {
 
 #[test]
 fn registry_downloads_are_checked() {
+    let _turn = plugin_store_turn();
     let bytes = rustgis_plugins::testing::package("eng-reg", &[]);
     let mut e = rustgis_plugins::registry::Entry {
         id: "eng-reg".into(),
