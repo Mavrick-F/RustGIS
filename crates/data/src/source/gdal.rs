@@ -309,7 +309,10 @@ fn convert_in(dir: &Path, src: &Path, layer: Option<&str>, crs: Option<&str>) ->
         }
     }
     if out.is_empty() {
-        return Err(last.unwrap_or_else(|| DataError::Format("GDAL found no features to read".into())));
+        // Nothing converted and no error: what was left out says why (all of it empty polygons).
+        return Err(last.unwrap_or_else(|| {
+            DataError::Format(if failed.is_empty() { "GDAL found no features to read".into() } else { failed.join("; ") })
+        }));
     }
     Ok((out, failed))
 }
@@ -840,29 +843,12 @@ mod tests {
                 }
             }
         }
-        // A layer of only empty polygons converts to nothing, beside one that converts: its
-        // whole count is said, fresh and from the cache.
-        let two = dir.path().join("two.gpkg");
-        let status = std::process::Command::new(super::program("ogr2ogr").unwrap())
-            .args(["-f", "GPKG", "-nln", "kept"])
-            .arg(&two)
-            .arg(dir.path().join("clean.geojsonl"))
-            .status()
-            .unwrap();
-        assert!(status.success());
         let empties = dir.path().join("empties.geojsonl");
         std::fs::write(&empties, format!("{empty}\n{empty}\n")).unwrap();
-        let status = std::process::Command::new(super::program("ogr2ogr").unwrap())
-            .args(["-f", "GPKG", "-update", "-nln", "gone", "-nlt", "POLYGON"])
-            .arg(&two)
-            .arg(&empties)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        // A file of only empty polygons converts to nothing: the error says how many were left out.
         for _ in 0..2 {
-            let (converted, notes) = convert_in(&dir.path().join("cache"), &two, None, None).unwrap();
-            assert_eq!(converted.iter().map(|c| c.layer.as_str()).collect::<Vec<_>>(), ["kept"]);
-            assert_eq!(notes, vec!["gone: GDAL conversion left out 2 of 2 source features"]);
+            let error = convert_in(&dir.path().join("cache"), &empties, None, None).unwrap_err().to_string();
+            assert!(error.contains("empties: GDAL conversion left out 2 of 2 source features"), "{error}");
         }
         // A cached conversion whose header can't be read is said, and the layer still comes back.
         let path = dir.path().join("clean.geojsonl");
