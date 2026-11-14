@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rustgis_engine::Session;
+use rustgis_engine::data::sync::FileSync;
 use rustgis_engine::observe::Observation;
 use serde_json::{Value, json};
 
@@ -276,17 +277,29 @@ struct Found {
     /// Read in place: a RustGIS write into its GeoPackage table reads it again
     /// (`gpkg::reset_sources`), so that write leaves nothing stale on it.
     streamed: bool,
+    /// For a layer read whole from a Shapefile or GeoJSON file it can publish to: the record of
+    /// its files at the last sync. Reload Data can't read such a layer again, so it's marked in
+    /// the Layers pane and not offered in the notification.
+    record: Option<FileSync>,
 }
 
-/// The linked local sources in every map: layers Reload Data reads and local archives. Remote,
-/// embedded and in-memory data aren't targets; a converted (GDAL, DuckDB) layer is watched at the
+/// The file a layer read whole from a local Shapefile or GeoJSON publishes to, and its record
+/// (`source.publish`): held in memory, not read in place.
+fn published_file(l: &rustgis_engine::map::Layer) -> Option<(&str, &rustgis_engine::data::sync::Synced)> {
+    let synced = l.synced.as_ref()?;
+    let path = l.dataset.source.as_deref().filter(|p| rustgis_engine::map::paths::is_local(p))?;
+    (l.source.is_none() && l.gpkg.is_none() && rustgis_engine::data::sync::is_syncable(path)).then_some((path, synced))
+}
+
+/// The linked local sources in every map: layers Reload Data reads, layers that publish to their
+/// file, and local archives. Remote, embedded and other in-memory data aren't targets; a converted (GDAL, DuckDB) layer is watched at the
 /// original file, not the conversion.
 fn targets(s: &Session) -> Vec<Found> {
     let mut out = Vec::new();
     for m in &s.project.maps {
         for l in &m.layers {
+            let target = Target::Layer { map: m.instance_id(), layer: l.instance_id() };
             if let Some((path, table, _)) = crate::reloaddata::source(l) {
-                let target = Target::Layer { map: m.instance_id(), layer: l.instance_id() };
                 let repairable = l.linked_file().is_some();
                 out.push(Found {
                     target,
@@ -297,6 +310,19 @@ fn targets(s: &Session) -> Vec<Found> {
                     name: l.name.clone(),
                     repairable,
                     streamed: l.gpkg.is_none() && l.source.is_some(),
+                    record: None,
+                });
+            } else if let Some((path, synced)) = published_file(l) {
+                out.push(Found {
+                    target,
+                    key: key(path),
+                    path: path.to_string(),
+                    table: None,
+                    map: m.name.clone(),
+                    name: l.name.clone(),
+                    repairable: false,
+                    streamed: false,
+                    record: Some(synced.files.clone()),
                 });
             }
         }
@@ -316,6 +342,7 @@ fn targets(s: &Session) -> Vec<Found> {
                     name: tile.name.clone(),
                     repairable: true,
                     streamed: false,
+                    record: None,
                 });
             }
         }
@@ -323,7 +350,9 @@ fn targets(s: &Session) -> Vec<Found> {
     out
 }
 
-type Scanned = crate::Slot<Vec<(String, Seen)>>;
+/// One scan's observations by key, and each published layer's file parts that differ from its
+/// record by length or presence ([`FileSync::resized`]), with the record compared.
+type Scanned = crate::Slot<(Vec<(String, Seen)>, Vec<(Target, FileSync, Vec<String>)>)>;
 
 /// The app's side of the monitor: its targets, its one scan at a time and when the next is due.
 #[derive(Default)]
@@ -340,6 +369,9 @@ pub struct Watch {
     /// A scan couldn't start, or one hasn't answered for [`STALLED`]: said once each.
     said_failed: bool,
     said_stalled: bool,
+    /// Each published layer's file parts the latest scan found resized against the record it
+    /// compared with; it counts only while the layer still has that record.
+    resized: HashMap<Target, (FileSync, Vec<String>)>,
 }
 
 impl Watch {
@@ -348,9 +380,23 @@ impl Watch {
     }
 }
 
-/// What the Layers pane says of a layer of the active map.
+/// What the Layers pane says of a layer of the active map. A layer that publishes to its file is
+/// changed, too, when its files' lengths or presence differ from its record: that catches a change
+/// made while the project was closed, which the first scan takes as the baseline.
 pub(crate) fn layer_status(app: &RustGisApp, layer: &rustgis_engine::map::Layer) -> Status {
-    app.diskwatch.status(&Target::Layer { map: app.session.map().instance_id(), layer: layer.instance_id() })
+    let target = Target::Layer { map: app.session.map().instance_id(), layer: layer.instance_id() };
+    let status = app.diskwatch.status(&target);
+    let resized = app
+        .diskwatch
+        .resized
+        .get(&target)
+        .is_some_and(|(record, parts)| !parts.is_empty() && layer.synced.as_ref().is_some_and(|s| s.files == *record));
+    if status == Status::Unchanged && resized { Status::Changed } else { status }
+}
+
+/// Whether Reload Data can read the layer again; a layer that publishes to its file can't.
+pub(crate) fn reloadable(layer: &rustgis_engine::map::Layer) -> bool {
+    crate::reloaddata::source(layer).is_some()
 }
 
 /// The target of tile layer `i` of `map`: its archive and which of the map's archives with that
@@ -418,7 +464,7 @@ pub(crate) fn tick(app: &mut RustGisApp, ctx: &egui::Context) {
     w.focused = focused;
     if let Some((scan, slot, _)) = &w.scan {
         let done = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        if let Some(results) = done {
+        if let Some((results, resized)) = done {
             let scan = *scan;
             w.scan = None;
             // A scan answered: a later stall is a new episode, said again.
@@ -428,6 +474,7 @@ pub(crate) fn tick(app: &mut RustGisApp, ctx: &egui::Context) {
                     w.monitor.observed(&key, seen, scan);
                 }
             }
+            w.resized = resized.into_iter().map(|(target, record, parts)| (target, (record, parts))).collect();
         }
     }
     let now = web_time::Instant::now();
@@ -482,11 +529,20 @@ fn start(w: &mut Watch, now: web_time::Instant) -> Result<(), String> {
     for f in &w.found {
         paths.entry(f.key.clone()).or_insert_with(|| f.path.clone());
     }
+    let records: Vec<(Target, String, FileSync)> =
+        w.found.iter().filter_map(|f| Some((f.target.clone(), f.path.clone(), f.record.clone()?))).collect();
     let slot = Scanned::default();
     let out = slot.clone();
     let spawned = std::thread::Builder::new().name("Changed on disk".into()).spawn(move || {
         let results = paths.into_iter().map(|(key, path)| (key, look(&path))).collect();
-        *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(results);
+        let resized = records
+            .into_iter()
+            .map(|(target, path, record)| {
+                let parts = record.resized(std::path::Path::new(&path));
+                (target, record, parts)
+            })
+            .collect();
+        *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((results, resized));
     });
     w.due = Some(now + EVERY);
     w.wanted = false;
@@ -587,6 +643,12 @@ pub(crate) fn plan_write(app: &RustGisApp, command: &str, params: &Value) -> Opt
             let edit = l.gpkg.as_ref()?;
             (edit.path.clone(), edit.table.clone(), Some(Target::Layer { map: s.map().instance_id(), layer: l.instance_id() }))
         }
+        // Publishing replaces its layer's file: the publishing layer holds what it wrote.
+        "source.publish" => {
+            let l = s.map().layer(s.layer_id(params).ok()?)?;
+            let (path, _) = published_file(l)?;
+            (path.to_string(), String::new(), Some(Target::Layer { map: s.map().instance_id(), layer: l.instance_id() }))
+        }
         // Conversion replaces a whole file; it writes no container table and refreshes no reader.
         "data.convert" => (params.get("path").and_then(Value::as_str)?.to_string(), String::new(), None),
         // An existing GeoPackage written into; a new file isn't watched yet.
@@ -615,6 +677,9 @@ pub(crate) fn plan_write(app: &RustGisApp, command: &str, params: &Value) -> Opt
     let stale = if command == "data.convert" {
         // The explicit format can differ from the suffix: even a .gpkg is replaced whole.
         app.diskwatch.found.iter().filter(|f| f.key == key).map(|f| f.target.clone()).collect()
+    } else if command == "source.publish" {
+        // Every other layer on the file keeps the rows it read.
+        app.diskwatch.found.iter().filter(|f| f.key == key && Some(&f.target) != writer.as_ref()).map(|f| f.target.clone()).collect()
     } else {
         stale_for(&app.diskwatch.found, &key, &path, &table, writer.as_ref())
     };
@@ -777,7 +842,7 @@ fn act(app: &mut RustGisApp, target: &Target, repair: bool) {
 pub(crate) fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let w = &app.diskwatch;
     let mut groups: Vec<(&str, &str, Status, Vec<&Found>)> = Vec::new();
-    for f in w.found.iter().filter(|f| w.monitor.notifies(&f.target)) {
+    for f in w.found.iter().filter(|f| f.record.is_none() && w.monitor.notifies(&f.target)) {
         match groups.iter_mut().find(|g| g.0 == f.key) {
             Some(g) => g.3.push(f),
             None => groups.push((&f.key, &f.path, w.status(&f.target), vec![f])),
@@ -1343,6 +1408,78 @@ mod tests {
         scan(&mut app, &ctx, 3);
         assert_eq!(app.diskwatch.status(&rows), Status::Changed, "the editable layer on the replaced table holds its old rows");
         assert_eq!(app.diskwatch.status(&other), Status::Unchanged, "RustGIS's own export isn't an outside change for another table");
+    }
+
+    /// What the Layers pane says of layer `id`'s edits, once its hash has landed.
+    fn edited(app: &mut RustGisApp, ctx: &egui::Context, id: u32) -> bool {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let l = app.session.map().layer(id).unwrap().clone();
+            if let Some(edited) = crate::syncmark::edited(app, &l, ctx) {
+                return edited;
+            }
+            assert!(std::time::Instant::now() < end, "the hash never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn status_of(app: &RustGisApp, id: u32) -> Status {
+        layer_status(app, app.session.map().layer(id).unwrap())
+    }
+
+    /// A GeoJSON read whole, as the desktop's Add Data reads it, so it can publish.
+    fn published_layer(dir: &std::path::Path) -> (RustGisApp, u32, std::path::PathBuf) {
+        let path = dir.join("parcels.geojson");
+        std::fs::write(
+            &path,
+            r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"owner":"Smith"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
+        )
+        .unwrap();
+        let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
+        let id = layer_id(app.run("layer.addData", json!({"path": path, "stream": false})).unwrap());
+        assert!(app.session.map().layer(id).unwrap().synced.is_some());
+        app.watch_files = true;
+        (app, id, path)
+    }
+
+    #[test]
+    fn a_published_file_resized_while_the_project_was_closed_is_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id, path) = published_layer(dir.path());
+        // Changed before the first scan, which takes what is there as its baseline.
+        std::fs::write(&path, r#"{"type":"FeatureCollection","features":[]}"#).unwrap();
+        let ctx = egui::Context::default();
+        scan(&mut app, &ctx, 2);
+        assert_eq!(status_of(&app, id), Status::Changed, "its length differs from the record");
+        assert!(!edited(&mut app, &ctx, id), "the layer holds what it read");
+    }
+
+    #[test]
+    fn edits_are_marked_until_published_and_the_publish_is_not_an_outside_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id, path) = published_layer(dir.path());
+        let ctx = egui::Context::default();
+        scan(&mut app, &ctx, 2);
+        assert_eq!(status_of(&app, id), Status::Unchanged);
+        assert!(!edited(&mut app, &ctx, id));
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        app.run("edit.setValue", json!({"layer": id, "row": 0, "field": "owner", "value": "Jones"})).unwrap();
+        assert!(edited(&mut app, &ctx, id), "an edit the file lacks");
+        crate::exportjob::start(&mut app, "source.publish", json!({"layer": id})).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::exportjob::land(&mut app) {
+            assert!(std::time::Instant::now() < end, "the publish never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Jones"));
+        scan(&mut app, &ctx, 3);
+        assert_eq!(status_of(&app, id), Status::Unchanged, "RustGIS's own publish is not an outside change");
+        assert!(!edited(&mut app, &ctx, id), "published");
+        // Another program writes the file; the notification leaves it to the Layers pane.
+        std::fs::write(&path, r#"{"type":"FeatureCollection","features":[]}"#).unwrap();
+        scan(&mut app, &ctx, 2);
+        assert_eq!(status_of(&app, id), Status::Changed);
+        assert!(app.diskwatch.found.iter().all(|f| f.record.is_some()), "offered no Reload Data");
     }
 
     #[test]
