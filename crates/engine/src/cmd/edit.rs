@@ -52,7 +52,7 @@ fn target(s: &Session, p: &Json) -> Result<Target, String> {
         return Err("give a layer or a standalone table (\"table\"), not both".into());
     }
     // Native tasks invoke handlers inline, including through nested scripts. Refuse here,
-    // before any row scan, so that every table-write path keeps progress and Cancel.
+    // before any row scan; tasks have no worker to supply progress and Cancel.
     #[cfg(not(target_arch = "wasm32"))]
     if s.task_running {
         return Err(
@@ -60,6 +60,17 @@ fn target(s: &Session, p: &Json) -> Result<Target, String> {
         );
     }
     s.table_index(p).map(Target::Table)
+}
+
+/// A synchronous edit's target. Native scoped callers must supply an owned worker result,
+/// which handlers land before reaching here; an unprepared call must never scan live rows.
+fn write_target(s: &Session, p: &Json) -> Result<Target, String> {
+    let target = target(s, p)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if matches!(target, Target::Table(_)) && !s.policy_user() {
+        return Err("this caller must prepare the table edit on a worker; run it from the table view instead of synchronously".into());
+    }
+    Ok(target)
 }
 
 /// The data of `t`.
@@ -97,7 +108,7 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(result) = land_table_edit(s, p, "edit.addFeature") {
         return result;
     }
-    let id = match target(s, p)? {
+    let id = match write_target(s, p)? {
         Target::Table(i) => return add_row(s, p, i),
         Target::Layer(id) => id,
     };
@@ -512,7 +523,7 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(result) = land_table_edit(s, p, "edit.setValue") {
         return result;
     }
-    let t = target(s, p)?;
+    let t = write_target(s, p)?;
     // A row past `usize` (on a 32-bit build) is no row, not a row it wraps round to.
     let row = usize::try_from(p.get("row").and_then(Json::as_u64).ok_or("row is required")?).map_err(|_| "no such row")?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
@@ -584,7 +595,7 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(result) = land_table_edit(s, p, "edit.addField") {
         return result;
     }
-    let t = target(s, p)?;
+    let t = write_target(s, p)?;
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or("name is required")?;
     if !name.chars().all(|c| c.is_alphanumeric() || c == '_') || name.chars().count() > 64 {
         return Err("field names use letters, digits and _ (at most 64)".into());
@@ -629,7 +640,7 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(result) = land_table_edit(s, p, "edit.convertField") {
         return result;
     }
-    let t = target(s, p)?;
+    let t = write_target(s, p)?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let ty = match ps(p, "type").ok_or("type is required")?.to_ascii_lowercase().as_str() {
         "date" => FieldType::Date,
@@ -760,7 +771,7 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(result) = land_table_edit(s, p, "edit.deleteField") {
         return result;
     }
-    let t = target(s, p)?;
+    let t = write_target(s, p)?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let Target::Layer(id) = t else {
         let ds = data_mut(s, t)?;
@@ -1034,7 +1045,7 @@ fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(result) = land_table_edit(s, p, "edit.calculateField") {
         return result;
     }
-    let t = target(s, p)?;
+    let t = write_target(s, p)?;
     let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let expr = ps(p, "expression").map(str::trim).filter(|e| !e.is_empty()).ok_or("expression is required")?.to_string();
     let Target::Layer(id) = t else {

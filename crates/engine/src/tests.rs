@@ -259,6 +259,42 @@ fn table_remove_takes_a_standalone_table_out_of_the_project() {
     assert!(undone["id"].as_u64() < next["id"].as_u64(), "{undone} then {next}");
 }
 
+/// Native scoped callers must prepare table work; owned results still land under that scope.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn scoped_table_writes_need_prepared_worker_results() {
+    use crate::{
+        cmd::reads::{read_ahead, read_land},
+        policy::{Call, Effects, Revocation, Scope},
+    };
+    use std::sync::Arc;
+    struct Live;
+    impl Revocation for Live {
+        fn allows(&self, _: Effects) -> bool {
+            true
+        }
+    }
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName": "records.csv", "text": format!("n\n{}", "1\n".repeat(20_000))})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    let scope = Scope::assistant(195509, Arc::new(Live));
+    let p = json!({"table": "records", "field": "n", "expression": "n + 1"});
+    let before = serde_json::to_value(&s.project.tables).unwrap();
+    let depth = s.undo_depth();
+    let error = s.run_scoped(scope.clone(), &Call::command("edit.calculateField", p.clone())).unwrap_err();
+    assert!(error.contains("prepare the table edit on a worker"), "{error}");
+    assert_eq!(serde_json::to_value(&s.project.tables).unwrap(), before);
+    assert_eq!(s.undo_depth(), depth);
+    let ahead = s.with_scope(scope, |s| read_ahead(s, "edit.calculateField", &p)).unwrap().unwrap();
+    assert!(ahead.reads());
+    let read = ahead.run(&rustgis_analysis::control::Control::stoppable()).unwrap();
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.project.tables[0].dataset.value(0, 0), &rustgis_data::Value::Int(2));
+    assert_eq!(s.undo_depth(), depth + 1);
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(serde_json::to_value(&s.project.tables).unwrap(), before);
+}
+
 #[test]
 fn a_standalone_table_is_edited_with_the_edit_commands() {
     let mut s = world();
