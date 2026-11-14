@@ -20,7 +20,7 @@ pub const MAX_LAYER_NAME: usize = 200;
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addData", "Add Data", "Home › Add", add_data).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
-            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a CityJSON or CityGML model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say (GDAL takes an authority code such as EPSG:2263 or the exact names WGS84, WGS72, NAD27, NAD83, not WKT or a file)", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
+            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "blocks"?: "bool: a DXF's block (图块) contents, true by default", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a DXF (which never says), a CityJSON or CityGML model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say (GDAL takes an authority code such as EPSG:2263 or the exact names WGS84, WGS72, NAD27, NAD83, not WKT or a file)", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
         C::new("layer.addPhotos", "Add Photos", "Home › Add", add_photos).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"paths"?: [JPEG photo files], "folder"?: "a folder of photos (every JPEG in it)", "name"?: "the layer (default Photos; photos join it when it exists)"}"#,
         ),
@@ -50,14 +50,14 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layer"?: name|id, "crs": "EPSG:… or WKT; reinterpret native coordinates, without rewriting the source file"}"#),
         C::new("layer.loadAll", "Load All Features", "Layers", load_all).roles(&[]).effects(crate::policy::Effects::NONE).when(need_streamed).params(r#"{"layer"?: name|id}"#),
         C::new("layer.addUrl", "Add Data From URL", "Home › Add › Add Data", add_url).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
-            r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.shp (its .dbf fetched beside it, and its .shx, .prj and .cpg when there)|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true frames everything added; false keeps the view, even on an empty map; omitted, the first content on an empty map is framed (a GeoParquet, FlatGeobuf or cloud-optimised GeoTIFF read in place likewise; a PMTiles or MBTiles archive ignores zoom and is framed on its bounds unless it covers the whole world)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place (an address without a file name is read in place when its first bytes are a cloud-optimised GeoTIFF)", "cog"?: "bool: the address is a cloud-optimised GeoTIFF whatever its name says (the app's probe found it so)", "bbox"?: "[west, south, east, north] in degrees | "view": a cloud-optimised GeoTIFF's window as a raster layer (desktop and command line), read by range at full resolution, in the file's coordinate system, with its colour table and class names; at most 64 million values (all bands)", "cellSize"?: "with bbox: the coarsest overview whose cells are at most this size is read (the file's units; metres for longitude/latitude, a degree taken as 111.32 km)", "cube"?: "bool: a data cube's file: a tile layer that follows the time slider (stac.addCube adds them), kept one when the project opens again", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on", "connection"?: "the id of the saved web-service connection it comes from (as service.add)", "anonymous"?: bool (internal: a plugin-origin download must never adopt a saved login), "request"?: "number (internal: the download a plugin command left to the app, #1202)"}"#,
+            r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.shp (its .dbf fetched beside it, and its .shx, .prj and .cpg when there)|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true frames everything added; false keeps the view, even on an empty map; omitted, the first content on an empty map is framed (a GeoParquet, FlatGeobuf or cloud-optimised GeoTIFF read in place likewise; a PMTiles or MBTiles archive ignores zoom and is framed on its bounds unless it covers the whole world)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place (an address without a file name is read in place when its first bytes are a cloud-optimised GeoTIFF)", "cog"?: "bool: the address is a cloud-optimised GeoTIFF whatever its name says (the app's probe found it so)", "bbox"?: "[west, south, east, north] in degrees | "view": a cloud-optimised GeoTIFF's window as a raster layer (desktop and command line), read by range at full resolution, in the file's coordinate system, with its colour table and class names; at most 64 million values (all bands)", "cellSize"?: "with bbox: the coarsest overview whose cells are at most this size is read (the file's units; metres for longitude/latitude, a degree taken as 111.32 km)", "cube"?: "bool: a data cube's file: a tile layer that follows the time slider (stac.addCube adds them), kept one when the project opens again", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on", "connection"?: "the id of the saved web-service connection it comes from (as service.add)", "anonymous"?: bool (internal: a plugin-origin download must never adopt a saved login), "request"?: "number (internal: the download a plugin command left to the app, #1202)"}"#,
         ),
         C::new("layer.addDownload", "Add Downloaded Data", "Home › Add", add_download).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))
-            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes (when they came as GeoJSON) and paging are checked, and the address is kept as the layer's source), "bounds"?: [west, south, east, north] (with service: the layer's longitude/latitude bounds from its capabilities, which its axes are checked against; without bounds they are left as they come; ignored without service), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error, and its request kept as the layer's source), "geolibreProject"?: bool (internal: downloaded project JSON), "geolibreLayer"?: {"token", "record"} (internal: reserved imported layer and its saved style), "geolibreZarr"?: bool (internal: an imported Zarr slice as GeoTIFF), "connection"?: "as layer.addUrl", "anonymous"?: bool (internal: preserves a plugin-origin download's anonymous reads), "request"?: number (internal: the download a plugin command left to the app, #1202), "window"?: {"bbox", "cellSize"?, "cog"?} (internal: what a cloud-optimised GeoTIFF's window the app read off the frame asked for, for a task to read it again, #1330)}"#),
+            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes (when they came as GeoJSON) and paging are checked, and the address is kept as the layer's source), "bounds"?: [west, south, east, north] (with service: the layer's longitude/latitude bounds from its capabilities, which its axes are checked against; without bounds they are left as they come; ignored without service), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error, and its request kept as the layer's source), "geolibreProject"?: bool (internal: downloaded project JSON), "geolibreLayer"?: {"token", "record"} (internal: reserved imported layer and its saved style), "geolibreZarr"?: bool (internal: an imported Zarr slice as GeoTIFF), "connection"?: "as layer.addUrl", "anonymous"?: bool (internal: preserves a plugin-origin download's anonymous reads), "request"?: number (internal: the download a plugin command left to the app, #1202), "window"?: {"bbox", "cellSize"?, "cog"?} (internal: what a cloud-optimised GeoTIFF's window the app read off the frame asked for, for a task to read it again, #1330)}"#),
         C::new("layer.addEncodedPolyline", "Add Encoded Polyline", "Home › Add", add_encoded_polyline).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"polyline": "encoded polyline text" | [texts] (one line each), "precision"?: 5 (Google) | 6 (OSRM, Valhalla), "name"?: text}"#,
         ),
-        C::new("layer.addDataText", "Add Data (from text)", "Home › Add", add_data_text).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"fileName": "name.geojson|.csv|.tsv|.city.json|.gml (CityJSON and CityGML: all their layers)", "text": string, "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"? (as layer.addData, for delimited text; crs also for a CityJSON or CityGML model), "layer"?, "paperSpace"? (as layer.addData, for a file of several layers)}"#),
+        C::new("layer.addDataText", "Add Data (from text)", "Home › Add", add_data_text).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"fileName": "name.geojson|.csv|.tsv|.city.json|.gml|.dxf (CityJSON and CityGML: all their layers)", "text": string, "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"? (as layer.addData, for delimited text; crs also for a CityJSON or CityGML model, and for a DXF), "layer"?, "paperSpace"?, "blocks"? (as layer.addData, for a DXF)}"#),
         C::new("layer.addSample", "Add Sample Data", "Home › Add › Add Data", add_sample).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name": "countries"|"cities"|"rivers"|"lakes"}"#),
         C::new("layer.remove", "Remove", "Layers", remove).roles(&[]).effects(crate::policy::Effects::NONE)
             .key("Delete")
@@ -1779,6 +1779,16 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
     if large_osm(path) {
         return add_gdal(s, p, path);
     }
+    if rustgis_data::dxf::is_dxf_name(path) {
+        let (full, reads) = match super::reads::take::<CityRead>(s, &whole_key(path)) {
+            Some(read) => read,
+            None => read_dxf_file(p, path),
+        }?;
+        if let Some(crs) = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()) {
+            super::say_crs_note(s, crs);
+        }
+        return add_reads(s, p, &full, reads, Vec::new(), None);
+    }
     if rustgis_data::io::is_multi_layer_name(path) {
         // A city model read ahead (the desktop app's, on a thread of its own): its layers, as
         // add_layers reads them here.
@@ -1871,6 +1881,41 @@ fn read_city_file(p: &Value, path: &str) -> CityRead {
     Ok((full, reads))
 }
 
+/// A DXF drawing read whole with its import options. Parsing checks Cancel between entities;
+/// decoding and the bounded file read complete before cancellation can be observed.
+fn read_dxf_file(p: &Value, path: &str) -> CityRead {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(rustgis_data::io::MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("{path}: {e}"))?;
+    let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
+    let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()).map(rustgis_data::raster::Crs::parse).transpose()?;
+    Ok((full.clone(), dxf_reads(p, &full, &bytes, crs)?))
+}
+
+/// Reads drawing layers with the same limits and options for paths, uploads and text.
+fn dxf_reads(
+    p: &Value,
+    name: &str,
+    bytes: &[u8],
+    crs: Option<rustgis_data::raster::Crs>,
+) -> Result<Vec<rustgis_data::io::LayerRead>, String> {
+    if bytes.len() as u64 > rustgis_data::io::MAX_BYTES {
+        return Err(format!("{name} is too large to open"));
+    }
+    let opts = rustgis_data::dxf::Options {
+        crs,
+        layer: ps(p, "layer").map(str::trim).filter(|l| !l.is_empty()),
+        paper_space: b(p, "paperSpace").unwrap_or(false),
+        blocks: b(p, "blocks").unwrap_or(true),
+    };
+    Ok(rustgis_data::dxf::read(name, bytes, &opts)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(dataset, report)| rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() })
+        .collect())
+}
+
 /// A spreadsheet's sheet ("layer"), read like delimited text.
 fn read_sheet_file(p: &Value, path: &str) -> WholeRead {
     let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
@@ -1956,7 +2001,7 @@ fn read_synced(path: &str, read: impl FnOnce() -> WholeRead) -> WholeRead {
 
 /// Add Data's read of the file `p` names, made before it runs ([`super::reads`]): a raster read
 /// whole or converted by GDAL, a GeoJSON read whole, delimited text, a spreadsheet or a city model
-/// (CityJSON or CityGML) read into its layers, a Shapefile read whole. `None` for
+/// (CityJSON or CityGML) or DXF drawing read into its layers, a Shapefile read whole. `None` for
 /// any other file, which [`add_data`] reads as it adds it. Each is picked only where `add_data`
 /// takes that read, so a read made is never wasted; a few it makes whole are left to it (a `.json`
 /// with a coordinate system or layer given, a large GeoJSON that isn't a FeatureCollection).
@@ -1980,6 +2025,10 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
         let text = |k: &str| ps(p, k).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
         let (key, layer, crs) = (super::raster::gdal_key(&path), text("layer"), text("crs"));
         return Some(ahead(NAME, key, move || super::raster::read_gdal(&path, layer.as_deref(), crs.as_deref())));
+    }
+    if rustgis_data::dxf::is_dxf_name(&path) {
+        let (key, q) = (whole_key(&path), p.clone());
+        return Some(ahead(NAME, key, move || read_dxf_file(&q, &path)));
     }
     let given = |k: &str| ps(p, k).is_some_and(|v| !v.trim().is_empty());
     let lower = path.to_ascii_lowercase();
@@ -2061,18 +2110,7 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
             let crs = crs.map(|text| super::parse_crs(s, text)).transpose()?;
             city_reads(file_name, bytes, crs)?
         }
-        _ if dxf => {
-            let opts = rustgis_data::dxf::Options {
-                crs: crs.map(|text| super::parse_crs(s, text)).transpose()?,
-                layer: ps(p, "layer").map(str::trim).filter(|l| !l.is_empty()),
-                paper_space: b(p, "paperSpace").unwrap_or(false),
-            };
-            rustgis_data::dxf::read(file_name, bytes, &opts)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|(dataset, report)| rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() })
-                .collect()
-        }
+        _ if dxf => dxf_reads(p, file_name, bytes, crs.map(|text| super::parse_crs(s, text)).transpose()?)?,
         Some(c) => {
             let crs = super::parse_crs(s, c)?;
             rustgis_data::landxml::read(file_name, bytes, Some(crs))
@@ -4473,7 +4511,7 @@ pub(crate) fn address_extension(url: &str) -> Option<String> {
 }
 
 /// `layer.addUrl` keys for other kinds of address, which a window (`"bbox"`) doesn't read.
-const WINDOW_UNREAD: [&str; 16] = [
+const WINDOW_UNREAD: [&str; 17] = [
     "layer",
     "x",
     "y",
@@ -4481,6 +4519,7 @@ const WINDOW_UNREAD: [&str; 16] = [
     "crs",
     "delimiter",
     "paperSpace",
+    "blocks",
     "stream",
     "start",
     "end",
@@ -5230,8 +5269,10 @@ pub(crate) fn add_data_text_after(s: &mut Session, p: &Value, zoom: Option<bool>
     let raw_name = s_req(p, "fileName")?;
     let name = super::raster::bytes_file_name(raw_name).ok_or("fileName is required")?;
     let text = s_req(p, "text")?;
-    // A city model: all its layers, in the coordinate system given or with a layer picked.
-    if rustgis_data::cityjson::is_cityjson_name(name)
+    // A city model: all its layers, in the coordinate system given or with a layer picked. A DXF
+    // drawing too, which takes its coordinate system and whether its blocks are drawn from here.
+    if rustgis_data::dxf::is_dxf_name(name)
+        || rustgis_data::cityjson::is_cityjson_name(name)
         || rustgis_data::io::is_citygml(name, text.as_bytes())
         || (["crs", "layer"].iter().any(|k| ps(p, k).is_some_and(|c| !c.trim().is_empty()))
             && rustgis_data::io::is_cityjson(name, text.as_bytes()))

@@ -1963,6 +1963,153 @@ fn delimited_text_dialog_lists_the_picked_files_columns() {
     assert_eq!((h.state().dialogs.a.as_str(), h.state().dialogs.b.as_str()), ("Lon", "Lat"));
 }
 
+/// Import DXF: a drawing picked, dropped or uploaded asks for the coordinate system its
+/// coordinates are in (the map's, to start with) and whether its blocks (图块) are drawn; a second
+/// drawing dropped meanwhile waits its turn.
+#[test]
+fn import_dxf_asks_for_its_coordinate_system_and_blocks() {
+    let pairs: &[(i32, &str)] = &[
+        (0, "SECTION"),
+        (2, "ENTITIES"),
+        (0, "LINE"),
+        (8, "Roads"),
+        (10, "500000"),
+        (20, "4649776"),
+        (11, "500100"),
+        (21, "4649776"),
+        (0, "ENDSEC"),
+        (0, "EOF"),
+    ];
+    let text: String = pairs.iter().map(|(c, v)| format!("{c:>3}\n{v}\n")).collect();
+    let mut h = harness();
+    h.state_mut().run("ui.language", json!({"code": "en"})).unwrap();
+    // A dropped drawing opens the dialog instead of being added at once.
+    h.state_mut().open_picked("site.dxf", text.as_bytes()).unwrap();
+    assert_eq!(h.state().dialogs.open, Some("addDxf"));
+    assert_eq!(h.state().dialogs.text, "EPSG:3857", "the map's coordinate system");
+    assert!(h.state().dialogs.flag, "blocks are drawn unless unticked");
+    // A second drawing dropped while it is open waits for the first to close.
+    h.state_mut().open_picked("other.dxf", text.as_bytes()).unwrap();
+    assert_eq!(h.state().ui.dxf_waiting.len(), 1);
+    // Unticked blocks and the drawing's own coordinate system go with the file.
+    {
+        let d = &mut h.state_mut().dialogs;
+        d.flag = false;
+        d.text = "EPSG:32633".into();
+    }
+    h.step();
+    h.step();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Add").click();
+    h.step();
+    h.step();
+    let e = h.state().session.map().layer_by_name("site lines").unwrap().extent();
+    assert!((e.min_x - 15.0).abs() < 1e-6 && (e.min_y - 42.0).abs() < 0.01, "{e:?}");
+    // The drawing that waited opens now, with the map's coordinate system again.
+    assert_eq!(h.state().dialogs.open, Some("addDxf"));
+    assert_eq!(h.state().dialogs.text, "EPSG:3857");
+    assert!(h.state().dialogs.flag, "blocks are drawn again");
+    assert!(h.state().ui.dxf_waiting.is_empty());
+    // Cancel discards the active drawing and advances the queue.
+    h.state_mut().open_picked("third.dxf", text.as_bytes()).unwrap();
+    let before = h.state().session.map().layers.len();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Cancel").click();
+    h.step();
+    h.step();
+    assert_eq!(h.state().dialogs.open, Some("addDxf"));
+    assert_eq!(h.state().dialogs.dxf.as_ref().unwrap().name, "third.dxf");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Cancel").click();
+    h.step();
+    h.step();
+    assert_eq!(h.state().dialogs.open, None);
+    assert!(h.state().dialogs.dxf.is_none());
+    assert_eq!(h.state().session.map().layers.len(), before);
+}
+
+/// Import DXF in the web app with a script's options: they go with the drawing picked next (and
+/// only that one), so it is added without the dialog.
+#[test]
+fn dxf_options_go_with_the_picked_drawing() {
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = asked.clone();
+    let services = rustgis_ui_egui::Services {
+        open_async: Some(Box::new(move |purpose: &str| log.lock().unwrap().push(purpose.to_string()))),
+        ..Default::default()
+    };
+    let mut app = RustGisApp::with_sample().with_services(services);
+    app.run("ui.addDxf", json!(null)).unwrap();
+    app.run("ui.addDxf", json!({"crs": "EPSG:32633", "blocks": false})).unwrap();
+    assert_eq!(asked.lock().unwrap().as_slice(), ["dxf:1", "dxf:2"]);
+    // A block's point and a line: leaving blocks out keeps the line only, in the CRS given.
+    let text: String = [
+        (0, "SECTION"),
+        (2, "BLOCKS"),
+        (0, "BLOCK"),
+        (2, "B"),
+        (0, "POINT"),
+        (8, "Symbols"),
+        (10, "500050"),
+        (20, "4649800"),
+        (0, "ENDBLK"),
+        (0, "ENDSEC"),
+        (0, "SECTION"),
+        (2, "ENTITIES"),
+        (0, "INSERT"),
+        (2, "B"),
+        (10, "500050"),
+        (20, "4649800"),
+        (0, "LINE"),
+        (8, "Roads"),
+        (10, "500000"),
+        (20, "4649776"),
+        (11, "500100"),
+        (21, "4649776"),
+        (0, "ENDSEC"),
+        (0, "EOF"),
+    ]
+    .iter()
+    .map(|(c, v)| format!("{c:>3}\n{v}\n"))
+    .collect();
+    let picked = format!("{}2:site.dxf", rustgis_ui_egui::DXF_PICK);
+    app.ui.pending_open = Some("map.import");
+    app.open_picked(&picked, text.as_bytes()).unwrap();
+    assert_eq!(app.ui.pending_open, Some("map.import"));
+    assert_eq!(app.dialogs.open, None, "the options add it without the dialog");
+    let names: Vec<&str> = app.session.map().layers.iter().map(|l| l.name.as_str()).filter(|n| n.starts_with("site")).collect();
+    assert_eq!(names, ["site lines"], "the block's point is left out");
+    let e = app.session.map().layer_by_name("site lines").unwrap().extent();
+    assert!((e.min_x - 15.0).abs() < 1e-6 && (e.min_y - 42.0).abs() < 0.01, "{e:?}");
+    // The options were used up: the next drawing opens the dialog.
+    let picked = format!("{}1:other.dxf", rustgis_ui_egui::DXF_PICK);
+    app.open_picked(&picked, text.as_bytes()).unwrap();
+    assert_eq!(app.dialogs.open, Some("addDxf"));
+    assert_eq!(app.dialogs.text, "EPSG:3857");
+    assert!(app.dialogs.flag);
+    // Two explicit option sets also remain distinct when the earlier picker finishes first.
+    app.run("ui.addDxf", json!({"crs": "EPSG:32633", "blocks": false})).unwrap();
+    app.run("ui.addDxf", json!({"crs": "EPSG:3857", "blocks": true})).unwrap();
+    app.open_picked(&format!("{}3:owned.dxf", rustgis_ui_egui::DXF_PICK), text.as_bytes()).unwrap();
+    let owned = app.session.map().layer_by_name("owned lines").unwrap().extent();
+    assert!((owned.min_x - 15.0).abs() < 1e-6 && (owned.min_y - 42.0).abs() < 0.01, "{owned:?}");
+    assert!(app.session.map().layer_by_name("owned points").is_none());
+    app.open_picked(&format!("{}4:later.dxf", rustgis_ui_egui::DXF_PICK), text.as_bytes()).unwrap();
+    assert!(app.session.map().layer_by_name("later points").is_some());
+    // Stored bytes are added through their own command after an unrelated picker starts.
+    let mut h = harness();
+    h.state_mut().open_picked("stored.dxf", text.as_bytes()).unwrap();
+    h.state_mut().ui.pending_open = Some("map.import");
+    h.step();
+    h.step();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Add").click();
+    h.step();
+    h.step();
+    assert!(h.state().session.map().layer_by_name("stored lines").is_some());
+    assert_eq!(h.state().ui.pending_open, Some("map.import"));
+    // Cancelling a picker consumes only that request's options.
+    app.run("ui.addDxf", json!({"blocks": false})).unwrap();
+    app.open_picked(&format!("{}5:", rustgis_ui_egui::DXF_PICK), &[]).unwrap();
+    assert!(app.ui.pending_dxf.is_empty());
+}
+
 /// Edit Text (#420) on a placed text opens the Format pane on it (#516): it is selected alone, and
 /// the text typed there is saved for that text only, as one undo step.
 #[test]

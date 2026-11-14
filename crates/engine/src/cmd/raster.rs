@@ -34,7 +34,7 @@ pub(crate) fn need_raster(s: &Session) -> Option<&'static str> {
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k (JPEG 2000: desktop, through GDAL)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData)}"#),
+            .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k|.dxf (JPEG 2000: desktop, through GDAL)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData)}"#),
         C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "grey"?: bool (shadedRelief without its colour ramp)}"#,
         ),
@@ -722,7 +722,7 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     let text = String::from_utf8(bytes).map_err(|_| format!("{name} is not a text file"))?;
     // The delimited-text and naming parameters carry over (not the data, already decoded).
     let mut q = json!({"fileName": name, "text": text});
-    for k in ["name", "x", "y", "wkt", "crs", "delimiter", "layer", "paperSpace"] {
+    for k in ["name", "x", "y", "wkt", "crs", "delimiter", "layer", "paperSpace", "blocks"] {
         if let Some(v) = p.get(k) {
             q[k] = v.clone();
         }
