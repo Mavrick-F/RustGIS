@@ -120,6 +120,16 @@ impl Monitor {
         self.targets.values().any(|t| t.baseline.is_none())
     }
 
+    /// Forgets what `target` was read with, so the next readable scan is its baseline: its data
+    /// was brought in step with its file some other way. `true`, as a scan is then wanted.
+    pub(crate) fn rebaseline(&mut self, target: &Target) -> bool {
+        if let Some(t) = self.targets.get_mut(target) {
+            t.baseline = None;
+            t.dismissed = None;
+        }
+        true
+    }
+
     /// Whether a target reads `key`.
     pub(crate) fn watches(&self, key: &str) -> bool {
         self.targets.values().any(|t| t.key == key)
@@ -479,8 +489,19 @@ pub(crate) fn tick(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     if w.revision != Some(app.session.revision) {
         w.revision = Some(app.session.revision);
+        let before = std::mem::take(&mut w.found);
         w.found = targets(&app.session);
         w.wanted |= w.monitor.track(w.found.iter().map(|f| (f.target.clone(), f.key.clone())));
+        // A published layer whose record changed was published, however the command reached the
+        // session (the assistant's relay and file bridge run it without this watcher's hooks): the
+        // file now holds what it does, so the next scan is its baseline again.
+        for f in &w.found {
+            if let Some(record) = &f.record
+                && before.iter().any(|b| b.target == f.target && b.record.as_ref().is_some_and(|old| old != record))
+            {
+                w.wanted |= w.monitor.rebaseline(&f.target);
+            }
+        }
     }
     let focused = ctx.input(|i| i.focused);
     w.wanted |= focused && !w.focused;
@@ -497,7 +518,16 @@ pub(crate) fn tick(app: &mut RustGisApp, ctx: &egui::Context) {
                     w.monitor.observed(&key, seen, scan);
                 }
             }
-            w.resized = resized.into_iter().map(|(target, record, parts)| (target, (record, parts))).collect();
+            // As for the observations: a file being written by RustGIS (a publish) is its write's,
+            // not a change, until it lands.
+            let found = &w.found;
+            w.resized = resized
+                .into_iter()
+                .filter(|(target, _, _)| {
+                    exporting.is_none() || found.iter().find(|f| f.target == *target).map(|f| f.key.as_str()) != exporting.as_deref()
+                })
+                .map(|(target, record, parts)| (target, (record, parts)))
+                .collect();
         }
     }
     let now = web_time::Instant::now();
@@ -1445,7 +1475,7 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let l = app.session.map().layer(id).unwrap().clone();
-            if let Some(edited) = crate::syncmark::edited(app, &l, ctx) {
+            if let Some(edited) = crate::syncmark::hashed(app, &l, ctx) {
                 return edited;
             }
             assert!(std::time::Instant::now() < end, "the hash never landed");
@@ -1488,6 +1518,24 @@ mod tests {
         app.run("source.publish", json!({"layer": id})).unwrap();
         scan(&mut app, &ctx, 3);
         assert_eq!(status_of(&app, id), Status::Unchanged, "the publish checked the contents and wrote them");
+    }
+
+    #[test]
+    fn a_publish_through_the_session_alone_clears_the_mark_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id, path) = published_layer(dir.path());
+        let ctx = egui::Context::default();
+        scan(&mut app, &ctx, 2);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, std::fs::read(&path).unwrap()).unwrap();
+        scan(&mut app, &ctx, 2);
+        assert_eq!(status_of(&app, id), Status::Changed);
+        // As the assistant's relay runs it: the session's own dispatch, without the app's hooks.
+        app.session.run("edit.enable", &json!({"on": true})).unwrap();
+        app.session.run("edit.setValue", &json!({"layer": id, "row": 0, "field": "owner", "value": "Jones"})).unwrap();
+        app.session.run("source.publish", &json!({"layer": id})).unwrap();
+        scan(&mut app, &ctx, 3);
+        assert_eq!(status_of(&app, id), Status::Unchanged, "the new record says the file was published");
     }
 
     #[test]

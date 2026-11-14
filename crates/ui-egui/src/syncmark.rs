@@ -29,6 +29,9 @@ struct Entry {
     job: Option<Job>,
     /// When to try again after the OS refused a thread.
     retry: Option<web_time::Instant>,
+    /// The answer for the layer's previous state, shown until this state's hash lands, so the
+    /// note doesn't drop out during each edit's hash.
+    shown: Option<bool>,
 }
 
 /// A hash on its thread: where it lands, its Cancel, and whether it hashes the layer as its entry
@@ -71,6 +74,15 @@ impl Entry {
         true
     }
 
+    /// Whether the layer holds edits its file lacks: its own hash's answer once that lands, else
+    /// the previous state's.
+    fn answer(&self) -> Option<bool> {
+        match &self.digest {
+            Some(Ok(digest)) => Some(*digest != self.synced.rows),
+            _ => self.shown,
+        }
+    }
+
     /// Whether it answers for `l` as it is now.
     fn of(&self, l: &Layer) -> bool {
         Weak::ptr_eq(&self.rows, &l.dataset.features.allocation_key())
@@ -102,7 +114,9 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
     let id = (app.session.map().instance_id(), l.instance_id());
     if !app.syncmark.entries.get(&id).is_some_and(|e| e.of(l)) {
         // The earlier hash is stopped, and kept until it lands.
-        let earlier = app.syncmark.entries.remove(&id).and_then(|mut e| e.job.take()).map(|mut job| {
+        let replaced = app.syncmark.entries.remove(&id);
+        let shown = replaced.as_ref().and_then(Entry::answer);
+        let earlier = replaced.and_then(|mut e| e.job.take()).map(|mut job| {
             job.stop.store(true, Ordering::Relaxed);
             job.current = false;
             job
@@ -115,6 +129,7 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
             digest: None,
             job: earlier,
             retry: None,
+            shown,
         };
         app.syncmark.entries.insert(id, entry);
     }
@@ -138,7 +153,9 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
             let dataset = l.dataset.clone();
             let spawned = std::thread::Builder::new().name("Edits not published".into()).spawn(move || {
                 let _probe = rustgis_engine::data::progress::install(Some(Arc::new(probe)));
-                // A panic lands as an answer too, so it never holds the turn.
+                // A panic lands as an answer too, so it never holds the turn. Neither this nor a
+                // refused thread below can be brought about in a test: `rows_digest` has no panic
+                // path, and the OS refuses threads only under load.
                 let digest = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::data::sync::rows_digest(&dataset)))
                     .map_err(|_| "the hash stopped".to_string())
                     .and_then(|d| d.map_err(|e| e.to_string()));
@@ -160,9 +177,18 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
             }
         }
     }
-    match &entry.digest {
-        Some(Ok(digest)) => Some(*digest != entry.synced.rows),
-        _ => None,
+    entry.answer()
+}
+
+/// [`edited`] as this state's own hash answers it, `None` until that lands (not the previous
+/// state's answer, which [`edited`] shows meanwhile).
+#[cfg(test)]
+pub(crate) fn hashed(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<bool> {
+    edited(app, l, ctx);
+    let e = app.syncmark.entries.get(&(app.session.map().instance_id(), l.instance_id()))?;
+    match e.digest.as_ref()? {
+        Ok(digest) => Some(*digest != e.synced.rows),
+        Err(_) => None,
     }
 }
 
@@ -202,6 +228,7 @@ mod tests {
             digest: None,
             job: Some(Job { slot, stop: Arc::new(AtomicBool::new(false)), current }),
             retry: None,
+            shown: Some(true),
         }
     }
 
@@ -215,5 +242,6 @@ mod tests {
         e.land();
         assert!(e.job.is_none());
         assert_eq!(e.digest, None, "an earlier state's hash doesn't answer");
+        assert_eq!(e.answer(), Some(true), "the previous answer stays shown until this state's lands");
     }
 }
