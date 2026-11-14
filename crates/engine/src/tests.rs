@@ -28342,6 +28342,27 @@ fn connection_browse_levels_and_adds() {
     assert!(!s.can_undo());
 }
 
+/// A kept field that only holds a secret once a source's details change is left out then, and
+/// said then, not only at start (the start-up notice has already been shown).
+#[test]
+fn a_secret_left_out_when_a_source_changes_is_said() {
+    let mut s = Session::new(Project::default());
+    s.sources = crate::sources::Sources::from_json(r#"{"saved":[{"kind":"file","name":"A","address":"/a.csv","key":"abc"}]}"#);
+    // Kept at start as a setting this version doesn't know: nothing beside it makes it a secret.
+    assert!(!s.sources.unread().iter().any(|t| t.contains("password")), "{:?}", s.sources.unread());
+    let mark = s.notices_given();
+    s.run("sources.save", &json!({"kind": "file", "name": "A", "address": "/a.csv"})).unwrap();
+    assert!(s.notices_since(mark).is_empty(), "{:?}", s.notices_since(mark));
+    s.run("sources.save", &json!({"kind": "file", "name": "A", "address": "/a.csv", "extra": {"endpoint": "https://api.example"}}))
+        .unwrap();
+    assert!(
+        s.notices_since(mark).iter().any(|n| n.text.starts_with("1 value in the saved data sources holds a password")),
+        "{:?}",
+        s.notices_since(mark)
+    );
+    assert!(!s.sources.to_json().contains("abc"));
+}
+
 fn rustgis_engine_sources_roundtrip(text: &str) -> crate::sources::Sources {
     crate::sources::Sources::from_json(text)
 }

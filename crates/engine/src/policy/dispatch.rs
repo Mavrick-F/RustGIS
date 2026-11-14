@@ -212,7 +212,12 @@ impl Session {
                         if result.is_ok()
                             && let Some(source) = crate::sources::added_by(command, &params)
                         {
+                            let before = s.sources.secrets_left_out();
                             s.sources.note(source);
+                            let left_out = s.sources.secrets_left_out().saturating_sub(before);
+                            if left_out > 0 {
+                                s.notify(crate::sources::secrets_notice(left_out), false);
+                            }
                         }
                         result
                     })?

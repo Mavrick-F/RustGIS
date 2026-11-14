@@ -71,10 +71,11 @@ fn read_state() -> State {
     let Some(path) = state_path() else { return State::default() };
     let read = match std::fs::read_to_string(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
-        // Written whole each time, so an empty file was made empty on purpose, not cut short.
-        Ok(text) if text.trim().is_empty() => return State::default(),
+        // Written whole each time, so an empty file was made empty on purpose, not cut short. A
+        // byte-order mark (an editor's) isn't part of the JSON.
+        Ok(text) if text.trim_start_matches('\u{feff}').trim().is_empty() => return State::default(),
         Err(e) => Err(e.to_string()),
-        Ok(text) => serde_json::from_str(&text).map_err(|e| e.to_string()),
+        Ok(text) => serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string()),
     };
     read.unwrap_or_else(|e| State { unreadable: Some(format!("{}: {e}", path.display())), ..State::default() })
 }

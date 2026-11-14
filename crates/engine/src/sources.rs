@@ -264,14 +264,16 @@ impl Sources {
             ));
         }
         if k.secrets > 0 {
-            let n = k.secrets;
-            said.push(format!(
-                "{n} value{} in the saved data sources {} a password, key or token: not kept, and left out the next time the sources are saved",
-                if n == 1 { "" } else { "s" },
-                if n == 1 { "holds" } else { "hold" }
-            ));
+            said.push(secrets_notice(k.secrets));
         }
         said
+    }
+
+    /// How many values holding a password, key or token have been left out of what is kept so far.
+    /// A caller that changes a source compares it before and after, to say what that change left
+    /// out ([`secrets_notice`]); [`Sources::unread`] says what reading did.
+    pub fn secrets_left_out(&self) -> usize {
+        self.kept.secrets
     }
 
     /// Takes in the sources kept with the preferences, keeping what this session already has:
@@ -494,6 +496,15 @@ impl Source {
     pub fn is(&self, kind: &str, address: &str) -> bool {
         self.kind == kind && self.address == address
     }
+}
+
+/// The notice for `n` values left out of the saved data sources because they hold a secret.
+pub fn secrets_notice(n: usize) -> String {
+    format!(
+        "{n} value{} in the saved data sources {} a password, key or token: not kept, and left out the next time the sources are saved",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "holds" } else { "hold" }
+    )
 }
 
 /// A source made safe to keep: a known kind, bounded text, and an address without secrets.

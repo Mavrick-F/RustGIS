@@ -1884,7 +1884,7 @@ fn plugin_state_keeps_what_this_version_cannot_read() {
         assert!(crate::store::load_installed().is_empty());
     }
     // No file, or an empty one, is nothing disabled, with no notice.
-    for empty in [None, Some("  \n")] {
+    for empty in [None, Some("  \n"), Some("\u{feff}")] {
         match empty {
             Some(text) => std::fs::write(&state, text).unwrap(),
             None => std::fs::remove_file(&state).unwrap(),
@@ -1893,6 +1893,11 @@ fn plugin_state_keeps_what_this_version_cannot_read() {
         assert!(crate::store::load_installed().is_empty(), "{empty:?}");
         assert!(crate::get("state-test").is_some_and(|p| p.enabled), "{empty:?}");
     }
+    // An editor's byte-order mark isn't part of the JSON.
+    std::fs::write(&state, "\u{feff}{\"disabled\": [\"state-test\"]}").unwrap();
+    crate::unload("state-test");
+    assert!(crate::store::load_installed().is_empty());
+    assert!(crate::get("state-test").is_some_and(|p| !p.enabled));
     crate::store::uninstall("state-test").unwrap();
     let _ = std::fs::remove_dir_all(&plugins);
 }
