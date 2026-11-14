@@ -14,6 +14,7 @@ allocations and hangs that hand-written hostile-input tests don't anticipate.
 | `mvt` | `rustgis_tiles::mvt::decode` | vector tiles |
 | `esripbf` | `esripbf::is_esripbf`, then `esripbf::read` | ArcGIS feature-service answers as protocol buffers (`f=pbf`) |
 | `project` | `Project::from_json` | `.rgis` projects |
+| `dates` | `Date::parse`, `DateTime::parse`, `Value::parse` and where clauses comparing date fields with the input, checking that a parsed value shows as text that reads back the same | date and date-time text in every reader, and the query language |
 | `sheets` | `sheets::sheet_names`, `sheets::columns`, `sheets::read` | Excel and OpenDocument workbooks, calamine, the `.xls` sector-table check |
 
 This crate is its own workspace, outside RustGIS's: `cargo build`, `cargo xtask ci`, the wasm
