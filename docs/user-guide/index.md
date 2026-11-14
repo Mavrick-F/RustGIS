@@ -483,7 +483,9 @@ why; the original file stays unchanged. A file with feature ids requires the sam
 ids in the same order: adding, deleting or reordering rows is refused when their external ids
 couldn't be preserved, and the same holds for a layer without fields whose features mix absent,
 null and object `properties`. Absent or null `properties` are kept only in a layer without fields:
-a collection that mixes them with attributed features is refused. Use Export Features for a
+a collection that mixes them with attributed features is refused. A `bbox` on the collection
+or its features is recomputed from the coordinates written; one that doesn't match the file's
+own coordinates, or a `bbox` on a geometry object, is refused. Use Export Features for a
 different document structure. A single Feature can't become a collection, a bare geometry can't
 gain attributes, and an empty collection can't retain a field schema.
 
