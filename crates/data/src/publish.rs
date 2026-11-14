@@ -72,11 +72,22 @@ fn refuse_link(source: &Path, part: &Path) -> Result<()> {
     }
 }
 
+/// A publisher's lock, released before its descriptor closes so duplicates inherited during
+/// process creation cannot extend its lifetime.
+struct SourceLock(std::fs::File);
+
+impl Drop for SourceLock {
+    /// Unlock the shared file description, including any duplicate descriptors.
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Holds an exclusive OS lock on a persistent sidecar through publication. The sidecar is
 /// never unlinked: deleting it could let a third process lock a different inode while another
-/// still holds the old one. Dropping the handle (including on process exit) releases the lock;
+/// still holds the old one. Dropping the guard explicitly unlocks before closing its handle;
 /// contention refuses immediately. This coordinates RustGIS publishers, not other programs.
-fn source_lock(path: &Path) -> Result<std::fs::File> {
+fn source_lock(path: &Path) -> Result<SourceLock> {
     refuse_link(path, path)?;
     let target = path.canonicalize()?;
     let mut name = std::ffi::OsString::from(".");
@@ -119,7 +130,7 @@ fn source_lock(path: &Path) -> Result<std::fs::File> {
         std::fs::TryLockError::WouldBlock => refused(path, "another RustGIS publisher holds this source; try again after it finishes"),
         std::fs::TryLockError::Error(e) => refused(path, format!("couldn't lock {}: {e}", lock_path.display())),
     })?;
-    Ok(file)
+    Ok(SourceLock(file))
 }
 
 /// The Shapefile at `path`'s parts as they are, read into memory, with its `.cpg`'s path.
@@ -865,6 +876,21 @@ mod tests {
         assert!(shapefile(&ds, &path, &sync).err().unwrap().to_string().contains("changed since the layer was read"));
     }
 
+    /// A duplicated descriptor must not keep a finished publisher's lock alive.
+    #[test]
+    fn a_source_lock_releases_while_a_duplicate_descriptor_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        written(&parcels(), &path);
+        let held = source_lock(&path).unwrap();
+        let duplicate = held.0.try_clone().unwrap();
+        drop(held);
+        let next = source_lock(&path).expect("a finished publisher must release its lock despite a duplicated descriptor");
+        drop(duplicate);
+        assert!(source_lock(&path).err().unwrap().to_string().contains("another RustGIS publisher"));
+        drop(next);
+    }
+
     /// A shared source's empty lock is writable across accounts, even under a private umask.
     /// Reopening it keeps a writable handle (required by NFS) and excludes a second publisher.
     #[cfg(unix)]
@@ -882,7 +908,7 @@ mod tests {
         drop(held);
         let mut held = source_lock(&path).unwrap();
         // A zero-byte write checks the descriptor's access mode without storing source data.
-        assert_eq!(held.write(&[]).unwrap(), 0);
+        assert_eq!(held.0.write(&[]).unwrap(), 0);
         assert!(source_lock(&path).err().unwrap().to_string().contains("another RustGIS publisher"));
         drop(held);
         source_lock(&path).unwrap();
@@ -902,6 +928,52 @@ mod tests {
         ds.features = rows.into();
         let e = shapefile(&ds, &path, &sync).err().expect("changed ring grouping must be refused").to_string();
         assert!(e.contains("shapes would read back otherwise") && e.contains("nothing was written"), "{e}");
+        assert!(sync.files.changed(&path).unwrap().is_empty());
+    }
+
+    /// Geometry edits remove obsolete indexes regardless of their extension's letter case.
+    #[test]
+    fn publishing_removes_case_variant_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let (mut ds, sync) = written(&parcels(), &path);
+        let indexes = ["qix", "QIX", "qIx", "sbn", "SBN", "SBX"];
+        for extension in indexes {
+            std::fs::write(path.with_extension(extension), b"old index").unwrap();
+        }
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        if let Some(Geometry::Polygon(polys)) = &mut rows[0].geometry {
+            polys[0][0][1].x += 0.005;
+        }
+        ds.features = rows.into();
+        shapefile(&ds, &path, &sync).unwrap();
+        for extension in indexes {
+            assert!(!path.with_extension(extension).exists(), "stale index {extension} survived");
+        }
+    }
+
+    /// A DBF record beyond its declared count must not disappear during an unrelated edit.
+    #[test]
+    fn publishing_refuses_unaccounted_dbf_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        crate::io::write_path(&parcels(), &path).unwrap();
+        let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        let header = usize::from(u16::from_le_bytes([dbf[8], dbf[9]]));
+        let width = usize::from(u16::from_le_bytes([dbf[10], dbf[11]]));
+        let count = u32::from_le_bytes(dbf[4..8].try_into().unwrap()) as usize;
+        let extra = dbf[header..header + width].to_vec();
+        dbf.truncate(header + count * width);
+        dbf.extend(extra);
+        dbf.push(0x1a);
+        std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
+        let (mut ds, sync) = read(&path);
+        assert_eq!(ds.features.len(), 2);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text("Smyth".into());
+        ds.features = rows.into();
+        let error = shapefile(&ds, &path, &sync).err().expect("uncounted DBF records must be refused").to_string();
+        assert!(error.contains("header") && error.contains("records") && error.contains("nothing was written"), "{error}");
         assert!(sync.files.changed(&path).unwrap().is_empty());
     }
 

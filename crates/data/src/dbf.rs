@@ -245,8 +245,10 @@ pub(crate) fn raw_table(dbf: &[u8]) -> Option<RawTable<'_>> {
         return None;
     }
     let body = dbf.get(header_len..)?;
-    // Fewer records than the header counts: not a table this can compare.
-    if body.len() < count.checked_mul(record_len)? {
+    // Every byte must belong to a counted record or the optional EOF marker. A rewrite
+    // must not discard uncounted records or other data left past the declared body.
+    let trailing = body.get(count.checked_mul(record_len)?..)?;
+    if !trailing.is_empty() && trailing != [0x1a] {
         return None;
     }
     let (mut records, mut deleted) = (Vec::new(), 0);

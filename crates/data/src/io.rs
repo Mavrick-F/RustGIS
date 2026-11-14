@@ -720,7 +720,15 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
     }
     // A spatial index left from an older file of the same name would no longer match.
     for stale in ["qix", "sbn", "sbx"] {
-        let _ = std::fs::remove_file(path.with_extension(stale));
+        // Sidecars may use any letter case, even beside a lowercase `.shp`.
+        for capitals in 0..8 {
+            let extension: String = stale
+                .bytes()
+                .enumerate()
+                .map(|(i, b)| char::from(if capitals & (1 << i) == 0 { b } else { b.to_ascii_uppercase() }))
+                .collect();
+            let _ = std::fs::remove_file(path.with_extension(extension));
+        }
     }
     Ok(())
 }
