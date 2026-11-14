@@ -217,9 +217,9 @@ fn name_key(instance: u64) -> egui::Id {
     egui::Id::unique(("layer_properties_name", instance))
 }
 
-/// The most characters `layer.rename` keeps of a name: the box takes no more (a longer paste is
-/// cut to fit, and a note under the box says so), so the command cuts none.
-const NAME_LIMIT: usize = 200;
+/// The most characters `layer.rename` takes of a name: the box takes no more (a longer paste is
+/// cut to fit, and a note under the box says so), so the command refuses none.
+const NAME_LIMIT: usize = rustgis_engine::cmd::layer::MAX_LAYER_NAME;
 
 /// The layer's name, renamed (`layer.rename`) when the box is left (a click elsewhere, another
 /// layer's included) or Enter is pressed, and put back as it was with Escape or when left empty. A
@@ -836,6 +836,31 @@ mod tests {
         h.get_by_role_and_label(Role::Button, "LIKE").click();
         h.run();
         assert_eq!(query_box(&h), "name LIKE ");
+    }
+
+    /// The Functions and Variables menus list the language's catalogs: a function is added open
+    /// for its arguments, and what follows it goes inside, not set apart from the bracket.
+    #[test]
+    fn the_functions_and_variables_menus_add_from_the_catalogs() {
+        use rustgis_engine::data::query::{VARS, functions};
+        let app = with_cities();
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Query");
+        type_query(&mut h, "name =");
+        // One that takes arguments, so it is added open.
+        let first = functions().find(|f| f.max > 0).unwrap();
+        h.get_by_role_and_label(Role::Button, "Functions ▾").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, first.signature).click();
+        h.run();
+        assert_eq!(query_box(&h), format!("name = {}(", first.name));
+        let var = VARS[0].names[0];
+        h.get_by_role_and_label(Role::Button, "Variables ▾").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, var).click();
+        h.run();
+        assert_eq!(query_box(&h), format!("name = {}({var} ", first.name));
     }
 
     /// Ctrl+Enter applies the clause without breaking the line; Escape drops what was typed.

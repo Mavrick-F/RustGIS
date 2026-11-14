@@ -29,6 +29,13 @@ smaller one is loaded whole.
 command line. A package opens as a new, unsaved project; Save writes a plain `.rgis` file.
 Opening or creating a project clears undo history; saving does not.
 
+This version already reads format 2, a newer `.rgis` format
+([#1853](https://github.com/opengeos/RustGIS/issues/1853)), when the file needs nothing this
+version lacks, and saves it in the format it writes today. A project, package, template, map or
+layer file that needs something this version can't read (what it lists under `requires`) is
+refused, naming what it needs, rather than opened without it; one of a newer format still asks
+you to update RustGIS.
+
 A `•` after the project's name in the title bar means it has unsaved changes. Undoing or redoing
 back to the state you last saved clears it. Before the desktop app discards unsaved changes, it
 asks **Save changes to…?** That happens when you quit or close the window, and when New, Open, the
@@ -222,10 +229,14 @@ with no basemap and no graticule, as QGIS draws it. A project in degrees (EPSG:4
 longitude/latitude systems) opens in the Equirectangular projection, the plate carrée QGIS draws
 it in; a map QGIS turned keeps its rotation. The project's bookmarks come in at their places (from
 the coordinate system each was saved in), turned as QGIS turns them; their groups are noted. Its
-relations come in as [relationships](editing.md#data-design) between the layers that came in (one on several
-pairs of fields relates by the first, noted). A layer whose time QGIS reads from a date field
-(or starts at one) is bound to the [time slider](#views-and-tools) on that field, the slider left off, as
-QGIS opens a project with its time navigation off: every feature draws until it is turned on; the
+relations come in as [relationships](editing.md#data-design) between the layers that came in; one
+on several pairs of fields relates by the first, noted. A relation to a layer that came in as
+several tables relates to the one table with its field, noted as a guess. It isn't made, and is
+noted, when several of those tables have the field, or when a layer related to itself has its
+two fields in two different tables.
+A layer whose time QGIS reads from a date field (or starts at one) is bound to the
+[time slider](#views-and-tools) on that field, the slider left off, as QGIS opens a project with
+its time navigation off: every feature draws until it is turned on; the
 project's own span and steps, when it sets one, are noted. The import is one undo step.
 Relative layer paths resolve from the project's folder on desktop. In the browser, relative
 file sources cannot be resolved and are listed in the import notes.

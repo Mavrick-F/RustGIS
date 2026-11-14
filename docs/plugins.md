@@ -179,9 +179,14 @@ cargo build --release --target wasm32-unknown-unknown
 - `runtime`: `wasm` (the default), `process` or `skills`. For WebAssembly plugins, `entry`
   defaults to `plugin.wasm` and must name a `.wasm` file relative to the manifest, using
   forward slashes with no `.` or `..` path segments. `abi` defaults to `1` and must equal `1`.
-- `version` and optional `minRustgisVersion` are numeric versions such as `1.2.3` or `1.2`.
-  RustGIS compares their numeric components, ignoring prerelease and build suffixes, and
-  refuses a plugin that needs a newer RustGIS.
+- `version` and optional `minRustgisVersion` are numeric versions such as `1.2.3` or `1.2`,
+  optionally with a pre-release (`1.2.3-beta.1`) and build metadata (`+build.5`). Plugin
+  versions follow [SemVer](https://semver.org/) precedence: a pre-release comes before its
+  release, pre-releases compare identifier by identifier (`beta.2` before `beta.11` before
+  `rc.1`), and build metadata is ignored. So **Update** is offered from `1.0.0-beta.1` to
+  `1.0.0-beta.2` and to `1.0.0`, never to an equal or older version. `minRustgisVersion`
+  compares only the numbers: RustGIS refuses a plugin that needs a newer RustGIS, and a
+  RustGIS pre-release such as `0.7.0-rc.1` runs plugins that need `0.7.0`.
 - `permissions`: `edit`, `files` and `network` (see [Safety](#safety)); empty by default.
   Ask only for what you use.
 - `commands[].params`: a string describing the command's parameters for scripts and agents,
@@ -595,12 +600,12 @@ Inside a request, `host::call(op, params)` sends one of these to RustGIS:
 | Request | Answer |
 |---|---|
 | `host.info` | `{rustgis, abi, plugin, permissions}`: version, ABI, plugin id and permissions |
-| `host.layers` | `[{id, name, raster, visible, geometry, features, selected, active, extent, transparency, group, fields: [{name, type}]}]`, top first: `extent` is `[west, south, east, north]` in longitude/latitude (`null` when empty or a raster not yet read), `transparency` the layer's own, 0 (opaque) to 100 (its groups' transparency applies on top), `group` the name of the group it is in or `null`. The web tile layers, groups, tables and layouts (with their page size) are in `info.project` |
-| `host.features` `{layer, selected?, limit?}` | the layer's features as GeoJSON; each feature has its `row` |
+| `host.layers` | `[{id, name, raster, visible, geometry, features, selected, active, extent, transparency, group, crs, fields: [{name, type}]}]`, top first: `crs` is the layer's own coordinate system, `"EPSG:32637"` (its WKT when it has no EPSG code, else its PROJ definition; `null` only for a raster not yet read), the one `share.exportLayer` keeps. A vector layer that carries no coordinate system is reported as `"EPSG:4326"`: RustGIS assumes WGS 84 for it, as it does everywhere, so that is a fallback, not a system the file declared; `extent` is `[west, south, east, north]` in longitude/latitude (`null` when empty or a raster not yet read), `transparency` the layer's own, 0 (opaque) to 100 (its groups' transparency applies on top), `group` the name of the group it is in or `null`. The web tile layers, groups, tables and layouts (with their page size) are in `info.project` |
+| `host.features` `{layer, selected?, limit?, crs?}` | the layer's features as GeoJSON; each feature has its `row`. With `crs` omitted, null or empty, coordinates retain the default longitude/latitude response without a `crs` member: WGS 84 for Earth layers, but the source body’s degrees for planetary layers. An explicit `"EPSG:4326"` (or `"4326"`), or `"layer"` resolving to WGS 84, also uses that response without a `crs` member. This preserves the existing numeric coordinates for planetary layers; it does not convert them to Earth’s WGS 84. Other `crs` values ask for: `"layer"` (the layer's own, as `host.layers` gives it: metres for a UTM layer), `"map"` (the map's projection; Web Mercator on the globe) or an EPSG code (`"EPSG:32637"`, or `"32637"`; WKT and PROJ text are refused, so a plugin can't add coordinate systems to the session). A non-default answer then has a GeoJSON `crs` member (`{"type": "name", "properties": {"name": "EPSG:32637"}}`), which `host.addLayer` reads back. A `crs` that is unknown, not text (except null), an unsupported form, has no EPSG code (a layer or map in a custom system), is geocentric, belongs to another body than the layer, or can't hold a feature (outside its area, or beyond Web Mercator's latitude of 85.05°) is an error starting with `crs:` (naming the feature count where it applies); nothing is dropped silently or moved. The request runs on the calling thread (the window's, in the app) like every host request |
 | `host.view` | `{center: [lon, lat], scale, projection, bearing, pitch}` (bearing and pitch in degrees, 0 for a flat north-up map) |
 | `host.notify` `{text, error?}` | shows a message in the status bar |
 | `host.addLayer` `{name, geojson}` | adds a layer (`edit`) |
-| `host.fetch` `{url}` | `{url, text, json?}`: the document at a web address (`network`; see [Fetching a document](#fetching-a-document)) |
+| `host.fetch` `{url, json?}` | `{url, text, json?}`: the document at a web address; `json: false` leaves out `json` (`network`; see [Fetching a document](#fetching-a-document)) |
 | `map.addTiles` `{url, kind?, name?, attribution?, maxZoom?, overlay?, replace?, blend?, …}` | adds a tile layer (`edit` and `network`); accepts the built-in command's parameters |
 | any command id (`layer.zoomTo`, `select.byAttributes`, `layer.symbology`…) | what the command returns, within the plugin's permissions |
 
@@ -670,6 +675,15 @@ answer, with a GET request. It needs the `network` permission. The answer is
 `{"url", "text", "json"?}`: `url` is the address fetched, `text` the document, and `json` the
 document parsed when it is a JSON object or array.
 
+`"json": false` leaves `json` out of the answer: `{"url", "text"}`. A plugin that only passes
+`text` on, to `service.layers` or `catalog.search` say, or parses it in its own way, then
+doesn't spend its fuel reading a parsed copy of a large document it never uses. Without
+`json`, or with `"json": true`, the answer is as above. Any
+other value is an error. Each address is kept once for both: a call with `"json": false` and
+one without answer from the same kept document. `json` is new in RustGIS 0.7.0: earlier
+versions ignore it and answer `json` anyway, so set `minRustgisVersion` to `0.7.0` for a plugin
+that needs it left out.
+
 - Only `http://` and `https://` addresses on the internet: not this computer, the local network
   or cloud metadata addresses, and no redirect may lead there or from `https` to `http`. Names
   are checked as written and again where they resolve, on every redirect too, so a name that
@@ -696,7 +710,8 @@ document parsed when it is a JSON object or array.
   address taken from the one before, runs once per step, up to 64 times. The browser follows
   redirects itself, and the server must allow requests from web pages (CORS).
 
-Use `host::call("host.fetch", json!({"url": url}))` in the Rust SDK.
+Use `host::call("host.fetch", json!({"url": url}))` in the Rust SDK, or
+`host::call("host.fetch", json!({"url": url, "json": false}))` for the text only.
 
 Tools work differently. A tool receives its layer parameters' features as GeoJSON (only the
 selected features when a layer has a selection), and its `file` parameters' files. It returns

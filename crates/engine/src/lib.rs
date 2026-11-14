@@ -15,6 +15,7 @@ mod notice_text;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod observe;
 pub mod peer;
+pub mod platform;
 pub mod policy;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prefs;
@@ -85,7 +86,8 @@ pub struct CommandSpec {
     pub shortcut: &'static str,
     /// Parameter description for scripts and agents.
     pub params: &'static str,
-    /// Whether it changes the project (and so takes an undo snapshot).
+    /// Whether it takes an automatic project-edit transaction (undo snapshot and dirty marking).
+    /// Changes committed without that transaction declare `Effect::Edits` explicitly.
     pub mutates: bool,
     /// `None` = enabled; `Some(reason)` = disabled.
     pub enabled: fn(&Session) -> Option<&'static str>,
@@ -108,6 +110,12 @@ impl CommandSpec {
     /// the description is not a `{"key": …}` object (nothing to check against).
     pub fn param_keys(&self) -> Option<Vec<&'static str>> {
         param_keys(self.params)
+    }
+
+    /// Whether it can change the project, including external commits that update metadata
+    /// without an automatic undo snapshot. Logging and command discovery use this contract.
+    pub const fn changes_project(&self) -> bool {
+        self.mutates || self.effects.contains(policy::Effect::Edits)
     }
 
     /// Whether the parameter description includes a required top-level input.
@@ -162,7 +170,8 @@ impl CommandSpec {
         self.params = p;
         self
     }
-    /// Doesn't change the project (no undo snapshot, not dirtying).
+    /// Suppresses automatic undo snapshots and dirty marking. Usually read-only; a command
+    /// committing external changes can update metadata itself and declares `Effect::Edits`.
     pub const fn view(mut self) -> Self {
         self.mutates = false;
         self
@@ -337,6 +346,9 @@ fn param_entries<'a>(desc: &'a str, mut visit: impl FnMut(&'a str, bool)) -> Opt
     }
     Some(())
 }
+
+/// What a zoom to a place the map's projection doesn't reach says, once in a command.
+const BEYOND_PROJECTION: &str = "The place lies beyond what the map's projection shows, so the view wasn't moved to it.";
 
 /// `s` cut to `n` characters, with `…` when cut.
 fn clip(s: &str, n: usize) -> String {
@@ -704,6 +716,9 @@ pub struct Session {
     pub tool: Tool,
     /// The layer selected in the Layers pane (the one the Style and Data tabs act on).
     pub active_layer: Option<u32>,
+    /// The standalone table a command's parameters name while its conditions are checked
+    /// ([`Session::named_table`]), as `active_layer` is the layer they name; None otherwise.
+    pub(crate) condition_table: Option<u32>,
     /// The layers picked together in the Layers pane, the active layer among them. Read through
     /// [`Session::selected_layers`]: it holds only while `layer_selection_of` is still the active
     /// layer, so setting `active_layer` on its own (adding data, a removal) starts over with that
@@ -738,6 +753,13 @@ pub struct Session {
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
     /// less those a failed command withdrew.
     notices_given: u64,
+    /// Whether the outermost command now running has said that a zoom couldn't reach its place;
+    /// `None` between commands. Its inner steps would each say it (a zoom refused by each layer an
+    /// add frames): it is said once in a command, however many notices come after.
+    beyond_said: Option<bool>,
+    /// The count of cloud-optimised GeoTIFF headers landed when [`Session::notice_landed_rasters`]
+    /// last looked back at the dates a dated series has shown (`cog::landed_count`).
+    cog_headers_seen: u64,
     /// Layer whose attribute table is open.
     pub table_layer: Option<u32>,
     /// The standalone table shown in the attribute table instead of a layer, by its id.
@@ -814,6 +836,9 @@ pub struct Session {
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
+    /// File writes committed inside the outer command, retained through layer removal or a
+    /// project replacement so its rollback can restore the current source-file record.
+    published_syncs: Vec<(u64, String, rustgis_data::sync::Synced)>,
     /// Who runs commands now: `None` is the user; the MCP relay names an attached agent around
     /// its calls. Each undo step remembers who made it ([`Session::undo_actor`]).
     pub actor: Option<String>,
@@ -1147,6 +1172,7 @@ impl Session {
             exchange: None,
             tool: Tool::Explore,
             active_layer: None,
+            condition_table: None,
             layer_selection: Vec::new(),
             layer_selection_of: None,
             view_size: (1200.0, 720.0),
@@ -1159,6 +1185,8 @@ impl Session {
             bundled_roots_said: false,
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
+            beyond_said: None,
+            cog_headers_seen: 0,
             table_layer: None,
             table_standalone: None,
             clipboard: None,
@@ -1192,6 +1220,7 @@ impl Session {
             depth: 0,
             diagnostic_source: None,
             restorable: 0,
+            published_syncs: Vec::new(),
             actor: None,
             back: Vec::new(),
             forward: Vec::new(),
@@ -1529,10 +1558,12 @@ impl Session {
             // A step that joins the last one (a held arrow key nudging an element: `merge_undo`) is
             // one entry too, as it is one step to undo.
             let joins = self.merge.is_some() && self.merge == self.merged && !self.undo.is_empty();
+            self.beyond_said = Some(false);
             let (at, start) = (project_log::now_ms(), web_time::Instant::now());
             #[cfg(not(target_arch = "wasm32"))]
             let files_before: Vec<String> = self.mbtiles_files().map(str::to_string).collect();
             let res = self.with_unread_bools(source, run);
+            self.beyond_said = None;
             // Whichever command took its last layer away (removed, undone, the project closed):
             // the file can now be moved or replaced, so what was read of it is forgotten too.
             #[cfg(not(target_arch = "wasm32"))]
@@ -1588,6 +1619,7 @@ impl Session {
         // Every top-level invocation consumes its key, even a refusal or panic before guarded.
         if outermost {
             self.merge = None;
+            self.beyond_said = None;
         }
         match result {
             Ok(result) => result,
@@ -1632,26 +1664,14 @@ impl Session {
                 self.warn(format!("{id} ignores {} (it reads {reads})", said.join(", ")));
             }
         }
-        // Layer conditions apply to the layer the parameters name (the first of a list), falling
-        // back to the active one.
-        let named = match params.get("layer") {
-            Some(serde_json::Value::Array(list)) => list.first().and_then(|v| self.layer_id(&serde_json::json!({"layer": v})).ok()),
-            Some(_) => self.layer_id(params).ok(),
-            None => None,
-        };
         let active = self.active_layer;
-        if named.is_some() {
-            self.active_layer = named;
-        }
-        // Restored on every path, even if a condition were to panic.
-        let enabled = spec.enabled;
-        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| enabled(self))).unwrap_or(Some("unavailable"));
-        self.active_layer = active;
+        let (blocked, named, table) = self.conditions(&spec, params);
         if let Some(why) = blocked {
             return Err(format!("{}: {why}", spec.label));
         }
         let (mutates, label) = (spec.mutates, spec.label);
-        if let Some(e) = self.streamed_edit(id, mutates, label, named.or(active)) {
+        // An edit of a table edits no layer: a streamed active layer doesn't stop it.
+        if let Some(e) = self.streamed_edit(id, mutates, label, if table.is_some() { None } else { named.or(active) }) {
             // Said, as a failure in `guarded` is: this returns before it (#468).
             self.notify(e.clone(), true);
             return Err(e);
@@ -1682,6 +1702,63 @@ impl Session {
         for (project, ..) in self.undo.iter_mut().chain(self.redo.iter_mut()) {
             project.discard_import_reservation(token);
         }
+    }
+
+    /// Why command `id` can't run with `params` now, judged as [`Session::run`] judges it: against
+    /// the layer or standalone table they name, else the active layer. None when it can (or isn't
+    /// a registered command), for a button whose parameters name what it acts on.
+    pub fn why_blocked(&mut self, id: &str, params: &Value) -> Option<&'static str> {
+        let spec = *self.registry.get(id)?;
+        self.conditions(&spec, params).0
+    }
+
+    /// Command `spec`'s conditions with `params`, and the layer and table they name. Layer
+    /// conditions apply to the layer the parameters name (the first of a list), falling back to
+    /// the active one; a command that takes a standalone table is checked against the one they
+    /// name.
+    fn conditions(&mut self, spec: &CommandSpec, params: &Value) -> (Option<&'static str>, Option<u32>, Option<u32>) {
+        let named = match params.get("layer") {
+            Some(serde_json::Value::Array(list)) => list.first().and_then(|v| self.layer_id(&serde_json::json!({"layer": v})).ok()),
+            Some(_) => self.layer_id(params).ok(),
+            None => None,
+        };
+        let active = self.active_layer;
+        if named.is_some() {
+            self.active_layer = named;
+        }
+        let (blocked, table) = self.check_conditions(spec, params);
+        self.active_layer = active;
+        (blocked.unwrap_or(Some("unavailable")), named, table)
+    }
+
+    /// Command `spec`'s conditions, checked against the standalone table `params` name, if any
+    /// ([`Session::named_table`]), and that table. Every dispatcher checks them this way (it makes
+    /// the layer the parameters name active itself), so `condition_table` is cleared on every path
+    /// and never lets the next command's conditions pass. A condition that panics is caught and
+    /// handed back: the dispatcher refuses the command or lets the panic go on, as it did before.
+    pub(crate) fn check_conditions(
+        &mut self,
+        spec: &CommandSpec,
+        params: &Value,
+    ) -> (std::thread::Result<Option<&'static str>>, Option<u32>) {
+        let table = self.named_table(spec, params);
+        self.condition_table = table;
+        let enabled = spec.enabled;
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| enabled(self)));
+        self.condition_table = None;
+        (blocked, table)
+    }
+
+    /// The standalone table `params` name for the conditions of command `spec`: their `"table"`,
+    /// when the command takes one (its parameters list `"table"`) and they name no layer. Only
+    /// the conditions of commands that edit a table read it (`need_editable_or_table`,
+    /// `need_layer_or_table`), so a `"table"` meaning something else (a GeoPackage's table)
+    /// changes nothing.
+    pub(crate) fn named_table(&self, spec: &CommandSpec, params: &Value) -> Option<u32> {
+        if params.get("layer").is_some_and(|l| !l.is_null()) || !spec.param_keys().is_some_and(|k| k.contains(&"table")) {
+            return None;
+        }
+        self.table_index(params).ok().and_then(|i| self.project.tables.get(i)).map(|t| t.id)
     }
 
     /// Why a command can't run on `layer`: it edits features, and the layer is read in place from
@@ -1742,6 +1819,10 @@ impl Session {
             // session's own flag says so, not the answer, which a plugin's command could forge.
             (Ok(_), Some(_)) if std::mem::take(&mut self.request_only) => {}
             (Ok(_), Some(mut snap)) => {
+                // A successful script may publish and then remove the layer. Its undo
+                // snapshot still needs the committed file record, even without a live layer
+                // from which undo could carry that record forward.
+                self.keep_published_syncs(&mut snap);
                 fresh_source_ids(&snap, &mut self.project);
                 forget_label_state_of_removed_features(&snap, &mut self.project);
                 // An edit may change the dates the time slider's window filters on: bound layers
@@ -1795,7 +1876,8 @@ impl Session {
                 let failed_history = if self.opened == opened { std::mem::take(&mut self.project.gp_history) } else { Vec::new() };
                 // The project as it was before the command, so the layout open then, whatever
                 // the command opened on the way (a task's steps).
-                self.project = snap;
+                let committed = std::mem::replace(&mut self.project, snap);
+                let sync_changed = self.keep_synced(&committed);
                 (self.trusted_tasks, self.trusted_models, self.trusted_notebooks) = trust;
                 self.active_layout = open_layout;
                 // Replaced during the command: what it held beside itself (its undo history, its
@@ -1818,7 +1900,12 @@ impl Session {
                 // go; its errors stay.
                 let new = usize::try_from(self.notices_given.saturating_sub(said)).unwrap_or(usize::MAX).min(self.notices.len());
                 let start = self.notices.len() - new;
-                let errors: Vec<Notice> = self.notices.drain(start..).filter(|n| n.error).collect();
+                let withdrawn: Vec<Notice> = self.notices.drain(start..).collect();
+                // A zoom it couldn't make, said and now withdrawn, is said again by the next one.
+                if withdrawn.iter().any(|n| n.text == BEYOND_PROJECTION) && self.beyond_said == Some(true) {
+                    self.beyond_said = Some(false);
+                }
+                let errors: Vec<Notice> = withdrawn.into_iter().filter(|n| n.error).collect();
                 self.notices_given -= (new - errors.len()) as u64;
                 self.notices.extend(errors);
                 let mut recorded_failure = false;
@@ -1828,7 +1915,11 @@ impl Session {
                     self.push_gp_record(record);
                     recorded_failure = true;
                 }
-                if recorded_failure {
+                if sync_changed {
+                    self.mark_unsaved();
+                    self.warn("Source-file records were kept: rolling back a command does not undo its file writes");
+                }
+                if recorded_failure || sync_changed {
                     if self.depth == 0 && self.project.gp_history.len() > 500 {
                         let excess = self.project.gp_history.len() - 500;
                         self.project.gp_history.drain(..excess);
@@ -1853,6 +1944,7 @@ impl Session {
         // The command, and those it ran, are done: a replaced project stays replaced.
         if self.depth == 0 {
             self.put_aside = None;
+            self.published_syncs.clear();
         }
         self.fix_active_layer();
         self.revision = self.revision.wrapping_add(1);
@@ -2021,8 +2113,10 @@ impl Session {
     /// read in place land later: in the browser, a project, an import): what the file's header
     /// left out (`Raster::lost`: a colour table missing or short, GDAL metadata that doesn't
     /// decode), an overview statistics and tools read, a layer read in place that couldn't be
-    /// read, and why. Once for each layer's pixels or failure, one notice of each kind; the app
-    /// calls it each frame.
+    /// read, and why; and what the header of a cloud-optimised GeoTIFF drawn as a tile layer
+    /// leaves out, once that header lands (each date's file of a dated series as it is shown).
+    /// Once for each layer's pixels, failure or file, one notice of each kind; the app calls it
+    /// each frame.
     pub fn notice_landed_rasters(&mut self) {
         // Streamed vector windows land after project opening too. Check each installed read
         // once, keeping the same counted notice channel as retained resident expressions.
@@ -2064,6 +2158,53 @@ impl Session {
                 let Some(d) = rl.pixels_unsaid() else { continue };
                 if let Some(what) = in_place.then(|| in_place_overview(&d)).flatten() {
                     held.push((l.name.clone(), what));
+                }
+            }
+        }
+        // A cloud-optimised GeoTIFF drawn as a tile layer (a dated series, a data cube's file,
+        // AlphaEarth) whose header wasn't in as it was added (the browser, a project opened):
+        // what its header leaves out, as adding it says it, once its header lands. Its header is
+        // asked for by the map drawing or exporting it, or by adding it, not here: a layer the map
+        // doesn't draw starts no read. A dated series' other dates' files it has shown (the slider
+        // moved on before a header landed, an export of the time steps) are looked at again only
+        // when a header has landed since the last look; those then neither said nor being read
+        // (not asked for yet: the slider passed over them, or their tiles still wait their turn)
+        // are let go, so the list holds only reads under way. A date let go draws nothing until it
+        // is shown again, and is said then, as the date shown.
+        use render::rustgis_tiles::cog;
+        let landed = cog::landed_count();
+        let look_back = landed != self.cog_headers_seen;
+        self.cog_headers_seen = landed;
+        for m in &mut self.project.maps {
+            for t in m.tiles.iter_mut().filter(|t| t.kind == rustgis_map::tiles::TileKind::Cog) {
+                // The address shown now, while its header is being read, is kept among those shown,
+                // whatever showed it (a dated series added, its project opened).
+                let dated = t.time_url.is_some() || !t.time_urls.is_empty();
+                if dated && cog::info_loading(&t.url) {
+                    t.note_shown();
+                }
+                let back = look_back.then_some(t.headers_shown.iter().filter(|u| **u != t.url)).into_iter().flatten();
+                // By its file: a look changed at the address's end (`#bands=…`) reads no new header.
+                let mut hits = Vec::new();
+                for address in std::iter::once(&t.url).chain(back) {
+                    let file = cog::split(address).0;
+                    if t.headers_said.iter().any(|f| f == file) || hits.iter().any(|(f, _, _): &(String, _, _)| f == file) {
+                        continue;
+                    }
+                    let Some(info) = cog::info_landed(address) else { continue };
+                    hits.push((file.to_string(), cmd::layer::cog_tile_where(t, address), info));
+                }
+                for (file, shown, info) in hits {
+                    t.headers_said.push(file);
+                    lost.extend(cmd::layer::cog_tile_losses(&info).into_iter().map(|line| (shown.clone(), line)));
+                }
+                if look_back {
+                    // Kept while unsaid and shown now (its read may start as it is drawn), being
+                    // read, or landed since this look (said on the next).
+                    let (said, now) = (&t.headers_said, &t.url);
+                    t.headers_shown.retain(|u| {
+                        !said.iter().any(|f| f == cog::split(u).0) && (u == now || cog::info_loading(u) || cog::info_landed(u).is_some())
+                    });
                 }
             }
         }
@@ -2128,6 +2269,12 @@ impl Session {
     fn say_bundled_roots(&mut self, bundled: bool) {
         if bundled && !self.bundled_roots_said {
             self.bundled_roots_said = true;
+            // Android: the bundled roots are the only source yet (`rustgis_data::http`).
+            #[cfg(target_os = "android")]
+            self.warn(
+                "HTTPS servers are checked against the Mozilla roots bundled with RustGIS, not this device's own certificates: a server trusted only by a certificate installed on the device is refused",
+            );
+            #[cfg(not(target_os = "android"))]
             self.warn(
                 "This system has no CA certificates, so HTTPS servers are checked against the Mozilla roots bundled with RustGIS: install the system's CA certificates (or set SSL_CERT_FILE or SSL_CERT_DIR) to use its trust instead",
             );
@@ -2433,6 +2580,8 @@ impl Session {
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
+        self.keep_headers_said(&cur);
+        self.keep_synced(&cur);
         self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
         self.touch_all_geometry();
         true
@@ -2457,6 +2606,8 @@ impl Session {
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
+        self.keep_headers_said(&cur);
+        self.keep_synced(&cur);
         self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
         self.touch_all_geometry();
         true
@@ -2473,6 +2624,51 @@ impl Session {
         }
         // Zarr layers that follow the slider read the step it is back at.
         cmd::zarr::follow_time(self);
+    }
+
+    /// Remembers a physical source write only while a command can still roll its project back.
+    /// The outer guard clears these records on success or failure; they never go in a project.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remember_source_write(&mut self, instance: u64, path: String, synced: rustgis_data::sync::Synced) {
+        if self.restorable > 0 {
+            self.published_syncs.retain(|(i, p, _)| *i != instance || *p != path);
+            self.published_syncs.push((instance, path, synced));
+        }
+    }
+
+    /// Gives a command's undo snapshot the records of files it physically wrote, including
+    /// layers the command removed after publishing. The records belong to these instances only.
+    fn keep_published_syncs(&self, project: &mut Project) {
+        for l in project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            if let Some((_, _, synced)) =
+                self.published_syncs.iter().rev().find(|(i, p, _)| *i == l.instance_id() && l.dataset.source.as_deref() == Some(p.as_str()))
+            {
+                l.synced = Some(synced.clone());
+            }
+        }
+    }
+
+    /// After undo, redo or failed-command rollback swaps the project: each layer keeps its
+    /// file record (`synced`), as restoring the project doesn't change the file. A published
+    /// layer keeps the record of what was written, so restored edits compare with that file.
+    /// Returns whether the restored project took a different record and needs saving.
+    fn keep_synced(&mut self, before: &Project) -> bool {
+        let mut changed = false;
+        for l in self.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            let old = before.maps.iter().flat_map(|m| &m.layers).find(|o| o.instance_id() == l.instance_id());
+            let synced = old.filter(|o| o.dataset.source == l.dataset.source).map(|o| o.synced.clone()).or_else(|| {
+                self.published_syncs
+                    .iter()
+                    .rev()
+                    .find(|(i, p, _)| *i == l.instance_id() && l.dataset.source.as_deref() == Some(p.as_str()))
+                    .map(|(_, _, synced)| Some(synced.clone()))
+            });
+            if let Some(synced) = synced {
+                changed |= l.synced != synced;
+                l.synced = synced;
+            }
+        }
+        changed
     }
 
     /// After undo or redo swaps the project: the tile layer picked in the Layers pane stays the one
@@ -2498,6 +2694,39 @@ impl Session {
             };
             if let Some(t) = at.and_then(|at| like.get_mut(at)) {
                 t.selected = true;
+            }
+        }
+    }
+
+    /// After undo or redo swaps the project: a cloud-optimised GeoTIFF tile layer keeps the files
+    /// whose header losses were said and the dates' addresses it has shown (neither is an undo
+    /// step), found again on the map of its name by its kind and its name or file (a rename
+    /// undone), so a file said since the restored copy was made isn't said again, and one shown
+    /// since is still said once its header lands. The restored addresses are looked at again on
+    /// the next landing check, a header having landed meanwhile or not.
+    fn keep_headers_said(&mut self, before: &Project) {
+        use render::rustgis_tiles::cog::split;
+        self.cog_headers_seen = u64::MAX;
+        let names: Vec<String> = self.project.maps.iter().map(|m| m.name.clone()).collect();
+        for (i, m) in self.project.maps.iter_mut().enumerate() {
+            // By its name, else (a map rename undone) the map in the same place, when no map of
+            // the restored project has that one's name.
+            let renamed = || before.maps.get(i).filter(|o| !names.contains(&o.name));
+            let Some(old) = before.maps.iter().find(|o| o.name == m.name).or_else(renamed) else { continue };
+            for t in m.tiles.iter_mut().filter(|t| t.kind == rustgis_map::tiles::TileKind::Cog) {
+                let same =
+                    |o: &&rustgis_map::tiles::TileLayer| o.kind == t.kind && (o.name == t.name || split(&o.url).0 == split(&t.url).0);
+                let old: Vec<&rustgis_map::tiles::TileLayer> = old.tiles.iter().filter(same).collect();
+                for file in old.iter().flat_map(|o| &o.headers_said) {
+                    if !t.headers_said.contains(file) {
+                        t.headers_said.push(file.clone());
+                    }
+                }
+                for address in old.iter().flat_map(|o| &o.headers_shown) {
+                    if t.headers_shown.len() < rustgis_map::time::MAX_STEPS && !t.headers_shown.contains(address) {
+                        t.headers_shown.push(address.clone());
+                    }
+                }
             }
         }
     }
@@ -2702,6 +2931,16 @@ impl Session {
         }
     }
 
+    /// Takes the saved `connections` preference (the apps at start, and the command line and
+    /// Python when they use the desktop's saved secrets): what of it isn't used here is said as
+    /// notices, one per kind (see [`connections::Connections::unread`]).
+    pub fn load_connections(&mut self, text: &str) {
+        self.connections = connections::Connections::from_json(text);
+        for said in self.connections.unread() {
+            self.warn(said);
+        }
+    }
+
     /// Takes another session's extension choices (a copy that runs a model or script ahead, on
     /// the desktop only).
     #[cfg(not(target_arch = "wasm32"))]
@@ -2744,17 +2983,29 @@ impl Session {
         cmd::navigate::view_of(self.map()).map(|(_, z)| z)
     }
 
-    /// Fits the camera to a lon/lat extent in the current view size.
-    pub fn zoom_to(&mut self, e: &rustgis_geom::Extent) {
+    /// Fits the camera to a lon/lat extent in the current view size; whether it did. One the map's
+    /// projection doesn't reach (wholly past Web Mercator's 85°, say) doesn't move the view to it,
+    /// and says so; an empty extent or view doesn't either, quietly.
+    pub fn zoom_to(&mut self, e: &rustgis_geom::Extent) -> bool {
         let (w, h) = self.view_size;
         let m = self.map_mut();
+        if e.is_empty() || w <= 1.0 || h <= 1.0 {
+            return false;
+        }
         if m.projection.is_globe() {
             rustgis_map::Globe::fit(&mut m.camera, e, w, h);
-        } else {
-            // An extent the projection doesn't reach leaves the view where it is.
-            let _ = m.fit_lonlat(e, w, h);
+        } else if !m.fit_lonlat(e, w, h) {
+            // Once in a command, though several of its steps zoom (each layer an add frames).
+            if self.beyond_said != Some(true) {
+                self.notify(BEYOND_PROJECTION, false);
+                if self.beyond_said.is_some() {
+                    self.beyond_said = Some(true);
+                }
+            }
+            return false;
         }
         self.record_extent();
+        true
     }
 
     pub fn title(&self) -> String {

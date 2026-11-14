@@ -32,6 +32,12 @@ pub fn install(probe: Option<Arc<dyn Probe>>) -> Installed {
     Installed(CURRENT.with(|c| c.replace(probe)))
 }
 
+/// The calling thread's probe, for installing on workers of the same run.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn current() -> Option<Arc<dyn Probe>> {
+    CURRENT.with(|c| c.borrow().clone())
+}
+
 /// Puts back the probe before when dropped (see [`install`]).
 pub struct Installed(Option<Arc<dyn Probe>>);
 
@@ -63,6 +69,22 @@ pub fn step(n: usize) -> Result<()> {
         }
         None => Ok(()),
     })
+}
+
+/// Runs a nested writer without resetting or advancing its source's scan count. Cancellation
+/// still reaches every writer check; dropping the guard restores the source probe on errors too.
+pub(crate) fn without_counting<T>(run: impl FnOnce() -> T) -> T {
+    struct CancelOnly(Arc<dyn Probe>);
+    impl Probe for CancelOnly {
+        fn cancelled(&self) -> bool {
+            self.0.cancelled()
+        }
+        fn begin(&self, _: u64) {}
+        fn advance(&self, _: u64) {}
+    }
+    let probe = CURRENT.with(|c| c.borrow().clone());
+    let _guard = install(probe.map(|p| Arc::new(CancelOnly(p)) as Arc<dyn Probe>));
+    run()
 }
 
 /// Stops the write once its run was asked to, counting nothing: for a check after a loop that
@@ -119,7 +141,13 @@ pub(crate) mod tests {
             begin(10);
             step(3).unwrap();
             assert_eq!((p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed)), (3, 10));
+            without_counting(|| {
+                begin(99);
+                step(7).unwrap();
+            });
+            assert_eq!((p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed)), (3, 10));
             p.cancel.store(true, Ordering::Relaxed);
+            assert!(matches!(without_counting(|| step(1)), Err(DataError::Cancelled)));
             assert!(matches!(step(1), Err(DataError::Cancelled)));
             assert!(matches!(check(), Err(DataError::Cancelled)));
         }
