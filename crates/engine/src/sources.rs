@@ -86,14 +86,16 @@ impl Kept {
     /// The entries of `o` without a password, key or token, counting those left out. Every entry is
     /// classified on the original object first, beside the others and `address` (the one a row
     /// keeps apart from them): a bare `key` is a secret beside a web address, and an address
-    /// holding a secret doesn't stop being one. Only then are the classified entries removed.
-    fn without_secrets(&mut self, mut o: Map<String, Value>, address: &str) -> Map<String, Value> {
+    /// holding a secret doesn't stop being one; `known` is the row's known details (its `extra`), a
+    /// sibling too. Only then are the classified entries removed.
+    fn without_secrets(&mut self, mut o: Map<String, Value>, address: &str, known: &Value) -> Map<String, Value> {
         let secret: Vec<String> = o
             .iter()
             .filter(|(k, v)| {
                 let mut probe = Map::new();
                 probe.insert((*k).clone(), (*v).clone());
                 if web_address(&Value::String(address.into()), 0)
+                    || web_address(known, 0)
                     || o.iter().any(|(other, v)| {
                         other != *k && !other.eq_ignore_ascii_case("data") && !other.eq_ignore_ascii_case("text") && web_address(v, 0)
                     })
@@ -173,7 +175,7 @@ impl Sources {
                 }
             }
         }
-        s.kept.top = s.kept.without_secrets(o, "");
+        s.kept.top = s.kept.without_secrets(o, "", &Value::Null);
         for (list, rows) in LISTS.into_iter().zip(lists) {
             let cap = if list == "recent" { MAX_RECENT } else { MAX_KEPT };
             let mut into = Vec::new();
@@ -191,7 +193,7 @@ impl Sources {
                 match read {
                     Some((was_cut, source, other)) if repeat || into.len() < cap => {
                         s.kept.cut += usize::from(was_cut);
-                        let other = s.kept.without_secrets(other, &source.address);
+                        let other = s.kept.without_secrets(other, &source.address, &source.extra);
                         s.kept.merged += usize::from(repeat);
                         if !other.is_empty() {
                             // A repeated row adds the unknown fields the first lacks; the combined
@@ -202,7 +204,7 @@ impl Sources {
                             for (k, v) in other {
                                 merged.entry(k).or_insert(v);
                             }
-                            let merged = if repeat { s.kept.without_secrets(merged, &source.address) } else { merged };
+                            let merged = if repeat { s.kept.without_secrets(merged, &source.address, &source.extra) } else { merged };
                             if !merged.is_empty() {
                                 s.kept.fields.insert(key, merged);
                             }
@@ -381,6 +383,18 @@ impl Sources {
         let gone = l.len() != before;
         if let Some(list) = LISTS.into_iter().find(|l| *l == list) {
             self.kept.fields.remove(&(list, kind.to_string(), address.to_string()));
+            // A readable row kept past the list's limit of the same source would be listed again
+            // by the next start.
+            if let Some(rows) = self.kept.rows.get_mut(list) {
+                let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(|s| s.trim().to_string());
+                let mut dropped = 0;
+                rows.retain(|r| {
+                    let same = text(r, "kind").as_deref() == Some(kind) && text(r, "address").as_deref() == Some(address.trim());
+                    dropped += usize::from(same && serde_json::from_value::<Row>(r.clone()).is_ok());
+                    !same
+                });
+                self.kept.over = self.kept.over.saturating_sub(dropped);
+            }
         }
         if gone {
             self.generation += 1;
@@ -1090,6 +1104,26 @@ MIIE
             let saved = Sources::from_json(&json!({"saved": rows}).to_string()).to_json();
             assert!(!saved.contains("abc") && saved.contains("api.example"), "{saved}");
         }
+        // A readable row past the limit is kept raw; once the source is listed and forgotten it
+        // doesn't come back with the next start.
+        let recent: Vec<Value> = (0..=MAX_RECENT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
+        let mut s = Sources::from_json(&json!({ "recent": recent }).to_string());
+        assert!(s.to_json().contains(&format!("/{MAX_RECENT}.csv")));
+        s.forget("recent", "file", "/0.csv").unwrap();
+        s.note(Source { kind: "file".into(), address: format!("/{MAX_RECENT}.csv"), ..Source::default() });
+        s.forget("recent", "file", &format!("/{MAX_RECENT}.csv")).unwrap();
+        assert!(!s.to_json().contains(&format!("/{MAX_RECENT}.csv")), "{}", s.to_json());
+        assert!(s.unread().iter().all(|t| !t.contains("past the lists' limits")), "{:?}", s.unread());
+        // The row's known details count beside an unknown key, as its address does.
+        let extra = json!({"saved": [{"kind": "file", "name": "A", "address": "/a.csv", "extra": {"endpoint": "https://api.example"}, "key": "abc"}]});
+        let saved = Sources::from_json(&extra.to_string()).to_json();
+        assert!(!saved.contains("abc") && saved.contains("api.example"), "{saved}");
+        // Sources merged past the limit are said by the merged sources.
+        let mut s = Sources::default();
+        s.keep("favourites", Source { kind: "file".into(), address: "/new.csv".into(), ..Source::default() }).unwrap();
+        let stored: Vec<Value> = (0..MAX_KEPT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
+        s.merge(Sources::from_json(&json!({ "favourites": stored }).to_string()));
+        assert!(s.unread().iter().any(|t| t.contains("past the lists' limits")), "{:?}", s.unread());
         // A repeat past the limit merges into its source, whether or not it holds a secret.
         let mut full: Vec<Value> = (0..MAX_KEPT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
         full.push(json!({"kind": "file", "name": "", "address": "/0.csv", "token": "hidden", "future": 1}));

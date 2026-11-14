@@ -60,10 +60,11 @@ pub fn load(app: &mut RustGisApp) {
         // What this session already has (added, saved or made favourite before the first read)
         // stays; the stored lists are added after it. What of them isn't used here is said.
         let stored = rustgis_engine::sources::Sources::from_json(&text);
-        for said in stored.unread() {
+        app.session.sources.merge(stored);
+        // After the merge: sources it moved past a list's limit are said too.
+        for said in app.session.sources.unread() {
             app.session.warn(said);
         }
-        app.session.sources.merge(stored);
     }
     if !changed {
         app.ui.sources_saved = app.session.sources.generation;
