@@ -388,7 +388,7 @@ impl Sources {
         if gone || kept_gone {
             self.generation += 1;
         }
-        Ok(gone)
+        Ok(gone || kept_gone)
     }
 
     fn list_mut(&mut self, list: &str) -> Result<&mut Vec<Source>, String> {
@@ -1125,8 +1125,8 @@ MIIE
         let mut s = Sources::from_json(&json!({"saved": full}).to_string());
         assert_eq!(s.kept.over, 2, "{:?}", s.unread());
         let generation = s.generation;
-        // Only kept rows go: the pane must still save.
-        assert!(!s.forget("saved", "url", &twin).unwrap() && s.generation != generation);
+        // Only kept rows go: that is still a removal, and the pane must still save.
+        assert!(s.forget("saved", "url", &twin).unwrap() && s.generation != generation);
         assert!(
             s.to_json().contains("gs://b/a.tif")
                 && s.to_json().contains("\"future\"")
