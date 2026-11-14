@@ -57,17 +57,18 @@ impl rustgis_engine::data::progress::Probe for Stop {
 }
 
 impl Entry {
-    /// Takes in its hash if it has landed: the answer, when it hashed the layer as the entry has it.
-    fn land(&mut self) {
-        let Some(job) = &self.job else { return };
+    /// Takes in its hash if it has landed: the answer, when it hashed the layer as the entry has
+    /// it. Whether a hash landed, freeing its turn.
+    fn land(&mut self) -> bool {
+        let Some(job) = &self.job else { return false };
         let landed = job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        if let Some(digest) = landed {
-            let current = job.current;
-            self.job = None;
-            if current {
-                self.digest = Some(digest);
-            }
+        let Some(digest) = landed else { return false };
+        let current = job.current;
+        self.job = None;
+        if current {
+            self.digest = Some(digest);
         }
+        true
     }
 
     /// Whether it answers for `l` as it is now.
@@ -88,6 +89,8 @@ pub(crate) struct Marks {
     entries: HashMap<(u64, u64), Entry>,
     /// The project revision the entries were last pruned at.
     revision: Option<u64>,
+    /// Hashes under way, as counted once a frame ([`tick`]) and as started since.
+    running: usize,
 }
 
 /// Whether `l`, a layer of the active map, holds edits its file lacks: `None` while that isn't
@@ -115,13 +118,12 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
         };
         app.syncmark.entries.insert(id, entry);
     }
-    // Every finished hash is taken in, whether its row is drawn or not (another map, a filtered
-    // or collapsed list), so one that landed never holds a turn another layer is waiting for.
-    for e in app.syncmark.entries.values_mut() {
-        e.land();
+    let marks = &mut app.syncmark;
+    let entry = marks.entries.get_mut(&id)?;
+    if entry.land() {
+        marks.running = marks.running.saturating_sub(1);
     }
-    let running = app.syncmark.entries.values().filter(|e| e.job.is_some()).count();
-    let entry = app.syncmark.entries.get_mut(&id)?;
+    let running = marks.running;
     let now = web_time::Instant::now();
     if entry.job.is_some() {
         // Looked at again soon: either it lands, or the next hash starts once it has.
@@ -146,6 +148,7 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
                 Ok(_) => {
                     entry.job = Some(Job { slot, stop, current: true });
                     entry.retry = None;
+                    marks.running += 1;
                     ctx.request_repaint_after(web_time::Duration::from_millis(100));
                 }
                 // A thread the OS refuses costs time, not the mark: the layer stays unmarked (an
@@ -163,10 +166,17 @@ pub(crate) fn edited(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
     }
 }
 
-/// Forgets layers that are gone, cancelling their hashes, so the answers kept follow the project;
-/// looked at once per project revision.
-pub(crate) fn retain(app: &mut crate::RustGisApp) {
-    if app.syncmark.revision == Some(app.session.revision) {
+/// Once a frame: takes in every finished hash, whether its row is drawn or not (another map, a
+/// filtered or collapsed list), so one that landed never holds a turn another layer is waiting
+/// for, and counts those still running. Once per project revision, forgets layers that are gone,
+/// cancelling their hashes, so the answers kept follow the project.
+pub(crate) fn tick(app: &mut crate::RustGisApp) {
+    let marks = &mut app.syncmark;
+    for e in marks.entries.values_mut() {
+        e.land();
+    }
+    marks.running = marks.entries.values().filter(|e| e.job.is_some()).count();
+    if marks.revision == Some(app.session.revision) {
         return;
     }
     app.syncmark.revision = Some(app.session.revision);

@@ -5874,7 +5874,7 @@ impl RustGisApp {
             diskwatch::tick(self, ctx);
         }
         #[cfg(not(target_arch = "wasm32"))]
-        syncmark::retain(self);
+        syncmark::tick(self);
         self.ensure_script_font();
         // Fonts downloaded by the web app.
         let fonts: Vec<(String, Vec<u8>)> = match &self.services.font_inbox {

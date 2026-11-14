@@ -75,6 +75,10 @@ struct Source {
     /// that started after the write, what was there just after it (RustGIS's result), and the
     /// targets whose data the write left behind (another layer on the table it wrote).
     wrote: Option<(Seen, u64, Seen, HashSet<Target>)>,
+    /// The target that write left in step whatever its baseline: a publish compares the file's
+    /// contents with its record before writing, so a change of metadata alone before it (the same
+    /// bytes written again) doesn't keep the publishing layer marked.
+    verified: Option<Target>,
 }
 
 struct Tracked {
@@ -152,9 +156,12 @@ impl Monitor {
             Some((before, after, result, stale)) if agreed && scan >= *after => Some((before.clone(), result.clone(), stale.clone())),
             _ => None,
         };
-        if acknowledged.is_some() {
+        let verified = if acknowledged.is_some() {
             source.wrote = None;
-        }
+            source.verified.take()
+        } else {
+            None
+        };
         for (target, t) in self.targets.iter_mut().filter(|(_, t)| t.key == key) {
             // A target added since: the first readable scan is what it was read with (a look
             // that couldn't read the metadata says nothing about what the layer holds).
@@ -162,7 +169,7 @@ impl Monitor {
                 t.baseline = Some(seen.clone());
             }
             if let Some((before, result, stale)) = &acknowledged
-                && t.baseline.as_ref() == Some(before)
+                && (t.baseline.as_ref() == Some(before) || verified.as_ref() == Some(target))
                 && !stale.contains(target)
             {
                 t.baseline = Some(result.clone());
@@ -250,6 +257,16 @@ impl Monitor {
             _ => (before, stale),
         };
         source.wrote = Some((before, next_scan, result, stale));
+        // Only a publish marks its writer verified, after this ([`Monitor::verified`]).
+        source.verified = None;
+    }
+
+    /// The write just recorded ([`Monitor::wrote`]) checked `target`'s file against its record
+    /// before writing it, so `target` takes the result whatever it held before.
+    pub(crate) fn verified(&mut self, key: &str, target: &Target) {
+        if let Some(source) = self.sources.get_mut(key).filter(|s| s.wrote.is_some()) {
+            source.verified = Some(target.clone());
+        }
     }
 }
 
@@ -689,7 +706,8 @@ pub(crate) fn plan_write(app: &RustGisApp, command: &str, params: &Value) -> Opt
     } else {
         stale_for(&app.diskwatch.found, &key, &path, &table, writer.as_ref())
     };
-    Some(Write { before: None, result: None, key, path, stale, writer, table })
+    let verified = command == "source.publish";
+    Some(Write { before: None, result: None, key, path, stale, writer, table, verified })
 }
 
 /// [`plan_write`] for a save or export that writes here, on the UI thread: the file is written
@@ -713,6 +731,8 @@ pub(crate) struct Write {
     writer: Option<Target>,
     /// The table written, as predicted, then as the engine named it.
     table: String,
+    /// A publish: it checked the file's contents against the writer's record first.
+    verified: bool,
 }
 
 impl Write {
@@ -793,6 +813,11 @@ pub(crate) fn wrote(app: &mut RustGisApp, mut write: Write, answer: &Value) {
     let w = &mut app.diskwatch;
     // A scan under way started before the write; the next one is the first after it.
     w.monitor.wrote(&write.key, before, result, write.stale, write.writer.as_ref(), w.scans + 1);
+    if write.verified
+        && let Some(writer) = &write.writer
+    {
+        w.monitor.verified(&write.key, writer);
+    }
 }
 
 /// Activates the target's map and returns the target's layer id or tile index there.
@@ -1445,6 +1470,24 @@ mod tests {
         assert!(app.session.map().layer(id).unwrap().synced.is_some());
         app.watch_files = true;
         (app, id, path)
+    }
+
+    #[test]
+    fn a_publish_clears_a_mark_left_by_the_same_bytes_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id, path) = published_layer(dir.path());
+        let ctx = egui::Context::default();
+        scan(&mut app, &ctx, 2);
+        // Another program writes the same bytes: only its metadata changed.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, std::fs::read(&path).unwrap()).unwrap();
+        scan(&mut app, &ctx, 2);
+        assert_eq!(status_of(&app, id), Status::Changed);
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        app.run("edit.setValue", json!({"layer": id, "row": 0, "field": "owner", "value": "Jones"})).unwrap();
+        app.run("source.publish", json!({"layer": id})).unwrap();
+        scan(&mut app, &ctx, 3);
+        assert_eq!(status_of(&app, id), Status::Unchanged, "the publish checked the contents and wrote them");
     }
 
     #[test]
