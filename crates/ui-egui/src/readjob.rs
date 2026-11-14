@@ -1979,4 +1979,27 @@ mod tests {
             Some(rustgis_engine::data::Geometry::Point(rustgis_engine::data::Coord::new(9.0, 47.0)))
         );
     }
+    /// Direct layer conversions use the desktop worker too, and stale rows cannot be replaced.
+    #[test]
+    fn date_conversion_runs_off_frame_for_layers() {
+        let mut app = RustGisApp::with_sample();
+        app.run("edit.addField", json!({"layer":"Cities", "name":"opened", "type":"text"})).unwrap();
+        app.run("edit.setValue", json!({"layer":"Cities", "row":0, "field":"opened", "value":"03/05/2026"})).unwrap();
+        app.reads_off_frame = true;
+        let p = json!({"layer":"Cities", "field":"opened", "type":"date", "format":"%d/%m/%Y"});
+        let depth = app.session.undo_depth();
+        assert_eq!(app.run_by_user("edit.convertField", p.clone()).unwrap()["started"], "Convert Field");
+        assert_eq!(app.session.undo_depth(), depth);
+        landed(&mut app, 60);
+        let ds = &app.session.map().layer_by_name("Cities").unwrap().dataset;
+        assert_eq!(ds.value(0, ds.field_index("opened").unwrap()).to_string(), "2026-05-03");
+        assert_eq!(app.session.undo_depth(), depth + 1);
+        app.run("edit.undo", json!({})).unwrap();
+        app.run_by_user("edit.convertField", p).unwrap();
+        app.session.run("edit.setValue", &json!({"layer":"Cities", "row":0, "field":"opened", "value":"new text"})).unwrap();
+        let depth = app.session.undo_depth();
+        landed(&mut app, 60);
+        assert_eq!(app.session.undo_depth(), depth);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("layer changed")));
+    }
 }
