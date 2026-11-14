@@ -1,12 +1,15 @@
-//! `cargo xtask ci | layers | notices [--check] | web-pwa <dir>`
+//! `cargo xtask ci | changed [--list] [base] | layers | notices [--check] | web-pwa <dir>`
 //!
 //! - `layers`: enforces the crate layering (nothing below L6 may depend on egui/eframe/rfd).
 //! - `ci`: fmt check, clippy -D warnings, tests and the layer check.
+//! - `changed [--list] [base]`: the same, on only the packages a branch changes and those that
+//!   depend on them (see `changed.rs`).
 //! - `notices [--check]`: writes the third-party licence notices the packages ship (see
 //!   `notices.rs`), or checks they are up to date (exit code 2 when they are not).
 //! - `web-pwa <dir>`: writes the web app's service worker into a `trunk build` output directory
 //!   (`dist/web`) from the template `apps/rustgis-web/sw.js`, listing the built files to cache.
 
+mod changed;
 mod notices;
 
 use std::process::{Command, ExitCode};
@@ -62,6 +65,15 @@ fn cargo(args: &[&str]) -> Result<(), String> {
     println!("$ cargo {}", args.join(" "));
     let st = Command::new(env!("CARGO")).args(args).current_dir(root()).status().map_err(|e| e.to_string())?;
     if st.success() { Ok(()) } else { Err(format!("cargo {} failed", args.join(" "))) }
+}
+
+/// `cargo xtask ci`: the fmt check, clippy with warnings as errors, the tests and the layer check,
+/// on the whole workspace.
+fn ci() -> Result<(), String> {
+    cargo(&["fmt", "--all", "--check"])
+        .and_then(|_| cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))
+        .and_then(|_| cargo(&["test", "--workspace", "-q"]))
+        .and_then(|_| layers())
 }
 
 /// Files in a web build the service worker must not cache: itself, the GitHub Pages
@@ -149,10 +161,8 @@ fn main() -> ExitCode {
     let task = std::env::args().nth(1).unwrap_or_default();
     let r = match task.as_str() {
         "layers" => layers(),
-        "ci" => cargo(&["fmt", "--all", "--check"])
-            .and_then(|_| cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))
-            .and_then(|_| cargo(&["test", "--workspace", "-q"]))
-            .and_then(|_| layers()),
+        "ci" => ci(),
+        "changed" => changed::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         "notices" => {
             let check = match std::env::args().nth(2).as_deref() {
                 None => false,
@@ -171,7 +181,7 @@ fn main() -> ExitCode {
             };
         }
         "web-pwa" => web_pwa(std::env::args().nth(2)),
-        _ => Err("usage: cargo xtask ci | layers | notices [--check] | web-pwa <dir>".into()),
+        _ => Err("usage: cargo xtask ci | changed [--list] [base] | layers | notices [--check] | web-pwa <dir>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
