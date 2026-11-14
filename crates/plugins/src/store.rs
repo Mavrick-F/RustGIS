@@ -64,8 +64,8 @@ fn state_path() -> Option<PathBuf> {
 }
 
 /// `state.json`: none is no plugin disabled or added from a folder. One that can't be read (or that
-/// a newer RustGIS wrote in a shape this one doesn't know) is said by [`load_installed`] and kept as
-/// it is: [`write_state`] refuses to write over it.
+/// a newer RustGIS wrote in a shape this one doesn't know) is said by [`load_installed`], which then
+/// loads no plugin, and kept as it is: [`write_state`] refuses to write over it.
 fn read_state() -> State {
     let Some(path) = state_path() else { return State::default() };
     let read = match std::fs::read_to_string(&path) {
@@ -122,10 +122,13 @@ pub fn load_installed() -> Vec<String> {
         )),
     }
     let st = read_state();
+    // Which plugins are disabled is in that file, and a disabled one may be a native program: with
+    // it unreadable none is loaded, rather than starting what the user turned off.
     if let Some(why) = &st.unreadable {
         errors.push(format!(
-            "{why}; it was ignored and is kept as it is, so plugins it disables are on and plugin folders it adds aren't loaded"
+            "{why}: plugins are off because this file couldn't be read; repairing or removing it brings them back (it is kept as it is until then)"
         ));
+        return errors;
     }
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rgplugin"))).collect())

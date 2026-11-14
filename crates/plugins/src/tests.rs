@@ -1875,9 +1875,19 @@ fn plugin_state_keeps_what_this_version_cannot_read() {
         assert!(crate::store::install_path(&folder).is_err() && crate::get("folder-test").is_none());
         assert!(crate::store::uninstall("state-test").is_err());
         assert_eq!(std::fs::read_to_string(&state).unwrap(), unreadable);
+        // At start none is loaded (it may have been disabled, and be a native program), and it is said.
+        crate::unload("state-test");
+        let errors = crate::store::load_installed();
+        assert!(errors.len() == 1 && errors[0].contains("state.json") && errors[0].contains("plugins are off"), "{errors:?}");
+        assert!(crate::get("state-test").is_none());
+        std::fs::write(&state, r#"{"disabled": ["state-test"]}"#).unwrap();
+        assert!(crate::store::load_installed().is_empty());
     }
     std::fs::remove_file(&state).unwrap();
+    // No file is nothing disabled, with no notice.
+    crate::unload("state-test");
     assert!(crate::store::load_installed().is_empty());
+    assert!(crate::get("state-test").is_some_and(|p| p.enabled));
     crate::store::uninstall("state-test").unwrap();
     let _ = std::fs::remove_dir_all(&plugins);
 }
