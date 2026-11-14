@@ -79,7 +79,9 @@ impl Entry {
     fn answer(&self) -> Option<bool> {
         match &self.digest {
             Some(Ok(digest)) => Some(*digest != self.synced.rows),
-            _ => self.shown,
+            // This state's hash failed: unknown, not the previous state's answer.
+            Some(Err(_)) => None,
+            None => self.shown,
         }
     }
 
@@ -103,6 +105,8 @@ pub(crate) struct Marks {
     revision: Option<u64>,
     /// Hashes under way, as counted once a frame ([`tick`]) and as started since.
     running: usize,
+    /// The project the entries belong to (`Session::opened`).
+    opened: u64,
 }
 
 /// Whether `l`, a layer of the active map, holds edits its file lacks: `None` while that isn't
@@ -192,12 +196,17 @@ pub(crate) fn hashed(app: &mut crate::RustGisApp, l: &Layer, ctx: &egui::Context
     }
 }
 
-/// Once a frame: takes in every finished hash, whether its row is drawn or not (another map, a
+/// Once a frame: forgets another project's answers, takes in every finished hash, whether its row is drawn or not (another map, a
 /// filtered or collapsed list), so one that landed never holds a turn another layer is waiting
 /// for, and counts those still running. Once per project revision, forgets layers that are gone,
 /// cancelling their hashes, so the answers kept follow the project.
 pub(crate) fn tick(app: &mut crate::RustGisApp) {
     let marks = &mut app.syncmark;
+    // Another project: nothing of the old one's applies, and its hashes are cancelled as their
+    // entries go.
+    if marks.opened != app.session.opened {
+        *marks = Marks { opened: app.session.opened, ..Marks::default() };
+    }
     for e in marks.entries.values_mut() {
         e.land();
     }
@@ -243,5 +252,9 @@ mod tests {
         assert!(e.job.is_none());
         assert_eq!(e.digest, None, "an earlier state's hash doesn't answer");
         assert_eq!(e.answer(), Some(true), "the previous answer stays shown until this state's lands");
+        let mut e = landed(true);
+        *e.job.as_ref().unwrap().slot.lock().unwrap() = Some(Err("the hash stopped".into()));
+        e.land();
+        assert_eq!(e.answer(), None, "a failed hash is unknown, not the previous state's answer");
     }
 }

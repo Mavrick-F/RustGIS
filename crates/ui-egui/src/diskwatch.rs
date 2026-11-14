@@ -88,6 +88,9 @@ struct Tracked {
     baseline: Option<Seen>,
     /// Not Now: the observation it was given for. A newer one notifies again.
     dismissed: Option<Seen>,
+    /// The first scan that may give it a baseline: after [`Monitor::rebaseline`], a scan that
+    /// started before (and may have seen the file before the change) doesn't.
+    from_scan: u64,
 }
 
 /// Change detection for every target, by observations alone (no clock, no files).
@@ -109,7 +112,7 @@ impl Monitor {
             match self.targets.get_mut(&target) {
                 Some(t) if t.key == key => {}
                 _ => {
-                    self.targets.insert(target.clone(), Tracked { key: key.clone(), baseline: None, dismissed: None });
+                    self.targets.insert(target.clone(), Tracked { key: key.clone(), baseline: None, dismissed: None, from_scan: 0 });
                 }
             }
             seen.insert(target);
@@ -120,12 +123,14 @@ impl Monitor {
         self.targets.values().any(|t| t.baseline.is_none())
     }
 
-    /// Forgets what `target` was read with, so the next readable scan is its baseline: its data
-    /// was brought in step with its file some other way. `true`, as a scan is then wanted.
-    pub(crate) fn rebaseline(&mut self, target: &Target) -> bool {
+    /// Forgets what `target` was read with, so the first readable scan numbered `next_scan` or
+    /// later is its baseline: its data was brought in step with its file some other way, and a
+    /// scan already under way may have looked before that. `true`, as a scan is then wanted.
+    pub(crate) fn rebaseline(&mut self, target: &Target, next_scan: u64) -> bool {
         if let Some(t) = self.targets.get_mut(target) {
             t.baseline = None;
             t.dismissed = None;
+            t.from_scan = next_scan;
         }
         true
     }
@@ -175,7 +180,7 @@ impl Monitor {
         for (target, t) in self.targets.iter_mut().filter(|(_, t)| t.key == key) {
             // A target added since: the first readable scan is what it was read with (a look
             // that couldn't read the metadata says nothing about what the layer holds).
-            if t.baseline.is_none() && !matches!(seen, Seen::Unreadable(_)) {
+            if t.baseline.is_none() && !matches!(seen, Seen::Unreadable(_)) && scan >= t.from_scan {
                 t.baseline = Some(seen.clone());
             }
             if let Some((before, result, stale)) = &acknowledged
@@ -499,7 +504,7 @@ pub(crate) fn tick(app: &mut RustGisApp, ctx: &egui::Context) {
             if let Some(record) = &f.record
                 && before.iter().any(|b| b.target == f.target && b.record.as_ref().is_some_and(|old| old != record))
             {
-                w.wanted |= w.monitor.rebaseline(&f.target);
+                w.wanted |= w.monitor.rebaseline(&f.target, w.scans + 1);
             }
         }
     }
@@ -1260,6 +1265,22 @@ mod tests {
         m.track([(layer(3), "b".into())]);
         m.observed("a", v0.clone(), scan + 3);
         assert!(!m.keys().contains("a"));
+    }
+
+    #[test]
+    fn a_scan_that_looked_before_a_rebaseline_does_not_become_the_baseline() {
+        let [v0, v1] = observations(2).try_into().unwrap();
+        let (mut m, scan) = monitor(&v0);
+        // Started (scan `scan`) while the file still held v0; a publish then wrote v1 and the
+        // layer's record changed before that scan landed.
+        m.rebaseline(&layer(3), scan + 1);
+        m.observed("b", v0.clone(), scan);
+        assert_eq!(m.status(&layer(3)), Status::Unchanged, "no baseline yet");
+        for next in [scan + 1, scan + 2] {
+            m.observed("b", v1.clone(), next);
+        }
+        assert_eq!(m.status(&layer(3)), Status::Unchanged, "the scans after it are the baseline");
+        assert_eq!(m.status(&layer(1)), Status::Unchanged, "another file's target is untouched");
     }
 
     #[test]
