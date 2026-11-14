@@ -89,7 +89,7 @@ pub fn geojson(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> 
         unchanged()?;
         crate::progress::check()?;
         std::fs::rename(temporary, path)?;
-        crate::io::sync_folder(path)?;
+        crate::io::sync_folder(path);
         Ok(())
     })();
     crate::io::unstage(&staged);

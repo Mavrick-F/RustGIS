@@ -1056,7 +1056,7 @@ pub fn write_file(r: &Raster, band: usize, path: &Path) -> Result<CogInfo> {
         // the last look: the rename commits the file, and a Cancel after it finds it written.
         crate::progress::check()?;
         std::fs::rename(&tmp, path)?;
-        crate::io::sync_folder(path)?;
+        crate::io::sync_folder(path);
         Ok(info)
     })();
     if res.is_err() {
