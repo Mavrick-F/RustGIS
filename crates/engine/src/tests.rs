@@ -11458,8 +11458,8 @@ fn the_graticule_takes_a_type_and_a_measured_grids_system() {
     assert!(!text.contains("graticule_type") && !text.contains("graticule_crs"));
 }
 
-/// Empty/reversed ranges remain half-open, say which ranges cannot match, and report an
-/// all-no-data result through every shared command path, including background completion.
+/// Ranges whose ends are equal or reversed still match nothing; Raster Functions, a chain and a
+/// suitability say which, and a result with no values, once per kind, also after a background run.
 #[test]
 fn remap_reports_empty_ranges_and_no_valid_cells() {
     use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
@@ -11512,20 +11512,43 @@ fn remap_reports_empty_ranges_and_no_valid_cells() {
                 let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
                 assert_eq!(said.len(), notices, "{command}: {said:?}");
                 if ranges[0][0] == ranges[0][1] {
-                    assert!(said[0].contains("classes:"), "{said:?}");
                     assert!(said[0].contains("up to, but not including, its high end, so [21, 22] picks 21"), "{said:?}");
                     if ranges.as_array().unwrap().len() == 2 {
-                        assert!(said[0].contains("2 remap ranges match nothing ([21, 21], [23, 22])"), "{said:?}");
+                        assert!(said[0].starts_with("2 remap ranges match nothing ([21, 21], [23, 22] in classes)"), "{said:?}");
                     } else {
-                        assert!(said[0].contains("1 remap range matches nothing ([21, 21])"), "{said:?}");
+                        assert!(said[0].starts_with("1 remap range matches nothing ([21, 21] in classes)"), "{said:?}");
                     }
                 }
                 if expected.iter().all(Option::is_none) {
-                    assert!(said.last().unwrap().contains("the remap left no cells with values (all 3 are no data)"), "{said:?}");
+                    let last = said.last().unwrap();
+                    if command == "analysis.suitability" {
+                        assert!(last.ends_with("no cell is scored by every criterion, so the result has no cells with values"), "{said:?}");
+                    } else {
+                        assert_eq!(*last, "classes: the remap left no cells with values", "{said:?}");
+                    }
                 }
             }
         }
     }
+    // One notice of each kind however many remaps meet it: two empty steps in a chain.
+    let mark = s.notice_mark();
+    let chain = json!({"layer": "classes", "steps": [
+        {"function": "remap", "ranges": [[20, 20, 1]], "keep": true},
+        {"function": "remap", "ranges": [[21, 21, 1]], "keep": false},
+    ]});
+    s.run("raster.functionChain", &chain).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert!(said[0].starts_with("2 remap ranges match nothing ([20, 20], [21, 21] in classes)"), "{said:?}");
+    // Criteria that each score some cells, but none in common, leave the overlay empty, and say so.
+    let mark = s.notice_mark();
+    let apart = json!({"criteria": [
+        {"layer": "classes", "ranges": [[20, 21, 5]], "weight": 1},
+        {"layer": "classes", "ranges": [[22, 23, 5]], "weight": 1},
+    ], "name": "Apart"});
+    s.run("analysis.suitability", &apart).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said, ["Apart: no cell is scored by every criterion, so the result has no cells with values"]);
 }
 
 #[test]

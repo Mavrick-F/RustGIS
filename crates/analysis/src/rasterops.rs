@@ -266,15 +266,15 @@ fn band_math_on(threads: Option<usize>, r: &Raster, expr: &str) -> Result<Vec<f3
     Ok(out)
 }
 
-/// A remap's cells, and notices for ranges that can match nothing and a result with no values.
+/// A remap's cells, and its ranges whose low end isn't below the high end, which match nothing.
 pub struct Remap {
     pub cells: Vec<f32>,
-    pub messages: Vec<String>,
+    pub empty: Vec<(f64, f64)>,
 }
 
 /// Remaps value ranges `[lo, hi)` to new values; other values become no-data unless `keep`.
-/// Its notices name ranges whose low end isn't below the high end, which match nothing (saved
-/// scripts and models rely on what a range matches), and a result with no values.
+/// A range whose low end isn't below its high end matches nothing (saved scripts and models
+/// rely on what a range matches); it is listed in [`Remap::empty`] for [`empty_ranges_note`].
 pub fn remap(r: &Raster, b: usize, ranges: &[(f64, f64, f64)], keep: bool) -> Result<Remap, String> {
     let d = band(r, b)?;
     let n = r.width as usize * r.height as usize;
@@ -294,32 +294,50 @@ pub fn remap(r: &Raster, b: usize, ranges: &[(f64, f64, f64)], keep: bool) -> Re
             }
         },
     )?;
-    let mut messages = Vec::new();
-    let empty: Vec<_> = ranges.iter().filter(|(lo, hi, _)| lo >= hi).collect();
-    if let Some((lo, _, _)) = empty.first() {
-        let listed: Vec<_> = empty.iter().map(|(lo, hi, _)| format!("[{lo}, {hi}]")).collect();
-        let what = if empty.len() == 1 { "1 remap range matches".to_string() } else { format!("{} remap ranges match", empty.len()) };
-        // A class code is the usual reason for equal ends: show the range that picks it.
-        let pick = if lo.fract() == 0.0 { format!(", so [{lo}, {}] picks {lo}", lo + 1.0) } else { String::new() };
-        messages.push(format!(
-            "{}: {what} nothing ({}): a range takes values from its low end up to, but not including, its high end{pick}",
-            r.name,
-            listed.join(", ")
-        ));
-    }
-    // Check by row so an entirely empty large result still responds to Cancel.
-    let mut valid = false;
-    for row in cells.chunks((r.width as usize).max(1)) {
-        crate::control::check()?;
-        if row.iter().any(|v| v.is_finite() && *v != NODATA) {
-            valid = true;
-            break;
+    let empty = ranges.iter().filter(|(lo, hi, _)| lo >= hi).map(|(lo, hi, _)| (*lo, *hi)).collect();
+    Ok(Remap { cells, empty })
+}
+
+/// The one notice for remap ranges that match nothing, each with the raster it was given for,
+/// or none when there are none. Where a range has equal whole ends (a class code), it shows the
+/// range that picks that value.
+pub fn empty_ranges_note(empty: &[(String, f64, f64)]) -> Option<String> {
+    let mut by_raster: Vec<(&str, Vec<String>)> = Vec::new();
+    for (name, lo, hi) in empty {
+        let range = format!("[{lo}, {hi}]");
+        match by_raster.iter_mut().find(|(n, _)| n == name) {
+            Some((_, ranges)) => ranges.push(range),
+            None => by_raster.push((name, vec![range])),
         }
     }
-    if !valid {
-        messages.push(format!("{}: the remap left no cells with values (all {} are no data)", r.name, cells.len()));
+    let listed: Vec<String> = by_raster.iter().map(|(name, ranges)| format!("{} in {name}", ranges.join(", "))).collect();
+    let what = match empty.len() {
+        0 => return None,
+        1 => "1 remap range matches".to_string(),
+        n => format!("{n} remap ranges match"),
+    };
+    // Past 2^53 a Double has no whole number between `lo` and `lo + 1`.
+    let pick = empty
+        .iter()
+        .find(|(_, lo, hi)| lo == hi && lo.fract() == 0.0 && lo.abs() < 9_007_199_254_740_992.0)
+        .map(|(_, lo, _)| format!(", so [{lo}, {}] picks {lo}", lo + 1.0))
+        .unwrap_or_default();
+    Some(format!(
+        "{what} nothing ({}): a range takes values from its low end up to, but not including, its high end{pick}",
+        listed.join("; ")
+    ))
+}
+
+/// Whether `cells`, rows of `width`, hold a cell with a value; looks at Cancel row by row, so a
+/// large result with none still stops.
+pub fn has_values(cells: &[f32], width: usize) -> Result<bool, String> {
+    for row in cells.chunks(width.max(1)) {
+        crate::control::check()?;
+        if row.iter().any(|v| v.is_finite() && *v != NODATA) {
+            return Ok(true);
+        }
     }
-    Ok(Remap { cells, messages })
+    Ok(false)
 }
 
 /// `band`'s values resampled (nearest neighbour) onto `target`'s grid, through longitude/latitude.

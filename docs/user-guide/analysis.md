@@ -1332,8 +1332,9 @@ click them on the map:
 
 A remap range, in Raster Functions, the Function Editor and the Suitability Modeler, takes values
 from its low end up to, but not including, its high end: `[21, 22, 1]` maps class 21 to 1, and
-`[21, 21, 1]` matches nothing. The first range that matches a cell wins. A notice names the ranges
-that can match nothing, and says when a remap leaves no cells with values.
+`[21, 21, 1]` matches nothing. The first range that matches a cell wins. One notice lists the
+ranges that can match nothing, and another says when a remap, or a suitability whose criteria
+score no cell in common, leaves no cells with values.
 
 Network routing rebuilds its graph for each request and solves each edge length on WGS 84.
 Large line networks can therefore take longer to route than with spherical lengths; repeated

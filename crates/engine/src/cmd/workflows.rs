@@ -180,18 +180,32 @@ pub(crate) fn add_made(s: &mut Session, m: Made) -> CmdResult {
     Ok(v)
 }
 
-/// Delivers shared raster-operation diagnostics only when the successful result is added.
-fn notify_messages(messages: Vec<String>) -> Then {
-    Box::new(move |s, _| {
-        for message in messages {
-            s.notify(message, false);
-        }
-    })
+/// What the remaps of a raster function, a chain or a suitability met: their ranges that match
+/// nothing, with the raster each was given for, and the first raster a remap left without a
+/// cell with a value.
+#[derive(Default)]
+struct Remaps {
+    empty: Vec<(String, f64, f64)>,
+    emptied: Option<String>,
 }
 
-/// Embeds a raster and carries its diagnostics across background completion to the session.
-fn made_with_messages(raster: Raster, messages: Vec<String>) -> Result<Made, String> {
-    made_then(raster, None, Some(notify_messages(messages)))
+impl Remaps {
+    /// Their notices, one of each kind, said when the result is added (after a background run
+    /// too).
+    fn then(self) -> Then {
+        let mut notes: Vec<String> = rasterops::empty_ranges_note(&self.empty).into_iter().collect();
+        notes.extend(self.emptied.map(|name| format!("{name}: the remap left no cells with values")));
+        notices(notes)
+    }
+}
+
+/// Says `notes` when the result is added.
+fn notices(notes: Vec<String>) -> Then {
+    Box::new(move |s, _| {
+        for note in notes {
+            s.notify(note, false);
+        }
+    })
 }
 
 /// What a command that makes its raster on another thread reads of the session, and the work
@@ -1050,8 +1064,9 @@ pub fn script_commands(script: &str) -> Result<Vec<(usize, String, Value)>, Stri
 }
 
 /// One raster function's output pixels on `r`'s grid, or a resample's on `target`'s (from
-/// [`resample_target`]). Remap diagnostics are collected for delivery when the result is added.
-fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>, messages: &mut Vec<String>) -> Result<Vec<f32>, String> {
+/// [`resample_target`]). A remap adds its ranges that match nothing to `remaps`, and whether it
+/// left any cell with a value.
+fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>, remaps: &mut Remaps) -> Result<Vec<f32>, String> {
     let band = band_of(p, r)?;
     let zf = f(p, "zFactor").unwrap_or(1.0).clamp(0.0001, 100_000.0);
     match ps(p, "function").ok_or("function is required")? {
@@ -1085,7 +1100,10 @@ fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>, messages: &mut
                     .collect::<Result<_, _>>()?
             };
             let remap = rasterops::remap(r, band, &ranges, b(p, "keep").unwrap_or(false))?;
-            messages.extend(remap.messages);
+            remaps.empty.extend(remap.empty.into_iter().map(|(lo, hi)| (r.name.clone(), lo, hi)));
+            if !rasterops::has_values(&remap.cells, r.width as usize)? {
+                remaps.emptied.get_or_insert_with(|| r.name.clone());
+            }
             Ok(remap.cells)
         }
         "resample" => rasterops::resample_to(r, band, target.ok_or("target (a raster to match) is required")?),
@@ -1122,13 +1140,13 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
         super::settle_bool(&mut p, "keep");
     }
     Ok(Box::new(move || {
-        let mut messages = Vec::new();
-        let pixels = apply_function(&src, &p, target.as_deref(), &mut messages)?;
+        let mut remaps = Remaps::default();
+        let pixels = apply_function(&src, &p, target.as_deref(), &mut remaps)?;
         if is_hillshade(&p) {
             return made_hillshade(rasterops::derive_hillshade(&src, &name, pixels)?, &defaults);
         }
         // Only a resample takes another raster's grid.
-        made_with_messages(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, messages)
+        made_then(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, None, Some(remaps.then()))
     }))
 }
 
@@ -1178,10 +1196,10 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
     Ok(Box::new(move || {
         let mut cur: Raster = (*src).clone();
         let mut names = Vec::new();
-        let mut messages = Vec::new();
+        let mut remaps = Remaps::default();
         for (i, (st, target)) in steps.iter().zip(&targets).enumerate() {
             let f = func(st);
-            let pixels = apply_function(&cur, st, target.as_deref(), &mut messages).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
+            let pixels = apply_function(&cur, st, target.as_deref(), &mut remaps).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             // Only a resample takes another raster's grid; otherwise the grid is the current one.
             cur = if is_hillshade(st) {
                 rasterops::derive_hillshade(&cur, &cur.name, pixels)?
@@ -1196,7 +1214,7 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
             Some(last) if is_hillshade(last) => made_hillshade(cur, &defaults)?,
             _ => made(cur, None)?,
         };
-        m.then = Some(notify_messages(messages));
+        m.then = Some(remaps.then());
         Ok(m)
     }))
 }
@@ -1235,16 +1253,21 @@ fn suitability_work(s: &Session, p: &Value) -> Result<Work, String> {
     let name = out_name(p, "Suitability".into());
     Ok(Box::new(move || {
         let mut scored = Vec::new();
-        let mut messages = Vec::new();
+        let mut empty = Vec::new();
         for (r, band, ranges, weight) in &criteria {
             let on_grid = rasterops::resample_to(r, *band, &first)?;
-            let grid = rasterops::derive(&first, &r.name, vec![on_grid])?;
-            let remap = rasterops::remap(&grid, 0, ranges, false)?;
-            messages.extend(remap.messages);
+            let remap = rasterops::remap(&rasterops::derive(&first, &r.name, vec![on_grid])?, 0, ranges, false)?;
+            empty.extend(remap.empty.into_iter().map(|(lo, hi)| (r.name.clone(), lo, hi)));
             scored.push((remap.cells, *weight));
         }
         let out = rasterops::weighted_overlay(&scored)?;
-        made_with_messages(rasterops::derive(&first, &name, vec![out])?, messages)
+        // A cell is scored only where every criterion scores it.
+        let none = !rasterops::has_values(&out, first.width as usize)?;
+        let mut notes: Vec<String> = rasterops::empty_ranges_note(&empty).into_iter().collect();
+        if none {
+            notes.push(format!("{name}: no cell is scored by every criterion, so the result has no cells with values"));
+        }
+        made_then(rasterops::derive(&first, &name, vec![out])?, None, Some(notices(notes)))
     }))
 }
 
