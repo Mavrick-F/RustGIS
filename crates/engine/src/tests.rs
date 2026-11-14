@@ -493,6 +493,10 @@ fn tools_read_the_features_a_definition_query_keeps() {
     let r = s.run("select.byAttributes", &json!({"layer": "Cities", "where": "pop_max > 0"})).unwrap();
     assert_eq!(r["selected"], json!(big));
     assert!(said(&s, mark, &format!("{} more features match but aren't drawn", cities - big)));
+    // A query that hides every feature: a Select tool selects nothing, rather than being refused.
+    query(&mut s, "Cities", "pop_max < 0");
+    s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
+    assert!(s.map().layer_by_name("Cities").unwrap().selection.is_empty());
     query(&mut s, "Cities", "");
     let mark = s.notice_mark();
     s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
@@ -512,6 +516,15 @@ fn tools_read_the_features_a_definition_query_keeps() {
             countries - shown(&s, "Countries")
         )
     ));
+    // Every row has its area and perimeter, the hidden countries' as much as the drawn ones'.
+    let layer = s.map().layer_by_name("Countries").unwrap();
+    let ds = &layer.dataset;
+    let (area, perimeter) = (ds.field_index("area_km2").unwrap(), ds.field_index("perimeter_km").unwrap());
+    let hidden = layer.visible_rows().iter().position(|v| !*v).unwrap();
+    for row in [hidden, layer.visible_rows().iter().position(|v| *v).unwrap()] {
+        assert!(ds.value(row, area).as_f64().is_some_and(|a| a > 0.0), "row {row}");
+        assert!(ds.value(row, perimeter).as_f64().is_some_and(|p| p > 0.0), "row {row}");
+    }
     query(&mut s, "Countries", "");
     let mark = s.notice_mark();
     s.run("gp.run", &json!({"tool": "calculateGeometry", "params": {"input": "Countries"}})).unwrap();

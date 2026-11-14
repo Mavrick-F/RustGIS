@@ -1126,7 +1126,14 @@ fn narrow_to_queries(
         .flat_map(|t| t.params.iter().filter(|p| reads_whole(t.id, p.name)).filter_map(|p| params.get(p.name)?.as_str()))
         .collect();
     let mut named = layer_names(spec, params);
-    for w in &whole {
+    // The layer a Select tool selects in is read whole, and its result is cut to the drawn
+    // features afterwards ([`fit_to_windows`]): not narrowed here, and never refused (it selects
+    // nothing then).
+    let selected_in: Vec<&str> = spec
+        .iter()
+        .flat_map(|t| t.params.iter().filter(|p| selects_in(t.id, p.name)).filter_map(|p| params.get(p.name)?.as_str()))
+        .collect();
+    for w in whole.iter().chain(&selected_in) {
         if let Some(i) = named.iter().position(|n| n.eq_ignore_ascii_case(w)) {
             named.remove(i);
         }
@@ -1169,10 +1176,15 @@ fn narrow_to_queries(
     Ok(())
 }
 
+/// The layer parameter a Select tool replaces the selection of: read whole, as the tool reads it.
+fn selects_in(tool: &str, param: &str) -> bool {
+    matches!((tool, param), ("selectByAttributes" | "selectByLocation", "input"))
+}
+
 /// The layer parameters a tool reads whole whatever the layer's selection or definition query:
 /// the one it updates in place, and the polygons it counts every point against (see the
 /// analysis guide). The Select tools read the whole layer too, and their selection is cut to the
-/// drawn features instead (see [`fit_to_windows`]).
+/// drawn features instead ([`selects_in`], [`fit_to_windows`]).
 fn reads_whole(tool: &str, param: &str) -> bool {
     matches!((tool, param), ("calculateGeometry", "input") | ("countPoints", "polygons"))
 }

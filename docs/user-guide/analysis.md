@@ -385,14 +385,16 @@ The search radius must be at least the pixel size. The extent can optionally be 
 as `xmin,ymin,xmax,ymax` text or a four-number array. The output is written as a single-band Float32 GeoTIFF.
 
 Most feature tools process only the selected rows when an input has a selection, and only the
-features a layer's definition query keeps (the ones the map draws, with the selection cut to them):
-a Clip by a layer filtered to one country uses that country, and a Buffer of a filtered layer
-buffers what is drawn. A tool refuses a layer whose definition query hides every feature it would
-read. Selection tools instead replace the input's selection, leaving out the features the map
-doesn't draw (its definition query, time window or display filters) and saying how many; Select Layer By Location honours the selecting layer's
-selection. Summarize Within counts the selected points against **all** input polygons, and
-Calculate Geometry Attributes updates **all** rows, including the ones a definition query hides: the
-run says how many. For tools that create a map layer, `output` is the layer name; `vectorToPmtiles`
+features a layer's definition query keeps (with the selection cut to them): a Clip by a layer
+filtered to one country uses that country, and a Buffer of a filtered layer buffers the features
+the filter keeps. Tools go by the definition query alone: the time slider's window and display
+filters, which follow the map's time and scale, don't change what a tool reads. A feature tool
+refuses a layer whose definition query hides every feature it would read. Selection tools instead
+replace the input's selection with features the map draws, leaving out the ones its definition
+query, time window or display filters hide and saying how many (none, if they hide every match);
+Select Layer By Location honours the selecting layer's selection. Summarize Within counts the
+selected points against **all** input polygons, and Calculate Geometry Attributes updates **all**
+rows, including the ones a definition query hides: the run says how many. For tools that create a map layer, `output` is the layer name; `vectorToPmtiles`
 uses it as a file destination.
 
 **Buffer** distances, and the distance of **Select Layer By Location**, are measured on the Earth
