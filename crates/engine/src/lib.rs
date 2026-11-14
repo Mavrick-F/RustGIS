@@ -1759,6 +1759,10 @@ impl Session {
             // session's own flag says so, not the answer, which a plugin's command could forge.
             (Ok(_), Some(_)) if std::mem::take(&mut self.request_only) => {}
             (Ok(_), Some(mut snap)) => {
+                // A successful script may publish and then remove the layer. Its undo
+                // snapshot still needs the committed file record, even without a live layer
+                // from which undo could carry that record forward.
+                self.keep_published_syncs(&mut snap);
                 fresh_source_ids(&snap, &mut self.project);
                 forget_label_state_of_removed_features(&snap, &mut self.project);
                 // An edit may change the dates the time slider's window filters on: bound layers
@@ -2564,6 +2568,18 @@ impl Session {
         if self.restorable > 0 {
             self.published_syncs.retain(|(i, p, _)| *i != instance || *p != path);
             self.published_syncs.push((instance, path, synced));
+        }
+    }
+
+    /// Gives a command's undo snapshot the records of files it physically wrote, including
+    /// layers the command removed after publishing. The records belong to these instances only.
+    fn keep_published_syncs(&self, project: &mut Project) {
+        for l in project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            if let Some((_, _, synced)) =
+                self.published_syncs.iter().rev().find(|(i, p, _)| *i == l.instance_id() && l.dataset.source.as_deref() == Some(p.as_str()))
+            {
+                l.synced = Some(synced.clone());
+            }
         }
     }
 
