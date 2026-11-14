@@ -336,7 +336,6 @@ pub fn export_land(s: &mut Session, started: Started, done: Result<Wrote, String
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use rustgis_analysis::control::Control;

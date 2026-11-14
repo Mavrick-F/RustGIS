@@ -550,7 +550,6 @@ pub fn styled_extent(text: &str, px: f32, face: Face, spacing: f32) -> (f32, f32
 /// Draws `text` from `left` (pixels), its line centred on `cy`, at `px` in `face` with `spacing`
 /// pixels between letters: italic in the family's italic face where it has one, else slanted.
 /// Plain (sans, no spacing, upright) it draws as [`text_at`] does from the left.
-#[allow(clippy::too_many_arguments)]
 pub fn styled_at(pm: &mut Canvas, text: &str, left: f32, cy: f32, px: f32, color: Rgba, face: Face, spacing: f32) {
     if !(left.is_finite() && cy.is_finite() && px.is_finite() && spacing.is_finite()) || px <= 0.0 {
         return;

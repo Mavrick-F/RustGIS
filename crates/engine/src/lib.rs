@@ -781,7 +781,7 @@ pub struct Session {
     /// Source layers' row versions that `pg.saveEdits` or `gpkg.saveEdits` saved over: a layer back on one
     /// (undone, or restored by a failed command, past a save) would write its edits again.
     /// Outside the project, so undo keeps it.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "saving edits back to a database is desktop only"))]
     pub(crate) saved_over: Vec<rustgis_map::source::Versions>,
     /// The feature cache fills itself after projection changes (Data › Feature Cache).
     pub auto_cache: bool,
@@ -874,7 +874,7 @@ pub struct Session {
     /// command reads what it needs from the map when the panel opens.
     pub plugin_panels: std::collections::BTreeMap<String, rustgis_plugins::PanelState>,
     /// What running session plugins were last told of the map, to send them events.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "session plugins run on the desktop only"))]
     pub(crate) plugin_watch: cmd::plugins::Watch,
     /// Data downloads of this project under way (Home › Add › Add Data › From URL), by id.
     downloading: Vec<u64>,
@@ -2285,7 +2285,7 @@ impl Session {
         self.say_bundled_roots(rustgis_data::http::bundled_roots());
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "native HTTPS only: the browser checks certificates itself"))]
     fn say_bundled_roots(&mut self, bundled: bool) {
         if bundled && !self.bundled_roots_said {
             self.bundled_roots_said = true;

@@ -841,7 +841,6 @@ pub fn color_button(ui: &mut Ui, color: &mut egui::Color32) -> Response {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use egui_kittest::kittest::Queryable;
 

@@ -97,7 +97,6 @@ pub fn check() -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

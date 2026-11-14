@@ -635,7 +635,6 @@ pub fn status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::time::Duration;

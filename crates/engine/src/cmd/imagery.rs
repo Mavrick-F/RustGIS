@@ -1043,7 +1043,7 @@ fn zone_rings(s: &Session, z: &str) -> Result<Vec<Vec<Coord>>, String> {
 /// and this polygon; read here otherwise (and recorded, on that copy, for the script's run here to
 /// take). A raster a tool made earlier in the script is decoded apart on each side, so its zones
 /// are read again here.
-#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+#[cfg_attr(target_arch = "wasm32", expect(unused_variables, reason = "zones are read ahead on the desktop only"))]
 fn zone_means(s: &mut Session, r: &Arc<Raster>, rings: Vec<Vec<Coord>>) -> Result<Option<(Vec<f64>, usize)>, String> {
     #[cfg(not(target_arch = "wasm32"))]
     let same = |z: &ZoneMeans| Arc::ptr_eq(&z.raster, r) && z.rings == rings;

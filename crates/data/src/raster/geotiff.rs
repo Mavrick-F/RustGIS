@@ -1105,7 +1105,6 @@ impl Chunks {
     /// Copies every `k`-th pixel each way of chunk `c` of `plane` (decoded as `values`) into
     /// `bands`, each `ow` pixels wide, counting in `rounded` (by band) the pixels copied whose bit
     /// is set in `changed` (from [`rounded_bits`]).
-    #[allow(clippy::too_many_arguments)]
     fn place(
         &self,
         bands: &mut [Vec<f32>],
@@ -1169,7 +1168,6 @@ const PARALLEL_CHUNKS: u64 = 16;
 /// each reading image `image` of its own copy of the file.
 /// Progress counts chunks examined, including ones skipped by the overview. Cancel is checked
 /// between chunks; decoding and placing an individual chunk cannot be interrupted.
-#[allow(clippy::too_many_arguments)]
 fn decimate<R: Read + Seek>(
     dec: &mut Decoder<R>,
     w: u32,
@@ -1222,7 +1220,6 @@ fn decimate<R: Read + Seek>(
 
 /// [`decimate`] on `threads` threads, each with its own decoder taking the next chunk in turn.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::too_many_arguments)]
 fn decimate_parallel(
     chunks: Chunks,
     bands: Vec<Vec<f32>>,

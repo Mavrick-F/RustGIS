@@ -129,7 +129,6 @@ fn softmax(a: &mut [f32]) {
 /// with its class and its share of the class's samples, and each class taking up to
 /// `max_per_class`: the samples, and how many each class got. The polygons are counted for the
 /// run's progress, and a cancelled run stops between rows of a polygon (see [`crate::control`]).
-#[allow(clippy::type_complexity)]
 pub fn training_samples(
     r: &Raster,
     bands: &[usize],

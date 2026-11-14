@@ -1320,7 +1320,7 @@ mod tests {
         assert!(told[0].0.starts_with("The plugin damaged wasn't loaded (open Plugins") && told[0].0.contains("damaged:"), "{told:?}");
 
         // Loaded: nothing to tell, nothing listed.
-        struct Cleanup(#[allow(dead_code)] tempfile::TempDir);
+        struct Cleanup(#[expect(dead_code, reason = "held for the test, never read")] tempfile::TempDir);
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 let _ = rustgis_plugins::store::uninstall("restore-ok");

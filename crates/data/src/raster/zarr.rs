@@ -821,7 +821,6 @@ fn bitunshuffle(d: &[u8], size: usize, format: u8) -> Vec<u8> {
 /// A shard of `shard` values: its chunks of `inner` values, each decoded with `codecs`, put in
 /// place (row-major), with its index of (offset, size) pairs (`index` its encoding) at the end
 /// or the start. Chunks it doesn't hold are `fill`. Returns the values' bytes and byte order.
-#[allow(clippy::too_many_arguments)]
 fn unshard(
     d: &[u8],
     shard: &[u64],

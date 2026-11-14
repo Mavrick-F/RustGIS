@@ -538,7 +538,6 @@ impl Reach {
 /// stretch needing more than [`POLAR_PIECES_MAX`] is measured in that many and sets `coarse`. At
 /// t = 0 and 1 the stretch ends at the edge's vertices `la` and `lb` (longitude/latitude),
 /// converted as an end is (not at a + (b − a)·1), so an end on a vertex is placed on it.
-#[allow(clippy::too_many_arguments)]
 fn edge_from(
     e: Coord,
     (a, b): (Coord, Coord),

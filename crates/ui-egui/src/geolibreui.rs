@@ -180,7 +180,6 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

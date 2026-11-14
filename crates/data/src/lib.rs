@@ -151,7 +151,6 @@ impl DataError {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod secret_redaction_tests {
     use super::*;
 

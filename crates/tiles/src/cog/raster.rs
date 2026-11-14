@@ -370,7 +370,6 @@ struct Gap {
 /// (the finer, then the coarser, then further): the level zoomed from stands in for the one zoomed
 /// to until its tiles arrive. Only the gaps are filled: a tile's own no-data pixels stay empty.
 /// `kept` gives a level's chunk when it is kept (marking it used); nothing is fetched.
-#[allow(clippy::too_many_arguments)]
 fn stand_in(
     info: &Info,
     level: usize,

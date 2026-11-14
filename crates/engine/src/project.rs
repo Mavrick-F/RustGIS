@@ -2409,7 +2409,6 @@ mod limit_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod login_binding_tests {
     use super::*;
 

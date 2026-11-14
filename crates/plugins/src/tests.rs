@@ -16,7 +16,6 @@ impl Host for Recorder {
         match op {
             "host.echo" => Ok(params.clone()),
             // A host request that fails unexpectedly.
-            #[allow(clippy::panic)]
             "host.panic" => panic!("a host request failed unexpectedly"),
             _ => Err(format!("no '{op}'")),
         }

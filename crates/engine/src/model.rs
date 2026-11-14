@@ -965,7 +965,6 @@ pub fn to_file(name: &str, g: &ModelGraph) -> Value {
     json!({"$schema": SCHEMA, "version": FILE_VERSION, "name": name, "graph": g})
 }
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::Project;
