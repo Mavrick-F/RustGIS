@@ -678,7 +678,14 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
                     break;
                 }
             };
+            // Reserve this name before moving the old part: a previous crash's backup
+            // (or a symlink) must never be replaced when a process id is reused.
+            if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).open(&bak).map(drop) {
+                result = Err(e);
+                break;
+            }
             if let Err(e) = std::fs::rename(target, &bak) {
+                let _ = std::fs::remove_file(&bak);
                 result = Err(e);
                 break;
             }
@@ -3825,7 +3832,7 @@ mod tests {
         Ok(())
     }
 
-    /// Exercises caller cleanup through the public Shapefile writer, one fresh process per collision.
+    /// Exercises staging and backup cleanup through the public writer, one fresh process per collision.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn shapefile_staging_collisions_preserve_existing_entries() -> std::io::Result<()> {
@@ -3836,32 +3843,35 @@ mod tests {
         const CHILD: &str = "RUSTGIS_SHAPEFILE_STAGING_COLLISION";
         let Ok(case) = std::env::var(CHILD) else {
             let kinds: &[&str] = if cfg!(unix) { &["file", "live", "dangling"] } else { &["file"] };
-            for index in 0..parts.len() {
-                for kind in kinds {
-                    let output = std::process::Command::new(std::env::current_exe()?)
-                        .args([
-                            "--exact",
-                            "io::tests::shapefile_staging_collisions_preserve_existing_entries",
-                            "--nocapture",
-                            "--test-threads=1",
-                        ])
-                        .env(CHILD, format!("{index}:{kind}"))
-                        .output()?;
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    assert!(
-                        output.status.success()
-                            && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
-                            && stdout.contains(&format!("collision case completed: {index}:{kind}")),
-                        "part={index} kind={kind}: {}{}",
-                        stdout,
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+            for phase in ["stage", "backup"] {
+                for index in 0..parts.len() {
+                    for kind in kinds {
+                        let output = std::process::Command::new(std::env::current_exe()?)
+                            .args([
+                                "--exact",
+                                "io::tests::shapefile_staging_collisions_preserve_existing_entries",
+                                "--nocapture",
+                                "--test-threads=1",
+                            ])
+                            .env(CHILD, format!("{phase}:{index}:{kind}"))
+                            .output()?;
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        assert!(
+                            output.status.success()
+                                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                                && stdout.contains(&format!("collision case completed: {phase}:{index}:{kind}")),
+                            "phase={phase} part={index} kind={kind}: {}{}",
+                            stdout,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
                 }
             }
-            println!("collision scenarios: {}", parts.len() * kinds.len());
+            println!("collision scenarios: {}", 2 * parts.len() * kinds.len());
             return Ok(());
         };
-        let (index, kind) = case.split_once(':').ok_or_else(|| std::io::Error::other("missing collision case"))?;
+        let (phase, case_parts) = case.split_once(':').ok_or_else(|| std::io::Error::other("missing collision phase"))?;
+        let (index, kind) = case_parts.split_once(':').ok_or_else(|| std::io::Error::other("missing collision case"))?;
         let index = index.parse::<usize>().map_err(std::io::Error::other)?;
         if !matches!(kind, "file" | "live" | "dangling") {
             return Err(std::io::Error::other("unknown collision kind"));
@@ -3873,12 +3883,17 @@ mod tests {
         for (extension, bytes) in &parts {
             std::fs::write(destination(extension), bytes)?;
         }
-        let (extension, _) = parts.get(index).ok_or_else(|| std::io::Error::other("collision part out of range"))?;
+        let mut ordered: Vec<_> = parts.iter().collect();
+        if phase == "backup" {
+            ordered.sort_by_key(|(extension, _)| *extension == "shp");
+        }
+        let (extension, _) = ordered.get(index).ok_or_else(|| std::io::Error::other("collision part out of range"))?;
         let target = destination(extension);
-        // This child runs only this test: write_path's first staging counter is zero.
+        // This child starts the counter at zero; backups follow all staged parts.
         let mut name = std::ffi::OsString::from(".");
         name.push(target.file_name().ok_or_else(|| std::io::Error::other("missing part name"))?);
-        name.push(format!(".{}.{index}.tmp", std::process::id()));
+        let counter = if phase == "backup" { parts.len() + index } else { index };
+        name.push(format!(".{}.{counter}.tmp", std::process::id()));
         let collision = target.with_file_name(name);
         #[cfg(unix)]
         let link_target = root.join("link-target");

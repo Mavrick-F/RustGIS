@@ -559,7 +559,7 @@ fn cell(ty: u8, bytes: &[u8]) -> Cell<'_> {
             }
         }
         b'N' | b'F' => {
-            if trimmed.is_empty() || trimmed.iter().all(|b| *b == b'*') {
+            if trimmed.is_empty() {
                 return Cell::Empty;
             }
             match decimal(trimmed) {
@@ -943,6 +943,28 @@ mod tests {
             assert_eq!(next.rows, published.rows);
             shapefile(&back, &path, &next).unwrap();
         }
+    }
+
+    /// An unedited numeric overflow marker must not silently become an empty cell.
+    #[test]
+    fn an_overflow_cell_is_refused_without_changing_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        crate::io::write_path(&parcels(), &path).unwrap();
+        let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        let table = crate::dbf::raw_table(&dbf).unwrap();
+        let header = usize::from(u16::from_le_bytes([dbf[8], dbf[9]]));
+        let at = header + 1 + usize::from(table.columns[0].len) + usize::from(table.columns[1].len);
+        dbf[at..at + 18].fill(b'*');
+        std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
+        let (mut ds, sync) = read(&path);
+        assert_eq!(ds.features.first().unwrap().attrs[2], Value::Null);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[1].attrs[0] = Value::Text("Jonas".into());
+        ds.features = rows.into();
+        let error = shapefile(&ds, &path, &sync).err().expect("overflow marker must be refused").to_string();
+        assert!(error.contains("table wouldn't be the same") && error.contains("UNITS") && error.contains("***"), "{error}");
+        assert!(sync.files.changed(&path).unwrap().is_empty());
     }
 
     /// A number past what an `f64` holds exactly, in a column that wasn't edited, is refused
