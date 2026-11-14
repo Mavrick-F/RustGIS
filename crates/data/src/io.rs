@@ -1765,16 +1765,18 @@ pub fn read_gzip_text(reader: impl std::io::Read, file_name: &str, opts: &CsvOpt
     }
     let delimiter = opts.delimiter.unwrap_or_else(|| sniff_delimiter(&String::from_utf8_lossy(&prefix)));
     let plain = file_name.get(..file_name.len().saturating_sub(3)).unwrap_or(file_name);
-    if plain.to_ascii_lowercase().ends_with(".dat")
-        && opts.delimiter.is_none()
-        && !looks_like_delimited_table(&String::from_utf8_lossy(&prefix))
-    {
-        return Err(DataError::Format(format!(
-            "{file_name}: not recognised as delimited text; give a delimiter, or decompress and rename to .txt"
-        )));
-    }
     let name = Path::new(plain).file_stem().and_then(|n| n.to_str()).unwrap_or("table");
     let mut rdr = csv::ReaderBuilder::new().flexible(true).delimiter(delimiter).from_reader(std::io::Cursor::new(prefix).chain(decoder));
+    // The sample can end inside a record. Parse the complete header from the stream before
+    // deciding whether an ambiguous DAT is delimited text.
+    if plain.to_ascii_lowercase().ends_with(".dat") && opts.delimiter.is_none() {
+        let headers = rdr.headers().map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
+        if headers.len() < 2 || headers.iter().any(|h| h.chars().any(char::is_control)) {
+            return Err(DataError::Format(format!(
+                "{file_name}: not recognised as delimited text; give a delimiter, or decompress and rename to .txt"
+            )));
+        }
+    }
     let result = read_csv_records(&mut rdr, name, opts);
     crate::progress::check()?;
     let (mut dataset, report) =
@@ -1812,7 +1814,7 @@ pub fn read_delimited_bytes(file_name: &str, bytes: &[u8], opts: &CsvOptions) ->
         return read_gzip_text(bytes, file_name, opts);
     }
     let (text, note) = delimited_text(file_name, bytes)?;
-    if file_name.to_ascii_lowercase().ends_with(".dat") && opts.delimiter.is_none() && !looks_like_delimited_table(&text) {
+    if file_name.to_ascii_lowercase().ends_with(".dat") && opts.delimiter.is_none() && delimited_table_columns(&text) < 2 {
         return Err(DataError::Format(format!(
             "{file_name}: not recognised as delimited text; give a delimiter, or rename to .txt to read it as a table"
         )));
@@ -2393,22 +2395,22 @@ pub const MAX_ZIP_LAYERS: usize = 32;
 /// A text table has matching CSV records, or an identifier-only header for an empty table.
 /// Read records rather than counting separators: quoted commas and embedded newlines belong
 /// to cells. A one-line prose readme with punctuation isn't an empty GTFS table.
-fn looks_like_delimited_table(text: &str) -> bool {
+fn delimited_table_columns(text: &str) -> usize {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     if text.chars().take(4096).any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
-        return false;
+        return 0;
     }
     let mut reader = csv::ReaderBuilder::new().delimiter(sniff_delimiter(text)).from_reader(text.as_bytes());
-    let Ok(headers) = reader.headers() else { return false };
+    let Ok(headers) = reader.headers() else { return 0 };
     let columns = headers.len();
-    if columns < 2 {
-        return false;
+    if columns == 0 {
+        return 0;
     }
     let identifiers = headers.iter().all(|name| !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'));
     match reader.records().next() {
-        Some(Ok(row)) => row.len() == columns,
-        None => identifiers,
-        Some(Err(_)) => false,
+        Some(Ok(row)) if row.len() == columns && (columns > 1 || identifiers) => columns,
+        None if identifiers => columns,
+        _ => 0,
     }
 }
 
@@ -2518,7 +2520,8 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     others.sort_by(|a, b| a.0.cmp(&b.0));
     for (n, b) in others {
         // Prose readmes aren't tables; optional empty GTFS tables still have headers.
-        if ext_of(&n) == "txt" && !delimited_text(&n, &b).is_ok_and(|(text, _)| looks_like_delimited_table(&text)) {
+        if ext_of(&n) == "txt" && !delimited_text(&n, &b).is_ok_and(|(text, _)| delimited_table_columns(&text) > 0) {
+            skipped.push(format!("{n} (not recognised as delimited text; extract it and add as .txt)"));
             continue;
         }
         if out.len() >= MAX_ZIP_LAYERS {
@@ -2544,12 +2547,9 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
             Err(e) => skipped.push(format!("{n} ({e})")),
         }
     }
-    if geodatabase.get() {
-        skipped.push("File Geodatabase contents (unzip the archive and add the .gdb folder on the desktop)".into());
-    }
     // At most this many skipped members are named; the rest are counted.
     const NAMED_SKIPPED: usize = 20;
-    let skipped = if skipped.len() > NAMED_SKIPPED {
+    let mut skipped = if skipped.len() > NAMED_SKIPPED {
         let more = skipped.len() - NAMED_SKIPPED;
         let mut named: Vec<String> = skipped.into_iter().take(NAMED_SKIPPED).collect();
         named.push(format!("and {more} more"));
@@ -2557,6 +2557,9 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     } else {
         skipped
     };
+    if geodatabase.get() {
+        skipped.push("File Geodatabase contents (unzip the archive and add the .gdb folder on the desktop)".into());
+    }
     if out.is_empty() {
         let why = if skipped.is_empty() { String::new() } else { format!(": {}", skipped.join("; ")) };
         let hint = if skipped.is_empty() {
@@ -5189,6 +5192,10 @@ mod tests {
         assert_eq!(table.geometry_type, GeometryType::None);
         assert_eq!(table.value(0, 1), &Value::Int(12));
         assert!(report.messages.is_empty());
+        let long = format!("id|value\n{}|1\n", "A".repeat(70_000));
+        let (table, report) = read_bytes("long.dat.gz", &gzip_csv(long.as_bytes())).unwrap();
+        assert_eq!(table.value(0, 1), &Value::Int(1));
+        assert!(report.messages.is_empty());
         let mut members = gzip_csv(b"id,count\nA,12\n");
         members.extend(gzip_csv(b"B,13\n"));
         assert_eq!(read_bytes("counts.csv.gz", &members).unwrap().0.features.len(), 2);
@@ -5249,7 +5256,15 @@ mod tests {
         assert_eq!(layers[0].0.name, "routes");
         assert_eq!(layers[0].0.geometry_type, GeometryType::None);
         assert_eq!(layers[1].0.features[0].geometry, Some(Geometry::Point(Coord::new(-89.9, 35.1))));
-        assert!(layers.iter().all(|(_, r)| r.messages.is_empty()));
+        assert!(layers[0].1.messages.iter().any(|m| m.contains("README.txt")));
+        let clean = crate::zip::write(&[("ids.txt".into(), b"id\nA\n".to_vec())]).unwrap();
+        let layers = read_zip("ids.zip", &clean).unwrap();
+        assert_eq!(layers[0].0.value(0, 0), &Value::Text("A".into()));
+        assert!(layers[0].1.messages.is_empty());
+        let ragged =
+            crate::zip::write(&[("ids.txt".into(), b"id\nA\n".to_vec()), ("ragged.txt".into(), b"id,n\nA,1,extra\n".to_vec())]).unwrap();
+        let layers = read_zip("ragged.zip", &ragged).unwrap();
+        assert!(layers[0].1.messages.iter().any(|m| m.contains("ragged.txt") && m.contains("extract")));
     }
 
     #[test]
@@ -5257,9 +5272,9 @@ mod tests {
         let zip = crate::zip::write(&[("County.GDB/a00000001.gdbtable".into(), vec![0])]).unwrap();
         let error = read_zip("county.zip", &zip).err().unwrap().to_string();
         assert!(error.contains("unzip") && error.contains(".gdb folder"), "{error}");
-        let mixed =
-            crate::zip::write(&[("county.gdb/a00000001.gdbtable".into(), vec![0]), ("counts.csv".into(), b"id,n\nA,12\n".to_vec())])
-                .unwrap();
+        let mut entries = vec![("county.gdb/a00000001.gdbtable".into(), vec![0]), ("counts.csv".into(), b"id,n\nA,12\n".to_vec())];
+        entries.extend((0..21).map(|i| (format!("bad{i}.csv.gz"), vec![0])));
+        let mixed = crate::zip::write(&entries).unwrap();
         let layers = read_zip("mixed.zip", &mixed).unwrap();
         assert!(layers[0].1.messages.iter().any(|m| m.contains(".gdb folder")));
     }
@@ -5296,7 +5311,7 @@ mod tests {
         assert_eq!(ds.name, "Paris");
         let c = ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
         assert!((c.x - 2.335).abs() < 1e-6 && (c.y - 48.855).abs() < 1e-6, "{c:?}");
-        assert!(rep.messages.is_empty(), "{:?}", rep.messages);
+        assert!(rep.messages.iter().any(|m| m.contains("ne_VERSION.txt")), "{:?}", rep.messages);
         assert_eq!(ds.value(0, 0), &Value::Text("paris".into()));
         assert_eq!(layers[1].0.name, "points");
         // read_bytes takes the first layer.
@@ -5317,7 +5332,7 @@ mod tests {
         with_tiles.extend((0..3).map(|i| (format!("tiles/3/{i}/1.pbf"), vec![0x1a, 2, 0, 0])));
         let layers = read_zip("x.zip", &crate::zip::write(&with_tiles).unwrap()).unwrap();
         assert_eq!(layers.len(), 2);
-        assert!(layers[0].1.messages.is_empty(), "{:?}", layers[0].1.messages);
+        assert!(layers[0].1.messages.iter().all(|m| !m.contains(".pbf")), "{:?}", layers[0].1.messages);
         // Nothing readable at all is an error.
         let only_shp: Vec<_> = entries.iter().filter(|(n, _)| n.ends_with(".SHP")).cloned().collect();
         assert!(read_zip("x.zip", &crate::zip::write(&only_shp).unwrap()).is_err());

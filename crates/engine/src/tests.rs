@@ -4325,6 +4325,39 @@ fn shaded_relief_keeps_its_sky_visibility() {
     assert!(s.notices.iter().all(|n| !n.text.contains("sky")), "{:?}", s.notices);
 }
 
+/// Shaded Relief's fill light is set, clamped, kept when left out, saved with the project only
+/// when there is some, and back when the project is opened again.
+#[test]
+fn shaded_relief_keeps_its_fill_light() {
+    let mut s = with_raster();
+    let fill = |s: &Session| match s.map().layers.iter().find_map(|l| l.raster.as_ref()).map(|r| &r.style.renderer) {
+        Some(rustgis_map::RasterRenderer::ShadedRelief { fill, .. }) => *fill,
+        other => panic!("{other:?}"),
+    };
+    let fills_saved = |s: &mut Session| s.project.saved_text(None).unwrap().0.matches("\"fill\"").count();
+    let before = fills_saved(&mut s);
+    s.run("raster.symbology", &json!({"type": "shadedRelief"})).unwrap();
+    assert_eq!((fill(&s), fills_saved(&mut s)), (0.0, before), "none, and not saved");
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": 0.3})).unwrap();
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "azimuth": 200})).unwrap();
+    assert_eq!(fill(&s), 0.3, "left out, kept");
+    assert_eq!(fills_saved(&mut s), before + 1);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": -2})).unwrap();
+    assert_eq!(fill(&s), 0.0);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": 7})).unwrap();
+    assert_eq!(fill(&s), 1.0);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": 0.45})).unwrap();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("rustgis-fill-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fill.rgis");
+    s.run("project.saveAs", &json!({"path": path.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": path.display().to_string()})).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(fill(&t), 0.45, "back when opened");
+}
+
 /// An export draws the sky a pit hides: its floor darker with `sky` 1 than with 0, the ground
 /// around it (which sees the whole sky) the same. The first export with the sky, from a cold
 /// cache, waits for the grid: it is the same image as one drawn once the grid is kept.
@@ -45853,12 +45886,19 @@ fn a_layer_publishes_its_edits_to_its_shapefile() {
     let e = s.run("source.publish", &json!({"layer": id})).unwrap_err();
     assert!(e.contains("towns.dbf changed since the layer was read") && e.contains("nothing was written"), "{e}");
     assert_eq!(dbf(), theirs);
-    // GeoJSON isn't published yet.
+    // The same command and sync record work for a GeoJSON source.
     let geojson = dir.path().join("towns.geojson");
     s.run("share.exportLayer", &json!({"layer": "Cities", "path": geojson})).unwrap();
     s.run("layer.addData", &json!({"path": geojson, "name": "towns.geojson"})).unwrap();
-    let e = s.run("source.publish", &json!({"layer": "towns.geojson"})).unwrap_err();
-    assert!(e.contains("only a layer read from a Shapefile"), "{e}");
+    s.run("edit.setValue", &json!({"layer": "towns.geojson", "row": 0, "field": "name", "value": "Published"})).unwrap();
+    let out = s.run("source.publish", &json!({"layer": "towns.geojson"})).unwrap();
+    assert_eq!(out["published"], true);
+    let (read, _) = rustgis_data::io::read_path(&geojson).unwrap();
+    let name = read.fields.iter().position(|f| f.name == "name").unwrap();
+    assert_eq!(read.features.first().unwrap().attrs[name], rustgis_data::Value::Text("Published".into()));
+    assert_eq!(s.run("source.syncState", &json!({"layer": "towns.geojson"})).unwrap()["state"], "inSync");
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.run("source.syncState", &json!({"layer": "towns.geojson"})).unwrap()["state"], "edited");
 }
 
 /// A layer read whole from a Shapefile or GeoJSON file remembers the files and its rows as read
@@ -47032,6 +47072,11 @@ fn published_text_import_paths() {
     p["text"] = json!("id|east|north\nA|10|20\n");
     s.run("layer.addDataText", &p).unwrap();
     assert_eq!(s.map().layers.len(), 3);
+    let utf16: Vec<u8> = [0xff, 0xfe].into_iter().chain("id|east|north\nA|10|20\n".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+    p.as_object_mut().unwrap().remove("text");
+    p["data"] = json!(base64::engine::general_purpose::STANDARD.encode(utf16));
+    s.run("layer.addDataBytes", &p).unwrap();
+    assert_eq!(s.map().layers.len(), 4);
     std::fs::remove_file(path).unwrap();
 
     // A desktop ZIP read lands from its prepared data, even after the source is gone.

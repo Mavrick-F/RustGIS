@@ -1911,13 +1911,18 @@ impl RustGisApp {
             || rustgis_engine::data::source::is_source_name(name)
             || rustgis_engine::data::io::is_multi_layer_name(name)
             || rustgis_engine::data::sheets::is_sheet_name(name)
+            || lower.ends_with(".gz")
+            || (lower.ends_with(".dat") && std::str::from_utf8(bytes).is_err())
         {
             use base64::Engine;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut p = json!({"fileName": name, "data": data});
             // A picked spreadsheet or Shapefile ZIP takes its import options.
-            if let Some(Value::Object(opts)) = csv.filter(|_| rustgis_engine::data::sheets::is_sheet_name(name) || lower.ends_with(".zip"))
-            {
+            if let Some(Value::Object(opts)) = csv.filter(|_| {
+                rustgis_engine::data::sheets::is_sheet_name(name)
+                    || lower.ends_with(".zip")
+                    || rustgis_engine::data::io::is_delimited_name(name)
+            }) {
                 for (k, v) in opts {
                     p[k] = v;
                 }
@@ -1938,7 +1943,7 @@ impl RustGisApp {
             r
         } else {
             let mut p = json!({"fileName": name, "text": text});
-            if let Some(Value::Object(opts)) = csv.filter(|_| [".csv", ".tsv", ".txt"].iter().any(|e| lower.ends_with(e))) {
+            if let Some(Value::Object(opts)) = csv.filter(|_| rustgis_engine::data::io::is_delimited_name(name)) {
                 for (k, v) in opts {
                     p[k] = v;
                 }
@@ -3772,6 +3777,9 @@ impl RustGisApp {
                             "json",
                             "csv",
                             "tsv",
+                            "txt",
+                            "dat",
+                            "gz",
                             "xlsx",
                             "xlsm",
                             "xlsb",
