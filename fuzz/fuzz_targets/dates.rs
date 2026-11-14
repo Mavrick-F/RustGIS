@@ -33,6 +33,12 @@ fuzz_target!(|data: &[u8]| {
         Value::parse_stored(text, FieldType::Date),
         Value::parse_stored(text, FieldType::DateTime),
         Value::Text(text.to_string()),
+        // Fixed values to compare against, so ordering is checked both ways, not only between
+        // values read from the same text.
+        Value::parse("2026-03-05", FieldType::Date),
+        Value::parse("2026-03-05T09:00:00+02:00", FieldType::DateTime),
+        Value::parse("2026-03-05T09:00:00", FieldType::DateTime),
+        Value::Text("2026-03-05".to_string()),
     ];
     for v in &values {
         let _ = v.temporal_key();

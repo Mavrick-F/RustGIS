@@ -119,6 +119,17 @@ fn dated() -> Dataset {
     ds
 }
 
+/// A point layer with one date-time field whose values are all zoned or all clock times, the two
+/// layouts GeoParquet stores as native timestamps (a column mixing them is written as text).
+fn times(name: &str, at: &[&str]) -> Dataset {
+    let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new("at", FieldType::DateTime)]);
+    for (i, t) in at.iter().enumerate() {
+        ds.push(Some(Geometry::Point(Coord::new(i as f64, 0.0))), vec![Value::parse(t, FieldType::DateTime)]);
+    }
+    ds.push(Some(Geometry::Point(Coord::new(9.0, 0.0))), vec![Value::Null]);
+    ds
+}
+
 /// The sample project's layers, each cut to its first few features.
 fn layers() -> Result<(Project, Vec<Dataset>)> {
     let mut s = Session::new(Project::new("seeds"));
@@ -134,6 +145,8 @@ fn layers() -> Result<(Project, Vec<Dataset>)> {
         })
         .collect();
     layers.push(dated());
+    layers.push(times("zoned", &["2026-03-05T09:00:00+02:00", "0001-01-01T00:00:00Z", "9999-12-31T23:59:59.999999-05:30"]));
+    layers.push(times("clock", &["2026-03-05T09:00:00", "1969-12-31T23:59:59.5", "9999-12-31T23:59:59.999999"]));
     Ok((s.project.clone(), layers))
 }
 

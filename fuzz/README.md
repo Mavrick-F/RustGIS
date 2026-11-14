@@ -34,6 +34,9 @@ ${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-gnu/release/seeds   # writes co
 cargo +nightly fuzz run -O read_layers -- -max_total_time=600 -rss_limit_mb=2048 -timeout=10
 ```
 
+A target with a dictionary of tokens (`dictionaries/<target>.dict`) runs with it: add
+`-dict=dictionaries/<target>.dict` after `--`, as CI does.
+
 The seeds are well-formed files written by RustGIS's own writers from the sample project, so
 fuzzing starts from real files; the repository commits no data. `corpus/` and `artifacts/` are
 ignored. Put `CARGO_TARGET_DIR` somewhere roomy: a sanitizer build of the engine is several GB.
