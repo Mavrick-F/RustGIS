@@ -850,13 +850,18 @@ mod native {
         let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|_| "the sign-in store isn't JSON")?;
         // One a newer RustGIS wrote may hold what this version would lose by writing it again: it
         // is neither used nor written over.
-        if let Some(version) = v.get("version").and_then(Value::as_u64).filter(|v| *v > STORE_VERSION) {
-            return Err(Error::new(
-                Recovery::Auth,
-                format!(
-                    "the ChatGPT sign-ins were saved by a newer RustGIS (version {version}; this one reads {STORE_VERSION}): use that RustGIS, or update this one"
-                ),
-            ));
+        match v.get("version").map(|version| version.as_u64().ok_or(version)) {
+            Some(Ok(version)) if version > STORE_VERSION => {
+                return Err(Error::new(
+                    Recovery::Auth,
+                    format!(
+                        "the ChatGPT sign-ins were saved by a newer RustGIS (version {version}; this one reads {STORE_VERSION}): use that RustGIS, or update this one"
+                    ),
+                ));
+            }
+            // A version that isn't a plain integer can't be told from a newer one's.
+            Some(Err(_)) => return Err("the sign-in store's version isn't a whole number".into()),
+            _ => {}
         }
         if let Some(entries) = v.get("accounts").and_then(Value::as_array) {
             let entries = entries.iter().map(Credentials::from_json).collect::<Result<Vec<_>, _>>()?;
@@ -2061,6 +2066,13 @@ mod native {
             assert!(sign_out_at(&path, &v).is_err());
             assert!(remove_at(&path, &v, "oaiapp_synthetic", "user-1").is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            // A version that isn't a plain integer is unreadable, not newer-or-not.
+            for odd in [serde_json::json!("3"), serde_json::json!(3.0), serde_json::json!(true)] {
+                let mut v: Value = serde_json::from_str(&text).unwrap();
+                v["version"] = odd;
+                std::fs::write(&path, v.to_string()).unwrap();
+                assert!(read_accounts(&path).is_err());
+            }
         }
 
         #[test]
