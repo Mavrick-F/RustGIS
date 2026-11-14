@@ -2794,8 +2794,8 @@ pub fn offset_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, 
     let mut counts = vec![0usize; fields.len()];
     for f in features {
         for ((n, field), v) in counts.iter_mut().zip(fields).zip(&f.attrs) {
-            // Text in a date field that reads as a date is written as that date.
-            let text = matches!(v, Value::Text(t) if field.ty.is_temporal() && offset(&Value::parse_stored(t, field.ty)));
+            // Text in a date field that reads as a date is written as that date (as a read takes it).
+            let text = matches!(v, Value::Text(t) if field.ty.is_temporal() && offset(&Value::parse_stored_counted(t, field.ty).0));
             if offset(v) || text {
                 *n += 1;
             }
@@ -2805,10 +2805,15 @@ pub fn offset_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, 
 }
 
 /// Whether a value written to a date field of type `ty` has digits past the millisecond, which a
-/// GeoPackage's DATETIME doesn't keep (text that reads as a date-time counts as that).
+/// GeoPackage's DATETIME doesn't keep (text that reads as a date-time counts as that, digits past
+/// the microsecond included).
 pub(crate) fn past_millisecond(v: &Value, ty: FieldType) -> bool {
     let fine = |v: &Value| matches!(v, Value::DateTime(t) if t.micros().rem_euclid(1000) != 0);
-    fine(v) || matches!(v, Value::Text(t) if ty.is_temporal() && fine(&Value::parse_stored(t, ty)))
+    fine(v)
+        || matches!(v, Value::Text(t) if ty.is_temporal() && {
+            let (d, cut) = Value::parse_stored_counted(t, ty);
+            cut || fine(&d)
+        })
 }
 
 /// Counts, for each field, the date-times with digits past the millisecond, which a GeoPackage
@@ -2887,7 +2892,7 @@ pub fn text_in_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>,
     let mut counts = vec![0usize; fields.len()];
     for f in features {
         for ((n, field), v) in counts.iter_mut().zip(fields).zip(&f.attrs) {
-            let text = matches!(v, Value::Text(t) if !v.asks_null() && Value::parse_stored(t, field.ty).is_null());
+            let text = matches!(v, Value::Text(t) if !v.asks_null() && Value::parse_stored_counted(t, field.ty).0.is_null());
             let moment = field.ty == FieldType::Date && matches!(v, Value::DateTime(t) if !t.is_date());
             let other = matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_));
             if field.ty.is_temporal() && (text || moment || other) {

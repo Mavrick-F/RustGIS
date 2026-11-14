@@ -3393,6 +3393,21 @@ fn gpkg_tables(path: &Path) -> Vec<String> {
     st.query_map([], |r| r.get(0)).unwrap().collect::<std::result::Result<_, _>>().unwrap()
 }
 
+/// Text in a date-time field with digits past the microsecond is written as a read takes it: as
+/// that date-time, to the millisecond and counted, not kept as text a read would call no date.
+#[test]
+fn geopackage_writes_fine_date_time_text_as_a_date_time() {
+    let workspace = tempfile::tempdir().unwrap();
+    let path = workspace.path().join("fine.gpkg");
+    let mut ds = Dataset::new("fine", GeometryType::Point, vec![Field::new("seen", FieldType::DateTime)]);
+    ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text("2026-03-05T14:30:00.1234567Z".into())]);
+    assert_eq!(crate::io::fine_dates(ds.features.iter(), &ds.fields), [1]);
+    assert_eq!(crate::io::text_in_dates(ds.features.iter(), &ds.fields), [0], "a read takes it as a date-time");
+    crate::io::write_path(&ds, &path).unwrap();
+    let stored: String = rusqlite::Connection::open(&path).unwrap().query_row("SELECT seen FROM fine", [], |r| r.get(0)).unwrap();
+    assert_eq!(stored, "2026-03-05T14:30:00.123Z");
+}
+
 /// A GeoPackage export writes DATE and DATETIME columns, as GeoPackage gives them: a date-time with
 /// a zone in UTC with `Z` (its other offset said), one without a zone without, milliseconds always.
 /// The desktop and browser readers read them back as dates; a value that isn't one, as null, said

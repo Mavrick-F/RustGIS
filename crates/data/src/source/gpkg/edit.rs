@@ -56,8 +56,9 @@ pub struct SavedRows {
     /// ([`crate::io::fine_dates`]): only values the save wrote.
     pub fine_dates: Vec<usize>,
     /// Per supplied field, date-times read back rounded to the microsecond
-    /// ([`crate::source::rounded_dates_note`]), except a stored value the save left as it was:
-    /// the load said those.
+    /// ([`crate::source::rounded_dates_note`]), except a stored value an updated row held before
+    /// the save: the load said those. A row only a trigger touched wasn't read before the save, so
+    /// its rounded values are counted even when unchanged, and may be said again.
     pub rounded_dates: Vec<usize>,
 }
 
@@ -638,7 +639,7 @@ fn count_utc(counts: &mut [usize], fine: &mut [usize], i: usize, attr: &Value, t
     }
     let offset = |v: &Value| matches!(v, Value::DateTime(t) if t.offset().is_some_and(|o| o != 0));
     // Text in a date field that reads as a date is written as that date.
-    let text = matches!(attr, Value::Text(t) if ty.is_temporal() && offset(&Value::parse_stored(t, ty)));
+    let text = matches!(attr, Value::Text(t) if ty.is_temporal() && offset(&Value::parse_stored_counted(t, ty).0));
     if (offset(attr) || text)
         && let Some(n) = counts.get_mut(i)
     {
