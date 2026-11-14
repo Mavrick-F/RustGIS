@@ -1171,6 +1171,9 @@ fn sql_value(v: &Value, ty: FieldType) -> rusqlite::types::Value {
         (Value::Date(d), FieldType::DateTime) => Sql::Text(gpkg_datetime(crate::date::DateTime::from_date(*d))),
         (Value::Date(d), _) => Sql::Text(d.to_string()),
         (Value::DateTime(t), FieldType::Date) if t.is_date() => Sql::Text(t.date().to_string()),
+        // A moment in a date field isn't a day: written as it is, not rounded into a midnight a
+        // read would take as one; it reads as null, as `io::text_in_dates` counts it.
+        (Value::DateTime(t), FieldType::Date) => Sql::Text(t.to_string()),
         (Value::DateTime(t), _) => Sql::Text(gpkg_datetime(*t)),
         // Text that reads as a date is written as that date, as a read takes it (digits past the
         // microsecond rounded); other text is kept as it is, though a read finds it isn't a date

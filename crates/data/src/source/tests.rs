@@ -3958,6 +3958,34 @@ fn flatgeobuf_exports_fine_date_time_text_as_it_is() {
     assert_eq!(batch.rounded_dates, [1]);
 }
 
+/// A date field's text that is a midnight is exported to FlatGeobuf as its day, so the column
+/// still reads back as dates.
+#[test]
+fn flatgeobuf_exports_a_midnight_in_a_date_field_as_its_day() {
+    let mut ds = Dataset::new("days", GeometryType::Point, vec![Field::new("day", FieldType::Date)]);
+    ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text("2026-03-05T00:00:00".into())]);
+    ds.push(Some(Geometry::Point(Coord::new(2.0, 2.0))), vec![Value::parse("2026-03-06", FieldType::Date)]);
+    let src = open_bytes("days.fgb", fgb::write(&ds).unwrap(), None).unwrap();
+    assert_eq!(src.info().fields[0].ty, FieldType::Date);
+    let mut days: Vec<String> = src.read(&Request::all()).unwrap().features.iter().map(|f| f.attrs[0].to_string()).collect();
+    days.sort();
+    assert_eq!(days, ["2026-03-05", "2026-03-06"]);
+}
+
+/// A moment in a GeoPackage date field isn't rounded into a midnight: it reads back as null, as
+/// the export counted it.
+#[test]
+fn geopackage_keeps_a_moment_in_a_date_field_from_becoming_a_day() {
+    let workspace = tempfile::tempdir().unwrap();
+    let path = workspace.path().join("days.gpkg");
+    let mut ds = Dataset::new("days", GeometryType::Point, vec![Field::new("day", FieldType::Date)]);
+    ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::parse("2026-03-05T00:00:00.000400", FieldType::DateTime)]);
+    assert_eq!(crate::io::text_in_dates(ds.features.iter(), &ds.fields), [1]);
+    crate::io::write_path(&ds, &path).unwrap();
+    let (back, _) = crate::io::read_path(&path).unwrap();
+    assert!(back.value(0, 0).is_null(), "{:?}", back.value(0, 0));
+}
+
 /// A readable size prefix can contain invalid UTF-8 properties. Classification ignores
 /// that row just as whole and streamed reads do, and the read reports the skipped feature.
 #[test]

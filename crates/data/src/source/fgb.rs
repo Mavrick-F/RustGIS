@@ -1022,9 +1022,13 @@ fn write_run(
                         Value::Int(x) => out.property(i, &f.name, &ColumnValue::Long(*x)),
                         Value::Float(x) => out.property(i, &f.name, &ColumnValue::Double(*x)),
                         Value::Bool(x) => out.property(i, &f.name, &ColumnValue::Bool(*x)),
-                        Value::Text(x) if matches!(f.ty, FieldType::Date | FieldType::DateTime) => {
-                            out.property(i, &f.name, &ColumnValue::DateTime(x))
-                        }
+                        // A date field's text as its day (a midnight `…T00:00:00` too), so a read
+                        // still finds a column of dates; a date-time's text as it is.
+                        Value::Text(x) if f.ty == FieldType::Date => match Value::parse_stored_counted(x, f.ty).0 {
+                            Value::Date(d) => out.property(i, &f.name, &ColumnValue::DateTime(&d.to_string())),
+                            _ => out.property(i, &f.name, &ColumnValue::DateTime(x)),
+                        },
+                        Value::Text(x) if f.ty == FieldType::DateTime => out.property(i, &f.name, &ColumnValue::DateTime(x)),
                         Value::Text(x) => out.property(i, &f.name, &ColumnValue::String(x)),
                         Value::Date(_) | Value::DateTime(_) => out.property(i, &f.name, &ColumnValue::DateTime(&v.to_string())),
                     };
