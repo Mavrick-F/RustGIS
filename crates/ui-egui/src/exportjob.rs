@@ -124,6 +124,28 @@ pub fn status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
 mod tests {
     use super::*;
 
+    /// The desktop command dispatch starts the table export worker, rather than sorting inline.
+    /// Its completion lands through the frame's export finalizer and writes the ranked rows.
+    #[test]
+    fn export_table_dispatches_and_lands_on_the_export_worker() {
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.addDataText", json!({"fileName": "ranks.csv", "text": "name,score\na,1\nc,3\nb,3\n"})).unwrap();
+        app.reads_off_frame = true;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("top.csv");
+        let params = json!({"table": "ranks", "path": path, "sort": [{"field": "score", "descending": true}], "limit": 2});
+        assert_eq!(app.run("share.exportTable", params).unwrap()["started"], "Export Table");
+        assert!(app.export_job.is_some());
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while land(&mut app) {
+            assert!(std::time::Instant::now() < end, "the table export never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: export workers publish completion to the frame's polled slot
+        }
+        let csv = std::fs::read_to_string(path).unwrap();
+        assert_eq!(csv.lines().skip(1).collect::<Vec<_>>(), ["c,3", "b,3"]);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("1 row(s) left out by the requested limit")));
+    }
+
     #[test]
     fn export_features_writes_on_a_thread_and_lands() {
         let mut app = RustGisApp::with_sample();
