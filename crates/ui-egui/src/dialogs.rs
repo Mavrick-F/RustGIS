@@ -1006,6 +1006,9 @@ fn keep_picked(d: &mut Dialogs, [x, y, wkt]: [String; 3]) {
         (d.a, d.b, d.c) = (x, y, String::new());
     } else if w {
         (d.a, d.b, d.c) = (String::new(), String::new(), wkt);
+    } else {
+        // The picks are gone with the old columns, so later defaults may follow the CRS again.
+        d.csv_picked = false;
     }
 }
 
