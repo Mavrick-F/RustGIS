@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const TIMERS: &[&str] = &["sleep", "sleep_until", "park_timeout", "park_timeout_ms", "interval", "interval_at"];
+/// Timer types constructed with `::new(..)`.
+const TIMER_TYPES: &[&str] = &["Delay", "TimeoutFuture"];
 
 /// A token retains its byte offset so diagnostics and exceptions refer to the original line.
 #[derive(Clone, Copy)]
@@ -139,12 +141,17 @@ fn requires_test(predicate: &[&str]) -> bool {
     }
 }
 
-/// Whether an attribute's words make the next item test-only (`cfg`) or a test (`test`, or
-/// `test` applied through `cfg_attr`).
+/// Whether an attribute's words make the next item test-only (`cfg`) or a test: `test`, a
+/// runtime's test attribute (`tokio::test(..)`, `wasm_bindgen_test`), or `test` through `cfg_attr`.
 fn marks_test(words: &[&str]) -> bool {
     let args = || words.get(2..words.len().saturating_sub(1)).unwrap_or_default();
+    let path: Vec<_> = words.iter().take_while(|w| **w != "(").collect();
+    if path.last().is_some_and(|w| **w == "test" || w.ends_with("_test"))
+        && path.iter().all(|w| w.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':'))
+    {
+        return true;
+    }
     match words {
-        ["test"] => true,
         ["cfg", "(", .., ")"] => requires_test(args()),
         ["cfg_attr", "(", .., ")"] => top_level(args()).iter().skip(1).any(|a| a.as_slice() == ["test"]),
         _ => false,
@@ -175,14 +182,21 @@ fn scan(path: &Path, source: &str, whole_test: bool) -> (Vec<String>, Vec<PathBu
     let mut pending_test = false;
     let mut module_path = None;
     let mut aliases: BTreeSet<&str> = TIMERS.iter().copied().collect();
+    let mut types: BTreeSet<&str> = TIMER_TYPES.iter().copied().collect();
     for w in tokens.windows(3) {
         if let [name, as_, alias] = w
-            && aliases.contains(name.text)
             && as_.text == "as"
         {
-            aliases.insert(alias.text);
+            if aliases.contains(name.text) {
+                aliases.insert(alias.text);
+            }
+            if types.contains(name.text) {
+                types.insert(alias.text);
+            }
         }
     }
+    // `(`/`[` depth outside attributes, so a `;` in a signature (`-> [u8; 4]`) doesn't end the item.
+    let mut nesting = 0usize;
     let mut i = 0;
     while let Some(t) = tokens.get(i) {
         let next = |n: usize| tokens.get(i + n).map_or("", |t| t.text);
@@ -235,7 +249,7 @@ fn scan(path: &Path, source: &str, whole_test: bool) -> (Vec<String>, Vec<PathBu
             continue;
         }
         let timer = (aliases.contains(t.text) && next(1) == "(")
-            || (matches!(t.text, "Delay" | "TimeoutFuture") && next(1) == ":" && next(2) == ":" && next(3) == "new" && next(4) == "(");
+            || (types.contains(t.text) && next(1) == ":" && next(2) == ":" && next(3) == "new" && next(4) == "(");
         if in_test && timer && !reasons.contains(&line()) {
             errors.push(format!("{}:{}: timer wait in test: wait on the job's completion or progress signal, not on time; if time is essential, add // test-wait: <reason> on this line", path.display(), line()));
         }
@@ -269,8 +283,12 @@ fn scan(path: &Path, source: &str, whole_test: bool) -> (Vec<String>, Vec<PathBu
                 scopes.pop();
                 pending_test = false;
             }
+            "(" | "[" => nesting += 1,
+            ")" | "]" => nesting = nesting.saturating_sub(1),
             ";" => {
-                pending_test = false;
+                if nesting == 0 {
+                    pending_test = false;
+                }
                 pending_module = None;
                 module_path = None;
             }
@@ -363,6 +381,8 @@ mod tests {
         }
         let text = "use std::thread::{sleep as pause}; #[test] fn check() { pause(d); }";
         assert_eq!(scan(Path::new("src/lib.rs"), text, false).0.len(), 1);
+        let text = "use futures_timer::Delay as Pause; #[test] fn check() { Pause::new(d); }";
+        assert_eq!(scan(Path::new("src/lib.rs"), text, false).0.len(), 1);
         assert!(scan(Path::new("tests/helper.rs"), "rx.recv_timeout(d); cv.wait_timeout(lock, d);", true).0.is_empty());
     }
 
@@ -378,8 +398,12 @@ mod tests {
             #[cfg(any(test, all(test, unix)))] fn only_test() { sleep(d); }
             #[cfg_attr(test, test)] fn conditional() { sleep(d); }
             #[cfg_attr(test, allow(dead_code))] fn allowed() { sleep(d); }
+            #[tokio::test(flavor = "multi_thread")] async fn runtime() { sleep(d); }
+            #[wasm_bindgen_test] fn browser() { sleep(d); }
+            #[test] fn array() -> [u8; 2] { sleep(d); [0; 2] }
+            #[inline] fn inlined() { sleep(d); }
         "#;
-        assert_eq!(scan(Path::new("src/lib.rs"), text, false).0.len(), 4);
+        assert_eq!(scan(Path::new("src/lib.rs"), text, false).0.len(), 7);
         assert_eq!(scan(Path::new("tests/helper.rs"), "fn helper() { sleep(d); }", true).0.len(), 1);
         assert_eq!(scan(Path::new("src/lib.rs"), "#![cfg(test)] fn helper() { sleep(d); }", false).0.len(), 1);
     }
