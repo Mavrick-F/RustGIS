@@ -38,6 +38,22 @@ map are unchanged. The toolbar says how many columns are hidden, and clicking it
 Hiding the column the rows are sorted by clears the sort. The order and hidden columns are kept
 per table until another project is opened, and are not saved in the project.
 
+**Statistics…** in the same menu shows the count, sum, mean, minimum, maximum and standard
+deviation of a number column in a small window, without making a table. With **Selected only** on
+it covers the selected rows, otherwise every row; the window says which. Empty values are counted
+apart, and numbers that aren't finite (NaN, infinity) are left out and counted in a notice. The
+standard deviation is the population one (divided by n), as in Summary Statistics. A column of
+whole numbers is added up exactly, so a sum, minimum or maximum past 2^53 keeps all its digits;
+when a column mixes whole numbers past 2^53 with decimals, a notice says how many were rounded. A
+sum or mean too large for a decimal number is left out, with a notice. A text or date column gives
+its count, distinct values (up to 100,000 entries or 8 MiB of distinct text; beyond either bound, a notice gives the lower bound), and
+first and last in order. The count runs in the background in the desktop app, with progress and
+Cancel. Scripts run `table.statistics` (`"layer"`, `"field"` or `"index"` (the field's zero-based position in dataset order, for columns of the same name; Move Left/Right does not change it), and `"selected"` for the selected rows only), which
+answers the same numbers as JSON. Headless scripts can call it synchronously. In a desktop
+window, use the column menu or a direct attached-MCP command; synchronous script and embedded
+assistant calls are refused rather than holding the window. It changes nothing in the project,
+so there is nothing to undo. Selected-only results close when the selection changes.
+
 A text column's menu also has **Convert to Date** and **Convert to Date and Time**
 (`edit.convertField`, `"type"`: `date` or `datetime`). A dialog lists only presets that read
 every non-empty value, with a few rows showing the result for each format. Choose a format and
@@ -231,7 +247,11 @@ where that map shows it: about 48 km at 84.5°N for an edge from (0°, 80°N) to
 pole is a line in these coordinates, not a point, so Minimum Bounding Geometry of points spread
 around a pole spans their longitudes (a flat polygon with no area, for points on one parallel,
 and the tool says how many hulls have no area), not the cap they
-enclose on the ground. The globe draws a long edge along the great circle between its ends, so near
+enclose on the ground. For the same reason a polygon whose ring goes around a pole without reaching
+it (written all the way round a parallel, say, rather than cut at ±180° and closed along the pole)
+is another shape in these coordinates, a line along that parallel; the overlays, joins, containment,
+zone, buffer and distance tools say how many such rings they read, and in which layers, and leave
+the data as it is. The globe draws a long edge along the great circle between its ends, so near
 a pole it shows a little poleward of where the tools take it: about 850 m at the middle of a 10°
 edge along 88°N (as everywhere, the tools take an edge as straight on the map, not on the globe).
 Beyond 85.05°, the dangle check measures line ends about their pole (on WGS 84's curvature there,
