@@ -342,7 +342,7 @@ pub(crate) fn days_in_month(y: i64, m: i64) -> i64 {
 /// <https://howardhinnant.github.io/date_algorithms.html>).
 ///
 /// `month` is 1 to 12 and `day` is 1 to the month's length; a date that doesn't exist rolls over
-/// (31 February is 3 March) rather than being refused, so check it with [`days_in_month`] first
+/// (31 February is 3 March) rather than being refused, so check it with `days_in_month` first
 /// where that matters. Exact for every year within about ±2.5×10¹⁶ (what an `i64` count of days
 /// holds); beyond that the arithmetic saturates instead of overflowing.
 pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -384,9 +384,12 @@ pub fn http_date(s: &str) -> Option<i64> {
         return None;
     }
     let month = MONTHS.iter().position(|m| *m == month)? as i64 + 1;
-    let (day, year): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
-    // Each field unsigned: a sign isn't a time.
-    let mut hms = time.split(':').map(|p| p.parse::<u8>().ok().map(i64::from));
+    // Each field is up to `n` digits and nothing else: `parse` alone would take a leading `+`.
+    let digits = |p: &str, n: usize| {
+        (!p.is_empty() && p.len() <= n && p.bytes().all(|b| b.is_ascii_digit())).then(|| p.parse::<i64>().ok()).flatten()
+    };
+    let (day, year) = (digits(day, 2)?, digits(year, 4)?);
+    let mut hms = time.split(':').map(|p| digits(p, 2));
     let (h, m, sec) = (hms.next()??, hms.next()??, hms.next()??);
     if !(1..=days_in_month(year, month)).contains(&day)
         || !(1970..=9999).contains(&year)

@@ -455,6 +455,8 @@ mod tests {
         assert_eq!(http_date("Sun, 32 Nov 1994 08:49:37 GMT"), None);
         assert_eq!(http_date("Wed, 31 Feb 2024 00:00:00 GMT"), None, "no 31 February");
         assert_eq!(http_date("Sun, 06 Nov 1994 -8:49:37 GMT"), None, "no negative hour");
+        assert_eq!(http_date("Sun, 06 Nov 1994 +8:49:37 GMT"), None, "no sign on an hour");
+        assert_eq!(http_date("Sun, +6 Nov 1994 08:49:37 GMT"), None, "no sign on a day");
         assert!(http_date("Thu, 29 Feb 2024 00:00:00 GMT").is_some() && http_date("Sat, 29 Feb 2025 00:00:00 GMT").is_none());
         // A refused answer's own header.
         let headers = vec![("Retry-After".to_string(), "12".to_string())];
