@@ -8488,3 +8488,4 @@ mod look_tests {
         assert_eq!(app.ui.web_file, None, "a picked project also goes through open_peer_text");
     }
 }
+// measurement
