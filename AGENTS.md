@@ -40,20 +40,21 @@ is out of scope.
   `progress::check`) and counts its progress. Where progress can't be measured, a busy indicator
   without a count is fine; Cancel is not optional.
 - A command that must run on the UI thread says why in its doc comment.
-- A new background command, or a tool whose work grows with its input, goes in the lists in
-  `crates/engine/src/tests.rs` (`cancel_rasters`, `cancel_exports`, `cancel_tools`), which must
-  match the background registries.
+- A new background raster command or export, or a tool whose work grows with its input, goes in
+  the lists in `crates/engine/src/tests.rs` (`cancel_rasters`, `cancel_exports`, `cancel_tools`),
+  which must match the background registries.
   `long_commands_stop_when_cancelled_while_they_run` fails one that never looks at Cancel;
-  `cancelling_at_each_check_leaves_nothing_behind` cancels it at each check and fails one that
-  leaves the project, its undo steps or the files changed, or can't run again. Passing shows the work looks, not that
+  `cancelling_at_each_check_leaves_nothing_behind` cancels it at its first three checks and its
+  last, and fails one that leaves the project, its undo steps or the files changed, or can't run
+  again (commands that read from the network are left out). Passing shows the work looks, not that
   it looks often: a long step without a check (one union, one read) is said in its doc comment.
 
 ## Use the threads
 Work that splits into independent parts runs on several threads where practical:
 - the same output as one thread, bit for bit; one thread below a size threshold and in the browser;
-- the shared helpers (`parallel::for_each_row`, `try_map`, `try_map_on`), with the thread count
-  from `rustgis_data::threads` (it follows the user's setting) and scratch memory within
-  `memory::thread_scratch`;
+- in `analysis`, the shared helpers (`parallel::for_each_row`, `try_map`, `try_map_on`);
+  everywhere, the thread count from `rustgis_data::threads` (it follows the user's setting) and
+  scratch memory within `memory::thread_scratch`;
 - a thread the OS refuses costs speed, not the run (`Builder::spawn_scoped`).
 
 ## Architecture
