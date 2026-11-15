@@ -46646,9 +46646,16 @@ fn cancelling_at_each_check_leaves_nothing_behind() {
     };
     let mut problems = Vec::new();
     // Each family runs and applies a command as the app does; `adds` is whether a finished run
-    // adds an undo step.
+    // adds an undo step. `fresh` builds the world again before each run, for a command whose
+    // finished run can't be undone and leaves nothing for the next to do (publishing an edit).
     type Attempt<'a> = &'a dyn Fn(&mut Session, &Arc<Control>) -> Result<(), String>;
-    let mut sweep = |s: &mut Session, what: &str, adds: bool, attempt: Attempt| {
+    let mut sweep = |s: &mut Session, what: &str, adds: bool, fresh: bool, attempt: Attempt| {
+        let renew = |s: &mut Session| {
+            if fresh {
+                *s = cancel_world(&dir.0).0;
+            }
+        };
+        renew(s);
         // How many looks a whole run takes.
         let counting = Control::cancelled_at_look(u64::MAX);
         let before = state(s);
@@ -46663,6 +46670,7 @@ fn cancelling_at_each_check_leaves_nothing_behind() {
             }
         }
         for n in (1..=total.min(LOOKS)).chain([total]) {
+            renew(s);
             let (before, held) = (state(s), files());
             let control = Control::cancelled_at_look(n);
             let result = attempt(s, &control);
@@ -46723,7 +46731,7 @@ fn cancelling_at_each_check_leaves_nothing_behind() {
                 }
             }
         };
-        sweep(&mut s, command, true, &attempt);
+        sweep(&mut s, command, true, false, &attempt);
     }
     for (command, p) in cancel_exports(&out, &dem) {
         let attempt = |s: &mut Session, control: &Arc<Control>| {
@@ -46731,7 +46739,7 @@ fn cancelling_at_each_check_leaves_nothing_behind() {
             let started = run.started();
             crate::cmd::exports::export_land(s, started, run.run(control)).map(|_| ())
         };
-        sweep(&mut s, command, false, &attempt);
+        sweep(&mut s, command, false, command == "source.publish", &attempt);
     }
     for (tool, params) in cancel_tools() {
         let attempt = |s: &mut Session, control: &Arc<Control>| {
@@ -46741,7 +46749,7 @@ fn cancelling_at_each_check_leaves_nothing_behind() {
             crate::cmd::gp::tool_complete(s, id, done)?;
             s.run("gp.finish", &json!({"id": id})).map(|_| ())
         };
-        sweep(&mut s, &format!("{tool} {params}"), true, &attempt);
+        sweep(&mut s, &format!("{tool} {params}"), true, false, &attempt);
     }
     assert!(problems.is_empty(), "Cancel left behind:\n{}", problems.join("\n"));
 }
