@@ -45,17 +45,18 @@ is out of scope.
   `cancel_rasters` and `cancel_exports` must match the background registries. A read-ahead command
   (`reads::prepare`, such as `service.layers`) has no list: add its call to the test below by hand.
   `long_commands_stop_when_cancelled_while_they_run` fails one that never looks at Cancel;
-  `cancelling_at_each_check_leaves_nothing_behind` cancels it at its first three checks and its
-  last, and fails one that leaves the project, its undo steps or the files changed, or can't run
-  again (commands that read from the network are left out). Passing shows the work looks, not that
+  `cancelling_at_each_check_leaves_nothing_behind` cancels each command of the three lists at its
+  first three checks and its last, and fails one that leaves the project, its undo steps or the
+  files changed, or can't run again (read-aheads and commands that read from the network are left
+  out). Passing shows the work looks, not that
   it looks often: a long step without a check (one union, one read) is said in its doc comment.
 
 ## Use the threads
 Work that splits into independent parts runs on several threads where practical:
 - the same output as one thread, bit for bit; one thread below a size threshold and in the browser;
 - in `analysis`, the shared helpers (`parallel::for_each_row`, `try_map`, `try_map_on`);
-  everywhere, the thread count from `rustgis_data::threads` (it follows the user's setting) and
-  scratch memory within `memory::thread_scratch`;
+  everywhere, the thread count from `rustgis_data::threads` (it follows the user's setting), never
+  `available_parallelism` or a fixed number, and scratch memory within `memory::thread_scratch`;
 - a thread the OS refuses costs speed, not the run (`Builder::spawn_scoped`).
 
 ## Architecture
@@ -126,7 +127,7 @@ the pull request which of these it reaches and why the rest don't apply:
 ## Quality gates
 `cargo xtask ci` (fmt, clippy -D warnings, tests, layers) before every commit.
 `cargo xtask test-hygiene` (also in CI) requires `// test-wait: reason` on timer waits in tests and
-`#[ignore = "reason"]` on ignored tests; wait on a completion or progress signal instead.
+`#[ignore = "reason"]` on ignored tests; prefer completion or progress signals.
 While you work, `cargo xtask changed` runs the same checks on only the packages your branch changes
 and those that depend on them (and `test-hygiene` on the whole workspace), or everything when a
 changed file such as `Cargo.lock` is outside every package and nothing includes it.
