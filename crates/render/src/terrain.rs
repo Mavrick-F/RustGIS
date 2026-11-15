@@ -9,9 +9,11 @@ use std::sync::Arc;
 use rustgis_data::raster::Raster;
 use rustgis_geom::{Coord, MERCATOR_R};
 use rustgis_map::view::{TerrainEncoding, TerrainSource};
-use rustgis_map::{Camera, Map};
+use rustgis_map::{Camera, Map, Rgba};
 use rustgis_tiles::cache::{self, Payload, State, Want};
 use rustgis_tiles::template::{self, TileId};
+
+mod water;
 
 /// Cells along each side of a tilted view's band laid over the relief while the map moves (the
 /// drape, `tilt_drape` in the app): few enough to lay out every frame.
@@ -91,12 +93,43 @@ enum Heights {
     },
 }
 
+/// A map's block diagram as a frame draws it (#1914, `TerrainBlock`): the box the ground is cut
+/// to (Web Mercator) and the height of its base.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Block {
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+    /// The base's height: metres, exaggerated as [`Ground::height`]'s are.
+    pub base: f64,
+    /// Whether the base is worked out from every height there will be: false while elevation
+    /// tiles are still on their way ([`Ground::pending`]), when the base would move with each one
+    /// that arrives, so the walls wait (the ground is cut all the same).
+    pub settled: bool,
+    pub walls: Rgba,
+}
+
+impl Block {
+    /// Whether the walls stand now: the base is settled and no elevation tile is still on its way.
+    /// A tile asked for after the block was read (the mesh's finer samples, say) can make the
+    /// base move, so `settled` alone is not enough once the ground has been sampled.
+    pub fn walls_stand(&self, ground: &Ground) -> bool {
+        self.settled && !ground.pending()
+    }
+}
+
+/// Points along each side of the grid of heights read for a block's lowest and highest ground.
+const BLOCK_SAMPLES: usize = 64;
+
 /// The ground of a map's terrain, read for one view.
 pub struct Ground {
     heights: Heights,
     exaggeration: f64,
     /// The map's body's ground over the Earth's (#223): heights are metres on it.
     body: f64,
+    /// Water flat at its level over the heights (#1915), when the terrain names a water layer.
+    water: Option<Arc<water::Water>>,
 }
 
 impl Ground {
@@ -104,6 +137,33 @@ impl Ground {
     /// isn't drawn in Web Mercator, which the heights are looked up in), or its DEM layer isn't
     /// there.
     pub fn of(map: &Map, camera: &Camera) -> Option<Ground> {
+        let mut ground = Ground::heights_of(map, camera)?;
+        ground.attach_water(map);
+        Some(ground)
+    }
+
+    /// Sets the water of `map`'s terrain over these heights. A water read while shore tiles were
+    /// on their way, taken again from its cache, leaves these heights pending too: inside its
+    /// lakes no tile is read, and a frame or an export waiting for tiles must still wait for the
+    /// levels to be read again.
+    fn attach_water(&mut self, map: &Map) {
+        self.water = water::of(map, self);
+        if self.water.as_ref().is_some_and(|w| w.waits_for_tiles())
+            && let Heights::Tiles { pending, .. } = &self.heights
+        {
+            *pending.borrow_mut() = true;
+        }
+    }
+
+    /// How many polygons of `map`'s water layer have their shore read at wider steps than half a
+    /// cell of the heights a view of `camera` reads (#1915; see [`Ground::water_coarse`]), from
+    /// their shapes alone: nothing is read, no elevation tile asked for. 0 without water.
+    pub fn water_coarse_unread(map: &Map, camera: &Camera) -> usize {
+        Ground::heights_of(map, camera).map_or(0, |g| water::coarse_shores(map, &g))
+    }
+
+    /// [`Ground::of`] without its water.
+    fn heights_of(map: &Map, camera: &Camera) -> Option<Ground> {
         let t = map.view.terrain.as_ref()?;
         if map.projection != rustgis_map::Projection::WebMercator {
             return None;
@@ -130,20 +190,37 @@ impl Ground {
                 }
             }
         };
-        Some(Ground { heights, exaggeration, body: map.body().ratio() })
+        Some(Ground { heights, exaggeration, body: map.body().ratio(), water: None })
     }
 
-    /// The ground's height (metres, exaggerated) at a Web Mercator point; `None` where nothing
-    /// is known (off the DEM, or no tile read yet).
+    /// The ground's height (metres, exaggerated) at a Web Mercator point: a water body's level
+    /// inside one (#1915); `None` where nothing is known (off the DEM, or no tile read yet).
     pub fn height(&self, m: Coord) -> Option<f64> {
-        let h = match &self.heights {
-            Heights::Raster { raster, wrap_width } => raster_height(raster, m, *wrap_width)?,
-            Heights::Tiles { url, encoding, zoom, read, pending, waiting } => {
-                tile_height(url, *encoding, *zoom, read, pending, waiting, m)?
-            }
-        };
+        let h = self.water.as_ref().and_then(|w| w.level(m)).or_else(|| self.raw_height(m))?;
         let h = h * self.exaggeration;
         h.is_finite().then_some(h)
+    }
+
+    /// The heights' own height (metres, before exaggeration, water left out) at a Web Mercator
+    /// point.
+    fn raw_height(&self, m: Coord) -> Option<f64> {
+        match &self.heights {
+            Heights::Raster { raster, wrap_width } => raster_height(raster, m, *wrap_width),
+            Heights::Tiles { url, encoding, zoom, read, pending, waiting } => tile_height(url, *encoding, *zoom, read, pending, waiting, m),
+        }
+    }
+
+    /// How many polygons of the terrain's water layer have no level, so stay on the ground: no
+    /// height known along their shore and no level given (#1915). 0 without water.
+    pub fn water_unlevelled(&self) -> usize {
+        self.water.as_ref().map_or(0, |w| w.unlevelled)
+    }
+
+    /// How many polygons of the terrain's water layer had their shore read at wider steps than
+    /// half the ground's cell, to keep a long shore's reading bounded: their level may lie a
+    /// little above their lowest shore (#1915). 0 without water.
+    pub fn water_coarse(&self) -> usize {
+        self.water.as_ref().map_or(0, |w| w.coarse)
     }
 
     /// How high the ground stands at `m` in a view of `cam`, in logical pixels at the centre's
@@ -237,6 +314,59 @@ impl Ground {
         Some((along(a, b, c, d).unwrap_or(longer), along(a, c, b, d).unwrap_or(longer)))
     }
 
+    /// The block diagram `map`'s terrain is cut to, when it has one: its box (the DEM's extent
+    /// when none is given; none over elevation tiles then), and its base `depth` metres below the
+    /// lowest ground read in it (on a grid of [`BLOCK_SAMPLES`] cells a side; where a DEM has no
+    /// height, 0, as the ground is drawn there; while elevation tiles are on their way, not
+    /// [`Block::settled`]), or
+    /// half its relief, at least `BLOCK_MIN_DEPTH`, both exaggerated as the heights are.
+    ///
+    /// Elevation tiles are read for it at a zoom the box spans at most two tiles of, so the grid
+    /// asks for a few tiles however large the box: its lowest and highest ground only set the
+    /// base, which a coarser tile serves.
+    pub fn block(&self, map: &Map) -> Option<Block> {
+        let b = map.view.terrain.as_ref()?.block.as_ref()?;
+        let [x0, y0, x1, y1] = match (b.extent, &self.heights) {
+            (Some(e), _) => e,
+            (None, Heights::Raster { raster, .. }) => raster_box(raster)?,
+            (None, Heights::Tiles { .. }) => return None,
+        };
+        let world = 2.0 * std::f64::consts::PI * MERCATOR_R;
+        let coarse = (world / (x1 - x0).max(y1 - y0).max(1e-9)).log2().floor();
+        let coarse = if coarse.is_finite() { coarse.clamp(0.0, f64::from(MAX_TILE_ZOOM)) as u8 } else { 0 };
+        let sample = |m: Coord| match &self.heights {
+            Heights::Raster { .. } => self.height(m),
+            Heights::Tiles { url, encoding, zoom, read, pending, waiting } => {
+                let h = tile_height(url, *encoding, coarse.min(*zoom), read, pending, waiting, m)? * self.exaggeration;
+                h.is_finite().then_some(h)
+            }
+        };
+        let n = BLOCK_SAMPLES as f64;
+        let (mut lo, mut hi, mut missing) = (f64::INFINITY, f64::NEG_INFINITY, false);
+        for (i, j) in (0..=BLOCK_SAMPLES).flat_map(|j| (0..=BLOCK_SAMPLES).map(move |i| (i as f64, j as f64))) {
+            match sample(Coord::new(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * j / n)) {
+                Some(h) => (lo, hi) = (lo.min(h), hi.max(h)),
+                None => missing = true,
+            }
+        }
+        // Elevation tiles still on their way: the base would move with each one that arrives.
+        let settled = !self.pending();
+        // Ground with no height (a DEM's nodata or ground off it, a tile that failed) is drawn at
+        // 0 (`up_px`): once settled, the base goes below it too.
+        if missing && settled {
+            lo = lo.min(0.0);
+        }
+        if lo > hi {
+            hi = lo.min(0.0);
+            lo = hi;
+        }
+        let depth = match b.depth {
+            Some(d) => d * self.exaggeration,
+            None => (0.5 * (hi - lo)).max(rustgis_map::view::BLOCK_MIN_DEPTH * self.exaggeration),
+        };
+        Some(Block { x0, y0, x1, y1, base: lo - depth, settled, walls: b.walls })
+    }
+
     /// Whether elevation tiles are still on their way (drawing again later shows more).
     pub fn pending(&self) -> bool {
         match &self.heights {
@@ -244,6 +374,43 @@ impl Ground {
             Heights::Tiles { pending, .. } => *pending.borrow(),
         }
     }
+}
+
+/// The largest north-up Web Mercator box inside a DEM's corners, near enough (the second
+/// smallest and second largest of their x and of their y): its whole extent for a DEM in
+/// geographic or Web Mercator coordinates, a little less for one turned a little by its
+/// projection (UTM). `None` when a corner can't be placed.
+pub fn raster_box(r: &Raster) -> Option<[f64; 4]> {
+    let (xs, ys) = raster_corners(r)?;
+    let b = [xs[1], ys[1], xs[2], ys[2]];
+    (b.iter().all(|v| v.is_finite()) && b[0] < b[2] && b[1] < b[3]).then_some(b)
+}
+
+/// The outer bounds of a DEM's footprint, its four corners' extremes (Web Mercator, `[xmin, ymin,
+/// xmax, ymax]`): every height the DEM gives lies inside them, so a box outside them misses it
+/// altogether, where a box can still reach its corners and miss [`raster_box`]. `None` when a
+/// corner can't be placed.
+pub fn raster_footprint(r: &Raster) -> Option<[f64; 4]> {
+    let (xs, ys) = raster_corners(r)?;
+    let b = [xs[0], ys[0], xs[3], ys[3]];
+    (b.iter().all(|v| v.is_finite()) && b[0] < b[2] && b[1] < b[3]).then_some(b)
+}
+
+/// The x and the y of a DEM's four corners in Web Mercator, each sorted; `None` when a corner
+/// can't be placed.
+fn raster_corners(r: &Raster) -> Option<([f64; 4], [f64; 4])> {
+    let gt = &r.transform;
+    let (w, h) = (gt.pixel_width * f64::from(r.width), gt.pixel_height * f64::from(r.height));
+    let t = r.transformer();
+    let mut xs = [0.0; 4];
+    let mut ys = [0.0; 4];
+    for (k, (dx, dy)) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)].into_iter().enumerate() {
+        let m = rustgis_geom::lonlat_to_merc(t.to_lonlat(Coord::new(gt.origin_x + dx, gt.origin_y + dy))?);
+        (xs[k], ys[k]) = (m.x, m.y);
+    }
+    xs.sort_by(f64::total_cmp);
+    ys.sort_by(f64::total_cmp);
+    Some((xs, ys))
 }
 
 /// A DEM's height at a Web Mercator point, read bilinearly from its first band; nodata and
@@ -377,7 +544,100 @@ mod tests {
         let data = [0.0, 10.0, 20.0, 30.0].repeat(3);
         let raster = Arc::new(Raster::new("heights", 4, 3, vec![data], gt, crs, nodata, ColorHint::Gray, "Float32").unwrap());
         let wrap_width = crate::raster::full_turn_width(&raster);
-        Ground { heights: Heights::Raster { raster, wrap_width }, exaggeration: 1.0, body: 1.0 }
+        Ground { heights: Heights::Raster { raster, wrap_width }, exaggeration: 1.0, body: 1.0, water: None }
+    }
+
+    #[test]
+    fn a_blocks_base_goes_below_the_nodata_drawn_at_zero() {
+        // #1914: ground 5000 m high beside nodata (drawn at 0): the base is 1000 m below 0, not
+        // below 5000 m, so the walls still go down.
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 100.0, pixel_width: 100.0, pixel_height: -100.0 };
+        let raster =
+            Raster::new("dem", 2, 1, vec![vec![5000.0, -9999.0]], gt, Crs::WebMercator, Some(-9999.0), ColorHint::Gray, "Float32").unwrap();
+        let mut m = Map::new("Map");
+        m.add_raster("dem", rustgis_map::RasterLayer::from_path(raster, "dem.tif"));
+        let block = rustgis_map::view::TerrainBlock {
+            extent: Some([0.0, 0.0, 200.0, 100.0]),
+            depth: Some(1000.0),
+            walls: rustgis_map::view::BLOCK_WALLS,
+        };
+        m.view.terrain = Some(rustgis_map::view::Terrain {
+            source: rustgis_map::view::TerrainSource::Layer("dem".into()),
+            exaggeration: 1.0,
+            block: Some(block),
+            water: None,
+        });
+        let camera = Camera { center: Coord::new(100.0, 50.0), res: 1.0, bearing: 0.0, pitch: 60.0 };
+        let b = Ground::of(&m, &camera).and_then(|g| g.block(&m)).expect("a block");
+        assert!((b.base + 1000.0).abs() < 1e-6, "{}", b.base);
+    }
+
+    #[test]
+    fn a_blocks_walls_wait_for_elevation_tiles_on_their_way() {
+        // #1914: over elevation tiles, the base isn't settled while tiles are on their way (it
+        // would move with each); once none is, a tile that failed counts as 0, as it's drawn.
+        let mut read = HashMap::new();
+        for z in 0..=2u8 {
+            for x in 0..(1u32 << z) {
+                for y in 0..(1u32 << z) {
+                    read.insert(TileId { z, x, y }, None);
+                }
+            }
+        }
+        let ground = |pending: bool| Ground {
+            heights: Heights::Tiles {
+                url: "https://example.invalid/{z}/{x}/{y}.png".into(),
+                encoding: TerrainEncoding::Terrarium,
+                zoom: 2,
+                read: RefCell::new(read.clone()),
+                pending: RefCell::new(pending),
+                waiting: RefCell::new(std::collections::HashSet::new()),
+            },
+            exaggeration: 1.0,
+            body: 1.0,
+            water: None,
+        };
+        let mut m = Map::new("Map");
+        let block = rustgis_map::view::TerrainBlock {
+            extent: Some([0.0, 0.0, 5000.0, 5000.0]),
+            depth: Some(300.0),
+            walls: rustgis_map::view::BLOCK_WALLS,
+        };
+        m.view.terrain = Some(rustgis_map::view::Terrain {
+            source: rustgis_map::view::TerrainSource::Tiles {
+                url: "https://example.invalid/{z}/{x}/{y}.png".into(),
+                encoding: TerrainEncoding::Terrarium,
+            },
+            exaggeration: 1.0,
+            block: Some(block),
+            water: None,
+        });
+        let waiting = ground(true).block(&m).expect("a block");
+        assert!(!waiting.settled);
+        let done = ground(false).block(&m).expect("a block");
+        assert!(done.settled && (done.base + 300.0).abs() < 1e-6, "{done:?}");
+        // The block read from cached tiles, then finer mesh samples asking for tiles on their way:
+        // the walls wait again, though the base was settled when it was read.
+        let flat = ground(false);
+        let cached = flat.block(&m).expect("a block");
+        assert!(cached.walls_stand(&flat));
+        if let Heights::Tiles { pending, .. } = &flat.heights {
+            *pending.borrow_mut() = true;
+        }
+        assert!(cached.settled && !cached.walls_stand(&flat));
+    }
+
+    #[test]
+    fn a_turned_dems_footprint_reaches_past_its_box() {
+        // A UTM DEM 200 km west of its central meridian is turned by its projection in Web
+        // Mercator: its footprint (the outer bounds of its corners) reaches past the largest box
+        // inside them, where a box given by the user may still reach its corners.
+        let gt = GeoTransform { origin_x: 300_000.0, origin_y: 5_000_000.0, pixel_width: 1000.0, pixel_height: -1000.0 };
+        let utm = Crs::from_epsg(32633).unwrap();
+        let raster = Raster::new("dem", 100, 100, vec![vec![0.0; 10_000]], gt, utm, None, ColorHint::Gray, "Float32").unwrap();
+        let (b, f) = (raster_box(&raster).expect("a box"), raster_footprint(&raster).expect("a footprint"));
+        assert!(f[0] <= b[0] && f[1] <= b[1] && b[2] <= f[2] && b[3] <= f[3], "{f:?} {b:?}");
+        assert!(f != b, "{f:?}");
     }
 
     #[test]
@@ -470,7 +730,7 @@ mod tests {
         let raster = Arc::new(
             Raster::new("heights", 400, 400, vec![vec![0.0; 160_000]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap(),
         );
-        let ground = Ground { heights: Heights::Raster { raster, wrap_width: None }, exaggeration: 1.0, body: 1.0 };
+        let ground = Ground { heights: Heights::Raster { raster, wrap_width: None }, exaggeration: 1.0, body: 1.0, water: None };
         let band = |deg: f64| {
             let (s, c) = deg.to_radians().sin_cos();
             [(-20_000.0, 5_000.0), (20_000.0, 5_000.0), (-20_000.0, -5_000.0), (20_000.0, -5_000.0)]
@@ -500,7 +760,7 @@ mod tests {
         let raster = Arc::new(
             Raster::new("heights", 400, 400, vec![vec![0.0; 160_000]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap(),
         );
-        let tall = Ground { heights: Heights::Raster { raster, wrap_width: None }, exaggeration: 1.0, body: 1.0 };
+        let tall = Ground { heights: Heights::Raster { raster, wrap_width: None }, exaggeration: 1.0, body: 1.0, water: None };
         let (cols, rows) = tall.cells_across(&band(45.0)).unwrap();
         let (x, y) = tall.cells_along(&band(45.0)).unwrap();
         // Across: direction (28.3, -2.83) on the grid; down: (7.07, 0.71), each normalised.
@@ -536,7 +796,7 @@ mod tests {
             let gt = GeoTransform { origin_x: west, origin_y: 90.0, pixel_width: 1.0, pixel_height: -60.0 };
             let raster =
                 Arc::new(Raster::new("heights", 10, 3, vec![vec![0.0; 30]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap());
-            Ground { heights: Heights::Raster { raster, wrap_width: None }, exaggeration: 1.0, body: 1.0 }
+            Ground { heights: Heights::Raster { raster, wrap_width: None }, exaggeration: 1.0, body: 1.0, water: None }
         };
         let east_of_seam = regional(-180.0).cells_across(&[at(170.0, 30.0), at(186.0, 30.0)]).unwrap().0;
         assert!((east_of_seam - 6.0).abs() < 1e-6, "{east_of_seam}");
@@ -554,6 +814,7 @@ mod tests {
             },
             exaggeration: 1.0,
             body: 1.0,
+            water: None,
         };
         let half = std::f64::consts::PI * MERCATOR_R;
         let world = tiles.cells_across(&[Coord::new(-2.0 * half, half), Coord::new(2.0 * half, -half)]).unwrap();

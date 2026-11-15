@@ -19,6 +19,7 @@ import java.util.ArrayList;
  *
  * An event is one string, its fields separated by tabs:
  *   picked    purpose  name  path    a chosen file, copied to the app's storage
+ *   ended     purpose               a request whose every file failed to be copied
  *   cancelled                        a picker closed without a choice
  *   saved     name                   a file written where the user chose
  *   position  lon  lat  accuracy  time   where the device is (accuracy in metres, or empty;
@@ -611,15 +612,57 @@ public class MainActivity extends NativeActivity {
             final String purpose = this.purpose;
             // Copied off the main thread: a document can be large, or come from the network.
             new Thread(() -> {
-                // One folder for what was picked together, and for nothing else: a file that is
-                // read with the one beside it (a .mif and its .mid) finds it, and a later pick of
-                // the same name can't replace a file the session has open.
+                // One folder for what was picked together, and for nothing else, with a folder of
+                // its own for each folder the documents came from: a file read with the one beside
+                // it (a .shp and its .dbf) finds that one, not one of the same name picked from
+                // elsewhere, and a later pick can't replace a file the session has open.
                 File dir = new File(new File(getFilesDir(), "picked"), Long.toString(System.nanoTime()));
+                ArrayList<String> sources = new ArrayList<>();
+                // A provider whose ids name no folder for any of the documents picked (the
+                // Downloads provider gives a numeric id to a download and a path to other files,
+                // both in one folder) keeps all its documents of the pick together, as one folder.
+                java.util.HashSet<String> folderless = new java.util.HashSet<>();
+                for (Uri uri : uris) {
+                    if (sourceFolder(uri) == null) {
+                        folderless.add(String.valueOf(uri.getAuthority()));
+                    }
+                }
+                int copies = 0;
+                // The pick's folder is marked while documents are copied into it, for the whole
+                // pick: Remove Unused Copies keeps it, also between two documents (the name is
+                // rustgis_ui_touch::COPYING).
+                File mark = new File(dir, ".copying");
                 try {
+                    if (dir.mkdirs()) {
+                        try {
+                            mark.createNewFile();
+                        } catch (java.io.IOException e) {
+                            // Unmarked, the pick is still kept while a copy's .part is in it.
+                        }
+                    }
                     for (Uri uri : uris) {
-                        copyIn(purpose, uri, dir);
+                        String folder = sourceFolder(uri);
+                        String authority = String.valueOf(uri.getAuthority());
+                        String source = authority + "|" + (folder == null || folderless.contains(authority) ? "" : folder);
+                        int k = sources.indexOf(source);
+                        if (k < 0) {
+                            sources.add(source);
+                            k = sources.size() - 1;
+                        }
+                        if (copyIn(purpose, uri, new File(dir, Integer.toString(k)))) {
+                            copies++;
+                        }
                     }
                 } finally {
+                    mark.delete();
+                    // Nothing copied (each failure said): this request ends, by name, as another
+                    // may have been asked for meanwhile (Import DXF stops waiting).
+                    if (copies == 0) {
+                        // Every copy failed, each removing its own file and folder: this one is
+                        // empty too.
+                        dir.delete();
+                        add("ended\t" + purpose);
+                    }
                     answered();
                 }
             }).start();
@@ -653,20 +696,52 @@ public class MainActivity extends NativeActivity {
         }
     }
 
-    /** Copies a picked document into the app's storage, where the Rust side can open it by path. */
-    private void copyIn(String purpose, Uri uri, File dir) {
+    /**
+     * The folder a picked document is in, as far as its provider's id says: the part of the
+     * document id before the last "/" (the device's storage gives "primary:Download/roads.shp"),
+     * the volume itself for a file at the root of the device's storage ("primary:roads.shp"), or
+     * null when the id names no folder (a numeric id, "msf:42").
+     */
+    private static String sourceFolder(Uri uri) {
+        String id;
+        try {
+            id = android.provider.DocumentsContract.getDocumentId(uri);
+        } catch (RuntimeException e) {
+            id = uri.getPath() == null ? "" : uri.getPath();
+        }
+        int slash = id.lastIndexOf('/');
+        if (slash >= 0) {
+            return id.substring(0, slash);
+        }
+        int colon = id.indexOf(':');
+        if ("com.android.externalstorage.documents".equals(uri.getAuthority()) && colon >= 0) {
+            return id.substring(0, colon + 1);
+        }
+        return null;
+    }
+
+    /**
+     * Copies a picked document into the app's storage, where the Rust side can open it by path.
+     * Returns whether it was copied.
+     */
+    private boolean copyIn(String purpose, Uri uri, File dir) {
         String name = displayName(uri);
         File file = new File(dir, name);
         // Two documents of one name picked together (from two folders) both keep their bytes.
         for (int n = 2; file.exists(); n++) {
             file = new File(dir, n + "-" + name);
         }
+        // Written under a name of its own, made for this copy alone (".part"), and renamed once
+        // whole: Remove Unused Copies keeps a pick holding one, so a copy being written is never
+        // taken for unused, and no document of the pick is written over.
+        File part = null;
         try {
             if (!dir.isDirectory() && !dir.mkdirs()) {
                 throw new java.io.IOException("the app's storage can't be written to");
             }
+            part = File.createTempFile(".copy-", ".part", dir);
             try (InputStream in = getContentResolver().openInputStream(uri);
-                    OutputStream out = new FileOutputStream(file)) {
+                    OutputStream out = new FileOutputStream(part)) {
                 if (in == null) {
                     throw new java.io.IOException("it can't be read");
                 }
@@ -675,14 +750,21 @@ public class MainActivity extends NativeActivity {
                     out.write(buffer, 0, n);
                 }
             }
+            if (!part.renameTo(file)) {
+                throw new java.io.IOException("the copy couldn't be given its name");
+            }
             // The copy's own name: a second document of one name is told from the first.
             add("picked\t" + purpose + "\t" + file.getName() + "\t" + file.getAbsolutePath());
+            return true;
         } catch (Throwable e) {
             // Half a copy would only fill the storage: nothing reports its path to remove it later.
             // (The folder goes only once it is empty.)
-            file.delete();
+            if (part != null) {
+                part.delete();
+            }
             dir.delete();
             add("failed\t" + name + " wasn't opened: " + e.getMessage());
+            return false;
         }
     }
 
