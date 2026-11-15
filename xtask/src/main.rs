@@ -1,12 +1,14 @@
-//! `cargo xtask ci | changed [--list] [base] | layers | test-hygiene | notices [--check] | web-pwa <dir>`
+//! `cargo xtask ci | changed [--list] [base] | layers | test-hygiene | notices [--check] | schema [--check] | web-pwa <dir>`
 //!
 //! - `layers`: enforces the crate layering (nothing below L6 may depend on egui/eframe/rfd).
 //! - `test-hygiene`: timer waits in tests need same-line reasons; ignored tests need reasons.
-//! - `ci`: test hygiene, fmt check, clippy -D warnings, tests and the layer check.
+//! - `ci`: test hygiene, fmt, clippy -D warnings, tests, layering and the project schema check.
 //! - `changed [--list] [base]`: the same, on only the packages a branch changes and those that
 //!   depend on them (see `changed.rs`).
 //! - `notices [--check]`: writes the third-party licence notices the packages ship (see
 //!   `notices.rs`), or checks they are up to date (exit code 2 when they are not).
+//! - `schema [--check]`: writes the project file's JSON Schema (`schema/project.schema.json`)
+//!   from the types it is saved from, or checks it is up to date and the fixture projects open.
 //! - `web-pwa <dir>`: writes the web app's service worker into a `trunk build` output directory
 //!   (`dist/web`) from the template `apps/rustgis-web/sw.js`, listing the built files to cache.
 
@@ -69,14 +71,15 @@ fn cargo(args: &[&str]) -> Result<(), String> {
     if st.success() { Ok(()) } else { Err(format!("cargo {} failed", args.join(" "))) }
 }
 
-/// `cargo xtask ci`: test hygiene, fmt, clippy with warnings as errors, tests and layering,
-/// on the whole workspace.
+/// `cargo xtask ci`: test hygiene, fmt, clippy with warnings as errors, tests, layering and the
+/// project schema check, on the whole workspace.
 fn ci() -> Result<(), String> {
     test_hygiene::run(&root())?;
     cargo(&["fmt", "--all", "--check"])
         .and_then(|_| cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))
         .and_then(|_| cargo(&["test", "--workspace", "-q"]))
         .and_then(|_| layers())
+        .and_then(|_| schema(true))
 }
 
 /// Files in a web build the service worker must not cache: itself, the GitHub Pages
@@ -160,6 +163,36 @@ fn web_pwa(dir: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Writes the project file's JSON Schema from the types it is saved from (`schema/`), or with
+/// `check` fails when the committed one is out of date or a fixture project doesn't open, after
+/// linting the code behind the `schema` feature, which the workspace's clippy run leaves out.
+/// (CI's "Project schema" job also validates the fixtures against the schema with
+/// `check-jsonschema`.)
+fn schema(check: bool) -> Result<(), String> {
+    let mut args = vec!["run", "-q", "-p", "rustgis-engine", "--features", "schema", "--example", "project_schema"];
+    if check {
+        cargo(&[
+            "clippy",
+            "--locked",
+            "-p",
+            "rustgis-geom",
+            "-p",
+            "rustgis-data",
+            "-p",
+            "rustgis-engine",
+            "--features",
+            "rustgis-engine/schema",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])?;
+        // A Cargo.lock out of date with the manifests fails here too.
+        args.extend(["--locked", "--", "--check"]);
+    }
+    cargo(&args)
+}
+
 fn main() -> ExitCode {
     let task = std::env::args().nth(1).unwrap_or_default();
     let r = match task.as_str() {
@@ -184,8 +217,13 @@ fn main() -> ExitCode {
                 }
             };
         }
+        "schema" => match std::env::args().nth(2).as_deref() {
+            None => schema(false),
+            Some("--check") => schema(true),
+            Some(other) => Err(format!("unknown argument {other}: usage: cargo xtask schema [--check]")),
+        },
         "web-pwa" => web_pwa(std::env::args().nth(2)),
-        _ => Err("usage: cargo xtask ci | changed [--list] [base] | layers | test-hygiene | notices [--check] | web-pwa <dir>".into()),
+        _ => Err("usage: cargo xtask ci | changed [--list] [base] | layers | test-hygiene | notices [--check] | schema [--check] | web-pwa <dir>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
