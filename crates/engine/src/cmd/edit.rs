@@ -1078,23 +1078,31 @@ struct LayerDates {
     result: Result<(Dataset, Json, Vec<crate::Notice>), String>,
 }
 
-/// Runs the normal handler on an isolated map copy. Parsing and the first shared-row copy are
-/// off frame; Cancel is checked between rows. No outside effects are performed.
+/// Captures shared rows only; the worker uses an isolated table session. Layer schema
+/// consumers are checked before capture and again at landing, without cloning edit archives.
 fn layer_dates_ahead(s: &Session, p: &Json) -> Result<super::reads::ReadWork, String> {
     let id = s.layer_id(p)?;
     let layer = s.map().layer(id).ok_or("no layer")?;
+    let fi = field_of(s, Target::Layer(id), ps(p, "field").ok_or("field is required")?)?;
+    let ty = match ps(p, "type").unwrap_or("").to_ascii_lowercase().as_str() {
+        "date" => FieldType::Date,
+        "datetime" | "date-time" | "timestamp" => FieldType::DateTime,
+        _ => return Err("type must be date or datetime".into()),
+    };
+    check_layer_dates(s, id, fi, ty)?;
     let (opened, instance, input) = (s.opened, layer.instance_id(), layer.dataset.clone());
-    let (map, p) = (s.map().clone(), p.clone());
+    let (dataset, mut p) = (input.clone(), p.clone());
     Ok(super::reads::ahead("Convert Field", "edit.convertField".into(), move || {
         let result = (|| {
             rustgis_data::progress::begin(0);
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
             let mut copy = Session::new(crate::Project::default());
-            *copy.map_mut() = map;
-            copy.active_layer = Some(id);
+            let table = copy.project.put_table(dataset);
+            p.as_object_mut().ok_or("parameters must be an object")?.remove("layer");
+            p["table"] = json!(table);
             let answer = convert_field(&mut copy, &p)?;
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
-            let output = copy.map().layer(id).ok_or("no layer")?.dataset.clone();
+            let output = copy.project.table(table).ok_or("no table")?.dataset.clone();
             Ok((output, answer, copy.notices))
         })();
         LayerDates { opened, id, instance, input, result }

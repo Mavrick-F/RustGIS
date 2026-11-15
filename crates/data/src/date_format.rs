@@ -82,20 +82,16 @@ impl DateFormat {
         match self.format.as_str() {
             "iso" => return DateTime::parse_rounding(text),
             "excel1900" | "excel1904" => {
-                let serial: f64 = text.parse().ok()?;
-                let (serial, epoch) = if self.format == "excel1904" {
-                    (serial, i64::from(Date::from_ymd(1904, 1, 1)?.days()))
+                let (whole, micros, rounded) = decimal_days(text)?;
+                let epoch = if self.format == "excel1904" {
+                    i64::from(Date::from_ymd(1904, 1, 1)?.days())
                 } else {
-                    if serial.floor() == 60.0 {
+                    if whole == 60 {
                         return None;
                     }
-                    (serial + if serial < 60.0 { 1.0 } else { 0.0 }, -25_569)
+                    -25_569 + i64::from(whole < 60)
                 };
-                let (time, rounded) = crate::date::serial_datetime(serial, epoch)?;
-                // Parsing the number, or shifting the early 1900 epoch, can erase a tiny
-                // fraction before serial_datetime sees it. A date still needs exact midnight.
-                let rounded = rounded || (time.is_date() && serial_has_fraction(text)?);
-                return Some((time, rounded));
+                return DateTime::local(epoch.checked_mul(DAY_US)?.checked_add(micros)?).map(|t| (t, rounded));
             }
             _ => {}
         }
@@ -168,19 +164,73 @@ impl DateFormat {
     }
 }
 
-/// Whether a decimal day number is non-integral as written, before binary floating-point
-/// rounding. Compare its decimal scale with its trailing zeros, including scientific notation.
-fn serial_has_fraction(text: &str) -> Option<bool> {
+const DAY_US: i64 = 86_400_000_000;
+
+/// Multiply decimal digits exactly before rounding to microseconds. Storage grows only with
+/// the input, never with its exponent. Negative half-microseconds round toward later time,
+/// matching the existing serial-date reader. The original floor identifies the fictitious day 60.
+fn decimal_days(text: &str) -> Option<(i64, i64, bool)> {
     let (mantissa, exponent) = match text.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().ok()?),
+        Some((m, e)) => (m, e.parse::<i64>().ok()?),
         None => (text, 0),
     };
-    if !mantissa.bytes().any(|b| matches!(b, b'1'..=b'9')) {
-        return Some(false);
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.strip_prefix(['-', '+']).unwrap_or(mantissa);
+    let mut dot = false;
+    let mut decimals = 0i128;
+    let mut digits = Vec::new();
+    for b in mantissa.bytes() {
+        if b == b'.' && !dot {
+            dot = true;
+            continue;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        decimals += i128::from(dot);
+        digits.push(b - b'0');
     }
-    let decimals = mantissa.split_once('.').map_or(0, |(_, digits)| digits.len());
-    let zeros = mantissa.bytes().rev().filter(|&b| b != b'.').take_while(|&b| b == b'0').count();
-    Some(i128::try_from(decimals).ok()? - i128::from(exponent) > i128::try_from(zeros).ok()?)
+    if digits.is_empty() {
+        return None;
+    }
+    digits.reverse();
+    let mut carry = 0i64;
+    for digit in &mut digits {
+        let product = i64::from(*digit) * DAY_US + carry;
+        *digit = (product % 10) as u8;
+        carry = product / 10;
+    }
+    while carry > 0 {
+        digits.push((carry % 10) as u8);
+        carry /= 10;
+    }
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        return Some((0, 0, false));
+    }
+    let scale = decimals - i128::from(exponent);
+    // More than 18 integer digits cannot fit a supported date, including negative dates.
+    if i128::try_from(digits.len()).ok()? - scale > 18 {
+        return None;
+    }
+    let split = usize::try_from(scale.max(0)).unwrap_or(usize::MAX).min(digits.len());
+    let mut micros = 0i64;
+    for &digit in digits.get(split..)?.iter().rev() {
+        micros = micros.checked_mul(10)?.checked_add(i64::from(digit))?;
+    }
+    if scale < 0 {
+        micros = micros.checked_mul(10i64.checked_pow(u32::try_from(-scale).ok()?)?)?;
+    }
+    let remainder = digits.get(..split)?;
+    let rounded = remainder.iter().any(|&d| d != 0);
+    let half = if scale > i128::try_from(digits.len()).ok()? { 0 } else { remainder.last().copied().unwrap_or(0) };
+    let above_half = half > 5 || (half == 5 && remainder.iter().rev().skip(1).any(|&d| d != 0));
+    let whole = if negative { -micros / DAY_US - i64::from(micros % DAY_US != 0 || rounded) } else { micros / DAY_US };
+    let up = above_half || (!negative && half == 5);
+    micros = micros.checked_add(i64::from(up))?;
+    Some((whole, if negative { -micros } else { micros }, rounded))
 }
 
 /// Dialog presets: human-readable labels and command patterns. Both date orders stay choices.
@@ -263,19 +313,27 @@ mod tests {
             ("excel1900", "1", "1900-01-01T00:00:00"),
             ("excel1900", "59", "1900-02-28T00:00:00"),
             ("excel1900", "61", "1900-03-01T00:00:00"),
+            ("excel1900", "45000.1", "2023-03-15T02:24:00"),
             ("excel1900", "25569.5", "1970-01-01T12:00:00"),
             ("excel1904", "0", "1904-01-01T00:00:00"),
             ("excel1904", "24107.5", "1970-01-01T12:00:00"),
         ] {
             let f = DateFormat::new(format, None).unwrap();
-            assert_eq!(f.parse(serial, FieldType::DateTime).0.to_string(), expected);
+            let (value, rounded) = f.parse(serial, FieldType::DateTime);
+            assert_eq!(value.to_string(), expected);
+            assert!(!rounded, "{serial}");
         }
         let f = DateFormat::new("excel1900", None).unwrap();
         for bad in ["60", "60.5", "NaN", "inf", "1e100", "2958466"] {
             assert!(f.parse(bad, FieldType::DateTime).0.is_null(), "{bad}");
         }
         assert!(f.parse("25569.5", FieldType::Date).0.is_null());
-        for (format, text) in [("excel1900", "25569.0000000000000001"), ("excel1900", "0.00000000000000000001"), ("excel1904", "1e-400")] {
+        for (format, text) in [
+            ("excel1900", "45000.5000000000001"),
+            ("excel1900", "25569.0000000000000001"),
+            ("excel1900", "0.00000000000000000001"),
+            ("excel1904", "1e-400"),
+        ] {
             let reader = DateFormat::new(format, None).unwrap();
             assert!(reader.parse(text, FieldType::Date).0.is_null(), "{text} wasn't exact midnight");
             let (value, rounded) = reader.parse(text, FieldType::DateTime);

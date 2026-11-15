@@ -208,7 +208,11 @@ pub(super) fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 dialog.params["pivotYear"] = json!(dialog.pivot);
             }
             let mark = app.session.notice_mark();
-            if let Err(e) = app.run("edit.convertField", dialog.params.clone())
+            #[cfg(not(target_arch = "wasm32"))]
+            let result = crate::readjob::run_date_preview(app, dialog.params.clone(), dialog.dataset.clone());
+            #[cfg(target_arch = "wasm32")]
+            let result = app.run("edit.convertField", dialog.params.clone());
+            if let Err(e) = result
                 && app.session.notices_since(mark).is_empty()
             {
                 app.session.notify(e, true);
@@ -223,6 +227,33 @@ pub(super) fn show(app: &mut RustGisApp, ctx: &egui::Context) {
 mod tests {
     use super::*;
     use egui_kittest::kittest::{NodeT, Queryable};
+
+    /// A read-in-place view is a sample, never evidence for the whole-column preview.
+    #[test]
+    fn date_dialog_refuses_streamed_layer_before_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dates.geojson");
+        std::fs::write(&path, r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"opened":"03/05/2026"},"geometry":{"type":"Point","coordinates":[8,47]}}]}"#).unwrap();
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let id = app.run("layer.addData", json!({"path":path, "stream":true})).unwrap()["layer"].as_u64().unwrap();
+        app.run("table.open", json!({"layer":id})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        h.get_by_label("opened").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Convert to Date").click();
+        h.run_steps(3);
+        assert!(h.state().table.dates.is_none());
+        assert!(h.state().session.notices.iter().any(|n| n.text.contains("Load All Features")));
+        assert!(h.state().session.map().layer(id as u32).unwrap().is_streamed());
+    }
 
     /// Drives the real column menu and dialog: ambiguous formats stay unselected, Cancel leaves
     /// text intact, and the chosen order is the command's order and one undo step.

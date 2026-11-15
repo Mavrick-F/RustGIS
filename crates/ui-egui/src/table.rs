@@ -571,8 +571,13 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             if let Some((i, ty)) = convert
                 && let Some(fd) = ds.fields.get(i)
             {
-                app.table.dates =
-                    Some(dates::Dialog::new(key, table_instance, ds.clone(), i, ty, target(json!({"field": fd.name, "type": ty}))));
+                let params = target(json!({"field": fd.name, "type": ty}));
+                if is_layer && layer_id.and_then(|id| app.session.map().layer(id)).is_some_and(|l| l.is_streamed()) {
+                    // Use the ordinary command admission refusal before scanning a view sample.
+                    let _ = app.run("edit.convertField", params);
+                } else {
+                    app.table.dates = Some(dates::Dialog::new(key, table_instance, ds.clone(), i, ty, params));
+                }
             }
             if by_other_name {
                 app.session.notify(shadowed().to_string(), true);
