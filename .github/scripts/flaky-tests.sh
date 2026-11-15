@@ -9,8 +9,8 @@ set -euo pipefail
 report="${1:?usage: flaky-tests.sh <junit.xml>}"
 [ -f "$report" ] || exit 0
 
-# A flaky test is a <testcase> with a <flakyFailure> inside it; the failed attempts' output in the
-# report is escaped, so a `<testcase` on a line is always a test's own.
+# A flaky test is a <testcase> with a <flakyFailure> or <flakyError> inside it; the failed
+# attempts' output in the report is escaped, so a `<testcase` on a line is always a test's own.
 awk '
   function attr(line, name,    m) {
     if (match(line, " " name "=\"[^\"]*\"") == 0) return ""
@@ -18,6 +18,6 @@ awk '
     return m
   }
   /<testcase / { test = attr($0, "classname") " " attr($0, "name") }
-  /<flakyFailure/ { if (test != "") flaky[test] = 1 }
+  /<flaky(Failure|Error)/ { if (test != "") flaky[test] = 1 }
   END { for (t in flaky) print t }
 ' "$report" | sort

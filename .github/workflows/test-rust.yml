@@ -101,7 +101,7 @@ jobs:
       # ci.yml's `flaky` job reads these on a push to main. The nightly run and pull requests only
       # show the summary.
       - name: Keep the flaky tests' names
-        if: steps.flaky.outputs.found == 'true' && github.event_name == 'push'
+        if: ${{ !cancelled() && steps.flaky.outputs.found == 'true' && github.event_name == 'push' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: flaky-${{ matrix.os }}
