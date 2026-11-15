@@ -41,10 +41,11 @@ is out of scope.
   without a count is fine; Cancel is not optional.
 - A command that must run on the UI thread says why in its doc comment.
 - A new background command, or a tool whose work grows with its input, goes in the lists in
-  `crates/engine/src/tests.rs` (`cancel_rasters`, `cancel_exports`, `cancel_tools`).
+  `crates/engine/src/tests.rs` (`cancel_rasters`, `cancel_exports`, `cancel_tools`), which must
+  match the background registries.
   `long_commands_stop_when_cancelled_while_they_run` fails one that never looks at Cancel;
   `cancelling_at_each_check_leaves_nothing_behind` cancels it at each check and fails one that
-  leaves the project, its undo steps or the files changed. Passing shows the work looks, not that
+  leaves the project, its undo steps or the files changed, or can't run again. Passing shows the work looks, not that
   it looks often: a long step without a check (one union, one read) is said in its doc comment.
 
 ## Use the threads
@@ -82,7 +83,9 @@ Work that splits into independent parts runs on several threads where practical:
 - **Never break wasm**: everything below `apps/` must build for `wasm32-unknown-unknown`
   (CI runs `cargo build --target wasm32-unknown-unknown -p rustgis-web` with warnings as errors;
   the Zstandard decoder in `rustgis-data` is C, so this needs clang). Use `web_time`, not
-  `std::time`; file access goes through `Services` on the web. Code only the desktop calls is
+  `std::time`; file access goes through `Services` on the web. In the browser, GeoLibre tools run
+  asynchronously (`external_start` → `Services::geolibre_run` → `gp.finish`), never as a blocking
+  call. Code only the desktop calls is
   dead code in the browser build and fails it: put it behind `#[cfg(not(target_arch = "wasm32"))]`
   and check with `RUSTFLAGS='-D warnings' cargo check -p <crate> --target wasm32-unknown-unknown`.
 - **Interface text is translatable**: wrap user-visible literals in `tl!("…")`, use
@@ -127,7 +130,7 @@ changed file such as `Cargo.lock` is outside every package and nothing includes 
 A new dependency must have a licence `deny.toml` allows (CI runs `cargo deny check licenses`); after
 changing dependencies, run `cargo xtask notices` to refresh the `THIRD-PARTY-LICENSES.txt` files the
 packages ship (the release build fails on stale ones).
-Pull requests run CI on Linux only. Label one `ci:windows`, `ci:macos` or `ci:full` (every
+Pull requests run CI on Linux only; pushes to `main` test every platform. Label one `ci:windows`, `ci:macos` or `ci:full` (every
 platform and the release build) when it touches platform-specific code, paths or file dialogs.
 
 ## Review comments
