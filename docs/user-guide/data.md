@@ -641,7 +641,7 @@ plus `geocoded`, what the geocoder called the place, and a text field `match_sta
 
 Rows that weren't found stay in its table without a point, and a notice counts them; filter
 `match_status = 'unmatched'` to review them. A field of the same name in the input is kept, and
-the new one gets an underscore appended. `matched` means the geocoder returned a point, not that
+the new one gets an underscore appended (`match_status_`; filter that one then). `matched` means the geocoder returned a point, not that
 it is the exact address: it may be placed along the street or at a broader place. The geocoders
 don't give a match score, so there is none in the output.
 
