@@ -857,7 +857,8 @@ pub fn open_csv(app: &mut RustGisApp, name: &str, source: CsvSource) -> Result<V
     app.run("ui.dialog", json!({"name": "addCsv"}))?;
     let file = CsvFile { name: name.to_string(), source };
     app.dialogs.mode = "auto";
-    show_columns(&mut app.dialogs, csv_columns(&file, "auto"));
+    let found = csv_columns(&file, "auto", &app.dialogs.text);
+    show_columns(&mut app.dialogs, found);
     app.dialogs.csv = Some(file);
     Ok(Value::Null)
 }
@@ -957,9 +958,12 @@ pub(crate) fn add_dxf_file(app: &mut RustGisApp, p: Value) -> Result<Value, Stri
 }
 
 /// The columns of a file picked for Add Delimited Text, split at `separator` (a code of
-/// [`SEPARATORS`]).
-fn csv_columns(file: &CsvFile, separator: &str) -> Result<Value, String> {
-    let p = if separator == "auto" { json!({}) } else { json!({"delimiter": separator}) };
+/// [`SEPARATORS`]), respecting the coordinate system entered in the dialog.
+fn csv_columns(file: &CsvFile, separator: &str, crs: &str) -> Result<Value, String> {
+    let mut p = if separator == "auto" { json!({}) } else { json!({"delimiter": separator}) };
+    if !crs.trim().is_empty() {
+        p["crs"] = json!(crs.trim());
+    }
     match &file.source {
         CsvSource::Path(path) => rustgis_engine::cmd::layer::columns_in_file(path, &p),
         CsvSource::Bytes(bytes) => rustgis_engine::cmd::layer::columns_of(&file.name, bytes, &p),
@@ -1014,6 +1018,7 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     ui.label(egui::RichText::new(shown).strong());
     ui.label(egui::RichText::new(tl!("Columns named like longitude/latitude, easting/northing or geometry are picked for you.")).weak());
     let mut reread = false;
+    let mut crs_changed = false;
     egui::Grid::new("csv").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
         let columns = app.dialogs.list.clone();
         for (i, label) in ["X column", "Y column", "WKT column"].into_iter().enumerate() {
@@ -1048,7 +1053,10 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             ui.end_row();
         }
         let input_label = ui.label(tl!("Coordinate system"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:4326").desired_width(240.0)).labelled_by(input_label.id);
+        crs_changed = ui
+            .add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:4326").desired_width(240.0))
+            .labelled_by(input_label.id)
+            .changed();
         ui.end_row();
         // A sheet has no separator.
         if !sheet {
@@ -1069,12 +1077,19 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             ui.end_row();
         }
     });
-    // Another separator splits the header differently: its columns are read again.
-    if reread && let Some(file) = &app.dialogs.csv {
-        let found = csv_columns(file, app.dialogs.mode);
+    // Recompute defaults for a new valid CRS; don't read while its text is incomplete.
+    // Another separator keeps the previous picks when its columns still exist.
+    let crs = app.dialogs.text.trim();
+    if (reread || crs_changed)
+        && (crs.is_empty() || rustgis_engine::data::raster::Crs::parse(crs).is_ok())
+        && let Some(file) = &app.dialogs.csv
+    {
+        let found = csv_columns(file, app.dialogs.mode, crs);
         let picked = [app.dialogs.a.clone(), app.dialogs.b.clone(), app.dialogs.c.clone()];
         show_columns(&mut app.dialogs, found);
-        keep_picked(&mut app.dialogs, picked);
+        if !crs_changed {
+            keep_picked(&mut app.dialogs, picked);
+        }
     }
     buttons(app, ui, "Add", |app| {
         let mut p = json!({});

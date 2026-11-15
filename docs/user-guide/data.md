@@ -97,10 +97,12 @@ the columns again); `info.fileColumns` lists them for scripts. Add Data finds th
 (columns named like longitude/latitude, including GTFS `stop_lon`/`stop_lat`, easting/northing or
 geometry, and EWKT's `SRID=`). With no projected coordinate system or explicit column choices,
 if the first pair contains coordinates outside ±180° longitude or ±90° latitude and a more
-specific longitude/latitude pair has usable degree values, that pair is used for the whole file.
+specific longitude/latitude pair gives in-range, non-0,0 positions on at least as many rows as
+the first pair gives finite positions, that pair is used for the whole file.
 The published aliases `Longitude Decimal Degrees`/`Latitude Decimal Degrees` and
 `Longitutde`/`Lattitude` are recognised too. The dialog checks its first 1,000 rows to pick
-defaults; Add Data checks all rows. Coordinates still outside degree ranges are counted in a
+defaults, and recomputes them when a valid coordinate system is entered; a projected system
+keeps the columns found by name. Add Data checks all rows. Coordinates still outside degree ranges are counted in a
 notice. Points placed at exactly 0,0 are also counted in a notice: these often mean missing
 coordinates, but the points are kept. A CSV without coordinate columns, or a layer without geometry, opens as a
 standalone table, listed under the map in Layers; right-click it to open or remove it. Tables
