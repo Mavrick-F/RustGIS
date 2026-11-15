@@ -715,7 +715,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         if let Some(e) = &app.dialogs.error {
-            ui.label(egui::RichText::new(crate::i18n::calculation_error(e, crate::i18n::fmt)).color(t.red));
+            ui.label(egui::RichText::new(e).color(t.red));
         }
         if let Some(i) = &app.dialogs.info {
             ui.label(egui::RichText::new(i).color(t.green));

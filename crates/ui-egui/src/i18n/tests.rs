@@ -369,32 +369,3 @@ fn context_lookup_fallback_macros_and_formatted_values() {
     set_current(previous);
     result.unwrap();
 }
-
-/// Both calculation errors translate their guidance while preserving literal script/data text.
-#[test]
-fn calculation_errors_translate_only_the_guidance() {
-    use rustgis_engine::{
-        Project, Session,
-        data::{Dataset, Field, FieldType, GeometryType},
-    };
-    use serde_json::json;
-
-    /// Substitute test translations without changing the thread's active language.
-    fn translated(key: &str, args: &[(&str, &str)]) -> String {
-        let template = match key {
-            "unit does not match the property; valid units: {units}" => "Units: {units}",
-            "no field named '{field}'; use {action} (edit.addField) first" => "Missing {field}: {action} (edit.addField)",
-            _ => panic!("unexpected template: {key}"),
-        };
-        fill_placeholders(template, args)
-    }
-    let mut session = Session::new(Project::default());
-    let id = session.map_mut().add_dataset(Dataset::new("calc", GeometryType::Polygon, vec![Field::new("result", FieldType::Double)]));
-    session.active_layer = Some(id);
-    let units = session.run("edit.calculateGeometry", &json!({"property": "area", "unit": "sqft"})).unwrap_err();
-    assert_eq!(calculation_error(&units, translated), "Units: m2, km2, ha, ac, ft2, mi2");
-    let field = "{action}'s result";
-    let missing = session.run("edit.calculateField", &json!({"field": field, "expression": "1"})).unwrap_err();
-    assert_eq!(calculation_error(&missing, translated), format!("Missing {field}: {} (edit.addField)", tl_raw!("Add Field")));
-    assert_eq!(calculation_error("some other error", translated), "some other error");
-}

@@ -469,22 +469,6 @@ pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
     rtl::visual(&fmt_raw(template, args))
 }
 
-/// Calculation command errors keep script keys and field names literal while the surrounding
-/// guidance is translated. The formatter selects display or logical order (for hover text).
-/// Other engine errors and already translated UI text pass through.
-pub(crate) fn calculation_error(error: &str, format: fn(&str, &[(&str, &str)]) -> String) -> String {
-    if let Some(units) = error.strip_prefix("unit does not match the property; valid units: ") {
-        return format("unit does not match the property; valid units: {units}", &[("units", units)]);
-    }
-    if let Some(field) = error.strip_prefix("no field named '").and_then(|s| s.strip_suffix("'; use Add Field (edit.addField) first")) {
-        return format(
-            "no field named '{field}'; use {action} (edit.addField) first",
-            &[("field", field), ("action", crate::tl_raw!("Add Field"))],
-        );
-    }
-    error.to_string()
-}
-
 /// [`fmt`] in logical order, without the display form: for a message shown with
 /// [`paragraph`], which fits a right-to-left message to its rows and puts each row in
 /// display form itself.
