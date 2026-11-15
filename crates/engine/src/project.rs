@@ -982,7 +982,23 @@ pub(crate) fn check_format(text: &str, kind: &str) -> Result<(), String> {
     if header.format > u64::from(READ_FORMAT) {
         return Err(format!("this {kind} was saved by a newer RustGIS (format {}). Update RustGIS to open it.", header.format));
     }
-    let unknown = unknown_capabilities(&header.requires, kind)?;
+    requires_known(&header.requires, kind, "open")
+}
+
+/// Refuse a document whose `requires` (`None` when it has none) lists a capability this RustGIS
+/// doesn't know, naming them, as [`check_format`] does: for files read as JSON values, such as
+/// models and web tools. `open` is what the refusal says to update RustGIS for ("import").
+pub(crate) fn check_requires(requires: Option<&serde_json::Value>, kind: &str, open: &str) -> Result<(), String> {
+    let requires = match requires {
+        None => Requires::Nothing,
+        Some(v) => Requires::deserialize(v).map_err(|e| format!("not a RustGIS {kind}: {e}"))?,
+    };
+    requires_known(&requires, kind, open)
+}
+
+/// Refuse what `requires` lists that this RustGIS doesn't know, each name said once.
+fn requires_known(requires: &Requires, kind: &str, open: &str) -> Result<(), String> {
+    let unknown = unknown_capabilities(requires, kind)?;
     if !unknown.is_empty() {
         let mut said: Vec<String> = Vec::new();
         for name in unknown.iter().map(|n| capability_said(n)) {
@@ -990,7 +1006,7 @@ pub(crate) fn check_format(text: &str, kind: &str) -> Result<(), String> {
                 said.push(name);
             }
         }
-        return Err(format!("this {kind} needs what this RustGIS can't read: {}. Update RustGIS to open it.", crate::names_said(&said)));
+        return Err(format!("this {kind} needs what this RustGIS can't read: {}. Update RustGIS to {open} it.", crate::names_said(&said)));
     }
     Ok(())
 }
