@@ -21899,6 +21899,63 @@ fn area_review_reports_retain_where_clauses_when_fitted() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
+fn missing_read_in_place_file_names_layer_and_path_once() {
+    use crate::render;
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    use rustgis_map::source::SourceLayer;
+
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("rustgis-missing-source-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut data = Dataset::new("sites", GeometryType::Point, vec![]);
+    data.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![]);
+    for ext in ["shp", "fgb", "parquet", "gpkg"] {
+        let path = dir.join(format!("sites.{ext}"));
+        rustgis_data::io::write_path(&data, &path).unwrap();
+        let mut session = Session::new(Project::default());
+        let source = SourceLayer::from_path(path.to_string_lossy(), None, rustgis_data::source::open_path(&path, None).unwrap());
+        let id = session.map_mut().add_streamed("Survey sites", source);
+        let view = render::View { width: 160.0, height: 120.0, pixels_per_point: 1.0, camera: session.map().camera, sky: false };
+        let mark = session.notice_mark();
+        assert!(render::render_png(session.map_mut(), &view).is_ok(), "{ext}: intact file");
+        session.notice_landed_rasters();
+        assert!(session.notices_since(mark).is_empty(), "{:?}", session.notices_since(mark));
+        let saved = serde_json::to_string(&session.project).unwrap();
+        // Discard the cached window so the next view must read the file again.
+        session.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap().reset();
+        // GeoParquet and GeoPackage retain open file handles: deleting their paths need not
+        // interrupt a live reader, but reopening must still report the missing file.
+        let mut sessions = if matches!(ext, "parquet" | "gpkg") {
+            drop(session);
+            Vec::new()
+        } else {
+            vec![session]
+        };
+        sessions.push(Session::new(serde_json::from_str(&saved).unwrap()));
+        std::fs::remove_file(&path).unwrap();
+        for mut session in sessions {
+            let error = render::render_png(session.map_mut(), &view).unwrap_err();
+            for detail in ["Survey sites", path.to_str().unwrap(), "moved or deleted", "Repair Data Source"] {
+                assert!(error.contains(detail), "missing {detail:?} in {error:?}");
+            }
+            let mark = session.notice_mark();
+            for _ in 0..3 {
+                // The screen draws a copy and adopts its errors before the frame's notices.
+                let mut worker = session.map().clone();
+                let _ = render::render(&mut worker, &view);
+                session.map_mut().adopt_caches(&worker);
+                session.notice_landed_rasters();
+            }
+            let notices: Vec<_> = session.notices_since(mark).iter().filter(|n| n.error).collect();
+            assert_eq!(notices.len(), 1, "{ext}: {notices:?}");
+            assert_eq!(notices[0].text, error);
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn area_review_repair_checks_retained_classification_fields() {
     use rustgis_map::{
         color::Ramp,

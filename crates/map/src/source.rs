@@ -34,6 +34,9 @@ pub const VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 100_000 } else {
 /// The most features a view reads from a file by its web address (each one is fetched).
 pub const REMOTE_VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 30_000 } else { 60_000 };
 
+/// Repair advice shared by render errors and the session's translated read-failure notice.
+pub const REPAIR_SOURCE: &str = "if the file was moved or deleted, restore it or use Repair Data Source to point to its new location";
+
 const RECONNECT_REQUIRED: &str = "this database source came from a peer; reconnect explicitly before reading it";
 
 /// Ambiguous polygon areas among decoded features, including rows an area query could not keep.
@@ -139,6 +142,9 @@ pub struct SourceLayer {
     /// Why the source couldn't be opened or read.
     #[serde(skip)]
     pub error: Option<String>,
+    /// Last read failure reported by the session, independent of disposable render copies.
+    #[serde(skip)]
+    error_said: Option<String>,
     /// The last open failed because the server refused the login (no password given this session, or a wrong one).
     #[serde(skip)]
     pub login: bool,
@@ -761,6 +767,27 @@ impl SourceLayer {
             self.path.as_deref()
         };
         p.filter(|p| crate::paths::is_local(p))
+    }
+
+    /// A read failure with the linked file and the repair action, when it has a local source.
+    /// The caller supplies the layer's current name, which can differ from the file's name.
+    pub fn read_error(&self) -> Option<String> {
+        let error = self.error.as_ref()?;
+        Some(match self.linked_file() {
+            Some(path) => format!("could not read {path}: {error}; {REPAIR_SOURCE}"),
+            None => error.clone(),
+        })
+    }
+
+    /// Takes each persistent read failure once, so redraws do not repeat its notice. A successful
+    /// read observed here, or an explicit reopen/repair, allows a later failure to be reported.
+    pub fn error_unsaid(&mut self) -> Option<String> {
+        let error = self.error.clone();
+        if error == self.error_said {
+            return None;
+        }
+        self.error_said.clone_from(&error);
+        error
     }
 
     /// Opens a replacement with fresh handles, windows, caches and selection.
@@ -1405,6 +1432,7 @@ impl SourceLayer {
         self.opening = None;
         self.pending = None;
         self.error = None;
+        self.error_said = None;
         self.login = false;
         // A new opening may hold other values: what was said of the last one doesn't hold.
         self.unread_dates = None;
@@ -1716,6 +1744,7 @@ impl SourceLayer {
             query: _,
             opening: _,
             error: _,
+            error_said: _,
             login: _,
             reconnect_required: _,
             limit: _,

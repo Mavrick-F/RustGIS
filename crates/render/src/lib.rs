@@ -2031,9 +2031,17 @@ impl ArchiveRevision {
         self.0 == archive_revisions(maps).0
     }
 
-    /// Refuses a spanning render before reporting any ordinary drawing failure.
+    /// Refuses a spanning render before reporting a drawing failure, preserving a source's
+    /// layer name, file and repair advice instead of the generic allocation/drawing error.
     pub(crate) fn finish<'a, T>(self, maps: impl IntoIterator<Item = &'a Map>, result: Option<T>, failure: &str) -> Result<T, String> {
-        self.finish_revision(archive_revisions(maps), result, failure)
+        let mut source_error = None;
+        let current = archive_revisions(maps.into_iter().inspect(|map| {
+            if result.is_none() && source_error.is_none() {
+                source_error =
+                    map.layers.iter().find_map(|layer| layer.source.as_ref()?.read_error().map(|why| format!("{}: {why}", layer.name)));
+            }
+        }));
+        self.finish_revision(current, result, source_error.as_deref().unwrap_or(failure))
     }
 
     /// Checks a composed output against a newly captured revision of the same source set.
@@ -4238,6 +4246,12 @@ fn render_frame(
         let Some(layer) = map.layers.get_mut(li) else { continue };
         if !layer.visible || !layer.in_scale_range(scale) || held.contains(&layer.id) {
             continue;
+        }
+        // A failed window read must not export an apparently complete map without that layer.
+        if full_res_rasters
+            && layer.source.as_ref().is_some_and(|s| s.linked_file().is_some() && s.chunk_source().is_none() && s.error.is_some())
+        {
+            return None;
         }
         pm.layer_with_id(&layer_name(layer), u64::from(layer.id));
         let opacity = layer.opacity() * group_opacity.get(&layer.id).copied().unwrap_or(1.0);
