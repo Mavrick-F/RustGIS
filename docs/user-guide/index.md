@@ -15,6 +15,7 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
 | [Layouts and Reports](layouts.md) | Page layouts, map series, reports, presentations and notebooks |
 | [Sharing](sharing.md) | Exports, packages and open-format web maps, layers, styles and scenes |
 | [Workspace](workspace.md) | Linked views, the Browser view, animation, profiles, offline areas, customizing the ribbon |
+| [Field Work](field-work.md) | The phone apps: capturing and editing by touch, the device's position and tracks, photos, offline basemaps and field packages |
 | [AI Assistant](assistant.md) | A chat pane that answers questions and acts on the map through commands |
 
 <figure markdown="span">
@@ -469,12 +470,10 @@ Do not restore an arbitrary temporary file or mix parts from different versions.
 files may help with manual recovery, but are not a crash-safe backup.
 
 Once published, the layer holds its rows as the file reads them, which differs only where a
-Shapefile can't tell values apart (an empty text reads as no value, a column of whole numbers as
-integers, date-time fields as ISO 8601 text). A double field becoming integer or a date-time field
-becoming text produces a notice. The layer reads `inSync`; the project has a change to save.
-Undo doesn't change the file:
-undoing an edit made before publishing shows the layer as `edited` again. A layer with no edits
-writes nothing. Layers read in place remain read-only.
+Shapefile can't tell values apart (an empty text reads as no value, a column of whole numbers with no declared
+decimals as integers, date-time fields as ISO 8601 text). A double field becoming integer or a date-time field
+becoming text produces a notice. The layer reads `inSync`; the project has a change to save. Undo doesn't change the file:
+undoing an edit made before publishing shows the layer as `edited` again. A layer with no edits writes nothing. Layers read in place remain read-only.
 
 #### GeoJSON
 
