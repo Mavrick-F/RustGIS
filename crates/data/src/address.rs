@@ -55,6 +55,49 @@ fn decode_pass(bytes: &[u8], mode: DecodeMode) -> Vec<u8> {
     out
 }
 
+/// Text with its `%XX` escapes decoded, for paths, connection strings and tokens, where `+` is
+/// itself. An escape without two hex digits (`%zz`, `%+1`) stays as it is; bytes that aren't UTF-8
+/// become U+FFFD.
+pub fn percent_decode(s: &str) -> String {
+    decode(s, false)
+}
+
+/// [`percent_decode`] for a query string or form body, where `+` is a space.
+pub fn form_decode(s: &str) -> String {
+    decode(s, true)
+}
+
+/// One pass over `s`: an escape is `%` and exactly two hex digits ([`hex`] takes no sign), and
+/// the bytes are made text only at the end, so a character escaped as several bytes decodes whole.
+fn decode(s: &str, plus: bool) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%'
+            && let Some(n) = bytes.get(i + 1..i + 3).and_then(hex)
+        {
+            out.push(n as u8);
+            i += 3;
+        } else {
+            out.push(if b == b'+' && plus { b' ' } else { b });
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A query string's or form body's parameters, decoded ([`form_decode`]); a parameter without `=`
+/// has an empty value.
+pub fn query_params(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').unwrap_or((p, "")))
+        .map(|(k, v)| (form_decode(k), form_decode(v)))
+        .collect()
+}
+
 /// Repeated decoding stops at a fixed point; a fifth changing pass is unresolved.
 fn decoded_name(raw: &str, mode: DecodeMode) -> Option<Vec<u8>> {
     if raw.len() > MAX_NAME_BYTES {
@@ -609,6 +652,20 @@ fn inherit_reviewed(from: &str, to: &str, relation: Relation, skip: &[&str], rev
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An escape needs two hex digits: `%+1` and `%-1` stay as typed rather than decoding as the
+    /// byte 1 (a sign is not a digit). `+` is a space in form data only, so there `%+1` is `% 1`.
+    #[test]
+    fn percent_escapes_need_two_hex_digits() {
+        assert_eq!(percent_decode("a%+1b%-1c%zz%4"), "a%+1b%-1c%zz%4");
+        assert_eq!(percent_decode("My%20Data+1.gpkg"), "My Data+1.gpkg");
+        assert_eq!(form_decode("x+y%2By"), "x y+y");
+        assert_eq!(percent_decode("%C3%A9%FF"), "é\u{FFFD}");
+        assert_eq!(
+            query_params("code=a%2Fb&state=%+1&flag"),
+            [("code", "a/b"), ("state", "% 1"), ("flag", "")].map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+    }
 
     #[test]
     fn explicit_query_names_preserve_plus_and_other_punctuation_through_decoding() {
