@@ -1570,9 +1570,11 @@ impl<W: std::io::Write> GeoJsonWriter<W> {
 
 /// Longitude and latitude columns, recognised in any order; CSV export names its coordinate
 /// columns with the first of each that no field has.
-const LON_NAMES: &[&str] =
-    &["longitude", "lon", "lng", "long", "x", "lon_dd", "longitude_dd", "stop_lon", "longitude decimal degrees", "longitutde"];
-const LAT_NAMES: &[&str] = &["latitude", "lat", "y", "lat_dd", "latitude_dd", "stop_lat", "latitude decimal degrees", "lattitude"];
+const LON_NAMES: &[&str] = &["longitude", "lon", "lng", "long", "x", "lon_dd", "longitude_dd", "stop_lon"];
+const LAT_NAMES: &[&str] = &["latitude", "lat", "y", "lat_dd", "latitude_dd", "stop_lat"];
+/// Further spellings seen in published files, recognised on reading but never written.
+const LON_ALIASES: &[&str] = &["longitude decimal degrees", "longitutde"];
+const LAT_ALIASES: &[&str] = &["latitude decimal degrees", "lattitude"];
 
 /// Projected coordinate columns, recognised as well as longitude/latitude ones.
 const X_NAMES: &[&str] = &["easting", "point_x", "xcoord", "x_coord"];
@@ -1638,8 +1640,13 @@ pub fn sniff_delimiter(text: &str) -> u8 {
 /// The x/y columns found by name, as a pair from one family: longitude/latitude, else
 /// easting/northing.
 fn found_xy(headers: &[String]) -> Option<(usize, usize)> {
-    let find = |names: &[&str]| headers.iter().position(|h| names.contains(&h.trim().to_ascii_lowercase().as_str()));
-    find(LON_NAMES).zip(find(LAT_NAMES)).or_else(|| find(X_NAMES).zip(find(Y_NAMES)))
+    let find = |names: &[&str], aliases: &[&str]| {
+        headers.iter().position(|h| {
+            let name = h.trim().to_ascii_lowercase();
+            names.contains(&name.as_str()) || aliases.contains(&name.as_str())
+        })
+    };
+    find(LON_NAMES, LON_ALIASES).zip(find(LAT_NAMES, LAT_ALIASES)).or_else(|| find(X_NAMES, &[]).zip(find(Y_NAMES, &[])))
 }
 
 /// Keeps the first named pair unless its values exceed degrees and a more specific
@@ -1648,13 +1655,13 @@ fn found_xy(headers: &[String]) -> Option<(usize, usize)> {
 /// explicit columns and projected systems bypass this inference.
 fn found_xy_in_rows(headers: &[String], rows: &[Vec<String>]) -> Result<Option<(usize, usize)>> {
     let Some(xy) = found_xy(headers) else { return Ok(None) };
-    let find = |names: &[&str], generic: &str| {
+    let find = |names: &[&str], aliases: &[&str], generic: &str| {
         headers.iter().position(|h| {
             let name = h.trim().to_ascii_lowercase();
-            name != generic && names.contains(&name.as_str())
+            name != generic && (names.contains(&name.as_str()) || aliases.contains(&name.as_str()))
         })
     };
-    let Some(geographic) = find(LON_NAMES, "x").zip(find(LAT_NAMES, "y")) else { return Ok(Some(xy)) };
+    let Some(geographic) = find(LON_NAMES, LON_ALIASES, "x").zip(find(LAT_NAMES, LAT_ALIASES, "y")) else { return Ok(Some(xy)) };
     if xy == geographic {
         return Ok(Some(xy));
     }
