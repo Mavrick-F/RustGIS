@@ -10,8 +10,9 @@ to change it. **Data › Data Design** (and **Data › Fields**) adds and delete
 field from an expression; **Calculate Geometry** (in the attribute table's toolbar) fills a new or
 existing numeric field with each feature's area, perimeter, length or X/Y coordinate, in the units
 you choose, for all features or the selected ones. Length and perimeter include feet and miles;
-area includes square feet (`ft2`), acres (`ac`) and square miles (`mi2`). Every edit is one undo
-step. Areas, perimeters and lengths measure on the WGS 84 ellipsoid, the same measure as the network tools and the Measure panel (Spatial Join still
+area includes square feet (`ft2`), acres (`ac`) and square miles (`mi2`). An unrecognized
+`edit.calculateGeometry` unit is refused with the valid unit keys for the chosen property.
+Every edit is one undo step. Areas, perimeters and lengths measure on the WGS 84 ellipsoid, the same measure as the network tools and the Measure panel (Spatial Join still
 measures on the sphere). A ring with a full-turn edge, -180° to 180° along a parallel that the
 ring reaches down one meridian and leaves back up the other (a globe-wide band, or a cap closed
 along the pole), counts that whole parallel, as long as the ring's turns leave it closed around
@@ -23,6 +24,20 @@ Undo (++ctrl+z++) and Redo (++ctrl+y++ or ++ctrl+shift+z++) restore project chan
 feature edits; use ++cmd++ instead of ++ctrl++ on macOS. While typing in a text field, those
 shortcuts undo or redo the typing instead. Saving keeps the undo history; opening or creating
 a project clears it. Undo does not reverse files already written by an export.
+
+## Which parcel area to report
+
+**Calculate Geometry** and `area('ac')` measure the polygon on the WGS 84 ellipsoid, regardless
+of the display projection, with holes subtracted. Acres use 4,046.8564224 square metres per acre.
+This is a measurement of the mapped boundary, not a deed acreage or a terrain-surface area.
+
+A State Plane area is measured on that projection's flat grid, so its scale distortion and units
+(often US survey square feet rather than international ones) make it differ slightly: on Shelby
+County, Tennessee parcels, by about 0.01% from the same boundaries in EPSG:2274.
+
+A stored `Shape__Area` field is the area when the file was made, in that file's units; it isn't
+updated when a boundary is edited, so check both before comparing. A deed acreage describes the
+recorded parcel, which can differ from the mapped boundary.
 
 ## Modifying features
 

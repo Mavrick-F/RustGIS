@@ -682,6 +682,13 @@ contribute their points, while lines and polygons contribute their bounding-box 
 two distinct locations with numeric values are needed. It adds **two separate Float32 GeoTIFF
 layers**: the prediction, named by `output`, and `<output>_variance`.
 
+**Clip** (`clip`) keeps the parts of `input` inside the `clip` polygons. It gives one notice with
+the count of output polygon features whose total area is less than one millionth (`1e-6`) of
+their input feature's area, measured in the overlay plane. These may be slivers along the clip
+boundary; they are kept unchanged. Check these features before using the result as a map series
+index, where a tiny sliver can make an apparently empty page. Ordinary clipped pieces give no
+sliver notice, and empty intersections are still left out.
+
 **Erase** (`erase`) removes from `input` features (points, lines or polygons) their parts inside
 the `erase` polygons. An erase polygon's edge counts as inside it, as for Clip, so a point on the
 edge or a stretch of line along it is erased; features left with nothing are left out, and one
@@ -925,6 +932,25 @@ number written with a decimal point or an exponent (`6.02e23`) asks for a decima
 notice. A Double field's values are decimals already, rounded as decimal arithmetic rounds, and
 get no notice. Without `statistics`, `field` gives that field's `COUNT`, `SUM`, `MEAN`, `MIN`,
 `MAX` and `STD`, reading its values as numbers.
+
+Numeric sentinels are real values to these statistics: for example, a FEMA vector field's
+`STATIC_BFE = -9999` is included in `MEAN`, `MIN` and `COUNT`, not treated as empty. Check the
+dataset's field definitions and exclude its sentinel first: set a **Definition Query** such as
+`STATIC_BFE IS NOT NULL AND STATIC_BFE <> -9999` before running Summary Statistics.
+
+**Count records by month.** To count permits by issue month, start with `issue_date` as a Date/Date-time field or ISO text
+(`YYYY-MM-DD`, optionally followed by a time). Convert other date spellings with
+**Convert Field** first ([date formats](#the-attribute-table); it reads months and days as two
+digits, so `06/23/2021` converts but `6/23/2021` doesn't).
+
+1. Clear any selection and definition query to include all records. Add a **Text** field named
+   `issue_month`, turn editing on, and use **Calculate Field** with `substr(issue_date, 1, 7)`.
+   A date such as `2026-03-05` becomes `2026-03`, keeping different years separate.
+2. Run **Summary Statistics** on the permits, with **Case Fields** = `issue_month` and a
+   **COUNT** statistic on `issue_date` (use **Add statistic**).
+3. Read `FREQUENCY` as the number of permits per month. Records without a date form a separate
+   group with an empty key. The output
+   contains months present in the data; it does not fill in missing months with zero.
 
 **Minimum Bounding Geometry** (`convexHull`) encloses each feature in its convex hull (Group
 Option `None`), or all of them in one (`All`, with `count`, the features it enclosed). It passes
