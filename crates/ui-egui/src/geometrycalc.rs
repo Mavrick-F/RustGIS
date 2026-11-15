@@ -195,7 +195,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     ui.checkbox(&mut f.overwrite, tl!("Overwrite existing values"));
                 }
                 if let Some(error) = &f.error {
-                    ui.colored_label(t.red, error);
+                    ui.colored_label(t.red, crate::i18n::calculation_error(error, crate::i18n::fmt));
                 }
                 ui.separator();
                 ui.horizontal(|ui| {

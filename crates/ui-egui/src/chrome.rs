@@ -1407,18 +1407,19 @@ pub fn about(app: &mut RustGisApp, ctx: &egui::Context) {
 }
 
 /// Translates deferred engine text in logical order, then shapes the completed message once.
-/// Ordinary notices have already reached their final display form and pass through unchanged.
+/// Calculation errors translate their guidance; other ordinary notices pass through unchanged.
 fn notice_text(notice: &rustgis_engine::Notice) -> String {
     notice
         .translated(crate::i18n::fmt_raw)
         .map(|message| crate::i18n::fmt("{message}", &[("message", &message)]))
-        .unwrap_or_else(|| notice.text.clone())
+        .unwrap_or_else(|| crate::i18n::calculation_error(&notice.text, crate::i18n::fmt))
 }
 
 /// A deferred message stays in logical order until the complete tooltip is shaped, including
 /// its translated action label. Feeding status-bar display text back into fmt would shape twice.
 fn notice_hover(notice: &rustgis_engine::Notice) -> String {
-    let message = notice.translated(crate::i18n::fmt_raw).unwrap_or_else(|| notice.text.clone());
+    let message =
+        notice.translated(crate::i18n::fmt_raw).unwrap_or_else(|| crate::i18n::calculation_error(&notice.text, crate::i18n::fmt_raw));
     crate::i18n::fmt("{message}\n{open}", &[("message", &message), ("open", tl_raw!("Open Messages"))])
 }
 

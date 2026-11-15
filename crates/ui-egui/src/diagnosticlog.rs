@@ -89,7 +89,7 @@ fn entry(ui: &mut Ui, record: &Record, t: &Tokens) {
         ui.label(RichText::new(severity).small().strong().color(color));
         ui.label(RichText::new(source).small().color(t.text_dim));
     });
-    ui.add(egui::Label::new(&record.message).wrap().selectable(true));
+    ui.add(egui::Label::new(crate::i18n::calculation_error(&record.message, crate::i18n::fmt)).wrap().selectable(true));
     if !record.details.is_empty() || record.network.is_some() {
         egui::CollapsingHeader::new(tl!("Technical details")).show(ui, |ui| {
             if let Some(network) = &record.network {
