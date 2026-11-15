@@ -239,7 +239,7 @@ fn geocode(s: &mut Session, p: &Value) -> CmdResult {
     let mut ds = rustgis_data::Dataset::new(name, GeometryType::Point, fields);
     let (mut matched, mut unmatched) = (0usize, 0usize);
     for (i, (feat, address)) in src.features.iter().zip(&rows).enumerate() {
-        let place = found.get(address).and_then(Option::as_ref);
+        let place = if address.is_empty() { None } else { found.get(address).and_then(Option::as_ref) };
         let mut attrs = feat.attrs.clone();
         attrs.resize(src.fields.len(), Attr::Null);
         attrs.push(place.map(|pl| Attr::Text(pl.name.clone())).unwrap_or(Attr::Null));
