@@ -41,6 +41,7 @@ pub const PAGES: &[Page] = pages![
     "user-guide/assistant.md",
     "comparison/index.md",
     "comparison/geolibre.md",
+    "geolibre-parity.md",
     "comparison/qgis.md",
     "cli.md",
     "python.md",
