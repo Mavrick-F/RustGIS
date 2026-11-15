@@ -134,9 +134,10 @@ changed file such as `Cargo.lock` is outside every package and nothing includes 
 A new dependency must have a licence `deny.toml` allows (CI runs `cargo deny check licenses`); after
 changing dependencies, run `cargo xtask notices` to refresh the `THIRD-PARTY-LICENSES.txt` files the
 packages ship (the release build fails on stale ones).
-Pull requests run CI on Linux (plus the iOS build when they touch `apps/rustgis-mobile`); pushes to
-`main` test every platform. Label one `ci:windows`, `ci:macos` or `ci:full` (every platform and the
-release build) when it touches platform-specific code, paths or file dialogs.
+Pull requests run CI on Linux (plus the Android and iOS builds when they touch
+`apps/rustgis-mobile`); pushes to `main` test every platform. When a pull request touches
+platform-specific code, paths or file dialogs, label it `ci:windows` or `ci:macos` to test there,
+or `ci:full` for every platform and the release build.
 
 ## Review comments
 - Fix in the pull request what a review finds wrong: bugs, crash paths, silent data loss, a broken
