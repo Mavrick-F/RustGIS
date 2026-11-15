@@ -79,10 +79,16 @@ const LIMITS: &[(&str, f64, Where, &str)] = &[
     ("EPSG:2193", 16.0, Where::Outside, "transverse Mercator far from its meridian, within 1e-4°"),
     // The datum transformation is chosen for each place by its area of use, as PROJ chooses it:
     // there and back may take different ones at the area's edge (OSGB 1936's at 9°W, 45.6 m
-    // apart; at 0°E 61°N 135 m, at 1.72°E 49.75°N 150 m: PROJ 9.8.1 the same to the digit).
+    // apart; at 0°E 61°N 135 m, at 1.72°E 49.75°N 150 m: PROJ 9.8.1 the same to the digit), and
+    // outside it at the edge of a transformation's own area (84 m at 9.94°W 60.55°N, as PROJ's).
     ("EPSG:27700", 16.0, Where::Outside, "transverse Mercator far from its meridian, within 1e-4°"),
     ("EPSG:27700", 200.0, Where::NearEdge(0.5), "the datum transformation differs there and back at the area's edge"),
+    ("EPSG:27700", 200.0, Where::Outside, "the datum transformation differs there and back at its own area's edge"),
     ("EPSG:2056", 16.0, Where::Outside, "oblique Mercator far from its centre line, within 1e-4°"),
+    // Its datum, NAD83, has transformations to WGS 84 for Alaska and for Hawaii (up to 0.97 m)
+    // as well as none; outside the area of use there and back may take one and not the other
+    // (0.60 m at 156.6°W 26.8°N, 0.75 m at 180°W 53.8°N: PROJ 9.8.1 the same to the digit).
+    ("EPSG:3347", 1.0, Where::Outside, "NAD83's transformation for Alaska or Hawaii is taken one way only"),
     // Albers' inverse (PROJ's) snaps a latitude within about 0.02° of a pole onto
     // it. Those `from_lonlat` takes are the ones within 1e-4° of the pole.
     ("EPSG:5070", 16.0, Where::Outside, "Albers takes a place near a pole as the pole, within 1e-4°"),
