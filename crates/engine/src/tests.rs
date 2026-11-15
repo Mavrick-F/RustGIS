@@ -23505,7 +23505,7 @@ fn geocoding_match_status_preserves_fields_and_unmatched_notice() {
             }
         }
         // A usable point counts as a match even if the provider gave no display name.
-        assert_eq!(ds.value(0, 5), rustgis_data::Value::Text(String::new()));
+        assert_eq!(ds.value(0, 5), &rustgis_data::Value::Text(String::new()));
         let notices = s.notices_since(mark);
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].text, format!("{unmatched} of 4 rows weren't found; they are in the table without a point"));
