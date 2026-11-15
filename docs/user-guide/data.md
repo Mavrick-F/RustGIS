@@ -101,8 +101,9 @@ specific longitude/latitude pair gives in-range, non-0,0 positions on at least a
 the first pair gives finite positions, that pair is used for the whole file.
 The published aliases `Longitude Decimal Degrees`/`Latitude Decimal Degrees` and
 `Longitutde`/`Lattitude` are recognised too. The dialog checks its first 1,000 rows to pick
-defaults, and recomputes them when a valid coordinate system is entered; a projected system
-keeps the columns found by name. Add Data checks all rows. Coordinates still outside degree ranges are counted in a
+defaults, and recomputes unchanged defaults when you leave the coordinate-system box or press
+Enter; columns you picked stay picked. A projected system keeps the columns found by name.
+Add Data checks all rows. Coordinates still outside degree ranges are counted in a
 notice. Points placed at exactly 0,0 are also counted in a notice: these often mean missing
 coordinates, but the points are kept. A CSV without coordinate columns, or a layer without geometry, opens as a
 standalone table, listed under the map in Layers; right-click it to open or remove it. Tables

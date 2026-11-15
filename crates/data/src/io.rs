@@ -1702,7 +1702,7 @@ const COLUMN_SAMPLE_ROWS: usize = 1000;
 
 /// The columns of rows under a header row, as [`read_rows`] would find them with `crs`.
 pub(crate) fn columns_of(headers: &[String], rows: &[Vec<String>], crs: Option<Crs>) -> Result<Columns> {
-    let xy = if crs.is_none_or(|c| c == Crs::LonLat) { found_xy_in_rows(headers, rows)? } else { found_xy(headers) };
+    let xy = if crs.is_none_or(Crs::is_geographic) { found_xy_in_rows(headers, rows)? } else { found_xy(headers) };
     let wkt = if xy.is_some() { None } else { found_wkt(headers, rows) };
     let name = |i: usize| headers.get(i).map(|h| h.trim().to_string());
     Ok(Columns {
@@ -2004,7 +2004,7 @@ pub(crate) fn read_rows(
     let (x, y) = match (x, y) {
         (Some(x), Some(y)) => (Some(x), Some(y)),
         (None, None) if wkt_given.is_none() => {
-            if opts.crs.is_none_or(|c| c == Crs::LonLat) { found_xy_in_rows(headers, rows)? } else { found_xy(headers) }.unzip()
+            if opts.crs.is_none_or(Crs::is_geographic) { found_xy_in_rows(headers, rows)? } else { found_xy(headers) }.unzip()
         }
         (None, None) => (None, None),
         _ => return Err(DataError::Format("give both the x and the y column".into())),
@@ -2142,7 +2142,7 @@ pub(crate) fn read_rows(
             report.messages.push(format!("{lost} rows couldn't be converted from {} to longitude/latitude", c.label()));
         }
     }
-    let read_as_degrees = crs.is_none_or(|c| c == Crs::LonLat);
+    let read_as_degrees = crs.is_none_or(Crs::is_geographic);
     let (mut outside, mut zero) = (0usize, 0usize);
     for f in &ds.features {
         crate::progress::check()?;
@@ -5174,12 +5174,20 @@ mod tests {
         let Some(Geometry::Point(p)) = ds.features[0].geometry else { panic!("point") };
         assert!((p.x - 0.00898315).abs() < 1e-7 && (p.y - 0.0179663).abs() < 1e-7);
         assert!(report.messages.is_empty());
-        for crs in [Crs::WebMercator, Crs::parse("EPSG:2263").unwrap()] {
+        for crs in [Crs::WebMercator, Crs::parse("EPSG:2263").unwrap(), Crs::parse("+proj=merc +datum=WGS84 +units=m").unwrap()] {
             let c = csv_columns(text, None, Some(crs)).unwrap();
             assert_eq!((c.x.as_deref(), c.y.as_deref()), (Some("X"), Some("Y")));
         }
-        let c = csv_columns(text, None, Some(Crs::LonLat)).unwrap();
-        assert_eq!((c.x.as_deref(), c.y.as_deref()), (Some("Longitude"), Some("Latitude")));
+        for crs in [Crs::LonLat, Crs::parse("+proj=latlong +datum=WGS84 +no_defs").unwrap()] {
+            let c = csv_columns(text, None, Some(crs)).unwrap();
+            assert_eq!((c.x.as_deref(), c.y.as_deref()), (Some("Longitude"), Some("Latitude")));
+            let opts = CsvOptions { crs: Some(crs), ..Default::default() };
+            let (ds, report) = read_csv_with(text, "geographic", &opts).unwrap();
+            let Some(Geometry::Point(p)) = ds.features[0].geometry else { panic!("point") };
+            assert!((p.x + 89.9).abs() < 1e-10 && (p.y - 35.1).abs() < 1e-10);
+            assert_eq!(report.skipped, 0);
+            assert!(report.messages.is_empty(), "{:?}", report.messages);
+        }
         let opts = CsvOptions { x: Some("X".into()), y: Some("Y".into()), ..Default::default() };
         assert_eq!(
             read_csv_with(text, "explicit", &opts).unwrap().0.features[0].geometry,

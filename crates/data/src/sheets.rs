@@ -752,9 +752,13 @@ mod tests {
     fn coordinate_columns_follow_crs() {
         use crate::raster::Crs;
         let book = xlsx(&[("Mixed", &[&["X", "Y", "Longitude", "Latitude"], &["1000", "2000", "3", "4"]])]);
-        for crs in [None, Some(Crs::LonLat), Some(Crs::parse("EPSG:2263").unwrap())] {
+        for (crs, expected) in [
+            (None, ("Longitude", "Latitude")),
+            (Some(Crs::LonLat), ("Longitude", "Latitude")),
+            (Some(Crs::parse("+proj=latlong +datum=WGS84 +no_defs").unwrap()), ("Longitude", "Latitude")),
+            (Some(Crs::parse("EPSG:2263").unwrap()), ("X", "Y")),
+        ] {
             let c = columns(&book, None, crs).unwrap();
-            let expected = if crs.is_none_or(|c| c == Crs::LonLat) { ("Longitude", "Latitude") } else { ("X", "Y") };
             assert_eq!((c.x.as_deref(), c.y.as_deref()), (Some(expected.0), Some(expected.1)));
         }
     }

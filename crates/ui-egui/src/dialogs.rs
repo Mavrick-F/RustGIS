@@ -63,6 +63,10 @@ pub struct Dialogs {
     pub listed: Option<String>,
     /// Add Delimited Text's file, picked before the dialog opens.
     pub csv: Option<CsvFile>,
+    /// Explicit column selections survive coordinate-system changes, including a pick of None.
+    pub csv_picked: bool,
+    /// Coordinate-system edits are applied on focus loss, rather than parsed while typing.
+    pub csv_crs_dirty: bool,
     /// Import DXF's file, picked before the dialog opens.
     pub dxf: Option<DxfFile>,
     /// Reset collapsed then closed dialogs when reopening
@@ -1018,7 +1022,7 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     ui.label(egui::RichText::new(shown).strong());
     ui.label(egui::RichText::new(tl!("Columns named like longitude/latitude, easting/northing or geometry are picked for you.")).weak());
     let mut reread = false;
-    let mut crs_changed = false;
+    let mut crs_committed = false;
     egui::Grid::new("csv").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
         let columns = app.dialogs.list.clone();
         for (i, label) in ["X column", "Y column", "WKT column"].into_iter().enumerate() {
@@ -1043,6 +1047,7 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .response
                 .labelled_by(input_label.id);
             // x/y columns or a WKT column, not both.
+            d.csv_picked |= *v != before;
             if *v != before && !v.is_empty() {
                 if i == 2 {
                     (d.a, d.b) = (String::new(), String::new());
@@ -1053,10 +1058,14 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             ui.end_row();
         }
         let input_label = ui.label(tl!("Coordinate system"));
-        crs_changed = ui
+        let response = ui
             .add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:4326").desired_width(240.0))
-            .labelled_by(input_label.id)
-            .changed();
+            .labelled_by(input_label.id);
+        app.dialogs.csv_crs_dirty |= response.changed();
+        if response.lost_focus() && app.dialogs.csv_crs_dirty {
+            app.dialogs.csv_crs_dirty = false;
+            crs_committed = true;
+        }
         ui.end_row();
         // A sheet has no separator.
         if !sheet {
@@ -1077,17 +1086,17 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             ui.end_row();
         }
     });
-    // Recompute defaults for a new valid CRS; don't read while its text is incomplete.
+    // Only untouched defaults follow a committed CRS edit (Enter also ends a single-line edit).
+    // Parsing a PROJ string registers it, so never parse while the user is still typing.
     // Another separator keeps the previous picks when its columns still exist.
     let crs = app.dialogs.text.trim();
-    if (reread || crs_changed)
-        && (crs.is_empty() || rustgis_engine::data::raster::Crs::parse(crs).is_ok())
+    if (reread || (crs_committed && !app.dialogs.csv_picked))
         && let Some(file) = &app.dialogs.csv
     {
         let found = csv_columns(file, app.dialogs.mode, crs);
         let picked = [app.dialogs.a.clone(), app.dialogs.b.clone(), app.dialogs.c.clone()];
         show_columns(&mut app.dialogs, found);
-        if !crs_changed {
+        if reread {
             keep_picked(&mut app.dialogs, picked);
         }
     }
@@ -2852,6 +2861,52 @@ mod tests {
             },
             app,
         )
+    }
+
+    /// CRS typing leaves the column choices alone; committing updates defaults, while explicit
+    /// X/Y and None selections survive both Enter and focus loss.
+    #[test]
+    fn delimited_columns_follow_committed_crs_without_replacing_picks() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        for pick in [None, Some("chosen_x"), Some("None")] {
+            let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
+            open_csv(
+                &mut app,
+                "points.csv",
+                CsvSource::Bytes(b"X,Y,Longitude,Latitude,chosen_x,chosen_y\n1000000,200000,-74,40,1000001,200001\n".to_vec()),
+            )
+            .unwrap();
+            let mut h = app_harness(app);
+            h.run_steps(3);
+            assert_eq!((&*h.state().dialogs.a, &*h.state().dialogs.b), ("Longitude", "Latitude"));
+            if let Some(pick) = pick {
+                h.get_by_role_and_label(Role::ComboBox, "X column").click();
+                h.run_steps(2);
+                h.get_by_role_and_label(Role::Button, pick).click();
+                h.run_steps(2);
+                if pick == "chosen_x" {
+                    h.get_by_role_and_label(Role::ComboBox, "Y column").click();
+                    h.run_steps(2);
+                    h.get_by_role_and_label(Role::Button, "chosen_y").click();
+                    h.run_steps(2);
+                }
+            }
+            let before = (h.state().dialogs.a.clone(), h.state().dialogs.b.clone());
+            h.get_by_role_and_label(Role::TextInput, "Coordinate system").click();
+            h.run_steps(2);
+            h.event(egui::Event::Text("EPSG:2263".into()));
+            h.run_steps(2);
+            assert_eq!(h.state().dialogs.text, "EPSG:2263");
+            assert_eq!((&h.state().dialogs.a, &h.state().dialogs.b), (&before.0, &before.1), "typing must not recompute defaults");
+            h.key_press(if pick == Some("None") { egui::Key::Tab } else { egui::Key::Enter });
+            h.run_steps(2);
+            let expected = if pick.is_none() { ("X", "Y") } else { (before.0.as_str(), before.1.as_str()) };
+            assert_eq!((&*h.state().dialogs.a, &*h.state().dialogs.b), expected, "pick {pick:?}");
+            // Enter also confirms Add through the dialog's usual OK/Cancel row.
+            assert_eq!(h.state().dialogs.open, if pick == Some("None") { Some("addCsv") } else { None });
+            assert!(h.state().dialogs.error.is_none());
+        }
     }
 
     /// The map stamp Add From Service checks: the UI changes the map through `map_mut` and
