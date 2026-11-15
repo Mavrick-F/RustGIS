@@ -47,7 +47,7 @@ if git diff --name-only "$fork_point" HEAD | grep -qE '^(Cargo\.lock|rust-toolch
   everything "Cargo.lock, rust-toolchain, .github/ or .config/ changed"
 fi
 
-selected="$(cargo xtask changed --list "$base")"
+selected="$(cargo xtask changed --list "$base")" || everything "cargo xtask changed --list failed"
 case "$selected" in
   all) everything "a changed file is outside every package and nothing includes it" ;;
   "") everything "no changed file found against $base" ;;
