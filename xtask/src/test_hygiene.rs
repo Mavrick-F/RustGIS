@@ -16,9 +16,16 @@ struct Token<'a> {
     at: usize,
 }
 
+/// The 1-based line of a byte offset, from the file's newline offsets.
+fn line_of(newlines: &[usize], at: usize) -> usize {
+    newlines.partition_point(|&n| n < at) + 1
+}
+
 /// Skip comments and keep literals whole: examples, URLs, braces and embedded scripts are data.
-fn tokens(source: &str) -> (Vec<Token<'_>>, BTreeSet<usize>) {
+/// Also returns the newline offsets, so lines are looked up without rescanning the file.
+fn tokens(source: &str) -> (Vec<Token<'_>>, BTreeSet<usize>, Vec<usize>) {
     let b = source.as_bytes();
+    let newlines: Vec<usize> = source.match_indices('\n').map(|(n, _)| n).collect();
     let mut out = Vec::new();
     let mut reasons = BTreeSet::new();
     let mut at = 0;
@@ -27,7 +34,7 @@ fn tokens(source: &str) -> (Vec<Token<'_>>, BTreeSet<usize>) {
         if b.get(at..at + 2) == Some(b"//") {
             let end = source[at..].find('\n').map_or(b.len(), |n| at + n);
             if source[at + 2..end].trim().strip_prefix("test-wait:").is_some_and(|s| !s.trim().is_empty()) {
-                reasons.insert(source[..at].bytes().filter(|c| *c == b'\n').count() + 1);
+                reasons.insert(line_of(&newlines, at));
             }
             at = end;
             continue;
@@ -92,7 +99,56 @@ fn tokens(source: &str) -> (Vec<Token<'_>>, BTreeSet<usize>) {
         }
         out.push(Token { text: &source[start..at], at: start });
     }
-    (out, reasons)
+    (out, reasons, newlines)
+}
+
+/// Split attribute words at top-level commas.
+fn top_level<'a>(words: &[&'a str]) -> Vec<Vec<&'a str>> {
+    let mut parts = vec![Vec::new()];
+    let mut depth = 0usize;
+    for word in words {
+        match *word {
+            "(" | "[" => depth += 1,
+            ")" | "]" => depth = depth.saturating_sub(1),
+            "," if depth == 0 => {
+                parts.push(Vec::new());
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(part) = parts.last_mut() {
+            part.push(*word);
+        }
+    }
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
+/// Whether a `cfg` predicate holds only in test builds: `test`, an `all` with such a part, or
+/// an `any` whose every part is one. `not(..)` and other options never imply it.
+fn requires_test(predicate: &[&str]) -> bool {
+    let inner = || predicate.get(2..predicate.len().saturating_sub(1)).unwrap_or_default();
+    match predicate {
+        ["test"] => true,
+        ["all", "(", .., ")"] => top_level(inner()).iter().any(|p| requires_test(p)),
+        ["any", "(", .., ")"] => {
+            let parts = top_level(inner());
+            !parts.is_empty() && parts.iter().all(|p| requires_test(p))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an attribute's words make the next item test-only (`cfg`) or a test (`test`, or
+/// `test` applied through `cfg_attr`).
+fn marks_test(words: &[&str]) -> bool {
+    let args = || words.get(2..words.len().saturating_sub(1)).unwrap_or_default();
+    match words {
+        ["test"] => true,
+        ["cfg", "(", .., ")"] => requires_test(args()),
+        ["cfg_attr", "(", .., ")"] => top_level(args()).iter().skip(1).any(|a| a.as_slice() == ["test"]),
+        _ => false,
+    }
 }
 
 /// Contents of a plain or raw string literal, for ignore reasons and module paths.
@@ -108,7 +164,7 @@ fn string_contents(text: &str) -> Option<&str> {
 /// Find test-only modules and test bodies using balanced delimiters, independent of formatting.
 /// Follow external modules and `include!` as well, so helpers needn't have a special filename.
 fn scan(path: &Path, source: &str, whole_test: bool) -> (Vec<String>, Vec<PathBuf>) {
-    let (tokens, reasons) = tokens(source);
+    let (tokens, reasons, newlines) = tokens(source);
     let mut errors = Vec::new();
     let mut modules = Vec::new();
     let parent = path.parent().unwrap_or(Path::new(""));
@@ -131,7 +187,7 @@ fn scan(path: &Path, source: &str, whole_test: bool) -> (Vec<String>, Vec<PathBu
     while let Some(t) = tokens.get(i) {
         let next = |n: usize| tokens.get(i + n).map_or("", |t| t.text);
         let in_test = scopes.last().is_some_and(|s| s.0) || pending_test;
-        let line = || source[..t.at].bytes().filter(|c| *c == b'\n').count() + 1;
+        let line = || line_of(&newlines, t.at);
         let inner = next(1) == "!";
         if t.text == "#" && next(if inner { 2 } else { 1 }) == "[" {
             let start = i + if inner { 3 } else { 2 };
@@ -165,8 +221,7 @@ fn scan(path: &Path, source: &str, whole_test: bool) -> (Vec<String>, Vec<PathBu
                     }
                 }
             }
-            pending_test |= words == ["test"]
-                || (words.first() == Some(&"cfg") && words.contains(&"test") && !words.windows(3).any(|w| w == ["not", "(", "test"]));
+            pending_test |= marks_test(&words);
             if words.first() == Some(&"path") {
                 module_path = words.get(2).and_then(|s| string_contents(s)).map(str::to_string);
             }
@@ -269,10 +324,11 @@ pub fn run(root: &Path) -> Result<(), String> {
         }
         visited.insert(path);
     }
-    for path in files {
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        errors.extend(scan(relative, &text, tests.contains(&path)).0);
+    // Included sources needn't end in `.rs`, so the discovered test sources are checked too.
+    for path in files.union(&tests) {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        errors.extend(scan(relative, &text, tests.contains(path)).0);
     }
     if !errors.is_empty() {
         return Err(errors.join("\n"));
@@ -318,8 +374,12 @@ mod tests {
             fn more_production() { std::thread::sleep(d); }
             #[cfg(all(test, not(target_arch = "wasm32")))] fn helper() { sleep(d); }
             #[cfg(not(test))] fn native() { sleep(d); }
+            #[cfg(any(test, unix))] fn unix_or_test() { sleep(d); }
+            #[cfg(any(test, all(test, unix)))] fn only_test() { sleep(d); }
+            #[cfg_attr(test, test)] fn conditional() { sleep(d); }
+            #[cfg_attr(test, allow(dead_code))] fn allowed() { sleep(d); }
         "#;
-        assert_eq!(scan(Path::new("src/lib.rs"), text, false).0.len(), 2);
+        assert_eq!(scan(Path::new("src/lib.rs"), text, false).0.len(), 4);
         assert_eq!(scan(Path::new("tests/helper.rs"), "fn helper() { sleep(d); }", true).0.len(), 1);
         assert_eq!(scan(Path::new("src/lib.rs"), "#![cfg(test)] fn helper() { sleep(d); }", false).0.len(), 1);
     }
@@ -363,9 +423,14 @@ mod tests {
         std::fs::create_dir_all(dir.join("checks/nested")).unwrap();
         std::fs::write(dir.join("lib.rs"), "#[cfg(test)] mod checks { mod helper; }").unwrap();
         std::fs::write(dir.join("checks/helper.rs"), "#[path = \"nested/worker.rs\"] mod worker;").unwrap();
-        std::fs::write(dir.join("checks/nested/worker.rs"), "include!(\"body.rs\");").unwrap();
+        std::fs::write(dir.join("checks/nested/worker.rs"), "include!(\"body.rs\"); include!(\"cases.inc\");").unwrap();
         let body = dir.join("checks/nested/body.rs");
         std::fs::write(&body, "fn helper() { std::thread::sleep(d); }").unwrap();
+        let cases = dir.join("checks/nested/cases.inc");
+        std::fs::write(&cases, "fn case() { sleep(d); }").unwrap();
+        let error = run(&dir).unwrap_err();
+        assert!(error.contains("cases.inc:1: timer wait"), "{error}");
+        std::fs::write(&cases, "fn case() {}").unwrap();
         let error = run(&dir.join("checks/..")).unwrap_err();
         assert!(error.contains("body.rs:1: timer wait"), "{error}");
         std::fs::write(&body, "fn helper() { std::thread::sleep(d); } // test-wait: simulated slow worker").unwrap();
