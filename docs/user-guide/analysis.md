@@ -933,15 +933,16 @@ dataset's field definitions and exclude its sentinel first: set a **Definition Q
 
 **Count records by month.** To count permits by issue month, start with `issue_date` as a Date/Date-time field or ISO text
 (`YYYY-MM-DD`, optionally followed by a time). Convert other date spellings with
-**Convert Field** first; taking the first seven characters of `6/23/2021` does not give a month.
+**Convert Field** first ([date formats](#the-attribute-table); it reads months and days as two
+digits, so `06/23/2021` converts but `6/23/2021` doesn't).
 
 1. Clear any selection and definition query to include all records. Add a **Text** field named
    `issue_month`, turn editing on, and use **Calculate Field** with `substr(issue_date, 1, 7)`.
    A date such as `2026-03-05` becomes `2026-03`, keeping different years separate.
 2. Run **Summary Statistics** on the permits, with **Case Fields** = `issue_month` and a
    **COUNT** statistic on `issue_date` (use **Add statistic**).
-3. Read `FREQUENCY` as the number of permits per month. Missing dates form a separate empty-key
-   group: its `FREQUENCY` counts those records, while `COUNT_issue_date` is zero. The output
+3. Read `FREQUENCY` as the number of permits per month. Records without a date form a separate
+   group with an empty key. The output
    contains months present in the data; it does not fill in missing months with zero.
 
 **Minimum Bounding Geometry** (`convexHull`) encloses each feature in its convex hull (Group

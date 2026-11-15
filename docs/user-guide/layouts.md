@@ -464,7 +464,9 @@ Use `layout.series` to set a page-name field and margin; for example, on the act
 layout.series={"layer":"Tracts","nameField":"GEOID","margin":0.1}
 ```
 
-Without `frame`, the command uses the layout's first map frame. `nameField` supplies
+Without `frame` (the frame's element id), the command uses the layout's first map frame, so
+name the frame when the series is on another one. Running `layout.series` again starts the series
+over at its first page. `nameField` supplies
 `{pageName}` in dynamic text; if omitted, it uses the index layer's label field, or the row number
 (starting at 1) when that field is unavailable. Add a text element such as
 `Tract {pageName} · {page} of {pages}`. In commands, `layout.seriesPage={"page":0}` is the
