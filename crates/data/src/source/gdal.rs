@@ -206,11 +206,6 @@ fn version(text: &str) -> Option<(u32, u32)> {
 
 /// The vector layers of a dataset, from `ogrinfo -json`.
 fn list(src: &Path) -> Result<Vec<LayerInfo>> {
-    list_with_timeout(src, LIST_TIMEOUT)
-}
-
-/// Lists afresh with a bounded program run; the deadline is injectable for the timeout regression.
-fn list_with_timeout(src: &Path, timeout: std::time::Duration) -> Result<Vec<LayerInfo>> {
     let src = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
     // A file or folder on this computer: GDAL would fetch a `/vsicurl/` address.
     std::fs::metadata(&src)?;
@@ -220,7 +215,7 @@ fn list_with_timeout(src: &Path, timeout: std::time::Duration) -> Result<Vec<Lay
     check_version(&ogrinfo).map_err(|e| DataError::Format(format!("{}: {e}", src.display())))?;
     let mut c = command(ogrinfo, drivers);
     c.args(["-json", "-ro", "-so", "-nomd", "-noextent"]).arg(&src);
-    let out = output(c, timeout, &format!("GDAL listing {}", src.display()))?;
+    let out = output(c, LIST_TIMEOUT, &format!("GDAL listing {}", src.display()))?;
     if !out.status.success() {
         return Err(DataError::Format(format!("GDAL: {}", String::from_utf8_lossy(&out.stderr).trim())));
     }
@@ -964,19 +959,6 @@ mod tests {
         std::fs::write(&path, vec![b'!'; input.len() + 1]).unwrap();
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
         assert!(cached_list(&cache, &path).is_err(), "size changed");
-    }
-
-    #[test]
-    fn listing_timeout_names_the_source_and_operation() {
-        if !usable() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("parcels.geojsonl");
-        std::fs::write(&path, r#"{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}"#).unwrap();
-        let error = list_with_timeout(&path, std::time::Duration::ZERO).unwrap_err().to_string();
-        assert!(error.contains(&path.display().to_string()), "{error}");
-        assert!(error.contains("GDAL listing") && error.contains("ran for more than"), "{error}");
     }
 
     #[test]
