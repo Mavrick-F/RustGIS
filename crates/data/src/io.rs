@@ -1570,8 +1570,9 @@ impl<W: std::io::Write> GeoJsonWriter<W> {
 
 /// Longitude and latitude columns, recognised in any order; CSV export names its coordinate
 /// columns with the first of each that no field has.
-const LON_NAMES: &[&str] = &["longitude", "lon", "lng", "long", "x", "lon_dd", "longitude_dd", "stop_lon"];
-const LAT_NAMES: &[&str] = &["latitude", "lat", "y", "lat_dd", "latitude_dd", "stop_lat"];
+const LON_NAMES: &[&str] =
+    &["longitude", "lon", "lng", "long", "x", "lon_dd", "longitude_dd", "stop_lon", "longitude decimal degrees", "longitutde"];
+const LAT_NAMES: &[&str] = &["latitude", "lat", "y", "lat_dd", "latitude_dd", "stop_lat", "latitude decimal degrees", "lattitude"];
 
 /// Projected coordinate columns, recognised as well as longitude/latitude ones.
 const X_NAMES: &[&str] = &["easting", "point_x", "xcoord", "x_coord"];
@@ -1641,6 +1642,40 @@ fn found_xy(headers: &[String]) -> Option<(usize, usize)> {
     find(LON_NAMES).zip(find(LAT_NAMES)).or_else(|| find(X_NAMES).zip(find(Y_NAMES)))
 }
 
+/// Keeps the first named pair unless its values exceed degrees and a more specific
+/// longitude/latitude pair has usable degree values. The choice covers the whole file;
+/// explicit columns and projected systems bypass this inference.
+fn found_xy_in_rows(headers: &[String], rows: &[Vec<String>]) -> Result<Option<(usize, usize)>> {
+    let Some(xy) = found_xy(headers) else { return Ok(None) };
+    let find = |names: &[&str], generic: &str| {
+        headers.iter().position(|h| {
+            let name = h.trim().to_ascii_lowercase();
+            name != generic && names.contains(&name.as_str())
+        })
+    };
+    let Some(geographic) = find(LON_NAMES, "x").zip(find(LAT_NAMES, "y")) else { return Ok(Some(xy)) };
+    if xy == geographic {
+        return Ok(Some(xy));
+    }
+    let degrees = |p: Coord| p.x.abs() <= 180.0 && p.y.abs() <= 90.0;
+    let (mut outside, mut usable) = (false, false);
+    for row in rows {
+        crate::progress::check()?;
+        let point = |(x, y): (usize, usize)| {
+            let x = row.get(x)?.trim().parse::<f64>().ok()?;
+            let y = row.get(y)?.trim().parse::<f64>().ok()?;
+            let p = Coord::new(x, y);
+            p.is_finite().then_some(p)
+        };
+        outside |= point(xy).is_some_and(|p| !degrees(p));
+        usable |= point(geographic).is_some_and(degrees);
+        if outside && usable {
+            return Ok(Some(geographic));
+        }
+    }
+    Ok(Some(xy))
+}
+
 /// A WKT column found: one named like geometry whose first value reads as WKT.
 fn found_wkt(headers: &[String], rows: &[Vec<String>]) -> Option<usize> {
     // The name first: looking for a column's first value costs a pass over the rows.
@@ -1662,25 +1697,26 @@ pub struct Columns {
     pub delimiter: Option<u8>,
 }
 
-/// The rows [`csv_columns`] reads: a WKT column is found by its first value.
+/// The rows [`csv_columns`] samples for coordinate ranges and a WKT column's first value.
 const COLUMN_SAMPLE_ROWS: usize = 1000;
 
 /// The columns of rows under a header row, as [`read_rows`] would find them.
-pub(crate) fn columns_of(headers: &[String], rows: &[Vec<String>]) -> Columns {
-    let xy = found_xy(headers);
+pub(crate) fn columns_of(headers: &[String], rows: &[Vec<String>]) -> Result<Columns> {
+    let xy = found_xy_in_rows(headers, rows)?;
     let wkt = if xy.is_some() { None } else { found_wkt(headers, rows) };
     let name = |i: usize| headers.get(i).map(|h| h.trim().to_string());
-    Columns {
+    Ok(Columns {
         names: headers.iter().map(|h| h.trim().to_string()).collect(),
         x: xy.and_then(|(x, _)| name(x)),
         y: xy.and_then(|(_, y)| name(y)),
         wkt: wkt.and_then(name),
         delimiter: None,
-    }
+    })
 }
 
 /// The columns of delimited text (split at `delimiter`, or the one found), without reading all
-/// of it: a WKT column whose first value is past the first [`COLUMN_SAMPLE_ROWS`] rows isn't found.
+/// of it: coordinate ranges and a WKT column's first value are checked within
+/// the first [`COLUMN_SAMPLE_ROWS`] rows only.
 pub fn csv_columns(text: &str, delimiter: Option<u8>) -> Result<Columns> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let delimiter = delimiter.unwrap_or_else(|| sniff_delimiter(text));
@@ -1688,7 +1724,7 @@ pub fn csv_columns(text: &str, delimiter: Option<u8>) -> Result<Columns> {
     let headers: Vec<String> = rdr.headers().map_err(|e| DataError::Format(format!("CSV: {e}")))?.iter().map(|s| s.to_string()).collect();
     let rows: Vec<Vec<String>> =
         rdr.records().flatten().take(COLUMN_SAMPLE_ROWS).map(|r| r.iter().map(|s| s.to_string()).collect()).collect();
-    Ok(Columns { delimiter: Some(delimiter), ..columns_of(&headers, &rows) })
+    Ok(Columns { delimiter: Some(delimiter), ..columns_of(&headers, &rows)? })
 }
 
 /// The text of a delimited file from its bytes, and the note to report when it wasn't UTF-8.
@@ -1967,7 +2003,9 @@ pub(crate) fn read_rows(
     }
     let (x, y) = match (x, y) {
         (Some(x), Some(y)) => (Some(x), Some(y)),
-        (None, None) if wkt_given.is_none() => found_xy(headers).unzip(),
+        (None, None) if wkt_given.is_none() => {
+            if opts.crs.is_none_or(|c| c == Crs::LonLat) { found_xy_in_rows(headers, rows)? } else { found_xy(headers) }.unzip()
+        }
         (None, None) => (None, None),
         _ => return Err(DataError::Format("give both the x and the y column".into())),
     };
@@ -2083,37 +2121,45 @@ pub(crate) fn read_rows(
         },
         (None, None) => None,
     };
-    match crs.filter(|c| *c != crate::raster::Crs::LonLat) {
-        Some(c) => {
-            let t = c.transformer().map_err(DataError::Format)?;
-            ds.crs = Some(c);
-            let mut lost = 0usize;
-            for f in &mut ds.features {
-                if let Some(g) = f.geometry.take() {
-                    let out = g.map_coords(&|p| t.to_lonlat(p).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
-                    let mut ok = true;
-                    out.for_each_coord(|c| ok &= c.is_finite());
-                    if ok {
-                        f.geometry = Some(out);
-                    } else {
-                        lost += 1;
-                    }
+    if let Some(c) = crs.filter(|c| *c != crate::raster::Crs::LonLat) {
+        let t = c.transformer().map_err(DataError::Format)?;
+        ds.crs = Some(c);
+        let mut lost = 0usize;
+        for f in &mut ds.features {
+            if let Some(g) = f.geometry.take() {
+                let out = g.map_coords(&|p| t.to_lonlat(p).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
+                let mut ok = true;
+                out.for_each_coord(|c| ok &= c.is_finite());
+                if ok {
+                    f.geometry = Some(out);
+                } else {
+                    lost += 1;
                 }
             }
-            if lost > 0 {
-                report.skipped += lost;
-                report.messages.push(format!("{lost} rows couldn't be converted from {} to longitude/latitude", c.label()));
-            }
         }
-        None => {
-            let outside = ds.features.iter().filter_map(|f| f.geometry.as_ref()).any(out_of_lonlat);
-            if outside {
-                report.messages.push(
-                    "coordinates aren't longitude/latitude: give the file's coordinate system (\"crs\", such as EPSG:2263) to place them"
-                        .into(),
-                );
-            }
+        if lost > 0 {
+            report.skipped += lost;
+            report.messages.push(format!("{lost} rows couldn't be converted from {} to longitude/latitude", c.label()));
         }
+    }
+    let read_as_degrees = crs.is_none_or(|c| c == Crs::LonLat);
+    let (mut outside, mut zero) = (0usize, 0usize);
+    for f in &ds.features {
+        crate::progress::check()?;
+        if let Some(g) = &f.geometry {
+            outside += usize::from(read_as_degrees && out_of_lonlat(g));
+            zero += usize::from(matches!(g, Geometry::Point(p) if p.x == 0.0 && p.y == 0.0));
+        }
+    }
+    if outside > 0 {
+        let rows = if outside == 1 { "1 row has".to_string() } else { format!("{outside} rows have") };
+        report.messages.push(format!(
+            "{rows} coordinates that aren't longitude/latitude (outside ±180° longitude or ±90° latitude): give the file's coordinate system (\"crs\", such as EPSG:2263) to place them"
+        ));
+    }
+    if zero > 0 {
+        let rows = if zero == 1 { "1 row was".to_string() } else { format!("{zero} rows were") };
+        report.messages.push(format!("{rows} placed at 0,0; these may be missing coordinates (the points were kept)"));
     }
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
     report.messages.extend(report.unread_dates.clone());
@@ -5064,6 +5110,83 @@ mod tests {
         assert_eq!(rep.skipped, 1);
         assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(20.0, 10.0))));
         assert!(to_csv(&ds).unwrap().contains("longitude"));
+    }
+
+    /// Projected X/Y must not hide geographic columns; explicit columns and systems still win.
+    #[test]
+    fn csv_coordinate_choice() {
+        for (lon, lat) in [
+            ("Longitude", "Latitude"),
+            ("lon_dd", "lat_dd"),
+            ("stop_lon", "stop_lat"),
+            ("Longitutde", "Lattitude"),
+            ("Longitude Decimal Degrees", "Latitude Decimal Degrees"),
+        ] {
+            let text = format!("X,Y,{lon},{lat}\n500000,3800000,-89.9,35.1\n");
+            let (ds, report) = read_csv(&text, "mixed").unwrap();
+            assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(-89.9, 35.1))), "{lon}/{lat}");
+            assert!(report.messages.is_empty(), "{:?}", report.messages);
+            let c = csv_columns(&text, None).unwrap();
+            assert_eq!((c.x.as_deref(), c.y.as_deref()), (Some(lon), Some(lat)));
+        }
+        let text = "X,Y,Longitude,Latitude\n1000,2000,-89.9,35.1\n";
+        let opts = CsvOptions { crs: Some(Crs::WebMercator), ..Default::default() };
+        let (ds, report) = read_csv_with(text, "projected", &opts).unwrap();
+        let Some(Geometry::Point(p)) = ds.features[0].geometry else { panic!("point") };
+        assert!((p.x - 0.00898315).abs() < 1e-7 && (p.y - 0.0179663).abs() < 1e-7);
+        assert!(report.messages.is_empty());
+        let opts = CsvOptions { x: Some("X".into()), y: Some("Y".into()), ..Default::default() };
+        assert_eq!(
+            read_csv_with(text, "explicit", &opts).unwrap().0.features[0].geometry,
+            Some(Geometry::Point(Coord::new(1000.0, 2000.0)))
+        );
+        // Degree-sized X/Y retain their existing priority, and an unusable alternative doesn't win.
+        for text in ["X,Y,Longitude,Latitude\n1,2,3,4\n", "X,Y,Longitude,Latitude\n1000,2000,bad,\n"] {
+            let c = csv_columns(text, None).unwrap();
+            assert_eq!((c.x.as_deref(), c.y.as_deref()), (Some("X"), Some("Y")));
+        }
+        // A named GTFS pair works alone, but a lone longitude never becomes geometry.
+        assert_eq!(read_csv("stop_lat,stop_lon\n35.1,-89.9\n", "stops").unwrap().0.geometry_type, GeometryType::Point);
+        assert_eq!(read_csv("stop_lon,stop_name\n-89.9,Main\n", "stops").unwrap().0.geometry_type, GeometryType::None);
+    }
+
+    /// Count suspect degree positions, retaining them; one zero axis or a nearby point is clean.
+    #[test]
+    fn csv_coordinate_notices() {
+        let (ds, report) = read_csv("lon,lat\n0,0\n-0,0\n181,20\n20,-91\n", "suspect").unwrap();
+        assert_eq!(ds.features.len(), 4);
+        assert_eq!(report.skipped, 0);
+        assert!(report.messages.iter().any(|m| m.contains("2 rows") && m.contains("0,0")), "{:?}", report.messages);
+        assert!(report.messages.iter().any(|m| m.contains("2 rows") && m.contains("aren't longitude/latitude")), "{:?}", report.messages);
+        let (_, report) = read_csv("lon,lat\n0,1\n1,0\n0.000001,0\n180,90\n-180,-90\n", "clean").unwrap();
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+    }
+
+    /// Default import, explicit dialog picks, byte uploads, paths and gzip share the same rules.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn csv_coordinate_import_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in ["X,Y,Longitude,Latitude\n1000,2000,-89.9,35.1\n1001,2001,0,0\n", "X,Y,Longitude,Latitude\n1000,2000,-89.9,35.1\n"] {
+            let columns = csv_columns(text, None).unwrap();
+            let dialog = CsvOptions { x: columns.x, y: columns.y, ..Default::default() };
+            for name in ["points.csv", "points.txt", "points.dat", "points.csv.gz", "points.dat.gz"] {
+                let bytes = if name.ends_with(".gz") { gzip_csv(text.as_bytes()) } else { text.as_bytes().to_vec() };
+                let path = dir.path().join(name);
+                std::fs::write(&path, &bytes).unwrap();
+                for (ds, report) in
+                    [read_bytes(name, &bytes).unwrap(), read_path(&path).unwrap(), read_delimited_bytes(name, &bytes, &dialog).unwrap()]
+                {
+                    assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(-89.9, 35.1))), "{name}");
+                    if ds.features.len() == 2 {
+                        assert_eq!(report.messages.len(), 1, "{name}: {:?}", report.messages);
+                        assert!(report.messages[0].contains("1 row was placed at 0,0"));
+                    } else {
+                        assert!(report.messages.is_empty(), "{name}: {:?}", report.messages);
+                    }
+                }
+            }
+        }
     }
 
     /// A layer that declares no geometry type gets no coordinate columns, so geometry it holds

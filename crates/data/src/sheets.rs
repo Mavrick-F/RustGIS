@@ -70,7 +70,7 @@ pub fn read(bytes: &[u8], name: &str, sheet: Option<&str>, opts: &CsvOptions) ->
 /// is read from when none are given.
 pub fn columns(bytes: &[u8], sheet: Option<&str>) -> Result<Columns> {
     let g = grid(bytes, sheet)?;
-    Ok(columns_of(&g.headers, &g.rows))
+    columns_of(&g.headers, &g.rows)
 }
 
 /// A sheet as text: the workbook's sheets, the one picked, its column names and its rows.
