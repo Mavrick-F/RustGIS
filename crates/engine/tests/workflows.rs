@@ -40,7 +40,10 @@ fn model_import_refuses_unsupported_files_without_changing_session() {
             "can't read: futureLoops. Update RustGIS to import it",
         ),
         (json!({"version": 1, "requires": ["futureSteps", "futureSteps"], "steps": "unreadable"}), "can't read: futureSteps. Update"),
-        (json!({"requires": "futureLoops", "steps": []}), "as something other than names"),
+        (
+            json!({"requires": "futureLoops", "steps": []}),
+            "other than names, so this RustGIS can't tell whether it reads it. It may be damaged, or from a newer RustGIS: update RustGIS to import it",
+        ),
         (json!({"graph": {"nodes": []}, "description": "Keep this"}), "file has unsupported fields"),
         (json!({"steps": [], "future": true}), "file has unsupported fields"),
         (json!({"graph": {"nodes": []}, "steps": [{"tool": "buffer", "params": {}}]}), "both a graph and steps"),

@@ -913,19 +913,19 @@ impl<'de> serde::de::Visitor<'de> for RequiresVisitor {
 }
 
 /// The capabilities a document requires that this RustGIS doesn't know, each once, or why its
-/// `requires` can't be read.
-fn unknown_capabilities(requires: &Requires, kind: &str) -> Result<Vec<String>, String> {
+/// `requires` can't be read (`open`: what that refusal says to update RustGIS for).
+fn unknown_capabilities(requires: &Requires, kind: &str, open: &str) -> Result<Vec<String>, String> {
     let names = match requires {
         Requires::Nothing => return Ok(Vec::new()),
         Requires::Names(names) => names,
         Requires::TooMany => {
             return Err(format!(
-                "this {kind} lists more than {MAX_REQUIRES} things it needs (`requires`), more than this RustGIS reads. It may be damaged, or from a newer RustGIS: update RustGIS to open it."
+                "this {kind} lists more than {MAX_REQUIRES} things it needs (`requires`), more than this RustGIS reads. It may be damaged, or from a newer RustGIS: update RustGIS to {open} it."
             ));
         }
         Requires::NotNames => {
             return Err(format!(
-                "this {kind} lists what it needs (`requires`) as something other than names, so this RustGIS can't tell whether it reads it. It may be damaged, or from a newer RustGIS: update RustGIS to open it."
+                "this {kind} lists what it needs (`requires`) as something other than names, so this RustGIS can't tell whether it reads it. It may be damaged, or from a newer RustGIS: update RustGIS to {open} it."
             ));
         }
     };
@@ -998,7 +998,7 @@ pub(crate) fn check_requires(requires: Option<&serde_json::Value>, kind: &str, o
 
 /// Refuse what `requires` lists that this RustGIS doesn't know, each name said once.
 fn requires_known(requires: &Requires, kind: &str, open: &str) -> Result<(), String> {
-    let unknown = unknown_capabilities(requires, kind)?;
+    let unknown = unknown_capabilities(requires, kind, open)?;
     if !unknown.is_empty() {
         let mut said: Vec<String> = Vec::new();
         for name in unknown.iter().map(|n| capability_said(n)) {
