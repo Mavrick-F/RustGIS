@@ -990,6 +990,8 @@ fn show_columns(d: &mut Dialogs, found: Result<Value, String>) {
         Err(e) => {
             d.list.clear();
             (d.a, d.b, d.c) = (String::new(), String::new(), String::new());
+            // Nothing picked is left, so a corrected coordinate system finds the columns again.
+            d.csv_picked = false;
             d.error = Some(e);
         }
     }
