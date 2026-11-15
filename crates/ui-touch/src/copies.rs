@@ -414,7 +414,7 @@ mod tests {
         }
         let a = picked.join("1").join("0").join("a.gpkg");
         std::fs::write(&a, b"a").unwrap();
-        std::fs::write(picked.join("2/0/b.gpkg"), b"bb").unwrap();
+        std::fs::write(picked.join("2").join("0").join("b.gpkg"), b"bb").unwrap();
         let found = unused(&picked, "{}", &AtomicBool::new(false)).unwrap();
         assert_eq!(found.picks.len(), 2);
         // An Undo brings back the layer reading a.gpkg before Remove Them.
