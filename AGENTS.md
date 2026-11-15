@@ -41,8 +41,9 @@ is out of scope.
   without a count is fine; Cancel is not optional.
 - A command that must run on the UI thread says why in its doc comment.
 - A new background raster command or export, or a tool whose work grows with its input, goes in
-  the lists in `crates/engine/src/tests.rs` (`cancel_rasters`, `cancel_exports`, `cancel_tools`),
-  which must match the background registries.
+  the lists in `crates/engine/src/tests.rs` (`cancel_rasters`, `cancel_exports`, `cancel_tools`);
+  `cancel_rasters` and `cancel_exports` must match the background registries. A read-ahead command
+  (`reads::prepare`, such as `service.layers`) has no list: add its call to the test below by hand.
   `long_commands_stop_when_cancelled_while_they_run` fails one that never looks at Cancel;
   `cancelling_at_each_check_leaves_nothing_behind` cancels it at its first three checks and its
   last, and fails one that leaves the project, its undo steps or the files changed, or can't run
@@ -61,9 +62,9 @@ Work that splits into independent parts runs on several threads where practical:
 | Layer | Crate | Job |
 |---|---|---|
 | L0 | `geom` | coordinates, extents, projections, geodesic measurement |
-| L1 | `data` | features and attributes, file formats, database providers, queries, rasters |
+| L1 | `data` | features and attributes, file formats, database providers (PostGIS and MySQL through pure-Rust clients, desktop only; GeoPackage in the browser through a pure-Rust `sqlite` reader), queries, rasters; GDAL and DuckDB through their programs |
 | L2 | `map`, `analysis`, `tiles`, `keychain` | layers and symbology; geoprocessing tools; web map tiles; the system's secret store |
-| L3 | `render`, `plugins`, `geolibre` | map rendering and export; WebAssembly plugins; the GeoLibre tool suite |
+| L3 | `render`, `plugins`, `geolibre` | map rendering and export; WebAssembly plugins; the GeoLibre tool suite (its program natively, its WASI runner in the browser) |
 | L4 | `engine` | `Session`, undo, the command registry, the sample project |
 | L5 | `assistant` | the AI Assistant (sans I/O); file, network and plugin commands wait for approval |
 | L6 | `ui-egui` | ribbon, panes, map view, attribute table, dialogs |
@@ -88,7 +89,8 @@ Work that splits into independent parts runs on several threads where practical:
   asynchronously (`external_start` → `Services::geolibre_run` → `gp.finish`), never as a blocking
   call. Code only the desktop calls is
   dead code in the browser build and fails it: put it behind `#[cfg(not(target_arch = "wasm32"))]`
-  and check with `RUSTFLAGS='-D warnings' cargo check -p <crate> --target wasm32-unknown-unknown`.
+  and check as CI does, with
+  `RUSTFLAGS='-D warnings' cargo build --locked --target wasm32-unknown-unknown -p rustgis-web`.
 - **Interface text is translatable**: wrap user-visible literals in `tl!("…")`, use
   `i18n::fmt("… {name} …", &[("name", …)])` instead of `format!` for messages, and pass labels to
   the ribbon widgets (they translate). Pull requests don't need to add the new strings to the
@@ -131,8 +133,9 @@ changed file such as `Cargo.lock` is outside every package and nothing includes 
 A new dependency must have a licence `deny.toml` allows (CI runs `cargo deny check licenses`); after
 changing dependencies, run `cargo xtask notices` to refresh the `THIRD-PARTY-LICENSES.txt` files the
 packages ship (the release build fails on stale ones).
-Pull requests run CI on Linux only; pushes to `main` test every platform. Label one `ci:windows`, `ci:macos` or `ci:full` (every
-platform and the release build) when it touches platform-specific code, paths or file dialogs.
+Pull requests run CI on Linux (plus the iOS build when they touch `apps/rustgis-mobile`); pushes to
+`main` test every platform. Label one `ci:windows`, `ci:macos` or `ci:full` (every platform and the
+release build) when it touches platform-specific code, paths or file dialogs.
 
 ## Review comments
 - Fix in the pull request what a review finds wrong: bugs, crash paths, silent data loss, a broken
