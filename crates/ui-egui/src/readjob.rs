@@ -644,7 +644,7 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
         while land(app) {
             assert!(std::time::Instant::now() < end, "the reads never landed");
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for background read completion
         }
     }
 
@@ -674,7 +674,7 @@ mod tests {
                 return (relay, grant, client, ahead);
             }
             assert!(std::time::Instant::now() < end, "relay never paused at its archive read");
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(5)); // test-wait: legacy polling for the relay archive barrier
         }
     }
 
@@ -713,7 +713,7 @@ mod tests {
                 break at;
             }
             assert!(std::time::Instant::now() < end, "the label was never drawn");
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(2)); // test-wait: legacy polling for the draggable label
         };
         label_pointer(&mut h, at, None);
         label_pointer(&mut h, at, Some(true));
@@ -769,7 +769,7 @@ mod tests {
                     let end = std::time::Instant::now() + Duration::from_secs(10);
                     while job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() {
                         assert!(std::time::Instant::now() < end, "cancelled worker did not stop");
-                        std::thread::sleep(Duration::from_millis(2));
+                        std::thread::sleep(Duration::from_millis(2)); // test-wait: legacy polling for cancelled worker completion
                     }
                 }
                 landed(h.state_mut(), 60);
@@ -861,7 +861,7 @@ mod tests {
                 let end = std::time::Instant::now() + Duration::from_secs(5);
                 while app.reads.job.as_ref().unwrap().slot.lock().unwrap().is_none() {
                     assert!(std::time::Instant::now() < end);
-                    std::thread::sleep(Duration::from_millis(1));
+                    std::thread::sleep(Duration::from_millis(1)); // test-wait: legacy polling for the dataset result slot
                 }
                 app.reads.cancel_for_tests();
             }
@@ -1069,7 +1069,7 @@ mod tests {
                 break;
             }
             assert!(std::time::Instant::now() < end, "relay never admitted the archive");
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(5)); // test-wait: legacy polling for relay archive admission
         }
         assert_eq!(app.reads.waiting.len(), 1, "the relay must reuse the one existing worker queue");
         assert_eq!(app.session.map().tiles[0].url, original.to_str().unwrap());

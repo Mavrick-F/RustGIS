@@ -1,7 +1,8 @@
-//! `cargo xtask ci | changed [--list] [base] | layers | notices [--check] | web-pwa <dir>`
+//! `cargo xtask ci | changed [--list] [base] | layers | test-hygiene | notices [--check] | web-pwa <dir>`
 //!
 //! - `layers`: enforces the crate layering (nothing below L6 may depend on egui/eframe/rfd).
-//! - `ci`: fmt check, clippy -D warnings, tests and the layer check.
+//! - `test-hygiene`: timer waits in tests need same-line reasons; ignored tests need reasons.
+//! - `ci`: test hygiene, fmt check, clippy -D warnings, tests and the layer check.
 //! - `changed [--list] [base]`: the same, on only the packages a branch changes and those that
 //!   depend on them (see `changed.rs`).
 //! - `notices [--check]`: writes the third-party licence notices the packages ship (see
@@ -11,6 +12,7 @@
 
 mod changed;
 mod notices;
+mod test_hygiene;
 
 use std::process::{Command, ExitCode};
 
@@ -67,9 +69,10 @@ fn cargo(args: &[&str]) -> Result<(), String> {
     if st.success() { Ok(()) } else { Err(format!("cargo {} failed", args.join(" "))) }
 }
 
-/// `cargo xtask ci`: the fmt check, clippy with warnings as errors, the tests and the layer check,
+/// `cargo xtask ci`: test hygiene, fmt, clippy with warnings as errors, tests and layering,
 /// on the whole workspace.
 fn ci() -> Result<(), String> {
+    test_hygiene::run(&root())?;
     cargo(&["fmt", "--all", "--check"])
         .and_then(|_| cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))
         .and_then(|_| cargo(&["test", "--workspace", "-q"]))
@@ -161,6 +164,7 @@ fn main() -> ExitCode {
     let task = std::env::args().nth(1).unwrap_or_default();
     let r = match task.as_str() {
         "layers" => layers(),
+        "test-hygiene" => test_hygiene::run(&root()),
         "ci" => ci(),
         "changed" => changed::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         "notices" => {
@@ -181,7 +185,7 @@ fn main() -> ExitCode {
             };
         }
         "web-pwa" => web_pwa(std::env::args().nth(2)),
-        _ => Err("usage: cargo xtask ci | changed [--list] [base] | layers | notices [--check] | web-pwa <dir>".into()),
+        _ => Err("usage: cargo xtask ci | changed [--list] [base] | layers | test-hygiene | notices [--check] | web-pwa <dir>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
