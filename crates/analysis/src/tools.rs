@@ -15037,13 +15037,13 @@ mod tests {
             2,
             vec![vec![11., 21., 21., 41., 11., -9999., 41., 41.]],
             GeoTransform { origin_x: 0., origin_y: 60., pixel_width: 30., pixel_height: -30. },
-            Crs::WebMercator,
+            Crs::Epsg(32631),
             Some(-9999.),
             ColorHint::Gray,
             "Float32",
         )
         .unwrap();
-        let polygon = |x: f64| sq(x, 0., 60.).map_coords(&rustgis_geom::merc_to_lonlat);
+        let polygon = |x: f64| sq(x, 0., 60.).map_coords(&|c| raster.transformer().to_lonlat(c).unwrap());
         let mut zones = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("tract", FieldType::Text)]);
         zones.crs = Some(Crs::Epsg(26916));
         for (x, name) in [(0., "a"), (60., "b"), (300., "c")] {
@@ -15052,6 +15052,7 @@ mod tests {
         let mut m = RasterMap { datasets: HashMap::from([("zones".into(), zones)]), rasters: HashMap::from([("cover".into(), &raster)]) };
         let params = serde_json::json!({"raster": "cover", "zones": "zones", "zoneField": "TRACT", "measure": "Count"});
         let result = crate::run("tabulateArea", &m, &params).unwrap();
+        assert!(!result.messages.iter().any(|m| m.contains("uses the raster projection")));
         assert!(result.messages.iter().any(|m| m.starts_with("1 NoData")));
         assert!(result.messages.iter().any(|m| m.starts_with("1 zone(s) contained no valid")));
         let Output::Table(table) = result.output else { panic!("a table") };
@@ -15065,6 +15066,7 @@ mod tests {
             p["measure"] = Json::from("Area");
             p["unit"] = Json::from(unit);
             let result = crate::run("tabulateArea", &m, &p).unwrap();
+            assert!(result.messages.iter().any(|m| m.contains("uses the raster projection (EPSG:32631)")));
             let Output::Table(area) = result.output else { panic!("a table") };
             for (row, expected) in area.features.iter().zip(counts) {
                 for (value, count) in row.attrs.iter().skip(1).zip(expected) {
@@ -15117,6 +15119,7 @@ mod tests {
         let one = tabulate_area::run_on(&m, &p, Some(1)).unwrap();
         let many = tabulate_area::run_on(&m, &p, Some(3)).unwrap();
         assert_eq!(one.messages, many.messages);
+        assert!(!one.messages.iter().any(|m| m.contains("uses the raster projection")));
         assert!(one.messages.iter().any(|m| m.starts_with("1 zone feature(s)")));
         let (Output::Table(a), Output::Table(b)) = (one.output, many.output) else { panic!("tables") };
         assert_eq!(a.features, b.features);
@@ -15143,6 +15146,73 @@ mod tests {
         .unwrap();
         let m = RasterMap { datasets: m.datasets, rasters: HashMap::from([("cover".into(), &many_classes)]) };
         assert!(crate::run("tabulateArea", &m, &p).unwrap_err().contains("more than 1000 classes"));
+    }
+
+    /// Web Mercator and longitude/latitude grids covering the same strips give ground acres.
+    /// A per-cell geographic reference tolerates only longitude-rounding noise; 32 overlapping
+    /// zones exercise the shared row cache across worker batches with bit-exact thread results.
+    #[test]
+    fn tabulate_area_ground_acres_and_row_cache_are_deterministic() {
+        use rustgis_data::raster::{ColorHint, GeoTransform, Raster};
+        let (w, h) = (4, 3);
+        let gt = GeoTransform { origin_x: -90.12345, origin_y: 35.0003, pixel_width: 0.0003, pixel_height: -0.0003 };
+        let band: Vec<f32> = (0..w * h).map(|i| if i % 2 == 0 { 1. } else { 2. }).collect();
+        let geo = Raster::new("geo", w, h, vec![band.clone()], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let top = rustgis_geom::lonlat_to_merc(gt.to_world(0., 0.));
+        let bottom = rustgis_geom::lonlat_to_merc(gt.to_world(f64::from(w), f64::from(h)));
+        let merc_gt = GeoTransform {
+            origin_x: top.x,
+            origin_y: top.y,
+            pixel_width: (bottom.x - top.x) / f64::from(w),
+            pixel_height: (bottom.y - top.y) / f64::from(h),
+        };
+        let merc = Raster::new("merc", w, h, vec![band], merc_gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
+        let lower = gt.to_world(0., f64::from(h));
+        let mut zones = Dataset::new("zones", GeometryType::Polygon, vec![]);
+        for _ in 0..32 {
+            zones.push(Some(sq(gt.origin_x - 0.001, lower.y - 0.001, 0.004)), vec![]);
+        }
+        let m = RasterMap {
+            datasets: HashMap::from([("zones".into(), zones)]),
+            rasters: HashMap::from([("geo".into(), &geo), ("merc".into(), &merc)]),
+        };
+        let divisor = rustgis_data::Measure::Area.unit("ac").unwrap();
+        let mut old = [0.; 2];
+        for row in 0..h {
+            for col in 0..w {
+                let (x, y) = (f64::from(col), f64::from(row));
+                let corners = [(x, y), (x + 1., y), (x + 1., y + 1.), (x, y + 1.)].map(|(c, r)| gt.to_world(c, r));
+                old[(col % 2) as usize] += rustgis_geom::wgs84_ring_perimeter_area_m2(&corners).1;
+            }
+        }
+        let mut geographic = Vec::new();
+        for raster in ["geo", "merc"] {
+            let p = serde_json::json!({"raster":raster,"zones":"zones","unit":"ac"});
+            let one = tabulate_area::run_on(&m, &p, Some(1)).unwrap();
+            assert!(!one.messages.iter().any(|m| m.contains("uses the raster projection")));
+            let Output::Table(table) = &one.output else { panic!("a table") };
+            for (i, expected) in old.iter().enumerate() {
+                let actual = table.features[0].attrs[i + 1].as_f64().unwrap();
+                assert!(
+                    (actual - expected / divisor).abs() <= expected.abs() / divisor * 1e-9,
+                    "{raster}: {actual} vs {}",
+                    expected / divisor
+                );
+                if raster == "geo" {
+                    geographic.push(actual);
+                } else {
+                    assert!((actual - geographic[i]).abs() <= geographic[i] * 1e-9);
+                    let planar = (merc_gt.pixel_width * merc_gt.pixel_height).abs() * f64::from(w * h / 2) / divisor;
+                    assert!(actual < planar * 0.8, "Web Mercator ground area must be smaller than its grid area at Memphis");
+                }
+            }
+            for threads in [2, 7] {
+                let many = tabulate_area::run_on(&m, &p, Some(threads)).unwrap();
+                let Output::Table(parallel) = many.output else { panic!("a table") };
+                assert_eq!(parallel.features, table.features, "{raster}, {threads} threads");
+                assert_eq!(many.messages, one.messages);
+            }
+        }
     }
 
     /// Zones worked out on several threads give the same statistics, bit for bit, as on one, in

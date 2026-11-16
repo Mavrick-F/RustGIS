@@ -1973,12 +1973,20 @@ in WGS 84 and transformed onto the raster's grid; the polygon layer's original C
 is not applied again. Invalid features and parts that cannot be placed on the raster are
 counted in notices, with valid features and grid-projected parts retained.
 
-For a projected raster, cell area is the absolute pixel width times pixel height, converted
-from its CRS's linear units to square metres. This is **area in the raster's projection**:
-use an equal-area raster for ground-area summaries. A 30 m equal-area raster contributes
-900 m² (900 / 4046.8564224 acres) per cell. For a geographic raster, each cell's four corners
-are transformed to WGS 84 and measured on the ellipsoid using geodesic edges; area varies
-with position. A cell whose area cannot be measured causes an error.
+For geographic and **Web Mercator** rasters, cell corners are transformed to WGS 84 and
+measured on the ellipsoid using geodesic edges. This gives ground area instead of Web
+Mercator's inflated map area. WGS 84 longitude/latitude and Web Mercator grids share a cache
+of cell areas by raster row; every worker uses the same first-column representative, keeping
+results identical across thread counts. Other geographic datums and axis orders retain
+per-cell measurement because their transformed cell areas can also vary across a row.
+A cell whose area cannot be measured causes an error.
+
+Other projected rasters use the absolute pixel width times pixel height, converted from the
+CRS's linear units to square metres. The tool reports this **area in the raster's projection**
+in a notice. RustGIS does not currently classify equal-area projections, so all projected
+rasters except Web Mercator receive that notice for Area measurements. Use an equal-area
+raster for ground-area summaries: a 30 m equal-area raster contributes 900 m²
+(900 / 4046.8564224 acres) per cell. Count measurements need no area conversion or notice.
 
 ```json
 {"tool":"tabulateArea","params":{"raster":"LandCover","zones":"Tracts","zoneField":"GEOID","unit":"ac","output":"CoverAcres"}}

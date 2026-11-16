@@ -50,8 +50,10 @@ pub(super) fn run_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Resu
         return Err(format!("Tabulate Area would make more than {MAX_PIVOT_CELLS} table values; select fewer zones"));
     }
     let index: HashMap<u32, usize> = classes.iter().enumerate().map(|(i, &v)| (class_key(v), i)).collect();
+    let areas = CellAreas::new(r, count);
     // The largest grouped geometry's copies in lon/lat and on the grid, the largest raster
-    // mask and its trimmed copy, plus each zone's dense class totals.
+    // mask and its trimmed copy, plus each zone's dense class totals. Conservatively include
+    // the shared row cache in each worker's estimate so it stays within the scratch allowance.
     let geometry_bytes = groups
         .iter()
         .map(|group| {
@@ -68,10 +70,11 @@ pub(super) fn run_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Resu
         .saturating_mul(r.height as usize)
         .saturating_mul(2)
         .saturating_add(classes.len().saturating_mul(size_of::<f64>()))
+        .saturating_add(areas.cache_bytes)
         .saturating_add(geometry_bytes);
     let threads = threads.unwrap_or_else(|| crate::parallel::threads_for_scratch(groups.len(), PARALLEL_FEATURES, scratch));
     let totals =
-        crate::parallel::try_map_on(&groups, threads, || (), |_, _, group| summarize(r, *band, zones, &group.rows, &index, count))?;
+        crate::parallel::try_map_on(&groups, threads, || (), |_, _, group| summarize(r, *band, zones, &group.rows, &index, &areas))?;
     let zone_field = keys.first().and_then(|&i| zones.fields.get(i)).cloned().unwrap_or_else(|| Field::new("zone_id", FieldType::Text));
     let mut out = Dataset::new(out_name(p, format!("{}_TabulateArea", zones.name)), GeometryType::None, vec![zone_field]);
     for &class in &classes {
@@ -92,6 +95,12 @@ pub(super) fn run_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Resu
     }
     let mut messages =
         vec![format!("Tabulated {} zone(s) by {} class(es), in {}", out.features.len(), classes.len(), if count { "cells" } else { unit })];
+    if !count && !ellipsoidal_area(r) {
+        messages.push(format!(
+            "Area for {} zone(s) uses the raster projection ({}); it may differ from ellipsoidal ground area. Use an equal-area raster for ground-area summaries",
+            out.features.len(), r.crs.label()
+        ));
+    }
     if nodata > 0 {
         messages.push(format!("{nodata} NoData or non-finite cell(s) inside zones were excluded (counted once per zone)"));
     }
@@ -154,7 +163,7 @@ fn summarize(
     zones: &Dataset,
     rows: &[usize],
     classes: &HashMap<u32, usize>,
-    count: bool,
+    areas: &CellAreas<'_>,
 ) -> Result<Totals, String> {
     let mut total = Totals { values: vec![0.0; classes.len()], nodata: 0, invalid: 0, parts: 0 };
     let mut polygons = Vec::new();
@@ -176,15 +185,10 @@ fn summarize(
     crate::control::check()?;
     let Some((cols, rows, mask)) = mask else { return Ok(total) };
     let width = (cols.end - cols.start) as usize;
-    let projected_area = if count || r.transformer().is_geographic() {
-        None
-    } else {
-        let metres = r.transformer().params().map_or(1.0, |p| p.to_meter);
-        Some((r.transform.pixel_width * r.transform.pixel_height).abs() * metres * metres)
-    };
     let mut pace = crate::control::Pace::default();
     for (ri, row) in rows.enumerate() {
         crate::control::check()?;
+        let mut row_area = areas.constant;
         let line = mask.get(ri * width..(ri + 1) * width).ok_or("invalid zone mask")?;
         for (ci, &inside) in line.iter().enumerate() {
             if pace.stop(1) {
@@ -198,12 +202,14 @@ fn summarize(
                 total.nodata += 1;
                 continue;
             };
-            let area = if count {
-                1.0
-            } else if let Some(a) = projected_area {
+            let area = if let Some(a) = row_area {
                 a
             } else {
-                geographic_cell_area(r, col, row)?
+                let a = areas.at(col, row)?;
+                if areas.by_row {
+                    row_area = Some(a);
+                }
+                a
             };
             if !area.is_finite() || area <= 0.0 {
                 return Err("raster cell area is not finite and positive".into());
@@ -218,15 +224,73 @@ fn summarize(
     Ok(total)
 }
 
-/// Geographic cells have no constant square-metre area: measure their four corners on WGS 84
-/// using the shared ellipsoidal area calculation. A corner that cannot transform is an error.
+/// Geographic and Web Mercator grids use ground area; other projections retain their grid area.
+fn ellipsoidal_area(r: &Raster) -> bool {
+    r.transformer().is_geographic() || r.crs == Crs::WebMercator
+}
+
+/// Ground area cached by row for WGS 84 lon/lat and Web Mercator. A fixed first-column cell
+/// makes rounding independent of zone order and worker scheduling. Other geographic datums or
+/// axis orders can vary across a row after transformation, so keep their per-cell calculation.
+struct CellAreas<'a> {
+    raster: &'a Raster,
+    constant: Option<f64>,
+    by_row: bool,
+    rows: std::sync::Mutex<Vec<Option<f64>>>,
+    cache_bytes: usize,
+}
+
+impl<'a> CellAreas<'a> {
+    /// Bounds the shared cache by the scratch budget. The worker estimate includes this shared
+    /// allocation conservatively; refused allocations and rows past its limit cost speed only.
+    fn new(r: &'a Raster, count: bool) -> Self {
+        let constant = if count {
+            Some(1.0)
+        } else if ellipsoidal_area(r) {
+            None
+        } else {
+            let metres = r.transformer().params().map_or(1.0, |p| p.to_meter);
+            Some((r.transform.pixel_width * r.transform.pixel_height).abs() * metres * metres)
+        };
+        let by_row = matches!(r.crs, Crs::LonLat | Crs::WebMercator);
+        let mut rows = Vec::new();
+        if constant.is_none() && by_row {
+            let n = (r.height as usize).min(crate::parallel::scratch_budget() / size_of::<Option<f64>>());
+            if rows.try_reserve_exact(n).is_ok() {
+                rows.resize(n, None);
+            }
+        }
+        let cache_bytes = rows.capacity().saturating_mul(size_of::<Option<f64>>());
+        Self { raster: r, constant, by_row, rows: std::sync::Mutex::new(rows), cache_bytes }
+    }
+
+    /// Measures only rows that contain a valid masked cell. Workers share each cached value;
+    /// no-data-only or off-raster zones neither fill the cache nor cause corner-transform errors.
+    fn at(&self, col: u32, row: u32) -> Result<f64, String> {
+        if !self.by_row {
+            return geographic_cell_area(self.raster, col, row);
+        }
+        let mut cache = self.rows.lock().map_err(|_| "raster row area cache could not be accessed")?;
+        if let Some(Some(a)) = cache.get(row as usize) {
+            return Ok(*a);
+        }
+        let a = geographic_cell_area(self.raster, 0, row)?;
+        if let Some(cached) = cache.get_mut(row as usize) {
+            *cached = Some(a);
+        }
+        Ok(a)
+    }
+}
+
+/// Measures a cell's four corners on WGS 84 using the shared ellipsoidal area calculation.
+/// A corner that cannot transform is an error.
 fn geographic_cell_area(r: &Raster, col: u32, row: u32) -> Result<f64, String> {
     let (x, y) = (f64::from(col), f64::from(row));
     let corners = [(x, y), (x + 1.0, y), (x + 1.0, y + 1.0), (x, y + 1.0)];
     let ring = corners
         .into_iter()
         .map(|(c, row)| {
-            r.transformer().to_lonlat(r.transform.to_world(c, row)).ok_or("a geographic raster cell corner could not be transformed")
+            r.transformer().to_lonlat(r.transform.to_world(c, row)).ok_or("a raster cell corner could not be transformed to WGS 84")
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rustgis_geom::wgs84_ring_perimeter_area_m2(&ring).1)
