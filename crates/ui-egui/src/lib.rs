@@ -3962,6 +3962,7 @@ impl RustGisApp {
                             "jpg",
                             "jpeg",
                             "shp",
+                            "dbf",
                             "zip",
                             "gpkg",
                             "parquet",
