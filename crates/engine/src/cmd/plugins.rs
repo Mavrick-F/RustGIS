@@ -1010,7 +1010,7 @@ struct Between<'a> {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Host for Between<'_> {
-    /// Keeps queued requests' inputs with their own entries, restoring the polling command's capture.
+    /// Keeps separately logged requests isolated, while reads retain the polling command's capture.
     fn call(&mut self, op: &str, params: &Value) -> Result<Value, String> {
         let plugin = self.plugin.clone();
         let bridge = |s: &mut Session| {
@@ -1028,15 +1028,21 @@ impl Host for Between<'_> {
         let reads = Bridge::reads_only(op);
         let mutates =
             plugin.manifest.has(Permission::Edit) && (op == "host.addLayer" || self.s.registry.get(op).is_some_and(|c| c.mutates));
+        // Reads remain part of the polling command; only requests with their own entries are isolated.
+        if reads {
+            return self
+                .s
+                .as_session_plugin(plugin.clone(), |s| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bridge(s).0))
+                        .unwrap_or_else(|_| Err(format!("'{op}' failed unexpectedly")))
+                })
+                .and_then(|r| r);
+        }
         // With the plugin's authority, exactly as during one of its commands.
         // Earlier queued requests have their own entries, separate from the command polling them.
         rustgis_data::provenance::without(|| {
             self.s
                 .as_session_plugin(plugin.clone(), |s| {
-                    if reads {
-                        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bridge(s).0))
-                            .unwrap_or_else(|_| Err(format!("'{op}' failed unexpectedly")));
-                    }
                     let _inputs = s.log.on().then(rustgis_data::provenance::Capture::start);
                     let (at, start) = (crate::project_log::now_ms(), web_time::Instant::now());
                     let res = s.guarded(leak(&plugin.manifest.name), mutates, |s| {

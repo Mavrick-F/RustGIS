@@ -90,7 +90,7 @@ pub fn current() -> Vec<Fingerprint> {
 }
 
 /// Whether provenance is wanted on this thread; ordinary rendering and reads pay no hash cost.
-fn active() -> bool {
+pub(crate) fn active() -> bool {
     INPUTS.with(|v| v.borrow().is_some())
 }
 

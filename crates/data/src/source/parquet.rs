@@ -38,7 +38,7 @@ const MAX_SCAN_BYTES: u64 = if cfg!(target_arch = "wasm32") { 64 << 20 } else { 
 
 /// A GeoParquet file.
 pub struct ParquetSource {
-    /// The actual file backing the retained reader, including a provider's conversion cache.
+    /// The local input attributed to reads; a conversion names its source, never its cache.
     path: Option<std::path::PathBuf>,
     info: SourceInfo,
     reader: Arc<dyn FileReader>,
@@ -73,12 +73,28 @@ impl ParquetSource {
         Ok(source)
     }
 
+    /// Opens a conversion while retaining its original local input for later reads and traversals.
+    /// Queries without a local database have no known local path; SQL's internal reads aren't inferred.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_converted_path(
+        path: &Path,
+        name: &str,
+        original: Option<&Path>,
+        workspace: Option<Arc<super::duckdb::ReloadWorkspace>>,
+    ) -> Result<Self> {
+        let mut source = crate::provenance::without(|| Self::open_path(path, name))?;
+        source.path = original.map(Path::to_path_buf);
+        if let Some(path) = &source.path {
+            crate::provenance::path(path);
+        }
+        source._workspace = workspace;
+        Ok(source)
+    }
+
     /// Opens a private conversion, keeping its files alive for every shared reader.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_owned_path(path: &Path, name: &str, workspace: Arc<super::duckdb::ReloadWorkspace>) -> Result<Self> {
-        let mut source = Self::open_path(path, name)?;
-        source._workspace = Some(workspace);
-        Ok(source)
+        Self::open_converted_path(path, name, None, Some(workspace))
     }
 
     pub fn open_bytes(bytes: Vec<u8>, name: &str) -> Result<Self> {

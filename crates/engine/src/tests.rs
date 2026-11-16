@@ -17554,7 +17554,7 @@ fn duckdb_queries_and_databases() {
 
 /// A source split by geometry type is added polygons first, so its points end on top and none hides
 /// under its own polygons, whether DuckDB or GDAL split it (#1488). Neither program is needed: the
-/// parts are FlatGeobuf fixtures, matching GDAL's conversion format.
+/// parts use each program's conversion format: GeoParquet for DuckDB, FlatGeobuf for GDAL.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn split_sources_keep_their_points_on_top() {
@@ -17568,8 +17568,8 @@ fn split_sources_keep_their_points_on_top() {
         Family::Polygons => r#"{"type": "Polygon", "coordinates": [[[10, 50], [11, 50], [11, 51], [10, 50]]]}"#,
     };
     // A file per part, in the order both programs give them: points first (`Family::ALL`).
-    let write = |stem: &str, f: Family| {
-        let path = dir.join(format!("{stem}-{}.fgb", f.label()));
+    let write = |stem: &str, f: Family, extension: &str| {
+        let path = dir.join(format!("{stem}-{}.{extension}", f.label()));
         let feature = format!(r#"{{"type": "Feature", "properties": {{}}, "geometry": {}}}"#, geometry(f));
         let json = format!(r#"{{"type": "FeatureCollection", "features": [{feature}]}}"#);
         let (ds, _) = rustgis_data::io::read_bytes("part.geojson", json.as_bytes()).unwrap();
@@ -17580,7 +17580,7 @@ fn split_sources_keep_their_points_on_top() {
 
     // A DuckDB query.
     let mut s = Session::new(Project::default());
-    let parts = Family::ALL.iter().map(|f| duckdb::Part { path: write("query", *f), family: *f, count: 1 }).collect();
+    let parts = Family::ALL.iter().map(|f| duckdb::Part { path: write("query", *f, "parquet"), family: *f, count: 1 }).collect();
     let origin =
         |family| rustgis_map::source::DuckdbOrigin { sql: Some("SELECT 1".into()), database: None, table: None, crs: None, family };
     let parts = duckdb_parts(&mut s, "Trip", duckdb::Output { parts, skipped: 0, other_family: 0 }, origin);
@@ -17599,7 +17599,7 @@ fn split_sources_keep_their_points_on_top() {
         .into_iter()
         .flat_map(|layer| Family::ALL.map(|f| (layer, f)))
         .map(|(layer, f)| gdal::Converted {
-            path: write(layer, f),
+            path: write(layer, f, "fgb"),
             name: format!("{layer} ({})", f.label()),
             layer: layer.to_string(),
             family: Some(f),
@@ -17613,7 +17613,7 @@ fn split_sources_keep_their_points_on_top() {
     assert!(!s.notices.iter().any(|n| n.text.contains("converted layer parts keep their generated names")), "no ignored name was supplied");
     let mut single = Session::new(Project::default());
     let output = duckdb::Output {
-        parts: vec![duckdb::Part { path: write("single", Family::Points), family: Family::Points, count: 1 }],
+        parts: vec![duckdb::Part { path: write("single", Family::Points, "parquet"), family: Family::Points, count: 1 }],
         skipped: 0,
         other_family: 0,
     };
@@ -40047,6 +40047,50 @@ fn session_log_export_inputs_exclude_output_reloads() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// DuckDB cache payloads never become inputs, including retained and restored streamed reads.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn session_log_duckdb_inputs_exclude_conversion_cache() {
+    use crate::cmd::layer::{add_converted, duckdb_parts};
+    use rustgis_data::source::{Family, duckdb};
+    let dir = std::env::temp_dir().join(format!("rustgis-log-duckdb-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("source.duckdb");
+    std::fs::write(&database, b"source identity").unwrap();
+    let cache = dir.join("generated.parquet");
+    let mut s = world();
+    rustgis_data::io::write_path(&s.map().layer_by_name("Cities").unwrap().dataset, &cache).unwrap();
+    let params = json!({"stream": true});
+    let added = s
+        .command_epilogue("layer.addSql", &params, |s| {
+            let out = duckdb::Output {
+                parts: vec![duckdb::Part { path: cache.clone(), family: Family::Points, count: 1 }],
+                skipped: 0,
+                other_family: 0,
+            };
+            let parts = duckdb_parts(s, "Converted", out, |family| rustgis_map::source::DuckdbOrigin {
+                sql: Some("SELECT * FROM cities".into()),
+                database: Some(database.display().to_string()),
+                table: None,
+                crs: None,
+                family,
+            });
+            add_converted(s, &params, "the query", &database.display().to_string(), parts)
+        })
+        .unwrap();
+    let inputs = &s.log.entries().last().unwrap().inputs;
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].path, database.display().to_string());
+    // Opening the saved stream's concrete reader also retains the original file identity.
+    let text = serde_json::to_string(&s.project).unwrap();
+    s.run("project.openText", &json!({"text": text})).unwrap();
+    s.run("layer.loadAll", &json!({"layer": added["layer"]})).unwrap();
+    let inputs = &s.log.entries().last().unwrap().inputs;
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].path, database.display().to_string());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Large input lists stay bounded, including merged entries, and disclose the missing count.
 #[test]
 fn session_log_bounds_input_fingerprints() {
@@ -40103,8 +40147,25 @@ fn session_log_bounds_input_fingerprints() {
     let joined = s.log.entries().last().unwrap();
     assert_eq!(joined.inputs.len(), LOG_LIST_ITEMS);
     assert_eq!(joined.inputs_omitted, 9);
-    assert_eq!(s.notices_since(mark).len(), 2);
-    assert!(s.notices_since(mark)[1].text.contains("9 input fingerprints"));
+    assert_eq!(s.notices_since(mark).len(), 1);
+    assert!(s.notices_since(mark)[0].text.contains("9 input fingerprints"));
+    let mut unchanged = joined.clone();
+    unchanged.inputs.clear();
+    unchanged.inputs_omitted = 0;
+    s.log_entry(unchanged, true);
+    assert_eq!(s.notices_since(mark).len(), 1);
+    assert!(s.notices_since(mark)[0].text.contains("9 input fingerprints"));
+    s.notices.clear();
+    let mut later = s.log.entries().last().unwrap().clone();
+    later.inputs = inputs(LOG_LIST_ITEMS, LOG_LIST_ITEMS + 1).collect();
+    later.inputs_omitted = 0;
+    s.log_entry(later, true);
+    assert!(s.notices.is_empty(), "a consumed notice is not repeated per joined step");
+    let mut separate = s.log.entries().last().unwrap().clone();
+    separate.inputs_omitted = 3;
+    s.log_entry(separate, false);
+    assert_eq!(s.notices.len(), 1);
+    assert!(s.notices[0].text.contains("3 input fingerprints"));
 }
 
 /// The session log (#797): a command run by itself that changes the project, or reaches a file

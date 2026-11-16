@@ -824,8 +824,13 @@ impl SourceLayer {
                 let part = out.parts.first().ok_or_else(|| format!("{path}: the table returns no {}", d.family.label()))?;
                 declared_empty = part.count == 0;
                 new.path = Some(part.path.display().to_string());
-                let handle = rustgis_data::source::parquet::ParquetSource::open_owned_path(&part.path, name, fresh.workspace)
-                    .map_err(|e| format!("{path}: {e}"))?;
+                let handle = rustgis_data::source::parquet::ParquetSource::open_converted_path(
+                    &part.path,
+                    name,
+                    Some(std::path::Path::new(path)),
+                    Some(fresh.workspace),
+                )
+                .map_err(|e| format!("{path}: {e}"))?;
                 new.handle = Some(Arc::new(handle));
                 conversion_zm_dropped = false;
                 new.duckdb = Some(d);
@@ -1073,7 +1078,17 @@ impl SourceLayer {
             }
             let opened = {
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(crs) = overridden {
+                if let Some(d) = &self.duckdb {
+                    use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                    let database = d.database.as_deref().map(Database::parse);
+                    let original = match &database {
+                        Some(Database::File(path)) => Some(path.as_path()),
+                        _ => None,
+                    };
+                    let path = std::path::Path::new(p);
+                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                    ParquetSource::open_converted_path(path, name, original, None).map(|src| Box::new(src) as Box<dyn FeatureSource>)
+                } else if let Some(crs) = overridden {
                     let name = std::path::Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
                     rustgis_data::source::shp::ShpSource::open_path_in(std::path::Path::new(p), name, Some(crs))
                         .map(|src| Box::new(src) as Box<dyn FeatureSource>)
@@ -1088,7 +1103,15 @@ impl SourceLayer {
                 #[cfg(not(target_arch = "wasm32"))]
                 (Err(_), Some(d)) if !std::path::Path::new(p).exists() => match rerun(d) {
                     Ok(fresh) => {
-                        let r = rustgis_data::source::open_path(&fresh, None);
+                        use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                        let database = d.database.as_deref().map(Database::parse);
+                        let original = match &database {
+                            Some(Database::File(path)) => Some(path.as_path()),
+                            _ => None,
+                        };
+                        let name = fresh.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                        let r = ParquetSource::open_converted_path(&fresh, name, original, None)
+                            .map(|src| Box::new(src) as Box<dyn FeatureSource>);
                         if r.is_ok() {
                             self.path = Some(fresh.display().to_string());
                         }

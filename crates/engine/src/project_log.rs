@@ -664,6 +664,8 @@ pub struct SessionLog {
     /// commands' (newer than some of the user's still kept), past [`LOG_PLUGIN_LIMIT`].
     dropped: u64,
     dropped_plugin: u64,
+    /// Absolute notice mark for the newest entry's single omission notice, if already said.
+    input_notice: Option<u64>,
 }
 
 impl SessionLog {
@@ -696,6 +698,7 @@ impl SessionLog {
         if plugin(&e) {
             self.plugin_entries += 1;
         }
+        self.input_notice = None;
         self.changes = self.changes.wrapping_add(1);
         self.entries.push_back(e);
         while self.entries.len() > LOG_LIMIT {
@@ -787,6 +790,7 @@ impl SessionLog {
 
     /// Empties the log; how many entries it had.
     pub fn clear(&mut self) -> usize {
+        self.input_notice = None;
         self.plugin_entries = 0;
         self.dropped = 0;
         self.dropped_plugin = 0;
@@ -830,18 +834,33 @@ fn write_entry(w: &mut dyn std::io::Write, e: &LogEntry, csv: bool) -> std::io::
 impl Session {
     /// Records a command's entry and says when its input list could not be kept in full.
     pub(crate) fn log_entry(&mut self, entry: LogEntry, joins: bool) {
+        let before = self.log.changes();
         if joins {
             self.log.join_last(entry)
         } else {
             self.log.push(entry)
         }
+        if self.log.changes() == before {
+            return;
+        }
         if let Some(entry) = self.log.entries.back()
             && entry.inputs_omitted > 0
         {
-            self.notify(
-                format!("Session log omitted {} input fingerprints from this entry (limit {LOG_LIST_ITEMS})", entry.inputs_omitted),
-                false,
-            );
+            let text = format!("Session log omitted {} input fingerprints from this entry (limit {LOG_LIST_ITEMS})", entry.inputs_omitted);
+            if let Some(mark) = self.log.input_notice {
+                // Joining updates the existing notice's total. A notice already consumed or
+                // evicted is not published again for each repeating step.
+                let offset = usize::try_from(self.notice_mark().saturating_sub(mark)).unwrap_or(usize::MAX);
+                if let Some(index) = self.notices.len().checked_sub(offset)
+                    && let Some(notice) = self.notices.get_mut(index)
+                    && notice.text.starts_with("Session log omitted ")
+                {
+                    notice.text = text;
+                }
+            } else {
+                self.log.input_notice = Some(self.notice_mark());
+                self.notify(text, false);
+            }
         }
     }
 }

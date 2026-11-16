@@ -3353,7 +3353,17 @@ pub(crate) fn add_converted(s: &mut Session, p: &Value, label: &str, original: &
                     .map_err(|e| format!("{original}: {e}"))
                     .and_then(|opened| add_source_with(s, &q, Origin::Path(&file), Some(Box::new(opened)), None))
             }
-            ConvertedOrigin::Duckdb(_) => add_source(s, &q, Origin::Path(&file), None),
+            ConvertedOrigin::Duckdb(d) => {
+                use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                let database = d.database.as_deref().map(Database::parse);
+                let original = match &database {
+                    Some(Database::File(path)) => Some(path.as_path()),
+                    _ => None,
+                };
+                ParquetSource::open_converted_path(&c.path, &c.name, original, None)
+                    .map_err(|e| format!("{file}: {e}"))
+                    .and_then(|opened| add_source_with(s, &q, Origin::Path(&file), Some(Box::new(opened)), None))
+            }
         };
         let r = match added {
             Ok(r) => r,

@@ -182,6 +182,39 @@ fn plain_ers(src: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Observes only plainly named local companions, without imposing a header validation on conversion.
+/// Failure to inspect this small header affects provenance alone, never whether GDAL can open it.
+fn observe_ers_companions(src: &Path) {
+    use std::io::Read;
+    if !crate::provenance::active() || !src.extension().is_some_and(|e| e.eq_ignore_ascii_case("ers")) {
+        return;
+    }
+    const MAX_HEADER: u64 = 1 << 20;
+    if !std::fs::metadata(src).is_ok_and(|m| m.is_file() && m.len() <= MAX_HEADER) {
+        return;
+    }
+    let Ok(file) = std::fs::File::open(src) else { return };
+    let mut bytes = Vec::new();
+    if (&file).take(MAX_HEADER + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_HEADER {
+        return;
+    }
+    crate::provenance::buffer(src, &file, &bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    for line in text.split(['\r', '\n']) {
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("DataFile")
+        {
+            let name = value.trim().trim_matches('"');
+            if !name.is_empty() && !matches!(name, "." | "..") && !name.contains(['/', '\\', ':']) {
+                let companion = src.with_file_name(name);
+                if companion.is_file() {
+                    crate::provenance::path(&companion);
+                }
+            }
+        }
+    }
+}
+
 fn is_vsi(s: &str) -> bool {
     s.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("/vsi"))
 }
@@ -451,7 +484,7 @@ fn convert_in(dir: &Path, src: &Path, layer: Option<&str>, crs: Option<&str>, bu
     }
     let full = local_regular_file(src)?;
     crate::provenance::path(&full);
-    plain_ers(&full)?;
+    observe_ers_companions(&full);
     let layer = layer.map(str::trim).filter(|l| !l.is_empty());
     std::fs::create_dir_all(dir)?;
     external::prune(dir, ours, KEEP);
@@ -753,6 +786,35 @@ mod tests {
         }
         // Not an ER Mapper header: nothing to check.
         assert!(plain_ers(Path::new("/nowhere/a.img")).is_ok());
+    }
+
+    /// A reusable conversion must not acquire new ER Mapper validation through logging.
+    #[test]
+    fn er_mapper_provenance_keeps_conversion_cache_hits_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(dir.path().join("plain.dat"), b"cells").unwrap();
+        for data in ["plain.dat", "../linked.dat"] {
+            let src = dir.path().join("linked.ers");
+            std::fs::write(&src, format!("DatasetHeader Begin\nDataSetType = Translated\nDataFile = \"{data}\"\nDatasetHeader End\n"))
+                .unwrap();
+            let (len, modified) = stamp(&src).unwrap();
+            let key = format!("raster {CONVERSION}\n{}\nNone\nNone\n{len}\n{modified}", src.display());
+            let tag = format!("{:016x}", fnv1a(key.as_bytes()));
+            std::fs::write(cache.join(format!("{tag}.tif")), b"cached conversion").unwrap();
+            std::fs::write(cache.join(format!("{tag}.rkey")), format!("{key}{FOUND}{{}}")).unwrap();
+            for enabled in [false, true] {
+                let capture = enabled.then(crate::provenance::Capture::start);
+                assert!(convert_in(&cache, &src, None, None, None).is_ok());
+                if let Some(capture) = capture {
+                    let inputs = capture.inputs();
+                    assert!(inputs.iter().any(|i| i.path == src.display().to_string()));
+                    assert_eq!(inputs.iter().any(|i| i.path.ends_with("plain.dat")), data == "plain.dat");
+                    assert!(!inputs.iter().any(|i| i.path.ends_with("linked.dat")));
+                }
+            }
+        }
     }
 
     /// A VRT renamed `.img` isn't opened as a VRT, so the raster it names isn't read.
