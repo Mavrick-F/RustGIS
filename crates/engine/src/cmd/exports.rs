@@ -144,9 +144,9 @@ fn said(s: &mut Session, wrote: Wrote) -> CmdResult {
 
 /// Lands an export drawn on a copy of the map or project (Export Map, Export Layout): what
 /// drawing it said, with each notice's severity; the streamed layers whose source failed on the
-/// copy, marked on their live layers as drawing them there would have (or, where that layer is
-/// gone or opened afresh, said in one notice to be missing from the file); then that it was
-/// written to `path`, or why not. A cancelled one says only that it was cancelled.
+/// copy, marked and reported once on their live layers as drawing them there would have (or,
+/// where that layer is gone or opened afresh, said in one notice to be missing from the file);
+/// then that it was written to `path`, or why not. A cancelled one says only that it was cancelled.
 pub(crate) fn drawn(
     maps: &[rustgis_map::Map],
     notices: Vec<(rustgis_data::diagnostics::Severity, String)>,
@@ -189,9 +189,12 @@ pub(crate) fn drawn(
                 Some(src) if src.same_opening(&copied) => {
                     src.error.get_or_insert(error);
                 }
-                _ => missing.push((name, error)),
+                _ => missing.push((name, copied.read_error().unwrap_or(error))),
             }
         }
+        // Background exports land without Session::run's final notices. Say the failures now,
+        // with the same per-layer marker the screen uses, before reporting the written file.
+        s.notice_landed_pixels();
         // One notice for them all, with a count, naming the first.
         if let Some((name, error)) = missing.first() {
             let n = missing.len();

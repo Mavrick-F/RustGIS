@@ -21900,7 +21900,11 @@ fn area_review_reports_retain_where_clauses_when_fitted() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn missing_read_in_place_file_names_layer_and_path_once() {
-    use crate::render;
+    use crate::{
+        cmd::exports::{export_land, export_start},
+        render,
+    };
+    use rustgis_analysis::control::Control;
     use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
     use rustgis_map::source::SourceLayer;
 
@@ -21909,6 +21913,41 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut data = Dataset::new("sites", GeometryType::Point, vec![]);
     data.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![]);
+    // Both command-line dispatch and the app's worker must report a successful export's gap
+    // immediately, without relying on a later screen frame, and only once for that failure.
+    let check_exports = |saved: &str, missing: bool, path: &std::path::Path| {
+        for background in [false, true] {
+            for (command, file) in [
+                ("share.exportMap", "map.png"),
+                ("share.exportMap", "map.tif"),
+                ("layout.export", "page.png"),
+                ("layout.export", "page.pdf"),
+                ("layout.export", "page.svg"),
+            ] {
+                let mut session = Session::new(serde_json::from_str(saved).unwrap());
+                let params = json!({"path": dir.join(file), "width": 160, "height": 120, "dpi": 48});
+                let mark = session.notice_mark();
+                for _ in 0..2 {
+                    if background {
+                        let run = export_start(&mut session, command, &params).unwrap();
+                        let started = run.started();
+                        export_land(&mut session, started, run.run(&Control::new())).unwrap();
+                    } else {
+                        session.run(command, &params).unwrap();
+                    }
+                }
+                assert!(dir.join(file).is_file());
+                let notices: Vec<_> = session.notices_since(mark).iter().filter(|n| n.text.contains("Survey sites")).collect();
+                assert_eq!(notices.len(), usize::from(missing), "{command} {file} background={background}: {notices:?}");
+                if missing {
+                    assert!(notices[0].error);
+                    for detail in [path.to_str().unwrap(), "moved or deleted", "Repair Data Source"] {
+                        assert!(notices[0].text.contains(detail), "missing {detail:?} in {notices:?}");
+                    }
+                }
+            }
+        }
+    };
     for ext in ["shp", "fgb", "parquet", "gpkg"] {
         let path = dir.join(format!("sites.{ext}"));
         rustgis_data::io::write_path(&data, &path).unwrap();
@@ -21920,7 +21959,13 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
         assert!(render::render_png(session.map_mut(), &view).is_ok(), "{ext}: intact file");
         session.notice_landed_rasters();
         assert!(session.notices_since(mark).is_empty(), "{:?}", session.notices_since(mark));
+        if ext == "fgb" {
+            session.run("layout.new", &json!({"template": "map"})).unwrap();
+        }
         let saved = serde_json::to_string(&session.project).unwrap();
+        if ext == "fgb" {
+            check_exports(&saved, false, &path);
+        }
         // Discard the cached window so the next view must read the file again.
         session.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap().reset();
         // GeoParquet and GeoPackage retain open file handles: deleting their paths need not
@@ -21934,7 +21979,16 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
         sessions.push(Session::new(serde_json::from_str(&saved).unwrap()));
         std::fs::remove_file(&path).unwrap();
         for mut session in sessions {
-            let error = render::render_png(session.map_mut(), &view).unwrap_err();
+            let result = render::render_png(session.map_mut(), &view);
+            let layer = session.map().layer(id).unwrap();
+            let error = format!("{}: {}", layer.name, layer.source.as_ref().unwrap().read_error().unwrap());
+            if ext == "shp" {
+                // The Shapefile reader already refuses a partial drawing; preserve
+                // the named source error at the archive/revision finalizer.
+                assert_eq!(result.unwrap_err(), error);
+            } else {
+                assert!(result.is_ok(), "a failed window source is omitted: {result:?}");
+            }
             for detail in ["Survey sites", path.to_str().unwrap(), "moved or deleted", "Repair Data Source"] {
                 assert!(error.contains(detail), "missing {detail:?} in {error:?}");
             }
@@ -21949,6 +22003,9 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
             let notices: Vec<_> = session.notices_since(mark).iter().filter(|n| n.error).collect();
             assert_eq!(notices.len(), 1, "{ext}: {notices:?}");
             assert_eq!(notices[0].text, error);
+        }
+        if ext == "fgb" {
+            check_exports(&saved, true, &path);
         }
     }
     std::fs::remove_dir_all(dir).unwrap();

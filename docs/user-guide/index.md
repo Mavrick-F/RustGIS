@@ -246,8 +246,9 @@ Exports and other files already written are not undone.
 ### Repair Data Source
 
 When drawing cannot read a linked vector file, the error names the layer and its file path.
-If the file was moved or deleted, restore it or repair the source. The same read failure is
-reported once per layer, rather than on every redraw.
+If the file was moved or deleted, restore it or repair the source. An export that succeeds
+without that layer reports the same read failure. It is reported once per layer, rather than
+on every redraw or export.
 
 If a linked file moved or was renamed, right-click its layer or local PMTiles/MBTiles tile
 archive and choose **Repair Data Source…**. For the selected layer, use **Data › Data Source ›

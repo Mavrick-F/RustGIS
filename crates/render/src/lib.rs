@@ -4247,12 +4247,6 @@ fn render_frame(
         if !layer.visible || !layer.in_scale_range(scale) || held.contains(&layer.id) {
             continue;
         }
-        // A failed window read must not export an apparently complete map without that layer.
-        if full_res_rasters
-            && layer.source.as_ref().is_some_and(|s| s.linked_file().is_some() && s.chunk_source().is_none() && s.error.is_some())
-        {
-            return None;
-        }
         pm.layer_with_id(&layer_name(layer), u64::from(layer.id));
         let opacity = layer.opacity() * group_opacity.get(&layer.id).copied().unwrap_or(1.0);
         let mask = masks.iter().find(|(id, _)| *id == layer.id).map(|(_, m)| m);
