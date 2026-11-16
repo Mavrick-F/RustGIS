@@ -39928,6 +39928,65 @@ fn calculate_geometry_updates_ellipsoidal_lengths_in_one_undo_step() {
     assert!((out.value(0, length).as_f64().unwrap() - 111.31949079327356).abs() < 1e-6);
 }
 
+/// Actual reads, including desktop read-ahead and script children, reach exported provenance.
+/// Outputs aren't inputs; old projects and exported entries without provenance still load.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn session_log_records_input_fingerprints_and_version() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use crate::project_log::LogEntry;
+    let dir = std::env::temp_dir().join(format!("rustgis-log-provenance-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("points.csv");
+    let contents = b"x,y,name\n1,2,A\n";
+    std::fs::write(&path, contents).unwrap();
+    let params = json!({"path": path, "x": "x", "y": "y"});
+    let mut s = world();
+    s.run("layer.addData", &params).unwrap();
+    let entry = s.log.entries().last().unwrap();
+    assert_eq!(entry.rustgis_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    let input = entry.inputs.iter().find(|f| f.path == path.to_string_lossy() && f.sha256.is_some()).unwrap();
+    assert_eq!(input.size, Some(contents.len() as u64));
+    assert_eq!(
+        input.modified_ns,
+        Some(std::fs::metadata(&path).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_string())
+    );
+    assert_eq!(input.sha256.as_deref(), Some("219f018d3f821dbd36cfffae3dfea5f6d4c6554b9e9dbf62b90dc0297680ae32"));
+    assert_eq!(input.hash_unavailable, None);
+    let first = input.clone();
+    // The desktop worker's reads belong to the admitted command that consumes them.
+    let ahead = read_ahead(&mut s, "layer.addData", &params).unwrap();
+    let read = std::thread::spawn(move || ahead.run(&rustgis_analysis::control::Control::new()).unwrap()).join().unwrap();
+    read_land(&mut s, read).unwrap();
+    assert!(s.log.entries().last().unwrap().inputs.contains(&first));
+    // A nested command contributes to its enclosing script's single entry.
+    s.run("script.run", &json!({"script": format!("layer.addData {params}")})).unwrap();
+    assert!(s.log.entries().last().unwrap().inputs.contains(&first));
+    // Mutating a file of the same size is visible in the recorded hash.
+    std::fs::write(&path, b"x,y,name\n1,2,B\n").unwrap();
+    s.run("layer.addData", &params).unwrap();
+    assert!(s.log.entries().last().unwrap().inputs.iter().any(|f| f.path == first.path && f.sha256.is_some() && f.sha256 != first.sha256));
+    // A WAL can hold newer input even when the database file's metadata hasn't changed.
+    let gpkg = dir.join("points.gpkg");
+    rustgis_data::io::write_path(&s.map().layer_by_name("points").unwrap().dataset, &gpkg).unwrap();
+    let db = rusqlite::Connection::open(&gpkg).unwrap();
+    db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE log_probe (id INTEGER);").unwrap();
+    s.run("layer.addData", &json!({"path": gpkg})).unwrap();
+    let wal = format!("{}-wal", gpkg.display());
+    assert!(s.log.entries().last().unwrap().inputs.iter().any(|f| f.path == wal && f.size.is_some() && f.hash_unavailable.is_some()));
+    drop(db);
+    let out = dir.join("log.jsonl");
+    s.run("project.exportLog", &json!({"path": out})).unwrap();
+    let entries: Vec<LogEntry> = std::fs::read_to_string(&out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(entries.iter().any(|e| e.inputs.contains(&first) && e.rustgis_version.is_some()));
+    assert!(s.log.entries().last().unwrap().inputs.is_empty(), "export destination isn't a read");
+    let old: LogEntry = serde_json::from_value(json!({"at": 1, "command": "layer.addData", "ok": true})).unwrap();
+    assert!(old.inputs.is_empty() && old.rustgis_version.is_none());
+    s.run("project.openText", &json!({"text": include_str!("../../../schema/fixtures/empty.rgis")})).unwrap();
+    assert!(s.project.maps.iter().all(|m| m.layers.is_empty()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// The session log (#797): a command run by itself that changes the project, or reaches a file
 /// or a service, is logged once (a script's lines inside it), with its outcome; reading isn't.
 /// Undo keeps the entries and is logged with the step it took back (not when there is none).
@@ -40071,12 +40130,13 @@ fn the_session_log_records_each_command_run_in_the_session() {
     s.run("project.exportLog", &json!({"path": csv.to_string_lossy()})).unwrap();
     let csv_text = std::fs::read_to_string(&csv).unwrap();
     assert!(
-        csv_text.starts_with("time_utc,at,command,ok,millis,error,params,plugin,project\n") && csv_text.contains("\"edit.undo\""),
+        csv_text.starts_with("time_utc,at,command,ok,millis,error,params,plugin,project,rustgis_version,inputs\n")
+            && csv_text.contains("\"edit.undo\""),
         "{csv_text}"
     );
     assert!(csv_text.contains("\"'=HYPERLINK(1)\"") && !csv_text.contains(",\"=HYPERLINK"), "{csv_text}");
-    // The plugin is the cell before the project's name, the last.
-    let plugin_cell = |l: &str| l.rsplit(',').nth(1).map(str::to_string);
+    // The plugin precedes the project, version and inputs (empty in these entries).
+    let plugin_cell = |l: &str| l.rsplit(',').nth(3).map(str::to_string);
     assert!(csv_text.lines().any(|l| l.contains("\"host.addLayer\"") && plugin_cell(l).as_deref() == Some("\"globe\"")), "{csv_text}");
     assert!(
         csv_text.lines().any(|l| l.contains("\"edit.undo\"") && plugin_cell(l).as_deref() == Some("\"\"")),
@@ -40241,11 +40301,12 @@ fn session_log_entries_name_their_project_and_say_when_their_params_are_partial(
     // And `project.log` says so: `partial` is in its answer.
     let answer = s.run("project.log", &json!({"command": "service.layers", "limit": 1})).unwrap();
     assert_eq!(answer["entries"][0]["partial"], json!(true), "{answer}");
-    // Saved: the project's name last in a CSV row; in JSON, the name, and `partial` only when so.
+    // Saved: the project precedes version and inputs in CSV; in JSON, the name, and `partial` only when so.
     let mut csv = Vec::new();
     s.log.write(&mut csv, true).unwrap();
     let csv = String::from_utf8(csv).unwrap();
-    assert!(csv.lines().nth(1).is_some_and(|row| row.ends_with(",\"Atlas\"")), "{csv}");
+    let suffix = format!(",\"Atlas\",\"{}\",\"[]\"", env!("CARGO_PKG_VERSION"));
+    assert!(csv.lines().nth(1).is_some_and(|row| row.ends_with(&suffix)), "{csv}");
     let json = serde_json::to_value(&renamed).unwrap();
     assert_eq!(json["project"], "Atlas");
     assert!(json.get("opened").is_none() && json.get("partial").is_none(), "{json}");

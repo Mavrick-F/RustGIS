@@ -38,6 +38,8 @@ const MAX_SCAN_BYTES: u64 = if cfg!(target_arch = "wasm32") { 64 << 20 } else { 
 
 /// A GeoParquet file.
 pub struct ParquetSource {
+    /// The actual file backing the retained reader, including a provider's conversion cache.
+    path: Option<std::path::PathBuf>,
     info: SourceInfo,
     reader: Arc<dyn FileReader>,
     /// Leaf column index of the geometry.
@@ -65,8 +67,10 @@ pub struct ParquetSource {
 
 impl ParquetSource {
     pub fn open_path(path: &Path, name: &str) -> Result<Self> {
-        let file = std::fs::File::open(path)?;
-        Self::new(Arc::new(SerializedFileReader::new(file).map_err(err)?), name, None)
+        let file = crate::provenance::open(path)?;
+        let mut source = Self::new(Arc::new(SerializedFileReader::new(file).map_err(err)?), name, None)?;
+        source.path = Some(path.to_path_buf());
+        Ok(source)
     }
 
     /// Opens a private conversion, keeping its files alive for every shared reader.
@@ -292,6 +296,7 @@ impl ParquetSource {
         }
         let untyped = types.is_empty() && !zm;
         let mut src = ParquetSource {
+            path: None,
             info,
             reader,
             geom_col,
@@ -454,6 +459,9 @@ impl FeatureSource for ParquetSource {
     /// budget before decoding, count rows and check Cancel between them. They decode every selected group's geometry
     /// and fields before sampling matches; a refused view therefore scans the selected file.
     fn read(&self, req: &Request) -> Result<Batch> {
+        if let Some(path) = &self.path {
+            crate::provenance::path(path);
+        }
         let limit = clamp_limit(req.limit);
         let md = self.reader.metadata();
         let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
@@ -659,6 +667,9 @@ impl FeatureSource for ParquetSource {
     /// Checks Cancel between groups and scanned rows; each group's column decoding finishes
     /// before the next check. An unbounded view also checks the decoded-column budget first.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        if let Some(path) = &self.path {
+            crate::provenance::path(path);
+        }
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         if self.remote.is_some() {
             return Err(DataError::Unsupported("a whole GeoParquet by its web address read a chunk at a time".into()));

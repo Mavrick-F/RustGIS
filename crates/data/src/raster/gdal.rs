@@ -117,7 +117,7 @@ pub fn convert_jpeg2000(bytes: Vec<u8>, crs: Option<&str>, max: u64) -> Result<C
             max >> 20
         )));
     }
-    Ok(ConvertedBytes { tif: std::fs::read(&c.path)?, assumed_lonlat: c.assumed_lonlat })
+    Ok(ConvertedBytes { tif: crate::provenance::read(&c.path)?, assumed_lonlat: c.assumed_lonlat })
 }
 
 fn missing() -> DataError {
@@ -155,7 +155,7 @@ fn plain_ers(src: &Path) -> Result<()> {
     if meta.len() > MAX_HEADER {
         return Err(DataError::Format("too large for an ER Mapper header".into()));
     }
-    let text = String::from_utf8_lossy(&std::fs::read(src)?).into_owned();
+    let text = String::from_utf8_lossy(&crate::provenance::read(src)?).into_owned();
     // Every line naming a key, so a second one can't hide behind the first.
     let values = |key: &str| {
         // GDAL ends a line at a carriage return too.
@@ -209,6 +209,7 @@ pub fn subdatasets(src: &Path) -> Result<Vec<(String, String)>> {
 /// Lists subdatasets with the downloaded raster's optional workspace budget.
 fn subdatasets_with_budget(src: &Path, workspace: Option<(&Path, u64)>) -> Result<Vec<(String, String)>> {
     let full = local_regular_file(src)?;
+    crate::provenance::path(&full);
     // Its type and header first, so a file that isn't read says so whether GDAL is installed or not.
     let drivers = drivers(&full)?;
     plain_ers(&full)?;
@@ -446,6 +447,7 @@ fn convert_in(dir: &Path, src: &Path, layer: Option<&str>, crs: Option<&str>, bu
         return Err(DataError::Format(format!("crs '{c}': give an EPSG code (EPSG:32633), a PROJ string or WKT")));
     }
     let full = local_regular_file(src)?;
+    crate::provenance::path(&full);
     let layer = layer.map(str::trim).filter(|l| !l.is_empty());
     std::fs::create_dir_all(dir)?;
     external::prune(dir, ours, KEEP);

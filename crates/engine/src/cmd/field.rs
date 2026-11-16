@@ -903,7 +903,7 @@ fn holds(path: &Path, data: &[u8]) -> bool {
         return false;
     }
     let mut there = Vec::with_capacity(data.len());
-    std::fs::File::open(path).and_then(|f| f.take(data.len() as u64 + 1).read_to_end(&mut there)).is_ok() && there == data
+    rustgis_data::provenance::open(path).and_then(|f| f.take(data.len() as u64 + 1).read_to_end(&mut there)).is_ok() && there == data
 }
 
 /// What `offline.package` returns.

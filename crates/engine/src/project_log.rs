@@ -546,6 +546,14 @@ pub(crate) fn entry(
         opened: project.1,
         partial,
         plugin: None,
+        rustgis_version: Some(env!("CARGO_PKG_VERSION").into()),
+        inputs: rustgis_data::provenance::current()
+            .into_iter()
+            .map(|mut input| {
+                input.path = Session::redacted(&input.path).into_string();
+                input
+            })
+            .collect(),
     }
 }
 
@@ -604,6 +612,12 @@ pub struct LogEntry {
     /// plugins' commands toward [`LOG_PLUGIN_LIMIT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<String>,
+    /// RustGIS that executed this entry; absent in older exported logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustgis_version: Option<String>,
+    /// Observed local file reads, never output paths inferred from parameters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<rustgis_data::provenance::Fingerprint>,
 }
 
 impl LogEntry {
@@ -682,6 +696,9 @@ impl SessionLog {
     pub fn join_last(&mut self, mut e: LogEntry) {
         // A session plugin's entry between the steps isn't the user's step to join.
         if let Some(last) = self.entries.back_mut().filter(|l| l.ok && l.command == e.command && l.plugin == e.plugin) {
+            e.inputs.extend(last.inputs.iter().cloned());
+            e.inputs.sort();
+            e.inputs.dedup();
             e.at = last.at;
             e.millis = last.millis.saturating_add(e.millis);
             *last = e;
@@ -745,7 +762,7 @@ impl SessionLog {
     /// line). Entry by entry, so a long log isn't held as text first.
     pub fn write(&self, w: &mut dyn std::io::Write, csv: bool) -> std::io::Result<()> {
         if csv {
-            w.write_all(b"time_utc,at,command,ok,millis,error,params,plugin,project\n")?;
+            w.write_all(b"time_utc,at,command,ok,millis,error,params,plugin,project,rustgis_version,inputs\n")?;
         }
         self.entries.iter().try_for_each(|e| write_entry(w, e, csv))
     }
@@ -772,7 +789,7 @@ fn write_entry(w: &mut dyn std::io::Write, e: &LogEntry, csv: bool) -> std::io::
     if csv {
         writeln!(
             w,
-            "{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{}",
             e.time_utc(),
             e.at,
             csv_cell(&e.command),
@@ -781,7 +798,9 @@ fn write_entry(w: &mut dyn std::io::Write, e: &LogEntry, csv: bool) -> std::io::
             csv_cell(e.error.as_deref().unwrap_or("")),
             csv_cell(&e.params.to_string()),
             csv_cell(e.plugin.as_deref().unwrap_or("")),
-            csv_cell(&e.project)
+            csv_cell(&e.project),
+            csv_cell(e.rustgis_version.as_deref().unwrap_or("")),
+            csv_cell(&serde_json::to_string(&e.inputs).map_err(std::io::Error::other)?)
         )
     } else {
         serde_json::to_writer(&mut *w, e).map_err(std::io::Error::other)?;

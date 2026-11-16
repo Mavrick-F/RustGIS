@@ -206,6 +206,7 @@ fn version(text: &str) -> Option<(u32, u32)> {
 
 /// The vector layers of a dataset, from `ogrinfo -json`.
 fn list(src: &Path) -> Result<Vec<LayerInfo>> {
+    crate::provenance::path(src);
     let src = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
     // A file or folder on this computer: GDAL would fetch a `/vsicurl/` address.
     std::fs::metadata(&src)?;
@@ -282,6 +283,7 @@ fn check_crs(crs: Option<&str>) -> Result<()> {
 /// Converts selected layers, reporting failed layers and known feature-count shortfalls across
 /// all their geometry families. Cache hits are checked too, without scanning converted features.
 fn convert_in(dir: &Path, src: &Path, layer: Option<&str>, crs: Option<&str>) -> Result<(Vec<Converted>, Vec<String>)> {
+    crate::provenance::path(src);
     check_crs(crs)?;
     if !available() {
         return Err(missing());

@@ -1827,12 +1827,13 @@ pub(crate) fn read_file(path: &Path, max: u64) -> Result<Vec<u8>, String> {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
+    rustgis_data::provenance::open(path)
         .and_then(|f| f.take(max.saturating_add(1)).read_to_end(&mut bytes))
         .map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() as u64 > max {
         return Err(too_large());
     }
+    rustgis_data::provenance::bytes(path, Some(&meta), &bytes);
     Ok(bytes)
 }
 

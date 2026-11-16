@@ -25,7 +25,7 @@ mod checked;
 /// indexed, and an indexed FlatGeobuf always gives its count, so 0 is no features.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn header_feature_count(path: &Path) -> Result<u64> {
-    let reader = open_reader(BufReader::new(std::fs::File::open(path)?))?;
+    let reader = open_reader(BufReader::new(crate::provenance::open(path)?))?;
     Ok(reader.header().features_count())
 }
 
@@ -79,7 +79,7 @@ impl FgbOpen {
                     "{} date/time columns are kept as ISO text to read this remote FlatGeobuf by range without scanning every feature",
                     date_columns.len()
                 )),
-                Input::Path(path) => src.classify_dates(BufReader::new(std::fs::File::open(path)?), &date_columns)?,
+                Input::Path(path) => src.classify_dates(BufReader::new(crate::provenance::open(path)?), &date_columns)?,
                 Input::Bytes(bytes) => src.classify_dates(Cursor::new(bytes.clone()), &date_columns)?,
             }
         }
@@ -94,7 +94,7 @@ impl FgbSource {
     /// Reads a local header without classifying date columns; finish it on a worker when needed.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn prepare_path(path: &Path, name: &str) -> Result<FgbOpen> {
-        Self::prepare(BufReader::new(std::fs::File::open(path)?), Input::Path(path.to_path_buf()), name)
+        Self::prepare(BufReader::new(crate::provenance::open(path)?), Input::Path(path.to_path_buf()), name)
     }
 
     /// The same staged open for bytes retained by a project, without copying them.
@@ -104,7 +104,7 @@ impl FgbSource {
     }
 
     pub fn open_path(path: &Path, name: &str) -> Result<Self> {
-        let f = BufReader::new(std::fs::File::open(path)?);
+        let f = BufReader::new(crate::provenance::open(path)?);
         Self::new(f, Input::Path(path.to_path_buf()), name)
     }
 
@@ -452,7 +452,7 @@ impl FgbSource {
             None
         };
         let r: Option<Box<dyn ReadSeek>> = match &self.input {
-            Input::Path(p) => std::fs::File::open(p).ok().map(|f| Box::new(BufReader::new(f)) as Box<dyn ReadSeek>),
+            Input::Path(p) => crate::provenance::open(p).ok().map(|f| Box::new(BufReader::new(f)) as Box<dyn ReadSeek>),
             Input::Bytes(b) => Some(Box::new(Cursor::new(b.clone()))),
             Input::Remote(f) => Some(Box::new(remote::Reader::new(f.clone()))),
         };
@@ -771,7 +771,7 @@ impl FeatureSource for FgbSource {
 
     fn read(&self, req: &Request) -> Result<Batch> {
         match &self.input {
-            Input::Path(p) => self.read_with(&|| Ok(BufReader::new(std::fs::File::open(p)?)), req, false),
+            Input::Path(p) => self.read_with(&|| Ok(BufReader::new(crate::provenance::open(p)?)), req, false),
             Input::Bytes(b) => self.read_with(&|| Ok(Cursor::new(b.clone())), req, false),
             Input::Remote(f) => self.read_remote(f, req),
         }
@@ -794,7 +794,7 @@ impl FeatureSource for FgbSource {
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         match &self.input {
-            Input::Path(p) => self.visit_with(&|| Ok(BufReader::new(std::fs::File::open(p)?)), extent, &mut chunks),
+            Input::Path(p) => self.visit_with(&|| Ok(BufReader::new(crate::provenance::open(p)?)), extent, &mut chunks),
             Input::Bytes(b) => self.visit_with(&|| Ok(Cursor::new(b.clone())), extent, &mut chunks),
             Input::Remote(_) => Err(DataError::Unsupported("a whole FlatGeobuf by its web address read a chunk at a time".into())),
         }

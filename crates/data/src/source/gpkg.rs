@@ -98,6 +98,7 @@ pub fn unsupported_table_counts_bytes(bytes: &[u8]) -> Result<Vec<(String, u64)>
 
 fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(err)?;
+    crate::provenance::sqlite(path);
     // A cap on SQLite's page cache, so a huge database can't take all the memory; and the file is
     // hostile: nothing it defines (views, triggers, generated columns) may call functions, and
     // nothing writes.
@@ -432,6 +433,9 @@ impl FeatureSource for GpkgSource {
     /// Samples native-envelope matches, or decoded view matches when the native box is refused.
     /// Scans count records and check Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
+        if let Some((path, _)) = &self.file {
+            crate::provenance::sqlite(path);
+        }
         let limit = clamp_limit(req.limit);
         let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
         let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;

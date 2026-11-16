@@ -39,9 +39,12 @@ fn project_text(p: &Value) -> Result<String, String> {
         }
     } else if let Some(path) = ps(p, "path") {
         let mut bytes = Vec::new();
-        std::fs::File::open(path)
+        rustgis_data::provenance::open(path)
             .and_then(|f| f.take(geolibre::MAX_TEXT as u64 + 1).read_to_end(&mut bytes))
             .map_err(|e| format!("{path}: {e}"))?;
+        if bytes.len() <= geolibre::MAX_TEXT {
+            rustgis_data::provenance::buffer(std::path::Path::new(path), &bytes);
+        }
         bytes
     } else {
         return Err("path, url, text or data is required".into());

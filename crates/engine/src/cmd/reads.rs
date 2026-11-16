@@ -27,6 +27,7 @@ pub struct Read {
     pub(crate) owner: Continuation,
     pub(crate) source: Option<rustgis_map::source::SourceLayer>,
     pub(crate) ready: Option<Ready>,
+    pub(crate) inputs: Vec<rustgis_data::provenance::Fingerprint>,
 }
 
 /// A reader chosen only after the command and its original input have been admitted.
@@ -102,6 +103,7 @@ impl ReadAhead {
     /// [`rustgis_analysis::control`]). A read that fails gives its failure to the command, which
     /// says it as it would have; only a cancelled run (or a bug in a reader) is an error here.
     pub fn run(self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> Result<Read, String> {
+        let inputs = rustgis_data::provenance::Capture::start();
         let ReadAhead { name, op, owner, source, work, table: _, preview: _ } = self;
         owner.check()?;
         let current = owner.clone();
@@ -118,7 +120,7 @@ impl ReadAhead {
         }))
         .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")));
         res?;
-        Ok(Read { op, owner, source, ready })
+        Ok(Read { op, owner, source, ready, inputs: inputs.inputs() })
     }
 }
 

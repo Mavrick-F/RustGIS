@@ -1193,15 +1193,15 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
             #[cfg(not(target_arch = "wasm32"))]
             let r = geotiff::read_file_with_nodata(path, &name, sidecar_nodata)?;
             #[cfg(target_arch = "wasm32")]
-            let r = geotiff::read_with_nodata(std::io::BufReader::new(std::fs::File::open(path)?), &name, sidecar_nodata)?;
+            let r = geotiff::read_with_nodata(std::io::BufReader::new(crate::provenance::open(path)?), &name, sidecar_nodata)?;
             r
         }
-        "png" | "jpg" | "jpeg" => read_scan(&name, std::io::BufReader::new(std::fs::File::open(path)?))?,
+        "png" | "jpg" | "jpeg" => read_scan(&name, std::io::BufReader::new(crate::provenance::open(path)?))?,
         "asc" => {
             if meta.len() > MAX_ASCII_BYTES {
                 return Err(DataError::Format("the ASCII grid is too large to open".into()));
             }
-            let text = std::fs::read_to_string(path)?;
+            let text = crate::provenance::read_to_string(path)?;
             read_ascii(path, &text, &name, sidecar_nodata)?
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -1227,12 +1227,12 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
         // The second read gives all the first did: the first goes before it, so two aren't held.
         drop(r);
         r = if ext == "asc" {
-            read_ascii(path, &std::fs::read_to_string(path)?, &name, nd)?
+            read_ascii(path, &crate::provenance::read_to_string(path)?, &name, nd)?
         } else {
             #[cfg(not(target_arch = "wasm32"))]
             let again = geotiff::read_file_with_nodata(path, &name, nd)?;
             #[cfg(target_arch = "wasm32")]
-            let again = geotiff::read_with_nodata(std::io::BufReader::new(std::fs::File::open(path)?), &name, nd)?;
+            let again = geotiff::read_with_nodata(std::io::BufReader::new(crate::provenance::open(path)?), &name, nd)?;
             again
         };
     }
@@ -1701,7 +1701,7 @@ pub fn read_prj(path: &Path) -> Option<String> {
     if !meta.is_file() || meta.len() > 1 << 20 {
         return None;
     }
-    std::fs::read_to_string(prj).ok()
+    crate::provenance::read_to_string(prj).ok()
 }
 
 /// Longitude/latitude bounds of a `width` × `height` grid placed by `transform` in `transformer`'s

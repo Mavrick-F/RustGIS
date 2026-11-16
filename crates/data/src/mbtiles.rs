@@ -310,6 +310,7 @@ mod file {
     fn open(path: &Path) -> Result<Connection, String> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::provenance::sqlite(path);
         // The file is hostile: nothing it defines may call functions, and nothing writes.
         let _ = conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false);
         let _ = conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
@@ -504,6 +505,7 @@ mod file {
 
     /// The tile at z/x/y (`y` from the north) of the file at `path`, `None` when it has none.
     pub fn tile_path(path: &Path, z: u8, x: u32, y: u32) -> Result<Option<Vec<u8>>, String> {
+        crate::provenance::sqlite(path);
         let Some(row) = flip(z, y) else { return Ok(None) };
         with(path, |c| {
             // The size first, so a huge blob is never read into memory.
