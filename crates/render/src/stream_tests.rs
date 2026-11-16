@@ -698,6 +698,67 @@ fn perspective_reports_shapefile_open_failure() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
+fn hidden_source_error_does_not_replace_an_unrelated_drawing_failure() {
+    let mut map = Map::new("hidden source");
+    let id = map.add_dataset(Dataset::new("broken", GeometryType::Point, vec![]));
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = SourceLayer::default();
+    source.path = Some(dir.path().join("missing.shp").display().to_string());
+    map.layer_mut(id).unwrap().source = Some(source);
+    let mut view = View { width: 120.0, height: 90.0, pixels_per_point: 1.0, camera: map.camera, sky: false };
+    assert!(render_png(&mut map, &view).unwrap_err().contains("missing.shp"));
+    map.layer_mut(id).unwrap().visible = false;
+    assert!(render_png(&mut map, &view).is_ok(), "the hidden source does not break a normal drawing");
+    // A non-finite width makes canvas allocation fail independently of the hidden source's
+    // retained read error. Report that drawing failure, rather than blaming the hidden layer.
+    view.width = f64::NAN;
+    assert_eq!(render_png(&mut map, &view).unwrap_err(), "could not draw the map");
+    assert_eq!(render_drawing(&mut map, &view).map(|_| ()).unwrap_err(), "could not draw the map");
+    assert_eq!(
+        layout::frame_map(&mut map, view.camera, view.width, view.height, view.pixels_per_point).unwrap_err(),
+        "could not draw the map frame"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn source_failure_names_the_layer_that_stopped_the_current_render() {
+    let mut data = Dataset::new("Current sites", GeometryType::Point, vec![]);
+    data.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![]);
+    let mut base = Map::new("source failures");
+    let current = base.add_dataset(data);
+    *base.layer_mut(current).unwrap() = streamed(base.layer(current).unwrap(), 0);
+    base.layer_mut(current).unwrap().source.as_mut().unwrap().path = Some("current.shp".into());
+    let old = base.add_dataset(Dataset::new("Earlier sites", GeometryType::Point, vec![]));
+    let mut source = SourceLayer::default();
+    source.path = Some("earlier.fgb".into());
+    source.error = Some("an earlier window read failed".into());
+    base.layer_mut(old).unwrap().source = Some(source);
+    // Earlier sites is first in map.layers, still visible, and retains its window read error.
+    // Current sites draws first in painter order and fails during this complete traversal.
+    assert_eq!(base.layers[0].id, old);
+    for (pitch, bearing) in [(0.0, 0.0), (0.0, 25.0), (35.0, 0.0)] {
+        let mut map = base.clone();
+        let mut view = View {
+            width: 120.0,
+            height: 90.0,
+            pixels_per_point: 1.0,
+            camera: Camera { pitch, bearing, ..Camera::new(Coord::new(0.0, 0.0), 80.0) },
+            sky: false,
+        };
+        let why = render_png(&mut map, &view).unwrap_err();
+        assert!(why.starts_with("Current sites: ") && why.contains("current.shp"), "{why}");
+        assert!(!why.contains("Earlier sites") && !why.contains("earlier.fgb"), "{why}");
+        assert!(map.layer(old).unwrap().source.as_ref().unwrap().error.is_some());
+        // A later allocation failure isn't a source failure, even while the old source is visible.
+        map.layer_mut(current).unwrap().visible = false;
+        view.width = f64::NAN;
+        assert_eq!(render_png(&mut map, &view).unwrap_err(), "could not draw the map");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn pitched_mixed_sources_keep_windows_and_pending_on_the_owner() {
     use std::sync::{Arc, Condvar, Mutex};
     struct WindowSource {
@@ -902,13 +963,13 @@ fn masks_skip_undrawn_targets_and_reuse_one_complete_source_with_distinct_swipes
     };
     let flat = base.flat();
     let scale = base.ground_res_at(&view.camera) / rustgis_geom::PIXEL_M;
-    let expected = layer_masks(&mut base.clone(), &ctx, 120, 90, &flat, "test", scale).unwrap();
+    let expected = layer_masks(&mut base.clone(), &ctx, 120, 90, &flat, "test", scale, &mut None).unwrap();
     let info = streamed(base.layer(mask).unwrap(), 1).source.unwrap().info().unwrap().clone();
     let calls = Arc::new(AtomicUsize::new(0));
     let mut actual = base.clone();
     actual.layer_mut(mask).unwrap().source =
         Some(SourceLayer::from_path("mask.shp", None, Box::new(Counted { chunks: Chunks { info, ds, size: 1 }, calls: calls.clone() })));
-    let got = layer_masks(&mut actual, &ctx, 120, 90, &flat, "test", scale).unwrap();
+    let got = layer_masks(&mut actual, &ctx, 120, 90, &flat, "test", scale, &mut None).unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert_eq!(got.len(), 2);
     for ((id, got), (expected_id, expected)) in got.iter().zip(&expected) {
@@ -937,7 +998,7 @@ fn masks_skip_undrawn_targets_and_reuse_one_complete_source_with_distinct_swipes
                 _ => {}
             }
         }
-        let got = layer_masks(&mut map, &ctx, 120, 90, &flat, "test", scale);
+        let got = layer_masks(&mut map, &ctx, 120, 90, &flat, "test", scale, &mut None);
         if mode == 4 {
             assert!(got.is_none(), "a failed required mask must still fail the frame");
         } else {

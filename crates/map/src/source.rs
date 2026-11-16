@@ -782,10 +782,10 @@ impl SourceLayer {
     /// Takes each persistent read failure once, so redraws do not repeat its notice. A successful
     /// read observed here, or an explicit reopen/repair, allows a later failure to be reported.
     pub fn error_unsaid(&mut self) -> Option<String> {
-        let error = self.error.clone();
-        if error == self.error_said {
+        if self.error == self.error_said {
             return None;
         }
+        let error = self.error.clone();
         self.error_said.clone_from(&error);
         error
     }

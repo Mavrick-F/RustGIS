@@ -2205,22 +2205,21 @@ impl Session {
         let mut landed = Vec::new();
         let mut dates = Vec::new();
         let mut source_errors = Vec::new();
+        let mut source_error_count = 0;
         for map in &mut self.project.maps {
             for layer in &mut map.layers {
                 if let Some(source) = &mut layer.source
-                    && let Some(path) = source.linked_file().map(str::to_string)
                     && let Some(error) = source.error_unsaid()
+                    && let Some(path) = source.linked_file()
                 {
-                    use notice_text::NoticeText;
-                    source_errors.push(NoticeText::format(
-                        "{name}: could not read {path}: {error}; {repair}",
-                        [
-                            ("name", layer.name.clone().into()),
-                            ("path", path.into()),
-                            ("error", error.into()),
-                            ("repair", NoticeText::term(rustgis_map::source::REPAIR_SOURCE)),
-                        ],
-                    ));
+                    source_error_count += 1;
+                    // Keep a moved folder's notice readable, marking every failure said.
+                    if source_errors.len() < 5 {
+                        source_errors.push(notice_text::NoticeText::format(
+                            "{name}: {path} ({error})",
+                            [("name", layer.name.clone().into()), ("path", path.to_string().into()), ("error", error.into())],
+                        ));
+                    }
                 }
                 // Values in date fields that weren't dates, once for a layer read in place.
                 let (unread, rounded) = layer.source.as_mut().map(|source| source.take_unread_dates()).unwrap_or_default();
@@ -2247,8 +2246,29 @@ impl Session {
         for note in dates {
             self.notify(note, false);
         }
-        for error in source_errors {
-            self.notify_text(error, true);
+        if source_error_count > 0 {
+            use notice_text::NoticeText;
+            let more = source_error_count - source_errors.len();
+            let mut layers = NoticeText::list(source_errors);
+            if more > 0 {
+                layers = NoticeText::format("{layers}; {count} more", [("layers", layers), ("count", more.to_string().into())]);
+            }
+            let key = if source_error_count == 1 {
+                "{count} linked layer could not be read: {layers}; {repair}"
+            } else {
+                "{count} linked layers could not be read: {layers}; {repair}"
+            };
+            self.notify_text(
+                NoticeText::format(
+                    key,
+                    [
+                        ("count", source_error_count.to_string().into()),
+                        ("layers", layers),
+                        ("repair", NoticeText::term(rustgis_map::source::REPAIR_SOURCE)),
+                    ],
+                ),
+                true,
+            );
         }
         let (mut lost, mut held, mut failed, mut dropped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for m in &mut self.project.maps {

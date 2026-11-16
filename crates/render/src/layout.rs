@@ -335,7 +335,7 @@ fn draw_page(
                 // The grid is drawn with the frame's map, before its attribution, which keeps
                 // clear of the grid's labels.
                 let grid = grid.as_ref().map(|g| (g, layout.decimal_comma));
-                let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), pending, grid) else {
+                let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), pending, grid, &mut None) else {
                     if frame_requires_complete(map, &view) {
                         return None;
                     }
@@ -348,7 +348,7 @@ fn draw_page(
                     frame_pm.overflowed() || pm.recorded_cost().saturating_add(frame_pm.recorded_cost()) > crate::vector::max_cost();
                 if frame_pm.is_recording()
                     && too_large
-                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false, pending, grid)
+                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false, pending, grid, &mut None)
                 {
                     frame_pm = pixels;
                     if let Some(list) = record.as_deref_mut() {
@@ -582,8 +582,9 @@ fn draw_page(
 /// page needs them all. Refuses a linked archive changed during the complete frame.
 pub fn frame_map(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Result<Pixmap, String> {
     let revisions = crate::archive_revisions([&*map]);
-    let result = frame_canvas(map, camera, w, h, ppp, false, &mut false, None).map(Canvas::into_pixmap);
-    revisions.finish([&*map], result, "could not draw the map frame")
+    let mut failed_source = None;
+    let result = frame_canvas(map, camera, w, h, ppp, false, &mut false, None, &mut failed_source).map(Canvas::into_pixmap);
+    revisions.finish(map, failed_source, result, "could not draw the map frame")
 }
 
 /// [`frame_map`] on a canvas: one that records (see [`crate::canvas`]) when `record` and the
@@ -600,12 +601,13 @@ fn frame_canvas(
     record: bool,
     pending: &mut bool,
     grid: Option<(&Grid, bool)>,
+    failed_source: &mut Option<u64>,
 ) -> Option<Canvas> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
     // Why its layers were drawn without their cast shadows is kept for the page's caller (see
     // `crate::shadows_said`).
     let (img, shadows) = crate::frame_with_shadows_to_come(|| {
-        if record { crate::render_complete_recorded(map, &view) } else { crate::render_complete(map, &view) }
+        if record { crate::render_complete_recorded(map, &view, failed_source) } else { crate::complete(map, &view, false, failed_source) }
     });
     let img = img?;
     *pending |= img.tiles_pending || img.data_pending || shadows;

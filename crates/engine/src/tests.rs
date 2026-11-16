@@ -21915,7 +21915,7 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
     data.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![]);
     // Both command-line dispatch and the app's worker must report a successful export's gap
     // immediately, without relying on a later screen frame, and only once for that failure.
-    let check_exports = |saved: &str, missing: bool, path: &std::path::Path| {
+    let check_exports = |saved: &str, missing: bool, path: &std::path::Path, other: &std::path::Path| {
         for background in [false, true] {
             for (command, file) in [
                 ("share.exportMap", "map.png"),
@@ -21925,9 +21925,11 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
                 ("layout.export", "page.svg"),
             ] {
                 let mut session = Session::new(serde_json::from_str(saved).unwrap());
-                let params = json!({"path": dir.join(file), "width": 160, "height": 120, "dpi": 48});
                 let mark = session.notice_mark();
-                for _ in 0..2 {
+                for attempt in 0..2 {
+                    let output = dir.join(format!("missing-{missing}-background-{background}-attempt-{attempt}-{file}"));
+                    assert!(!output.exists(), "each export must create a new output: {}", output.display());
+                    let params = json!({"path": output, "width": 160, "height": 120, "dpi": 48});
                     if background {
                         let run = export_start(&mut session, command, &params).unwrap();
                         let started = run.started();
@@ -21935,14 +21937,22 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
                     } else {
                         session.run(command, &params).unwrap();
                     }
-                }
-                assert!(dir.join(file).is_file());
-                let notices: Vec<_> = session.notices_since(mark).iter().filter(|n| n.text.contains("Survey sites")).collect();
-                assert_eq!(notices.len(), usize::from(missing), "{command} {file} background={background}: {notices:?}");
-                if missing {
-                    assert!(notices[0].error);
-                    for detail in [path.to_str().unwrap(), "moved or deleted", "Repair Data Source"] {
-                        assert!(notices[0].text.contains(detail), "missing {detail:?} in {notices:?}");
+                    assert!(output.is_file(), "{command} did not write {}", output.display());
+                    let notices: Vec<_> = session.notices_since(mark).iter().filter(|n| n.text.contains("Survey sites")).collect();
+                    assert_eq!(notices.len(), usize::from(missing), "{command} {file} background={background}: {notices:?}");
+                    if missing {
+                        assert!(notices[0].error);
+                        for detail in [
+                            "2 linked layers",
+                            "Boundary sites",
+                            path.to_str().unwrap(),
+                            other.to_str().unwrap(),
+                            "moved or deleted",
+                            "Repair Data Source",
+                        ] {
+                            assert!(notices[0].text.contains(detail), "missing {detail:?} in {notices:?}");
+                        }
+                        assert_eq!(notices[0].text.matches("Repair Data Source").count(), 1);
                     }
                 }
             }
@@ -21954,6 +21964,13 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
         let mut session = Session::new(Project::default());
         let source = SourceLayer::from_path(path.to_string_lossy(), None, rustgis_data::source::open_path(&path, None).unwrap());
         let id = session.map_mut().add_streamed("Survey sites", source);
+        // A moved folder can break several links at once: one counted notice names both.
+        let other = dir.join("boundaries.fgb");
+        if ext == "fgb" {
+            rustgis_data::io::write_path(&data, &other).unwrap();
+            let source = SourceLayer::from_path(other.to_string_lossy(), None, rustgis_data::source::open_path(&other, None).unwrap());
+            session.map_mut().add_streamed("Boundary sites", source);
+        }
         let view = render::View { width: 160.0, height: 120.0, pixels_per_point: 1.0, camera: session.map().camera, sky: false };
         let mark = session.notice_mark();
         assert!(render::render_png(session.map_mut(), &view).is_ok(), "{ext}: intact file");
@@ -21964,10 +21981,12 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
         }
         let saved = serde_json::to_string(&session.project).unwrap();
         if ext == "fgb" {
-            check_exports(&saved, false, &path);
+            check_exports(&saved, false, &path, &other);
         }
         // Discard the cached window so the next view must read the file again.
-        session.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap().reset();
+        for layer in &mut session.map_mut().layers {
+            layer.source.as_mut().unwrap().reset();
+        }
         // GeoParquet and GeoPackage retain open file handles: deleting their paths need not
         // interrupt a live reader, but reopening must still report the missing file.
         let mut sessions = if matches!(ext, "parquet" | "gpkg") {
@@ -21978,6 +21997,9 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
         };
         sessions.push(Session::new(serde_json::from_str(&saved).unwrap()));
         std::fs::remove_file(&path).unwrap();
+        if ext == "fgb" {
+            std::fs::remove_file(&other).unwrap();
+        }
         for mut session in sessions {
             let result = render::render_png(session.map_mut(), &view);
             let layer = session.map().layer(id).unwrap();
@@ -22002,10 +22024,34 @@ fn missing_read_in_place_file_names_layer_and_path_once() {
             }
             let notices: Vec<_> = session.notices_since(mark).iter().filter(|n| n.error).collect();
             assert_eq!(notices.len(), 1, "{ext}: {notices:?}");
-            assert_eq!(notices[0].text, error);
+            for detail in ["Survey sites", path.to_str().unwrap(), "moved or deleted", "Repair Data Source"] {
+                assert!(notices[0].text.contains(detail), "{ext}: missing {detail:?} in {notices:?}");
+            }
+            assert_eq!(notices[0].text.matches("Repair Data Source").count(), 1);
+            if ext == "fgb" {
+                for detail in ["2 linked layers", "Boundary sites", other.to_str().unwrap()] {
+                    assert!(notices[0].text.contains(detail), "missing {detail:?} in {notices:?}");
+                }
+            }
         }
         if ext == "fgb" {
-            check_exports(&saved, true, &path);
+            check_exports(&saved, true, &path, &other);
+            // More broken links than the notice displays still count, and all are marked said.
+            let mut folder = Session::new(serde_json::from_str(&saved).unwrap());
+            let source = folder.map().layer(id).unwrap().source.clone().unwrap();
+            for i in 0..5 {
+                folder.map_mut().add_streamed(format!("Other sites {i}"), source.clone());
+            }
+            assert!(render::render_png(folder.map_mut(), &view).is_ok());
+            let mark = folder.notice_mark();
+            for _ in 0..3 {
+                folder.notice_landed_rasters();
+            }
+            let notices: Vec<_> = folder.notices_since(mark).iter().filter(|n| n.error).collect();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(notices[0].text.starts_with("7 linked layers"), "{notices:?}");
+            assert!(notices[0].text.contains("2 more"), "{notices:?}");
+            assert_eq!(notices[0].text.matches("Repair Data Source").count(), 1);
         }
     }
     std::fs::remove_dir_all(dir).unwrap();
