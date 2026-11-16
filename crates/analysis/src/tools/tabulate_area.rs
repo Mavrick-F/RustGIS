@@ -29,7 +29,8 @@ pub(super) fn run_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Resu
         _ => return Err("Measure must be Area or Count".into()),
     };
     let unit = if s(p, "unit").is_empty() { "km2" } else { s(p, "unit") };
-    let divisor = Measure::Area.unit(unit).ok_or("choose an area unit: km2, m2, ha, ac, ft2 or mi2")?;
+    // A count has no unit, so its unit isn't checked.
+    let divisor = if count { 1.0 } else { Measure::Area.unit(unit).ok_or("choose an area unit: km2, m2, ha, ac, ft2 or mi2")? };
     let mut selected = rows(inp, p, "zones", zones);
     record_order(&mut selected);
     let groups = if keys.is_empty() {
