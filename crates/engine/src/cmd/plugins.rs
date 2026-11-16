@@ -1034,6 +1034,7 @@ impl Host for Between<'_> {
                     return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bridge(s).0))
                         .unwrap_or_else(|_| Err(format!("'{op}' failed unexpectedly")));
                 }
+                let _inputs = s.log.on().then(rustgis_data::provenance::Capture::start);
                 let (at, start) = (crate::project_log::now_ms(), web_time::Instant::now());
                 let res = s.guarded(leak(&plugin.manifest.name), mutates, |s| {
                     let (res, changed, requested) = bridge(s);
@@ -1050,7 +1051,7 @@ impl Host for Between<'_> {
                     let project = (crate::project_log::kept_name(&s.title()), s.opened);
                     let mut e = crate::project_log::entry(project, op, kept, partial, &res, at, start.elapsed());
                     e.plugin = Some(plugin.manifest.id.clone());
-                    s.log.push(e);
+                    s.log_entry(e, false);
                 }
                 res
             })

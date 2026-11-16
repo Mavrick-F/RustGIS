@@ -53,6 +53,13 @@ impl Drop for Capture {
     }
 }
 
+/// Reads generated files or reloads outputs without adding them to the enclosing command's inputs.
+/// Restores capture on every return and unwind; nested ordinary commands may still capture their own inputs.
+pub fn without<T>(read: impl FnOnce() -> T) -> T {
+    let _restore = Capture { previous: INPUTS.with(|v| v.replace(None)), _thread_bound: PhantomData };
+    read()
+}
+
 /// Adds worker inputs to the landing command. Repeated identical observations take one place.
 pub fn record(inputs: impl IntoIterator<Item = Fingerprint>) {
     INPUTS.with(|v| {
@@ -125,9 +132,9 @@ pub fn bytes(path: &Path, metadata: Option<&Metadata>, bytes: &[u8]) {
 }
 
 /// A bounded reader's complete file buffer; never use this for a prefix or decoded content.
-pub fn buffer(path: &Path, bytes: &[u8]) {
+pub fn buffer(path: &Path, file: &File, bytes: &[u8]) {
     if active() {
-        observe(path, std::fs::metadata(path).ok().as_ref(), Some(bytes));
+        observe(path, file.metadata().ok().as_ref(), Some(bytes));
     }
 }
 
@@ -237,6 +244,40 @@ pub fn read_to_string(path: impl AsRef<Path>) -> std::io::Result<String> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    /// An atomic pathname replacement cannot pair replacement metadata with the original bytes.
+    #[cfg(unix)]
+    #[test]
+    fn buffered_provenance_uses_the_opened_file_and_suppression_restores_capture() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.cpg");
+        std::fs::write(&path, b"UTF-8").unwrap();
+        let scope = Capture::start();
+        let mut file = open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"a different file").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        buffer(&path, &file, &contents);
+        let input = scope.inputs().pop().unwrap();
+        assert_eq!(input.size, Some(5));
+        assert_eq!(input.modified_ns, modified_ns(Some(&metadata)));
+        assert!(input.sha256.is_some());
+        assert_eq!(scope.inputs().len(), 1);
+        let output = dir.path().join("output");
+        std::fs::write(&output, b"generated").unwrap();
+        without(|| {
+            read(&output).unwrap();
+        });
+        assert_eq!(scope.inputs(), vec![input.clone()]);
+        assert!(std::panic::catch_unwind(|| without(|| panic!("reader failed"))).is_err());
+        assert_eq!(scope.inputs(), vec![input]);
+        read(&output).unwrap();
+        assert_eq!(scope.inputs().len(), 2);
+    }
 
     /// Sparse input opens must remain metadata-only, and one scope's reads must not leak to another.
     #[test]

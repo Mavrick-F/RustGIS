@@ -39959,6 +39959,14 @@ fn session_log_records_input_fingerprints_and_version() {
     let read = std::thread::spawn(move || ahead.run(&rustgis_analysis::control::Control::new()).unwrap()).join().unwrap();
     read_land(&mut s, read).unwrap();
     assert!(s.log.entries().last().unwrap().inputs.contains(&first));
+    // A worker admitted while logging is off must not stat or hash its reads for the log.
+    s.log.set_on(false);
+    let ahead = read_ahead(&mut s, "layer.addData", &params).unwrap();
+    let read = std::thread::spawn(move || ahead.run(&rustgis_analysis::control::Control::new()).unwrap()).join().unwrap();
+    assert!(read.inputs.is_empty(), "logging off must disable capture on the worker");
+    s.log.set_on(true);
+    read_land(&mut s, read).unwrap();
+    assert!(s.log.entries().last().unwrap().inputs.is_empty());
     // A nested command contributes to its enclosing script's single entry.
     s.run("script.run", &json!({"script": format!("layer.addData {params}")})).unwrap();
     assert!(s.log.entries().last().unwrap().inputs.contains(&first));
@@ -39981,10 +39989,105 @@ fn session_log_records_input_fingerprints_and_version() {
     assert!(entries.iter().any(|e| e.inputs.contains(&first) && e.rustgis_version.is_some()));
     assert!(s.log.entries().last().unwrap().inputs.is_empty(), "export destination isn't a read");
     let old: LogEntry = serde_json::from_value(json!({"at": 1, "command": "layer.addData", "ok": true})).unwrap();
-    assert!(old.inputs.is_empty() && old.rustgis_version.is_none());
+    assert!(old.inputs.is_empty() && old.rustgis_version.is_none() && old.inputs_omitted == 0);
     s.run("project.openText", &json!({"text": include_str!("../../../schema/fixtures/empty.rgis")})).unwrap();
     assert!(s.project.maps.iter().all(|m| m.layers.is_empty()));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Reopening a replaced output is not an input read; the export worker's true source still is.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn session_log_export_inputs_exclude_output_reloads() {
+    use crate::cmd::exports::{export_land, export_start};
+    let dir = std::env::temp_dir().join(format!("rustgis-log-exports-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("source.gpkg");
+    let mut s = world();
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": path})).unwrap();
+    s.run("layer.addData", &json!({"path": path, "layer": "Cities", "stream": true, "name": "InPlace"})).unwrap();
+    let copy = dir.join("copy.gpkg");
+    let work = export_start(&mut s, "share.exportLayer", &json!({"layer": "InPlace", "path": copy})).unwrap();
+    let started = work.started();
+    let done = std::thread::spawn(move || work.run(&rustgis_analysis::control::Control::new())).join().unwrap();
+    export_land(&mut s, started, done).unwrap();
+    let inputs = &s.log.entries().last().unwrap().inputs;
+    assert!(inputs.iter().any(|i| i.path == path.display().to_string()));
+    assert!(!inputs.iter().any(|i| i.path == copy.display().to_string()));
+    let params = json!({"layer": "Countries", "path": path, "mode": "replaceTable", "tableName": "Cities"});
+    s.run("share.exportLayer", &params).unwrap();
+    assert!(s.log.entries().last().unwrap().inputs.is_empty());
+    let work = export_start(&mut s, "share.exportLayer", &params).unwrap();
+    let started = work.started();
+    let done = std::thread::spawn(move || work.run(&rustgis_analysis::control::Control::new())).join().unwrap();
+    export_land(&mut s, started, done).unwrap();
+    assert!(s.log.entries().last().unwrap().inputs.is_empty());
+    assert_eq!(
+        s.map().layer_by_name("InPlace").unwrap().load_all().unwrap().features.len(),
+        s.map().layer_by_name("Countries").unwrap().dataset.features.len()
+    );
+    drop(s);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Large input lists stay bounded, including merged entries, and disclose the missing count.
+#[test]
+fn session_log_bounds_input_fingerprints() {
+    use crate::project_log::LOG_LIST_ITEMS;
+    use rustgis_data::provenance::{Fingerprint, record};
+    let inputs = |from, to| {
+        (from..to).map(|i| Fingerprint {
+            path: format!("/inputs/{i:04}.csv"),
+            size: Some(14),
+            modified_ns: Some("123456789".into()),
+            sha256: None,
+            hash_unavailable: Some("streamed input".into()),
+        })
+    };
+    let mut s = world();
+    let mark = s.notice_mark();
+    s.command_epilogue("project.rename", &json!({"name": "Clean"}), |_| {
+        record(inputs(0, 2));
+        Ok(Value::Null)
+    })
+    .unwrap();
+    let clean = s.log.entries().last().unwrap();
+    assert_eq!(clean.inputs.len(), 2);
+    assert_eq!(clean.inputs_omitted, 0);
+    assert!(s.notices_since(mark).is_empty());
+    assert!(serde_json::to_value(clean).unwrap().get("inputs_omitted").is_none());
+    let total = LOG_LIST_ITEMS + 7;
+    s.command_epilogue("project.rename", &json!({"name": "Many"}), |_| {
+        record(inputs(0, total));
+        Ok(Value::Null)
+    })
+    .unwrap();
+    let entry = s.log.entries().last().unwrap();
+    assert_eq!(entry.inputs, inputs(0, LOG_LIST_ITEMS).collect::<Vec<_>>());
+    assert_eq!(entry.inputs_omitted, 7);
+    assert_eq!(s.notices_since(mark).len(), 1);
+    assert!(s.notices_since(mark)[0].text.contains("7 input fingerprints"));
+    assert!(!s.notices_since(mark)[0].error);
+    let mut jsonl = Vec::new();
+    s.log.write(&mut jsonl, false).unwrap();
+    let jsonl = String::from_utf8(jsonl).unwrap();
+    let exported: crate::project_log::LogEntry = serde_json::from_str(jsonl.lines().last().unwrap()).unwrap();
+    assert_eq!(exported.inputs_omitted, 7);
+    assert_eq!(exported.inputs, entry.inputs);
+    let mut csv = Vec::new();
+    s.log.write(&mut csv, true).unwrap();
+    let csv = String::from_utf8(csv).unwrap();
+    assert!(csv.lines().last().unwrap().ends_with(",7"));
+    // A later step reusing two inputs and reading two new ones cannot grow a joined entry.
+    let mut next = entry.clone();
+    next.inputs = inputs(LOG_LIST_ITEMS - 2, LOG_LIST_ITEMS + 2).collect();
+    next.inputs_omitted = 0;
+    s.log_entry(next, true);
+    let joined = s.log.entries().last().unwrap();
+    assert_eq!(joined.inputs.len(), LOG_LIST_ITEMS);
+    assert_eq!(joined.inputs_omitted, 9);
+    assert_eq!(s.notices_since(mark).len(), 2);
+    assert!(s.notices_since(mark)[1].text.contains("9 input fingerprints"));
 }
 
 /// The session log (#797): a command run by itself that changes the project, or reaches a file
@@ -40130,13 +40233,13 @@ fn the_session_log_records_each_command_run_in_the_session() {
     s.run("project.exportLog", &json!({"path": csv.to_string_lossy()})).unwrap();
     let csv_text = std::fs::read_to_string(&csv).unwrap();
     assert!(
-        csv_text.starts_with("time_utc,at,command,ok,millis,error,params,plugin,project,rustgis_version,inputs\n")
+        csv_text.starts_with("time_utc,at,command,ok,millis,error,params,plugin,project,rustgis_version,inputs,inputs_omitted\n")
             && csv_text.contains("\"edit.undo\""),
         "{csv_text}"
     );
     assert!(csv_text.contains("\"'=HYPERLINK(1)\"") && !csv_text.contains(",\"=HYPERLINK"), "{csv_text}");
-    // The plugin precedes the project, version and inputs (empty in these entries).
-    let plugin_cell = |l: &str| l.rsplit(',').nth(3).map(str::to_string);
+    // The plugin precedes the project, version, inputs and omitted count (empty or zero here).
+    let plugin_cell = |l: &str| l.rsplit(',').nth(4).map(str::to_string);
     assert!(csv_text.lines().any(|l| l.contains("\"host.addLayer\"") && plugin_cell(l).as_deref() == Some("\"globe\"")), "{csv_text}");
     assert!(
         csv_text.lines().any(|l| l.contains("\"edit.undo\"") && plugin_cell(l).as_deref() == Some("\"\"")),
@@ -40305,7 +40408,7 @@ fn session_log_entries_name_their_project_and_say_when_their_params_are_partial(
     let mut csv = Vec::new();
     s.log.write(&mut csv, true).unwrap();
     let csv = String::from_utf8(csv).unwrap();
-    let suffix = format!(",\"Atlas\",\"{}\",\"[]\"", env!("CARGO_PKG_VERSION"));
+    let suffix = format!(",\"Atlas\",\"{}\",\"[]\",0", env!("CARGO_PKG_VERSION"));
     assert!(csv.lines().nth(1).is_some_and(|row| row.ends_with(&suffix)), "{csv}");
     let json = serde_json::to_value(&renamed).unwrap();
     assert_eq!(json["project"], "Atlas");

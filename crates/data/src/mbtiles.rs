@@ -320,6 +320,7 @@ mod file {
 
     /// Runs `f` with a connection to `path`, from the pool or newly opened, and puts it back.
     fn with<T>(path: &Path, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+        crate::provenance::sqlite(path);
         let (generation, epoch, pooled) = {
             let mut all = pool().lock().unwrap_or_else(|e| e.into_inner());
             // Track checked-out files too: close_unless must invalidate a handle even while no
@@ -529,6 +530,21 @@ mod file {
     #[cfg(test)]
     mod reload_tests {
         use super::*;
+
+        /// Pooled metadata queries must report the archive even without a new SQLite open.
+        #[test]
+        fn pooled_metadata_reads_record_provenance() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("map.mbtiles");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE tiles(zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);").unwrap();
+            drop(conn);
+            open_path(&path).unwrap();
+            let captured = crate::provenance::Capture::start();
+            open_path(&path).unwrap();
+            assert!(captured.inputs().iter().any(|i| i.path == path.display().to_string()));
+            close(&path);
+        }
 
         struct CancelAfterPolls {
             polls: std::sync::atomic::AtomicUsize,

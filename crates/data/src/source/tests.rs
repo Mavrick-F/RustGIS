@@ -385,6 +385,25 @@ fn tls_provider_builds_client_config() {
     let _ = rustls::ClientConfig::builder();
 }
 
+/// A retained SQLite connection must not describe the replacement at its former path.
+#[cfg(unix)]
+#[test]
+fn geopackage_provenance_skips_a_replaced_path() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("original.gpkg");
+    write_gpkg(&path, true);
+    let source = open_path(&path, None).unwrap();
+    let captured = crate::provenance::Capture::start();
+    source.read(&Request { extent: None, limit: 1 }).unwrap();
+    assert!(captured.inputs().iter().any(|i| i.path == path.display().to_string()));
+    drop(captured);
+    std::fs::rename(&path, folder.path().join("retained.gpkg")).unwrap();
+    std::fs::write(&path, b"replacement").unwrap();
+    let captured = crate::provenance::Capture::start();
+    assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+    assert!(captured.inputs().is_empty());
+}
+
 /// 30 × 20 points over the world, named and numbered.
 fn points() -> Vec<(Coord, String, i64)> {
     let mut v = Vec::new();

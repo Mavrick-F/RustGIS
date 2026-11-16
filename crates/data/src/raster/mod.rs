@@ -1337,7 +1337,8 @@ fn read_path_with_placing(path: &Path, subdataset: Option<&str>, crs: Option<&st
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_converted(path: &Path, c: &gdal::Converted) -> Result<Raster> {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
-    let mut r = geotiff::read_file(&c.path, stem)?;
+    crate::provenance::path(path);
+    let mut r = crate::provenance::without(|| geotiff::read_file(&c.path, stem))?;
     if let Some(s) = &c.subdataset {
         r.name = format!("{stem} {}", gdal::short_name(s));
     }

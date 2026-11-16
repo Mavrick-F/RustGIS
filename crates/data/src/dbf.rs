@@ -327,9 +327,9 @@ fn try_read_cpg(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
         match crate::provenance::open(path.with_extension(ext)) {
             Ok(file) => {
                 let mut bytes = Vec::new();
-                file.take(MAX_CPG_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+                (&file).take(MAX_CPG_BYTES as u64 + 1).read_to_end(&mut bytes)?;
                 if bytes.len() <= MAX_CPG_BYTES {
-                    crate::provenance::buffer(&path.with_extension(ext), &bytes);
+                    crate::provenance::buffer(&path.with_extension(ext), &file, &bytes);
                 }
                 return Ok(Some(bytes));
             }

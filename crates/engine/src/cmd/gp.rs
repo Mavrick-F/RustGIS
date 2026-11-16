@@ -514,6 +514,7 @@ pub struct ToolRun {
     pub tool: &'static str,
     snap: Snapshot<'static>,
     params: Value,
+    capture_inputs: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -529,7 +530,7 @@ impl ToolRun {
     /// Reads the tool's inputs and runs it, blocking until it ends; `control` stops it and counts
     /// its progress (see [`rustgis_analysis::control`]).
     pub fn run(self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> ToolDone {
-        let captured = rustgis_data::provenance::Capture::start();
+        let captured = self.capture_inputs.then(rustgis_data::provenance::Capture::start);
         let ToolRun { pin, continuation, snap, params, .. } = self;
         let spec = pin.spec();
         let name = spec.name;
@@ -564,7 +565,7 @@ impl ToolRun {
             result: Err(format!("{name} failed unexpectedly")),
             full_ids: FullIds::new(),
         });
-        done.inputs = captured.inputs();
+        done.inputs = captured.as_ref().map_or_else(Vec::new, rustgis_data::provenance::Capture::inputs);
         done
     }
 }
@@ -606,7 +607,7 @@ pub fn tool_start(s: &mut Session, tool: &str, params: &Value) -> Result<ToolRun
     if s.plugin_runs.len() > MAX_ASYNC_RUNS {
         s.plugin_runs.remove(0);
     }
-    Ok(ToolRun { id, tool: spec.id, snap: Snapshot::owned(s), params: resolved, pin, continuation })
+    Ok(ToolRun { id, tool: spec.id, snap: Snapshot::owned(s), params: resolved, pin, continuation, capture_inputs: s.log.on() })
 }
 
 #[cfg(not(target_arch = "wasm32"))]

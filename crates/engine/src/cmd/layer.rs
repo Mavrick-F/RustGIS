@@ -1901,9 +1901,9 @@ fn read_dxf_file(p: &Value, path: &str) -> LayersRead {
     use std::io::Read;
     let file = rustgis_data::provenance::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut bytes = Vec::new();
-    file.take(rustgis_data::io::MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("{path}: {e}"))?;
+    (&file).take(rustgis_data::io::MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("{path}: {e}"))?;
     if bytes.len() as u64 <= rustgis_data::io::MAX_BYTES {
-        rustgis_data::provenance::buffer(Path::new(path), &bytes);
+        rustgis_data::provenance::buffer(Path::new(path), &file, &bytes);
     }
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()).map(rustgis_data::raster::Crs::parse).transpose()?;
@@ -3347,7 +3347,15 @@ pub(crate) fn add_converted(s: &mut Session, p: &Value, label: &str, original: &
         }
         let file = c.path.display().to_string();
         // One layer that can't be added doesn't stop the others.
-        let r = match add_source(s, &q, Origin::Path(&file), None) {
+        let added = match &c.origin {
+            ConvertedOrigin::Gdal(_) => {
+                rustgis_data::source::fgb::FgbSource::open_converted_path(&c.path, &c.name, Path::new(original), None)
+                    .map_err(|e| format!("{original}: {e}"))
+                    .and_then(|opened| add_source_with(s, &q, Origin::Path(&file), Some(Box::new(opened)), None))
+            }
+            ConvertedOrigin::Duckdb(_) => add_source(s, &q, Origin::Path(&file), None),
+        };
+        let r = match added {
             Ok(r) => r,
             Err(e) if !single => {
                 s.notify(format!("{}: {e}", c.name), true);
@@ -3617,14 +3625,11 @@ pub fn columns_in_file(path: &str, p: &Value) -> CmdResult {
         return gzip_columns(plain, &prefix, p);
     }
     let mut bytes = Vec::new();
-    let read = if sheet {
-        rustgis_data::provenance::open(path).and_then(|mut f| f.read_to_end(&mut bytes))
-    } else {
-        rustgis_data::provenance::open(path).and_then(|f| f.take(COLUMNS_PREFIX as u64).read_to_end(&mut bytes))
-    };
+    let mut file = rustgis_data::provenance::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let read = if sheet { file.read_to_end(&mut bytes) } else { (&file).take(COLUMNS_PREFIX as u64).read_to_end(&mut bytes) };
     read.map_err(|e| format!("{path}: {e}"))?;
     if sheet {
-        rustgis_data::provenance::buffer(Path::new(path), &bytes);
+        rustgis_data::provenance::buffer(Path::new(path), &file, &bytes);
     }
     columns_of(path, &bytes, p)
 }

@@ -151,8 +151,14 @@ isn't itself an entry in the log, as a saved file is). **Clear Log** empties it 
   and larger inputs have `sha256: null` and a `hash_unavailable` reason: compare their size and
   modified time instead, which cannot prove identical content. Unavailable size or modified time
   is `null`. Repeated identical observations are combined; different observations of one path
-  can appear separately. The log captures local reads RustGIS makes; it cannot enumerate files
+  can appear separately. Each entry keeps at most 100 fingerprints; `inputs_omitted` counts
+  those left out (absent or zero when none), and a notice reports the omission. Joined steps
+  share this limit. Turning logging off also stops fingerprint collection on background jobs
+  started while it is off. The log captures local reads RustGIS makes; it cannot enumerate files
   opened internally by another program or include metadata the browser's upload did not supply.
+  GDAL conversions name the original local file, including cache hits; conversion caches and
+  reloads of files just exported are excluded. ER Mapper headers include validated `DataFile`
+  companions. Files inside a database folder opened by another program are not enumerated.
   Older exported entries lack these optional fields, so their version and inputs are unknown.
 - **For the session only:** the log is kept in memory, across the projects opened or made in the
   session, until RustGIS closes or the log is cleared. A saved project, its recovery copy, a

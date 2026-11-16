@@ -788,8 +788,13 @@ impl SourceLayer {
                 declared_empty = fresh.empty;
                 conversion_zm_dropped = fresh.zm_dropped;
                 new.path = Some(fresh.path.display().to_string());
-                let handle = rustgis_data::source::fgb::FgbSource::open_owned_path(&fresh.path, layer, fresh.workspace)
-                    .map_err(|e| format!("{path}: {e}"))?;
+                let handle = rustgis_data::source::fgb::FgbSource::open_converted_path(
+                    &fresh.path,
+                    layer,
+                    std::path::Path::new(path),
+                    Some(fresh.workspace),
+                )
+                .map_err(|e| format!("{path}: {e}"))?;
                 new.handle = Some(Arc::new(handle));
                 new.gdal = Some(GdalOrigin { path: path.into(), layer: layer.into(), ..g.clone() });
             }
@@ -1059,7 +1064,10 @@ impl SourceLayer {
             if p.to_ascii_lowercase().ends_with(".fgb") {
                 let path = std::path::Path::new(p);
                 let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
-                let prepared = rustgis_data::source::fgb::FgbSource::prepare_path(path, name);
+                let prepared = match &self.gdal {
+                    Some(g) => rustgis_data::source::fgb::FgbSource::prepare_converted_path(path, name, std::path::Path::new(&g.path)),
+                    None => rustgis_data::source::fgb::FgbSource::prepare_path(path, name),
+                };
                 self.conversion_fallback = saved_conversion_note;
                 return self.open_fgb(prepared);
             }

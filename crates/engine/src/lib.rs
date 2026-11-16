@@ -1669,7 +1669,7 @@ impl Session {
                         };
                         let project = (project_log::kept_name(&self.title()), self.opened);
                         let e = project_log::entry(project, id, params, partial, &res, at, start.elapsed());
-                        if joins && res.is_ok() { self.log.join_last(e) } else { self.log.push(e) }
+                        self.log_entry(e, joins && res.is_ok());
                     }
                 }));
                 if logged.is_err() {

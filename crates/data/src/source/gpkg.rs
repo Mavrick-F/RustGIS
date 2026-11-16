@@ -433,7 +433,9 @@ impl FeatureSource for GpkgSource {
     /// Samples native-envelope matches, or decoded view matches when the native box is refused.
     /// Scans count records and check Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
-        if let Some((path, _)) = &self.file {
+        if let Some((path, id)) = &self.file
+            && file_identity(path) == *id
+        {
             crate::provenance::sqlite(path);
         }
         let limit = clamp_limit(req.limit);
