@@ -159,7 +159,15 @@ impl Original {
     fn read(path: &Path) -> Result<Original> {
         let missing = |ext: &str| refused(path, format!("its .{ext} isn't there"));
         let shp = read_part(path)?.ok_or_else(|| missing("shp"))?;
-        let dbf = read_part(&path.with_extension("dbf"))?.ok_or_else(|| missing("dbf"))?;
+        let Some(dbf) = read_part(&path.with_extension("dbf"))? else {
+            // A table in another case is read, but publishing writes the parts in lower case.
+            let found = crate::io::dbf_sidecar(path);
+            if found.is_file() {
+                let name = found.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                return Err(refused(path, format!("its table is {name}; rename it with a lower-case .dbf to publish edits back")));
+            }
+            return Err(missing("dbf"));
+        };
         let shx = read_part(&path.with_extension("shx"))?;
         let prj = read_part(&path.with_extension("prj"))?;
         let mut cpg = None;

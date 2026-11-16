@@ -2948,6 +2948,11 @@ fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str, budget: &mut usize) 
             Err(_) => report.skipped += 1,
         }
     }
+    // The iterator passes over records marked deleted; the header still counts them.
+    let deleted = (reader.header().num_records as usize).saturating_sub(ds.features.len() + report.skipped);
+    if deleted > 0 {
+        report.messages.push(format!("{name}: {deleted} dBASE records marked deleted were left out"));
+    }
     dbf_notices(&ds, &mut report, &unread_dates, &nonfinite);
     integral_numeric_to_integer(&mut ds, &decimals);
     if report.skipped > 0 {
