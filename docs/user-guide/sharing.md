@@ -75,12 +75,17 @@ KML, GPX or CSV with WKT. Layouts, reports and presentations export from their o
 To export the largest rows of a Summary Statistics result, give `share.exportTable` an optional
 `sort` list and `limit`. Each sort key names a stored field; `descending` defaults to `false`.
 Keys are applied in list order. Numbers sort numerically, text sorts case-sensitively, and nulls
-stay last in either direction. Rows equal on every key keep their input order. The limit keeps
+stay last in either direction. Nonfinite numbers (NaN and infinity) sort with nulls.
+Rows equal on every key keep their input order. The limit keeps
 the first N rows **after** sorting (`0` writes an empty table); a limit without a sort keeps the
-first N rows in input order. An unknown field or invalid option is refused before writing.
+first N rows in input order. The limit selects rows before writing; formats that reorder rows,
+such as FlatGeobuf with its spatial index, can change their order in the file. An unknown field
+or invalid option is refused before writing.
 The command says how many rows the requested limit leaves out. Neither the project table nor
 its attribute-table view is changed. On the desktop, the export runs in the background with
 progress and **Cancel**. Without these options, all rows are exported in their stored order.
+Projects containing saved tasks or command notebook cells using these options require the
+`table-export-order` capability, so older readers refuse them instead of exporting different rows.
 
 ```json
 {"table": "crashes_Statistics", "path": "top10.csv",

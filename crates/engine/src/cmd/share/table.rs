@@ -34,10 +34,10 @@ fn options(ds: &Dataset, p: &Value) -> Result<(Vec<(usize, bool)>, Option<usize>
 }
 
 /// Compares mixed integer/float cells without rounding whole numbers past 2^53. Bounds are
-/// checked before the truncating cast; NaN follows all other numbers.
+/// checked before the truncating cast; nonfinite values are handled as nulls by the caller.
 fn compare_number(a: &Cell, b: &Cell) -> Ordering {
     let integer_float = |i: i64, f: f64| {
-        if f.is_nan() || f >= -(i64::MIN as f64) {
+        if f >= -(i64::MIN as f64) {
             Ordering::Less
         } else if f < i64::MIN as f64 {
             Ordering::Greater
@@ -52,9 +52,17 @@ fn compare_number(a: &Cell, b: &Cell) -> Ordering {
     }
 }
 
-/// Compares stored values without coercing text to numbers. Nulls stay last in both directions;
+/// Compares stored values without coercing text to numbers. Nulls and nonfinite numbers (which
+/// exports write as null) stay last in both directions;
 /// mixed stored types have a fixed order, so even hostile rows yield a consistent comparison.
 fn compare(a: &Cell, b: &Cell, descending: bool) -> Ordering {
+    let null = |v: &Cell| matches!(v, Cell::Null) || matches!(v, Cell::Float(f) if !f.is_finite());
+    match (null(a), null(b)) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
     let rank = |v: &Cell| match v {
         Cell::Int(_) | Cell::Float(_) => 0,
         Cell::Bool(_) => 1,
@@ -62,15 +70,9 @@ fn compare(a: &Cell, b: &Cell, descending: bool) -> Ordering {
         Cell::Text(_) => 3,
         Cell::Null => 4,
     };
-    if matches!(a, Cell::Null) || matches!(b, Cell::Null) {
-        return rank(a).cmp(&rank(b));
-    }
     let order = match (a, b) {
         (Cell::Int(a), Cell::Int(b)) => a.cmp(b),
-        (Cell::Float(a), Cell::Float(b)) => match (a.is_nan(), b.is_nan()) {
-            (false, false) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-            (a, b) => a.cmp(&b),
-        },
+        (Cell::Float(a), Cell::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
         (Cell::Int(_), Cell::Float(_)) | (Cell::Float(_), Cell::Int(_)) => compare_number(a, b),
         (Cell::Text(a), Cell::Text(b)) => a.cmp(b),
         (Cell::Bool(a), Cell::Bool(b)) => a.cmp(b),
@@ -81,7 +83,8 @@ fn compare(a: &Cell, b: &Cell, descending: bool) -> Ordering {
 
 /// Sorts row indices by bottom-up stable merging, checking Cancel between every emitted index.
 /// Equal keys take the left row first. Two index buffers avoid copying attributes during sorting;
-/// only the rows kept by the limit are cloned. No change reaches the project's original table.
+/// only the rows kept by the limit are cloned. Preparation, every merge pass and copying share
+/// one progress range; the writer then counts its own phase. No change reaches the source table.
 fn ordered(ds: &mut Dataset, sort: &[(usize, bool)], limit: Option<usize>) -> Result<usize, String> {
     let n = ds.features.len();
     let keep = limit.unwrap_or(n).min(n);
@@ -93,7 +96,8 @@ fn ordered(ds: &mut Dataset, sort: &[(usize, bool)], limit: Option<usize>) -> Re
     let count = if sort.is_empty() { keep } else { n };
     let mut rows = Vec::new();
     rows.try_reserve_exact(count).map_err(|e| e.to_string())?;
-    progress::begin(count);
+    let passes = if sort.is_empty() || n < 2 { 0 } else { (usize::BITS - (n - 1).leading_zeros()) as usize };
+    progress::begin(count.saturating_add(n.saturating_mul(passes)).saturating_add(keep));
     for r in 0..count {
         progress::step(1).map_err(|e| e.to_string())?;
         rows.push(r);
@@ -109,7 +113,6 @@ fn ordered(ds: &mut Dataset, sort: &[(usize, bool)], limit: Option<usize>) -> Re
         };
         let mut width = 1usize;
         while width < n {
-            progress::begin(n);
             merged.clear();
             for pair in rows.chunks(width.saturating_mul(2)) {
                 let (left, right) = pair.split_at(width.min(pair.len()));
@@ -132,7 +135,6 @@ fn ordered(ds: &mut Dataset, sort: &[(usize, bool)], limit: Option<usize>) -> Re
     }
     let mut features = Vec::new();
     features.try_reserve_exact(keep).map_err(|e| e.to_string())?;
-    progress::begin(keep);
     for row in rows.into_iter().take(keep) {
         progress::step(1).map_err(|e| e.to_string())?;
         if let Some(feature) = ds.features.get(row) {
@@ -176,23 +178,32 @@ pub(in crate::cmd) fn table_work(s: &Session, p: &Value) -> Result<Work, String>
         if let Some(note) = rustgis_data::io::left_out_note(&path, &ext, left_out) {
             notes.insert(0, note);
         }
+        let omitted_note = (omitted > 0).then(|| {
+            crate::notice_text::NoticeText::format(
+                "{path}: {count} row(s) left out by the requested limit",
+                [("path", path.clone().into()), ("count", omitted.to_string().into())],
+            )
+        });
+        let mut refused_notes = table.as_ref().map(|t| super::table_write_notes(&path, &gpkg, &default, t)).unwrap_or_default();
+        if let Some(note) = super::null_numbers_note(&path, null_numbers) {
+            refused_notes.push(note.english());
+        }
+        if let Some(note) = &omitted_note {
+            refused_notes.push(note.english());
+        }
         let answer = json!({"path": path});
         let written_path = Some(path.clone());
         Ok(Wrote {
             answer,
             notes,
             diagnostics: Vec::new(),
-            refused_notes: Vec::new(),
+            refused_notes,
             written_path,
             then: Some(Box::new(move |s, out| {
-                if omitted > 0 {
-                    s.notify_text(
-                        crate::notice_text::NoticeText::format(
-                            "{path}: {count} row(s) left out by the requested limit",
-                            [("path", path.clone().into()), ("count", omitted.to_string().into())],
-                        ),
-                        false,
-                    );
+                if let Some(note) = omitted_note {
+                    let mark = s.notice_mark();
+                    s.notify_text(note, false);
+                    s.retain_written_notices(mark);
                 }
                 super::notify_null_numbers(s, &path, null_numbers);
                 super::report_table(s, &path, &gpkg, &default, table, out);
@@ -204,4 +215,49 @@ pub(in crate::cmd) fn table_work(s: &Session, p: &Value) -> Result<Work, String>
             crs_used: Vec::new(),
         })
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Counts sorting work without a frame or a writer installing its own progress probe.
+    #[derive(Default)]
+    struct Counted(Mutex<(Vec<u64>, u64)>);
+
+    impl progress::Probe for Counted {
+        fn cancelled(&self) -> bool {
+            false
+        }
+        fn begin(&self, total: u64) {
+            let mut counts = self.0.lock().unwrap();
+            counts.0.push(total);
+            counts.1 = 0;
+        }
+        fn advance(&self, n: u64) {
+            self.0.lock().unwrap().1 += n;
+        }
+    }
+
+    /// Non-power-of-two input needs three merge passes: all of them and the retained copies
+    /// must share one range, rather than restarting the bar for every pass.
+    #[test]
+    fn table_export_sorting_counts_all_passes_in_one_range() {
+        let mut ds = Dataset::new(
+            "ranked",
+            rustgis_data::GeometryType::None,
+            vec![rustgis_data::Field::new("score", rustgis_data::FieldType::Integer)],
+        );
+        for i in (0..7).rev() {
+            ds.push(None, vec![Cell::Int(i)]);
+        }
+        let counts = Arc::new(Counted::default());
+        let _installed = progress::install(Some(counts.clone()));
+        assert_eq!(ordered(&mut ds, &[(0, false)], Some(4)).unwrap(), 3);
+        let counts = counts.0.lock().unwrap();
+        assert_eq!(counts.0, [32]); // 7 indices + 3 passes of 7 rows + 4 retained rows
+        assert_eq!(counts.1, 32);
+        assert_eq!(ds.features.len(), 4);
+    }
 }

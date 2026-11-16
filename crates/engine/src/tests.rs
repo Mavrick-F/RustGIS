@@ -612,7 +612,7 @@ fn table_export_sorts_stably_and_keeps_the_first_rows() {
         } else {
             assert!(notices.is_empty());
         }
-        assert_eq!(s.project.tables[0].dataset, original);
+        assert_eq!(s.project.table(table).unwrap().dataset, original);
     };
     let number = json!([{"field": "score", "descending": true}]);
     export("desc.csv", number.clone(), Value::Null, &["c", "a", "z", "d", "b"], None);
@@ -655,6 +655,39 @@ fn table_export_sorts_stably_and_keeps_the_first_rows() {
         .unwrap();
     let csv = std::fs::read_to_string(path).unwrap();
     assert_eq!(csv.lines().skip(1).map(|line| line.split(',').next().unwrap()).collect::<Vec<_>>(), ["a", "c"]);
+    // The writer turns nonfinite numbers into blank cells; they must sort alongside nulls,
+    // including stable ties between all four forms, and never displace the largest finite row.
+    let mut ds =
+        Dataset::new("nonfinite", GeometryType::None, vec![Field::new("label", FieldType::Text), Field::new("score", FieldType::Double)]);
+    for (label, score) in [
+        ("nan", Cell::Float(f64::NAN)),
+        ("high", Cell::Int(9)),
+        ("inf", Cell::Float(f64::INFINITY)),
+        ("null", Cell::Null),
+        ("low", Cell::Float(-2.5)),
+        ("neg-inf", Cell::Float(f64::NEG_INFINITY)),
+    ] {
+        ds.push(None, vec![Cell::Text(label.into()), score]);
+    }
+    let table = s.project.add_table(ds);
+    for (descending, want) in
+        [(true, vec!["high", "low", "nan", "inf", "null", "neg-inf"]), (false, vec!["low", "high", "nan", "inf", "null", "neg-inf"])]
+    {
+        let path = dir.join(format!("nonfinite-{descending}.geojson"));
+        let mark = s.notice_mark();
+        s.run("share.exportTable", &json!({"table": table, "path": path, "sort": [{"field":"score", "descending":descending}]})).unwrap();
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let rows = written["features"].as_array().unwrap();
+        assert_eq!(rows.iter().map(|row| row["properties"]["label"].as_str().unwrap()).collect::<Vec<_>>(), want);
+        assert!(rows.iter().skip(2).all(|row| row["properties"]["score"].is_null()), "{written}");
+        assert!(s.notices_since(mark).iter().any(|n| n.text.contains("3") && n.text.contains("null")));
+    }
+    let path = dir.join("finite-top.geojson");
+    let mark = s.notice_mark();
+    s.run("share.exportTable", &json!({"table":table,"path":path,"sort":[{"field":"score","descending":true}],"limit":1})).unwrap();
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(written["features"][0]["properties"]["label"], "high");
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("written as null")));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

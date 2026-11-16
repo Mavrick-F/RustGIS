@@ -26,14 +26,47 @@ impl<'de> Deserialize<'de> for Project {
 }
 
 impl Project {
-    /// Required features of all maps, including snapshots that can later be restored.
+    /// Required features of maps, snapshots and saved commands that can later be replayed.
     pub(crate) fn required_capabilities(&self) -> Vec<&'static str> {
         let mut required = map_capabilities(self.maps.iter().chain(self.offline_areas.iter().map(|a| &a.data)));
         if !self.origin_id.is_empty() || self.field_origin.is_some() || self.offline_areas.iter().any(|area| !area.id.is_empty()) {
             required.push("field-origin");
         }
+        if self.tasks.iter().any(|task| task.steps.iter().any(|step| command_uses_table_export_order(&step.command, &step.params)))
+            || self.gp_history.iter().any(|record| {
+                command_uses_table_export_order(&record.id, &record.params)
+                    || record.command.as_ref().is_some_and(|(id, params)| command_uses_table_export_order(id, params))
+            })
+            || self.notebooks.iter().any(|notebook| {
+                notebook.language().is_none()
+                    && notebook
+                        .cells
+                        .iter()
+                        .any(|cell| cell.kind == crate::cmd::notebook::CellKind::Code && script_uses_table_export_order(&cell.source))
+            })
+        {
+            required.push("table-export-order");
+        }
         required
     }
+}
+
+/// Only executable export options require the capability, not fields in unrelated data.
+/// Models and web tools run analysis tools, so cannot execute share.exportTable.
+fn command_uses_table_export_order(id: &str, params: &serde_json::Value) -> bool {
+    match id {
+        "share.exportTable" => ["sort", "limit"].iter().any(|key| params.get(key).is_some_and(|value| !value.is_null())),
+        "script.run" => params.get("script").and_then(serde_json::Value::as_str).is_some_and(script_uses_table_export_order),
+        _ => false,
+    }
+}
+
+/// Use the executor's bounded line grammar; nested script.run is refused by script_line,
+/// so inspecting script commands cannot recurse through scripts.
+fn script_uses_table_export_order(script: &str) -> bool {
+    script.lines().take(crate::cmd::workflows::MAX_SCRIPT_LINES).any(|line| {
+        crate::script_line(line).is_some_and(|parsed| parsed.is_ok_and(|(id, params)| command_uses_table_export_order(&id, &params)))
+    })
 }
 
 fn relief_effects(layer: &Layer) -> bool {
@@ -88,6 +121,53 @@ mod tests {
 
     fn json_bytes(bytes: &[u8]) -> Value {
         serde_json::from_slice(bytes).unwrap()
+    }
+
+    /// Tasks, scripts and command notebook cells need ordered-export support when replayed;
+    /// default exports, unrelated parameters and notebook prose retain legacy compatibility.
+    #[test]
+    fn table_export_order_capability_follows_saved_commands() {
+        let mut fixture = Project::from_json(include_str!("../../../schema/fixtures/table_export_order.rgis")).unwrap();
+        assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["table-export-order"]));
+        fixture.tasks.clear();
+        let base = serde_json::to_value(&fixture).unwrap();
+        for (params, required) in [
+            (json!({"table":"ranked","path":"top.csv"}), false),
+            (json!({"sort":null,"limit":null}), false),
+            (json!({"sort":[{"field":"score","descending":true}]}), true),
+            (json!({"limit":0}), true),
+        ] {
+            let script = format!("# Export\nshare.exportTable= {params}");
+            for (field, value) in [
+                ("tasks", json!([{"name":"Export","steps":[{"title":"Top","command":"share.exportTable","params":params}]}])),
+                ("tasks", json!([{"name":"Script","steps":[{"title":"Top","command":"script.run","params":{"script":script}}]}])),
+                ("notebooks", json!([{"name":"Commands","cells":[{"kind":"code","source":script}]}])),
+                (
+                    "gp_history",
+                    json!([{"tool":"Export Table","params":{},"command":["share.exportTable",params],"ok":true,"messages":[],"millis":0}]),
+                ),
+            ] {
+                let mut document = base.clone();
+                document[field] = value;
+                let project = Project::from_json(&document.to_string()).unwrap();
+                let saved = serde_json::to_value(&project).unwrap();
+                assert_eq!(saved.get("requires"), required.then(|| json!(["table-export-order"])).as_ref(), "{field} {params}");
+                let reopened = Project::from_json(&saved.to_string()).unwrap();
+                assert_eq!(serde_json::to_value(reopened).unwrap().get("requires"), saved.get("requires"));
+            }
+        }
+        let script = "share.exportTable {\"limit\":1}";
+        let mut document = base;
+        document["tasks"] =
+            json!([{"name":"Unrelated","steps":[{"title":"Other","command":"layer.addDataText","params":{"sort":[],"limit":1}}]}]);
+        document["notebooks"] = json!([
+            {"name":"Notes","cells":[{"kind":"markdown","source":script}]},
+            {"name":"Comments","cells":[{"kind":"code","source":format!("# {script}")}]},
+            {"name":"Foreign","cells":[{"kind":"code","source":script}],"jupyter":{"metadata":{"kernelspec":{"language":"python"}}}}
+        ]);
+        let project = Project::from_json(&document.to_string()).unwrap();
+        assert!(serde_json::to_value(project).unwrap().get("requires").is_none());
+        assert!(rustgis_analysis::resolve_published("share.exportTable").is_none(), "models and web tools execute analysis tools only");
     }
 
     #[test]
