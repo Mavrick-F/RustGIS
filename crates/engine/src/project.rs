@@ -77,6 +77,7 @@ pub const CAPABILITIES: &[&str] = &[
     "normalized-legend-urls",
     "field-origin",
     "slope-percent",
+    "table-export-order",
     "tabulate-intersection-unit",
 ];
 /// The most entries a document's `requires` may list: past it the document is refused without
