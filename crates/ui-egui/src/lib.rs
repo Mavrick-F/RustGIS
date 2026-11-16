@@ -2967,7 +2967,7 @@ impl RustGisApp {
         result
     }
 
-    /// Record Task: adds a command that ran from the app and changed the project as a step. Not
+    /// Record Task: adds a command that changed the project or exported a table as a step. Not
     /// panes and dialogs (`ui.*`), tasks themselves, or what only moves the view. A colour, outline
     /// or transparency set again on the same layer (dragged in its picker) updates the step it just
     /// made.
@@ -3029,7 +3029,9 @@ impl RustGisApp {
         {
             return;
         }
-        let Some(spec) = self.session.registry.get(id).filter(|c| c.mutates).copied() else { return };
+        // Export Table writes a file without changing the project, but remains a replayable
+        // task step. Other exports keep their existing recording behavior.
+        let Some(spec) = self.session.registry.get(id).filter(|c| c.mutates || id == "share.exportTable").copied() else { return };
         // Downloaded data is kept for this session only, and adding it uses it up: a task
         // couldn't add it again.
         // A result handed over by the app (`ran`: a summary worked out on a thread) is used up
