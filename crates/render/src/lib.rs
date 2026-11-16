@@ -5636,6 +5636,9 @@ fn layer_masks(
                             *failed_source = map.layers.get(mi).map(|layer| layer.instance_id());
                             return None;
                         }
+                        if let Some(source) = map.layers.get_mut(mi).and_then(|l| l.source.as_mut()) {
+                            source.clear_error();
+                        }
                     } else if let Some(ml) = map.layers.get_mut(mi) {
                         if ctx.globe.is_some() {
                             ml.dataset.features.iter().filter_map(|f| f.geometry.as_ref()).for_each(&mut add);

@@ -1953,6 +1953,9 @@ fn complete_shown_legends(
             *failed_source = Some(layer.instance_id());
             return None;
         }
+        if let Some(source) = &mut layer.source {
+            source.clear_error();
+        }
         if any {
             // (A sample of the classes seen: classed again at this scale, by expression.)
             let mut entries = layer.renderer.legend_at(&sample, &[], Some(scale));

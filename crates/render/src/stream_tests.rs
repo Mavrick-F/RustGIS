@@ -600,6 +600,44 @@ fn layout_export_keeps_all_drawn_legend_classes() {
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn legend_sizing_clears_recovered_source_errors_and_reports_a_later_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("classes.shp");
+    let moved = dir.path().join("moved.shp");
+    let mut ds = Dataset::new("classes", GeometryType::Point, vec![]);
+    ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![]);
+    rustgis_data::io::write_path(&ds, &path).unwrap();
+    let source = SourceLayer::from_path(path.to_string_lossy(), None, rustgis_data::source::open_path(&path, None).unwrap());
+    let mut map = Map::new("legend recovery");
+    let id = map.add_streamed("Survey classes", source);
+    let mut first_error = None;
+    for missing in [false, true, false, true] {
+        if missing {
+            std::fs::rename(&path, &moved).unwrap();
+        } else if moved.exists() {
+            std::fs::rename(&moved, &path).unwrap();
+        }
+        // Size the legend alone: no frame read, reopen or notice pass can clear the error.
+        let sizes = layout::legend_sizes_with_no_data_mm(&mut map, 300000.0, false, false, false, (&[], &Default::default()));
+        let source = map.layer_mut(id).unwrap().source.as_mut().unwrap();
+        if missing {
+            assert!(sizes.is_none());
+            let error = source.error_unsaid().expect("each failed traversal after recovery must be reportable");
+            assert!(source.error_unsaid().is_none());
+            if let Some(first) = &first_error {
+                assert_eq!(&error, first);
+            } else {
+                first_error = Some(error);
+            }
+        } else {
+            assert!(sizes.is_some());
+            assert!(source.error.is_none());
+        }
+    }
+}
+
+#[test]
 fn chunked_label_compaction_keeps_late_priorities_stable_ties_and_nan_order() {
     let candidates: Vec<Candidate> = (0..50_003)
         .map(|i| {
