@@ -141,7 +141,8 @@ isn't itself an entry in the log, as a saved file is). **Clear Log** empties it 
   (the one it opened, for a command that opens one), and `partial`, true when its parameters were
   cut short or had secrets taken out, and, for what a session plugin's program asked
   for between the plugin's commands, `plugin`, that plugin's id (left out of `project.log` and
-  JSON Lines for other entries; an empty cell in CSV). New entries also carry
+  JSON Lines for other entries; an empty cell in CSV). Such a request's inputs belong to its own
+  entry, even when the next command answers it. New entries also carry
   `rustgis_version`, the version that executed the command, and `inputs`, the local files actually
   opened by its readers (including sidecars and a script's child commands). SQLite journal/WAL
   companions present at read time are included too. Each fingerprint has
@@ -157,8 +158,9 @@ isn't itself an entry in the log, as a saved file is). **Clear Log** empties it 
   started while it is off. The log captures local reads RustGIS makes; it cannot enumerate files
   opened internally by another program or include metadata the browser's upload did not supply.
   GDAL conversions name the original local file, including cache hits; conversion caches and
-  reloads of files just exported are excluded. ER Mapper headers include validated `DataFile`
-  companions. Files inside a database folder opened by another program are not enumerated.
+  temporary GeoPackage copies and reloads of files just exported are excluded. ER Mapper headers
+  include validated `DataFile` companions. Files inside a database folder opened by another
+  program are not enumerated.
   Older exported entries lack these optional fields, so their version and inputs are unknown.
 - **For the session only:** the log is kept in memory, across the projects opened or made in the
   session, until RustGIS closes or the log is cleared. A saved project, its recovery copy, a

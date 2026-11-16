@@ -15655,7 +15655,7 @@ fn wait_for_exit(plugin: &str) {
 }
 
 /// What a program sent as it exited, after many lines, is answered before the next command, as
-/// between commands: its edit is an undo step of its own, not part of that command's.
+/// between commands: its edit and input provenance are its own, not part of that command's.
 #[test]
 fn a_session_programs_last_request_is_its_own_step_before_the_next_command() {
     let _turn = session_plugins_turn();
@@ -15663,13 +15663,23 @@ fn a_session_programs_last_request_is_its_own_step_before_the_next_command() {
     let dir = std::env::temp_dir().join(format!("rustgis-test-eng-session-late-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let run = rustgis_plugins::testing::child_run("tests::plugin_process_child");
-    std::fs::write(dir.join("plugin.json"), rustgis_plugins::testing::session_manifest("eng-sess-late", &["edit"], &run)).unwrap();
+    std::fs::write(dir.join("plugin.json"), rustgis_plugins::testing::session_manifest("eng-sess-late", &["edit", "files"], &run)).unwrap();
     rustgis_plugins::load(rustgis_plugins::Package::from_dir(&dir).unwrap(), "test").unwrap();
-    let fc = json!({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3, 4]}}]});
-    s.run("plugin:eng-sess-late/y", &json!({"op": "host.addLayer", "params": {"name": "Late", "geojson": fc}})).unwrap();
+    let path = dir.join("late.csv");
+    std::fs::write(&path, "x,y,name\n3,4,Late\n").unwrap();
+    s.log.set_on(true);
+    s.run("plugin:eng-sess-late/y", &json!({"op": "layer.addData", "params": {"name": "Late", "path": path, "x": "x", "y": "y"}})).unwrap();
     wait_for_exit("eng-sess-late");
     // No poll in between: the next command finds it exited.
     assert_eq!(s.run("plugin:eng-sess-late/h", &Value::Null).unwrap(), json!({"hello": "world"}));
+    let request = s.log.entries().find(|e| e.command == "layer.addData" && e.plugin.as_deref() == Some("eng-sess-late")).unwrap();
+    assert_eq!(request.inputs.len(), 1);
+    assert_eq!(request.inputs[0].path, path.display().to_string());
+    assert!(request.inputs[0].sha256.is_some());
+    assert_eq!(request.rustgis_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    let command = s.log.entries().last().unwrap();
+    assert_eq!(command.command, "plugin:eng-sess-late/h");
+    assert!(command.inputs.is_empty(), "the next command did not read the earlier request's input");
     assert!(s.map().layer_by_name("Late").is_some());
     assert_eq!(s.undo_label(), Some("Hello"));
     assert!(s.undo());
@@ -17418,6 +17428,11 @@ fn kml_and_gpx_add_as_layers() {
     .unwrap();
     let mut s = Session::new(Project::default());
     s.run("layer.addData", &json!({"path": gpx.display().to_string()})).unwrap();
+    let entry = s.log.entries().last().unwrap();
+    assert_eq!(entry.rustgis_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(entry.inputs.len(), 1);
+    assert_eq!(entry.inputs[0].path, gpx.display().to_string());
+    assert!(entry.inputs[0].sha256.is_some());
     let names: Vec<String> = s.map().layers.iter().map(|l| l.name.clone()).collect();
     for n in ["walk waypoints", "walk tracks", "walk track points"] {
         assert!(names.contains(&n.to_string()), "{names:?}");
@@ -17539,7 +17554,7 @@ fn duckdb_queries_and_databases() {
 
 /// A source split by geometry type is added polygons first, so its points end on top and none hides
 /// under its own polygons, whether DuckDB or GDAL split it (#1488). Neither program is needed: the
-/// parts are files already written, as they would have converted them.
+/// parts are FlatGeobuf fixtures, matching GDAL's conversion format.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn split_sources_keep_their_points_on_top() {
@@ -17554,9 +17569,11 @@ fn split_sources_keep_their_points_on_top() {
     };
     // A file per part, in the order both programs give them: points first (`Family::ALL`).
     let write = |stem: &str, f: Family| {
-        let path = dir.join(format!("{stem}-{}.geojson", f.label()));
+        let path = dir.join(format!("{stem}-{}.fgb", f.label()));
         let feature = format!(r#"{{"type": "Feature", "properties": {{}}, "geometry": {}}}"#, geometry(f));
-        std::fs::write(&path, format!(r#"{{"type": "FeatureCollection", "features": [{feature}]}}"#)).unwrap();
+        let json = format!(r#"{{"type": "FeatureCollection", "features": [{feature}]}}"#);
+        let (ds, _) = rustgis_data::io::read_bytes("part.geojson", json.as_bytes()).unwrap();
+        rustgis_data::io::write_path(&ds, &path).unwrap();
         path
     };
     let names = |s: &Session| s.map().layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();

@@ -93,7 +93,7 @@ pub fn unsupported_table_counts_bytes(bytes: &[u8]) -> Result<Vec<(String, u64)>
     let mut copy = tempfile::NamedTempFile::new()?;
     copy.write_all(bytes)?;
     copy.flush()?;
-    unsupported_table_counts(copy.path())
+    crate::provenance::without(|| unsupported_table_counts(copy.path()))
 }
 
 fn open_db(path: &Path) -> Result<Connection> {
@@ -171,7 +171,7 @@ impl GpkgSource {
         }
         drop(f);
         let id = file_identity(&p);
-        match open_db(&p).and_then(|c| Self::open_conn(c, layer, Some(p.clone()), id)) {
+        match crate::provenance::without(|| open_db(&p)).and_then(|c| Self::open_conn(c, layer, Some(p.clone()), id)) {
             Ok(s) => Ok(s),
             Err(e) => {
                 let _ = std::fs::remove_file(&p);
@@ -433,7 +433,8 @@ impl FeatureSource for GpkgSource {
     /// Samples native-envelope matches, or decoded view matches when the native box is refused.
     /// Scans count records and check Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
-        if let Some((path, id)) = &self.file
+        if self.temp.is_none()
+            && let Some((path, id)) = &self.file
             && file_identity(path) == *id
         {
             crate::provenance::sqlite(path);
@@ -554,7 +555,8 @@ impl FeatureSource for GpkgSource {
             Ok(())
         };
         same_file()?;
-        let conn = open_db(path)?;
+        // An upload's SQLite copy is generated; its bytes were supplied by the caller.
+        let conn = if self.temp.is_some() { crate::provenance::without(|| open_db(path)) } else { open_db(path) }?;
         same_file()?;
         let req = Request { extent, limit: usize::MAX };
         let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
