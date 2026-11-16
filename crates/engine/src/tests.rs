@@ -47595,7 +47595,10 @@ fn cancelling_at_each_check_leaves_nothing_behind() {
                     while s.undo_depth() > before.1 {
                         s.undo();
                     }
-                    if state(s) != before {
+                    let mut after = state(s);
+                    // Table ids are never reused: undo keeps the counter (see the standalone-table removal regression).
+                    after.0["next_table_id"] = before.0["next_table_id"].clone();
+                    if after != before {
                         problems.push(format!("{what}, look {n} of {total}: undoing the run again doesn't give the project back"));
                     }
                 }
