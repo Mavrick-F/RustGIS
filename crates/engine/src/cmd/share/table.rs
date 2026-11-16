@@ -181,6 +181,8 @@ pub(in crate::cmd) fn table_work(s: &Session, p: &Value) -> Result<Work, String>
         Ok(Wrote {
             answer,
             notes,
+            diagnostics: Vec::new(),
+            refused_notes: Vec::new(),
             written_path,
             then: Some(Box::new(move |s, out| {
                 if omitted > 0 {
