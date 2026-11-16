@@ -668,7 +668,8 @@ pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
             for n in 2.. {
                 match std::fs::metadata(&path) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                    Ok(_) if holds(&path, data) => {
+                    // A destination looked at before writing is not an input of the command.
+                    Ok(_) if rustgis_data::provenance::without(|| holds(&path, data)) => {
                         write = false;
                         break;
                     }

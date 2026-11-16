@@ -186,7 +186,7 @@ From scripts: `project.log {"since"?, "until"?, "command"?, "failed"?, "limit"?}
 newest last (`command` is an id, or the start of one ending in a dot, `layer.`; `limit` is a whole
 number, 100 by default and at most 1,000, with `count` saying how many match), and
 `project.exportLog {"path": "log.csv"}` writes it out as CSV (one row an entry, the parameters as a
-JSON column, followed by plugin, project, RustGIS version and inputs as JSON) or JSON Lines (`.jsonl` or `.ndjson`), as the path's extension says;
+JSON column, followed by plugin, project, RustGIS version, inputs as JSON and the count of inputs left out) or JSON Lines (`.jsonl` or `.ndjson`), as the path's extension says;
 any other extension (a `.json`, a project) is refused, whatever `format` is given.
 `project.clearLog` empties it (leaving its own entry) and `project.logCommands {"on": false}` stops
 it (what is there stays).
