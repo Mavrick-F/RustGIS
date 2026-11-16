@@ -50891,8 +50891,9 @@ fn standalone_dbf_add_data_uses_tables_and_companion_shapefile() {
     let (parts, _) = rustgis_data::io::shapefile_parts(&data).unwrap();
     let dbf = parts.iter().find(|(e, _)| *e == "dbf").unwrap().1.clone();
     let dir = std::env::temp_dir().join(format!("rustgis-add-dbf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("places.dbf");
+    let path = dir.join("places.DBF");
     std::fs::write(&path, &dbf).unwrap();
     let p = json!({"path": path});
     let mut s = Session::new(Project::default());
@@ -50935,7 +50936,15 @@ fn standalone_dbf_add_data_uses_tables_and_companion_shapefile() {
     assert_eq!(mixed.project.tables.len(), 1);
     assert_eq!(mixed.project.tables[0].dataset.name, "L_COMM_INFO");
     for (ext, bytes) in &parts {
-        std::fs::write(path.with_extension(if *ext == "shp" { "ShP" } else { ext }), bytes).unwrap();
+        std::fs::write(
+            path.with_extension(match *ext {
+                "shp" => "ShP",
+                "dbf" => "DBF",
+                ext => ext,
+            }),
+            bytes,
+        )
+        .unwrap();
     }
     // Read-ahead and dispatch must agree on the SHP path, including the streamed route.
     for stream in [false, true] {

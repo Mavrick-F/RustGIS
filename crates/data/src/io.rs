@@ -270,7 +270,7 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<(Dataset, ReadReport)
                 "shp on its own: add it together with its .dbf, which it needs, and its .shx and .prj if it has them (pick or drop them at once), or add them zipped".into(),
             ));
         }
-        "dbf" => read_dbf(bytes.to_vec(), None, &name)?,
+        "dbf" => read_dbf(bytes.to_vec(), None, &name, &mut csv_memory_budget())?,
         "shx" | "prj" | "cpg" => {
             return Err(DataError::Unsupported(format!("{ext} on its own: it is part of a Shapefile; add it together with its .shp")));
         }
@@ -337,7 +337,7 @@ pub fn read_path(path: &Path) -> Result<(Dataset, ReadReport)> {
             check_size(path)?;
             let mut notes = Vec::new();
             let cpg = crate::dbf::read_cpg(path, &mut notes);
-            let (ds, mut report) = read_dbf(std::fs::read(path)?, cpg.as_deref(), &name)?;
+            let (ds, mut report) = read_dbf(std::fs::read(path)?, cpg.as_deref(), &name, &mut csv_memory_budget())?;
             report.messages.extend(notes);
             (ds, report)
         }
@@ -2440,6 +2440,16 @@ pub fn shapefile_for_dbf(path: &Path) -> Option<std::path::PathBuf> {
     ["shp", "SHP", "Shp", "sHp", "shP", "SHp", "ShP", "sHP"].iter().map(|e| path.with_extension(e)).find(|p| p.is_file())
 }
 
+/// Finds the attributes beside a Shapefile, accepting every ASCII case of `.dbf` in whole
+/// and streamed reads. A missing sidecar keeps the usual lowercase path for the error.
+pub(crate) fn dbf_sidecar(path: &Path) -> std::path::PathBuf {
+    ["dbf", "DBF", "Dbf", "dBf", "dbF", "DBf", "DbF", "dBF"]
+        .iter()
+        .map(|e| path.with_extension(e))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| path.with_extension("dbf"))
+}
+
 /// Reads a loose Shapefile using its sidecar CRS, retaining the default reader's behavior.
 fn read_shapefile(path: &Path, name: &str) -> Result<(Dataset, ReadReport)> {
     read_shapefile_in(path, name, None)
@@ -2449,11 +2459,7 @@ fn read_shapefile(path: &Path, name: &str) -> Result<(Dataset, ReadReport)> {
 /// converted. This changes only interpretation; the files on disk are never modified.
 pub fn read_shapefile_in(path: &Path, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
     check_size(path)?;
-    let dbf = ["dbf", "DBF", "Dbf", "dBf", "dbF", "DBf", "DbF", "dBF"]
-        .iter()
-        .map(|e| path.with_extension(e))
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| path.with_extension("dbf"));
+    let dbf = dbf_sidecar(path);
     if !dbf.is_file() {
         return Err(DataError::Format(format!("Shapefile: {} is missing", dbf.display())));
     }
@@ -2800,7 +2806,7 @@ fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut
         let read = if ext_of(&n) == "dbf" {
             let cpg = take(&mut entries, &stem(&n), "cpg").map(|(_, b)| b);
             let name = Path::new(leaf).file_stem().and_then(|s| s.to_str()).unwrap_or("table");
-            read_dbf(b, cpg.as_deref(), name).map(|r| vec![r])
+            read_dbf(b, cpg.as_deref(), name, budget).map(|r| vec![r])
         } else if is_city_model(leaf, &b) {
             read_city_member(leaf, &b, crs)
         } else if is_delimited_name(leaf) {
@@ -2900,18 +2906,39 @@ fn dbf_reader(mut bytes: Vec<u8>, cpg: Option<&[u8]>) -> Result<DbfRead> {
 }
 
 /// Reads a geometry-free dBASE table, checking cancellation and counting progress per record.
+/// Charges retained rows and cell allocations, with room for vector capacity, against the
+/// same budget as delimited tables; archive members share the remaining allowance.
 /// The bounded file read and header decoding finish before cancellation can be observed.
-fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str) -> Result<(Dataset, ReadReport)> {
+fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str, budget: &mut usize) -> Result<(Dataset, ReadReport)> {
     let DbfRead { mut reader, fields, decimals, mut report } = dbf_reader(bytes, cpg)?;
     let mut ds = Dataset::new(name, GeometryType::None, fields);
     let mut unread_dates = vec![0; ds.fields.len()];
     let mut nonfinite = vec![0; ds.fields.len()];
+    let allowance = *budget;
+    let mut left = allowance;
     crate::progress::begin(reader.header().num_records as usize);
     for record in reader.iter_records() {
         crate::progress::step(1)?;
         match record {
             Ok(record) => {
                 let attrs = dbf_attrs(&record, &ds.fields, &mut unread_dates, &mut nonfinite);
+                let cost = attrs
+                    .iter()
+                    .fold(
+                        std::mem::size_of::<crate::Feature>().saturating_add(attrs.capacity().saturating_mul(std::mem::size_of::<Value>())),
+                        |sum, value| {
+                            sum.saturating_add(match value {
+                                Value::Text(s) => s.capacity(),
+                                _ => 0,
+                            })
+                        },
+                    )
+                    .saturating_mul(2);
+                left = left.checked_sub(cost).ok_or_else(|| {
+                    DataError::Format(format!(
+                        "{name}: dBASE retained table exceeds the {allowance}-byte remaining memory budget; import a smaller file"
+                    ))
+                })?;
                 ds.push_next(None, attrs);
             }
             // An I/O failure can leave dbase's iterator at the same record forever.
@@ -2926,6 +2953,7 @@ fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str) -> Result<(Dataset, 
     if report.skipped > 0 {
         report.messages.push(format!("{name}: {} dBASE records were unreadable and left out", report.skipped));
     }
+    *budget = left;
     Ok((ds, report))
 }
 
@@ -6180,6 +6208,32 @@ mod tests {
         let limited = read_zip("tables.zip", &crate::zip::write(&entries).unwrap()).unwrap();
         assert_eq!(limited.len(), MAX_ZIP_LAYERS);
         assert_eq!(limited[0].1.messages, ["tables.zip: skipped tables/table32.dbf (past the 32-layer limit)"]);
+    }
+
+    /// A small file can expand into many owned rows; both loose and zipped tables must fit
+    /// the retained-memory allowance, shared with other archive tables.
+    #[test]
+    fn standalone_dbf_rows_share_the_zip_memory_budget() {
+        let mut ds = Dataset::new("small", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        for _ in 0..32 {
+            ds.push_next(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text("one".into())]);
+        }
+        let (parts, _) = shapefile_parts(&ds).unwrap();
+        let bytes = &parts.iter().find(|(ext, _)| *ext == "dbf").unwrap().1;
+        let mut left = 1 << 20;
+        let (table, report) = read_dbf(bytes.clone(), None, "small", &mut left).unwrap();
+        assert_eq!(table.features.len(), 32);
+        assert!(report.messages.is_empty());
+        let cost = (1 << 20) - left;
+        let error = read_dbf(bytes.clone(), None, "small", &mut (cost - 1)).unwrap_err();
+        assert!(matches!(error, DataError::Format(_)) && error.to_string().contains("memory budget"), "{error}");
+        let zip = crate::zip::write(&[("a.dbf".into(), bytes.clone()), ("b.dbf".into(), bytes.clone())]).unwrap();
+        let limited = read_zip_budget("tables.zip", &zip, None, &mut { cost }).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert!(limited[0].1.messages.iter().any(|m| m.contains("b.dbf") && m.contains("memory budget")));
+        let clean = read_zip_budget("tables.zip", &zip, None, &mut (cost * 2)).unwrap();
+        assert_eq!(clean.len(), 2);
+        assert!(clean.iter().all(|(_, report)| report.messages.is_empty()));
     }
 
     /// Standalone tables share Shapefile typing and loss notices; .cpg wins over the header,
