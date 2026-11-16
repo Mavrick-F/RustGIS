@@ -779,8 +779,14 @@ impl SourceLayer {
         })
     }
 
+    /// Clears a recovered failure and its notice marker, even between notice passes.
+    pub fn clear_error(&mut self) {
+        self.error = None;
+        self.error_said = None;
+    }
+
     /// Takes each persistent read failure once, so redraws do not repeat its notice. A successful
-    /// read observed here, or an explicit reopen/repair, allows a later failure to be reported.
+    /// read, or an explicit reopen/repair, allows a later failure to be reported.
     pub fn error_unsaid(&mut self) -> Option<String> {
         if self.error == self.error_said {
             return None;
@@ -994,7 +1000,7 @@ impl SourceLayer {
                 self.conversion_notes_unsaid = self.conversion_info.as_ref().map(|info| info.notes.clone()).unwrap_or_default();
                 self.opening = None;
                 self.reset();
-                self.error = None;
+                self.clear_error();
                 self.login = false;
                 Ok(())
             }
@@ -1129,7 +1135,7 @@ impl SourceLayer {
                     self.conversion_fallback = saved_conversion_note;
                 }
                 self.window = None;
-                self.error = None;
+                self.clear_error();
                 self.login = false;
                 Ok(())
             }
@@ -1194,7 +1200,7 @@ impl SourceLayer {
             wake();
         };
         self.handle = None;
-        self.error = None;
+        self.clear_error();
         self.reset();
         if let Err(e) = std::thread::Builder::new().name("rustgis-source-open".into()).spawn(job) {
             return self.opened(Err(format!("couldn't start opening the layer: {e}")));
@@ -1318,7 +1324,7 @@ impl SourceLayer {
             Ok(s) => {
                 self.handle = Some(s);
                 self.window = None;
-                self.error = None;
+                self.clear_error();
                 Ok(())
             }
             Err(e) => {
@@ -1431,8 +1437,7 @@ impl SourceLayer {
         self.handle = None;
         self.opening = None;
         self.pending = None;
-        self.error = None;
-        self.error_said = None;
+        self.clear_error();
         self.login = false;
         // A new opening may hold other values: what was said of the last one doesn't hold.
         self.unread_dates = None;
@@ -1631,7 +1636,7 @@ impl SourceLayer {
                     self.ready_cache = Some(cache);
                     let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len(), filtered };
                     self.window = Some(w);
-                    self.error = None;
+                    self.clear_error();
                     return Polled::Done(w, b);
                 }
                 Some(Err(e)) => {

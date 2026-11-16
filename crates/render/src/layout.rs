@@ -332,7 +332,12 @@ fn draw_page(
             let lonlat = crate::view_lonlat(map, &view);
             let scale = map.ground_res_at(&cam) / rustgis_geom::PIXEL_M;
             map.sync_sources(&lonlat, scale, true);
-            shown.push((*f, *show_no_data, complete_shown_legends(map, scale, *show_no_data)?));
+            let mut failed_source = None;
+            let Some(entries) = complete_shown_legends(map, scale, *show_no_data, &mut failed_source) else {
+                *source_error = failed_source_error(map, failed_source);
+                return None;
+            };
+            shown.push((*f, *show_no_data, entries));
         }
     }
     for e in layout.elements.iter().filter(visible) {
@@ -358,10 +363,7 @@ fn draw_page(
                 let mut failed_source = None;
                 let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), pending, grid, &mut failed_source) else {
                     if frame_requires_complete(map, &view) {
-                        *source_error = failed_source.and_then(|id| {
-                            let layer = map.layers.iter().find(|layer| layer.instance_id() == id)?;
-                            layer.source.as_ref()?.read_error().map(|why| format!("{}: {why}", layer.name))
-                        });
+                        *source_error = failed_source_error(map, failed_source);
                         return None;
                     }
                     // Preserve upstream's best-effort page export for ordinary maps.
@@ -1863,8 +1865,22 @@ fn raster_classes(l: &rustgis_map::Layer, all_classes: bool) -> Option<Vec<Legen
     )
 }
 
+/// Names only the source whose read stopped this page, leaving unrelated failures generic.
+fn failed_source_error(map: &Map, failed_source: Option<u64>) -> Option<String> {
+    let id = failed_source?;
+    let layer = map.layers.iter().find(|layer| layer.instance_id() == id)?;
+    layer.source.as_ref()?.read_error().map(|why| format!("{}: {why}", layer.name))
+}
+
 /// Complete-source legends retain one minimal value per used class, never its geometry.
-fn complete_shown_legends(map: &mut Map, scale: f64, show_no_data: bool) -> Option<Vec<(u32, Vec<LegendEntry>)>> {
+/// A failed traversal returns its live layer identity for the page's source-error report.
+fn complete_shown_legends(
+    map: &mut Map,
+    scale: f64,
+    show_no_data: bool,
+    failed_source: &mut Option<u64>,
+) -> Option<Vec<(u32, Vec<LegendEntry>)>> {
+    *failed_source = None;
     if !map.layers.iter().any(|l| l.source.as_ref().and_then(|s| s.chunk_source()).is_some()) {
         return Some(shown_legends(map, scale, show_no_data));
     }
@@ -1934,6 +1950,7 @@ fn complete_shown_legends(map: &mut Map, scale: f64, show_no_data: bool) -> Opti
             if let Some(source) = &mut layer.source {
                 source.error = Some(e.to_string());
             }
+            *failed_source = Some(layer.instance_id());
             return None;
         }
         if any {
@@ -2400,7 +2417,7 @@ pub fn legend_sizes_with_no_data_mm(
     show_no_data: bool,
     (exclude, labels): (&[String], &BTreeMap<String, String>),
 ) -> Option<[(f64, f64); MAX_LEGEND_COLUMNS]> {
-    let drawn = if all_classes { None } else { Some(complete_shown_legends(map, scale, show_no_data)?) };
+    let drawn = if all_classes { None } else { Some(complete_shown_legends(map, scale, show_no_data, &mut None)?) };
     let rows = legend_rows(map, drawn.as_deref(), &LegendOptions { show_no_data, hide_other, exclude, labels, scale });
     let mm = 25.4 / 96.0;
     Some(std::array::from_fn(|i| {
@@ -3114,7 +3131,7 @@ mod tests {
         .unwrap();
         let fallback = l.renderer.symbol_for(&l.dataset, 2);
         let listed = |map: &mut Map, all: bool, show: bool| {
-            let drawn = (!all).then(|| complete_shown_legends(map, 1e6, show).unwrap());
+            let drawn = (!all).then(|| complete_shown_legends(map, 1e6, show, &mut None).unwrap());
             let opts = LegendOptions { show_no_data: show, hide_other: true, exclude: &[], labels: &NO_LABELS, scale: 1e6 };
             legend_rows(map, drawn.as_deref(), &opts)
                 .into_iter()

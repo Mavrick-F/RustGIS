@@ -561,6 +561,42 @@ fn layout_export_keeps_all_drawn_legend_classes() {
     let mut failed = base.clone();
     failed.layers[0] = streamed(&base.layers[0], 0);
     assert!(layout::render(&page, &mut [failed], 96.0, &layout::PageInfo::default()).is_err());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("classes.shp");
+        rustgis_data::io::write_path(&base.layers[0].dataset, &path).unwrap();
+        let source = SourceLayer::from_path(path.to_string_lossy(), None, rustgis_data::source::open_path(&path, None).unwrap());
+        // SVG records elements separately: visit the legend before the frame can fail instead.
+        page.elements.reverse();
+        for missing in [false, true] {
+            if missing {
+                std::fs::remove_file(&path).unwrap();
+            }
+            for format in ["png", "pdf", "svg"] {
+                let mut map = base.clone();
+                map.layers[0].name = "Survey classes".into();
+                map.layers[0].source = Some(source.clone());
+                let info = layout::PageInfo::default();
+                let maps = std::slice::from_mut(&mut map);
+                let result = match format {
+                    "png" => layout::render(&page, maps, 96.0, &info).map(|_| ()),
+                    "pdf" => layout::render_drawing(&page, maps, 96.0, &info).map(|_| ()),
+                    _ => crate::svg::layout_svg(&page, maps, 96.0, &info).map(|_| ()),
+                };
+                if missing {
+                    let error = result.unwrap_err();
+                    assert!(error.starts_with("Survey classes: "), "{format}: {error}");
+                    for detail in [path.to_str().unwrap(), "moved or deleted", "Repair Data Source"] {
+                        assert!(error.contains(detail), "{format}: missing {detail:?} in {error:?}");
+                    }
+                } else {
+                    assert!(result.is_ok(), "{format}: {result:?}");
+                }
+            }
+        }
+    }
 }
 
 #[test]

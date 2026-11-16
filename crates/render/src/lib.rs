@@ -2229,7 +2229,7 @@ fn render_pass(
                 return None;
             }
             if let Some(source) = map.layer_mut(layer.id).and_then(|l| l.source.as_mut()) {
-                source.error = None;
+                source.clear_error();
             }
             layer.selection = features.iter().enumerate().filter_map(|(r, f)| ids.contains(&f.id).then_some(r)).collect();
             layer.source = None;
@@ -5352,7 +5352,7 @@ fn render_frame(
                 return None;
             }
             if let Some(source) = &mut layer.source {
-                source.error = None;
+                source.clear_error();
             }
         } else if let Err(e) = draw_chunk(layer) {
             log::warn!("cannot render layer '{}': {e}", layer.name);

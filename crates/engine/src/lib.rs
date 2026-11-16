@@ -2248,29 +2248,8 @@ impl Session {
         for note in dates {
             self.notify(note, false);
         }
-        if source_error_count > 0 {
-            use notice_text::NoticeText;
-            let more = source_error_count - source_errors.len();
-            let mut layers = NoticeText::list(source_errors);
-            if more > 0 {
-                layers = NoticeText::format("{layers}; {count} more", [("layers", layers), ("count", more.to_string().into())]);
-            }
-            let key = if source_error_count == 1 {
-                "{count} linked layer could not be read: {layers}; {repair}"
-            } else {
-                "{count} linked layers could not be read: {layers}; {repair}"
-            };
-            self.notify_text(
-                NoticeText::format(
-                    key,
-                    [
-                        ("count", source_error_count.to_string().into()),
-                        ("layers", layers),
-                        ("repair", NoticeText::term(rustgis_map::source::REPAIR_SOURCE)),
-                    ],
-                ),
-                true,
-            );
+        if let Some(message) = notice_text::NoticeText::source_errors(source_error_count, source_errors, source_error_count) {
+            self.notify_text(message, true);
         }
         let (mut lost, mut held, mut failed, mut dropped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for m in &mut self.project.maps {
