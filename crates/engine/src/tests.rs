@@ -21899,6 +21899,28 @@ fn area_review_reports_retain_where_clauses_when_fitted() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
+fn streamed_non_local_source_error_remains_unsaid_for_its_own_reporting() {
+    use rustgis_map::source::SourceLayer;
+
+    let mut session = Session::new(Project::default());
+    let mut source = SourceLayer::default();
+    source.path = Some("https://example.invalid/sites.fgb".into());
+    source.error = Some("the server refused the read".into());
+    assert!(source.linked_file().is_none());
+    let id = session.map_mut().add_streamed("Remote sites", source);
+    let mark = session.notice_mark();
+    for _ in 0..2 {
+        session.notice_landed_rasters();
+    }
+    assert!(session.notices_since(mark).is_empty());
+    // Local-file notices must leave the failure available to the remote source's reporter.
+    let source = session.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap();
+    assert_eq!(source.error_unsaid().as_deref(), Some("the server refused the read"));
+    assert!(source.error_unsaid().is_none());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn missing_read_in_place_file_names_layer_and_path_once() {
     use crate::{
         cmd::exports::{export_land, export_start},

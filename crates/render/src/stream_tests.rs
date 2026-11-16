@@ -1227,15 +1227,27 @@ fn layout_export_rejects_unopened_local_shapefiles_and_required_masks() {
             let mut map = base.clone();
             let owner = if masked { mask } else { point };
             let mut source = SourceLayer::default();
-            source.path = Some(dir.path().join("missing.SHP").display().to_string());
+            let path = dir.path().join("missing.SHP").display().to_string();
+            source.path = Some(path.clone());
             map.layer_mut(owner).unwrap().source = Some(source);
             if masked {
                 map.layer_mut(point).unwrap().mask = Some("MASK".into());
             }
-            assert!(
-                layout::render(&page, std::slice::from_mut(&mut map), 96.0, &layout::PageInfo::default()).is_err(),
-                "missing complete source must fail the page: pitch {pitch}, masked {masked}"
-            );
+            for format in ["png", "pdf", "svg"] {
+                let maps = std::slice::from_mut(&mut map);
+                let info = layout::PageInfo::default();
+                let error = match format {
+                    "png" => layout::render(&page, maps, 96.0, &info).err(),
+                    "pdf" => layout::render_drawing(&page, maps, 96.0, &info).err(),
+                    _ => crate::svg::layout_svg(&page, maps, 96.0, &info).err(),
+                }
+                .unwrap_or_else(|| panic!("missing source must fail the page: pitch {pitch}, masked {masked}, format {format}"));
+                let layer = map.layer(owner).unwrap();
+                assert!(error.starts_with(&format!("{}: ", layer.name)), "{error}");
+                for detail in [layer.name.as_str(), path.as_str(), "moved or deleted", "Repair Data Source"] {
+                    assert!(error.contains(detail), "missing {detail:?} in {error:?}");
+                }
+            }
             assert!(map.layer(owner).unwrap().source.as_ref().unwrap().error.is_some());
         }
         let mut unused = base.clone();

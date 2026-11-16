@@ -2208,7 +2208,9 @@ impl Session {
         let mut source_error_count = 0;
         for map in &mut self.project.maps {
             for layer in &mut map.layers {
+                // Only a source with a local file is said here; others keep their error for their own reports.
                 if let Some(source) = &mut layer.source
+                    && source.linked_file().is_some()
                     && let Some(error) = source.error_unsaid()
                     && let Some(path) = source.linked_file()
                 {

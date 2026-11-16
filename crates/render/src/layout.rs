@@ -83,19 +83,26 @@ pub fn render_pending(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageIn
 /// [`render_pending`], its frames waiting for cast shadows when `wait_shadows` (an export).
 fn render_page(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo, wait_shadows: bool) -> Result<(Pixmap, bool), String> {
     let revisions = archive_revisions(layout, maps);
+    let mut source_error = None;
     let result = if wait_shadows {
-        render_pending_inner(layout, maps, dpi, info)
+        render_pending_inner(layout, maps, dpi, info, &mut source_error)
     } else {
-        crate::without_shadow_wait(|| render_pending_inner(layout, maps, dpi, info))
+        crate::without_shadow_wait(|| render_pending_inner(layout, maps, dpi, info, &mut source_error))
     };
-    revisions.finish_revision(archive_revisions(layout, maps), result, "the page is too large to draw")
+    revisions.finish_revision(archive_revisions(layout, maps), result, source_error.as_deref().unwrap_or("the page is too large to draw"))
 }
 
-fn render_pending_inner(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<(Pixmap, bool)> {
+fn render_pending_inner(
+    layout: &Layout,
+    maps: &mut [Map],
+    dpi: f64,
+    info: &PageInfo,
+    source_error: &mut Option<String>,
+) -> Option<(Pixmap, bool)> {
     let (w, h, k) = page_geometry(layout, dpi);
     let bounds = tiny_skia::IntRect::from_xywh(0, 0, w, h)?;
     let mut pending = false;
-    let pm = draw_page(layout, maps, info, k, bounds, None, None, &mut pending)?.into_pixmap();
+    let pm = draw_page(layout, maps, info, k, bounds, None, None, &mut pending, source_error)?.into_pixmap();
     Some((pm, pending))
 }
 
@@ -112,8 +119,9 @@ pub fn render_drawing(
     info: &PageInfo,
 ) -> Result<(crate::vector::Drawing, Vec<(u32, String)>), String> {
     let revisions = archive_revisions(layout, maps);
-    let result = render_drawing_inner(layout, maps, dpi, info);
-    revisions.finish_revision(archive_revisions(layout, maps), result, "the page is too large to draw")
+    let mut source_error = None;
+    let result = render_drawing_inner(layout, maps, dpi, info, &mut source_error);
+    revisions.finish_revision(archive_revisions(layout, maps), result, source_error.as_deref().unwrap_or("the page is too large to draw"))
 }
 
 fn render_drawing_inner(
@@ -121,11 +129,12 @@ fn render_drawing_inner(
     maps: &mut [Map],
     dpi: f64,
     info: &PageInfo,
+    source_error: &mut Option<String>,
 ) -> Option<(crate::vector::Drawing, Vec<(u32, String)>)> {
     let (w, h, k) = page_geometry(layout, dpi);
     let bounds = tiny_skia::IntRect::from_xywh(0, 0, w, h)?;
     let mut pictured = Vec::new();
-    let drawing = draw_page(layout, maps, info, k, bounds, None, Some(&mut pictured), &mut false)?.into_drawing()?;
+    let drawing = draw_page(layout, maps, info, k, bounds, None, Some(&mut pictured), &mut false, source_error)?.into_drawing()?;
     Some((drawing, pictured))
 }
 
@@ -228,9 +237,17 @@ pub fn clipped_text_notice(clipped: &[(u32, String)]) -> Option<String> {
 
 /// One element on transparency, allocating only its on-page pixel bounds.
 /// Outer `None` means rendering failed; inner `None` means the element is off-page.
-pub(crate) fn render_element(layout: &Layout, id: u32, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<Option<(Pixmap, [f64; 4])>> {
+/// A fatal source error is retained for the composed SVG's revision check and error report.
+pub(crate) fn render_element(
+    layout: &Layout,
+    id: u32,
+    maps: &mut [Map],
+    dpi: f64,
+    info: &PageInfo,
+    source_error: &mut Option<String>,
+) -> Option<Option<(Pixmap, [f64; 4])>> {
     let Some((bounds, k, mm)) = element_bounds(layout, id, dpi)? else { return Some(None) };
-    let pm = draw_page(layout, maps, info, k, bounds, Some(id), None, &mut false)?.into_pixmap();
+    let pm = draw_page(layout, maps, info, k, bounds, Some(id), None, &mut false, source_error)?.into_pixmap();
     Some(Some((pm, mm)))
 }
 
@@ -244,9 +261,10 @@ pub(crate) fn record_element(
     dpi: f64,
     info: &PageInfo,
     pictured: &mut Vec<(u32, String)>,
+    source_error: &mut Option<String>,
 ) -> Option<Option<(crate::vector::Drawing, [f64; 4], f64)>> {
     let Some((bounds, k, mm)) = element_bounds(layout, id, dpi)? else { return Some(None) };
-    let drawing = draw_page(layout, maps, info, k, bounds, Some(id), Some(pictured), &mut false)?.into_drawing()?;
+    let drawing = draw_page(layout, maps, info, k, bounds, Some(id), Some(pictured), &mut false, source_error)?.into_drawing()?;
     Some(Some((drawing, mm, k)))
 }
 
@@ -266,7 +284,8 @@ fn element_bounds(layout: &Layout, id: u32, dpi: f64) -> Option<Option<(tiny_ski
 /// Draws the selected region with the full layout's frame and dynamic-text context, recorded
 /// when `record` holds a list (see [`render_drawing`]), which gets the names of the frames
 /// drawn as pictures. `pending` is set when a frame drew while some of what it shows was still on
-/// its way (see [`render_pending`]).
+/// its way (see [`render_pending`]). A source read that stops the page supplies its named error;
+/// the caller checks the page's archive revision before reporting it.
 fn draw_page(
     layout: &Layout,
     maps: &mut [Map],
@@ -276,6 +295,7 @@ fn draw_page(
     element: Option<u32>,
     mut record: Option<&mut Vec<(u32, String)>>,
     pending: &mut bool,
+    source_error: &mut Option<String>,
 ) -> Option<Canvas> {
     let ppp = k / PT_PER_MM;
     let mut pm =
@@ -335,8 +355,13 @@ fn draw_page(
                 // The grid is drawn with the frame's map, before its attribution, which keeps
                 // clear of the grid's labels.
                 let grid = grid.as_ref().map(|g| (g, layout.decimal_comma));
-                let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), pending, grid, &mut None) else {
+                let mut failed_source = None;
+                let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), pending, grid, &mut failed_source) else {
                     if frame_requires_complete(map, &view) {
+                        *source_error = failed_source.and_then(|id| {
+                            let layer = map.layers.iter().find(|layer| layer.instance_id() == id)?;
+                            layer.source.as_ref()?.read_error().map(|why| format!("{}: {why}", layer.name))
+                        });
                         return None;
                     }
                     // Preserve upstream's best-effort page export for ordinary maps.
