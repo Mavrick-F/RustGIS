@@ -23,19 +23,23 @@ impl DateFormat {
             return Ok(Self { format: format.into(), pivot });
         }
         let mut codes = Vec::new();
+        let mut previous_variable = false;
         let mut chars = format.chars();
         while let Some(c) = chars.next() {
             if c != '%' {
+                previous_variable = false;
                 continue;
             }
             let mut code = chars.next().ok_or("unfinished % in date format")?;
-            if code == '-' {
+            let unpadded = code == '-';
+            if unpadded {
                 code = chars.next().ok_or("unfinished %- in date format")?;
                 if !matches!(code, 'm' | 'd' | 'H') {
                     return Err("%- is supported only for month (%-m), day (%-d) and 24-hour clock (%-H)".into());
                 }
             }
             if code == '%' {
+                previous_variable = false;
                 continue;
             }
             if !matches!(code, 'Y' | 'y' | 'm' | 'd' | 'H' | 'I' | 'p' | 'M' | 'S' | 'f' | 'z') {
@@ -43,6 +47,10 @@ impl DateFormat {
                     "unsupported date format code %{code}: use %Y, %y, %m, %d, %H, %-m, %-d, %-H, %I, %p, %M, %S, %f, %z or %%"
                 ));
             }
+            if previous_variable && matches!(code, 'Y' | 'y' | 'm' | 'd' | 'H' | 'I' | 'M' | 'S' | 'f') {
+                return Err("put a separator between a variable-width date code and the following digit code".into());
+            }
+            previous_variable = unpadded || code == 'I';
             if codes.contains(&code) {
                 return Err(format!("date format repeats %{code}"));
             }
@@ -340,6 +348,11 @@ mod tests {
 
     #[test]
     fn unpadded_dates_and_twelve_hour_clocks_are_explicit() {
+        for bad in ["%-m%-d-%Y", "%-m%d%Y", "%-d%Y-%m", "%m/%d/%Y %-H%M", "%m/%d/%Y %I%M %p", "%m/%d/%Y %I%f:%M:%S %p"] {
+            assert!(DateFormat::new(bad, None).unwrap_err().contains("separator"), "{bad}");
+        }
+        let f = DateFormat::new("%-m/%d-%Y", None).unwrap();
+        assert_eq!(f.parse("1/12-2021", FieldType::Date).0.to_string(), "2021-01-12");
         let pattern = "%-m/%-d/%Y %I:%M:%S %p";
         assert!(PRESETS.iter().any(|(_, p)| *p == pattern));
         let f = DateFormat::new(pattern, None).unwrap();
