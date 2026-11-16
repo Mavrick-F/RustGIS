@@ -99,8 +99,11 @@ fn command_uses_percent_slope(id: &str, params: &serde_json::Value) -> bool {
 }
 
 /// Inspect known command envelopes; unrelated data containing an areaUnit is not executable.
+/// Blank unit choices use the km² default and need no capability.
 fn command_uses_tabulate_unit(id: &str, params: &Value) -> bool {
-    let non_default = |p: &Value| p.get("areaUnit").and_then(Value::as_str).is_some_and(|u| !u.trim().eq_ignore_ascii_case("km2"));
+    let non_default = |p: &Value| {
+        p.get("areaUnit").and_then(Value::as_str).map(str::trim).is_some_and(|u| !u.is_empty() && !u.eq_ignore_ascii_case("km2"))
+    };
     if crate::cmd::gp::tool_id(id) == Some("tabulateIntersection") {
         return non_default(params);
     }
@@ -204,7 +207,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["tabulate-intersection-unit"]));
         fixture.models.clear();
         let base = serde_json::to_value(&fixture).unwrap();
-        for unit in [None, Some("km2"), Some(" KM2 "), Some("ac")] {
+        for unit in [None, Some(""), Some(" \t\n "), Some("km2"), Some(" KM2 "), Some("ac")] {
             let mut params = json!({"zones":"Zones", "classes":"Classes"});
             if let Some(unit) = unit {
                 params["areaUnit"] = json!(unit);
@@ -266,6 +269,7 @@ mod tests {
         let project = Project::from_json(&document.to_string()).unwrap();
         assert!(serde_json::to_value(&project).unwrap().get("requires").is_none());
         assert!(!command_uses_tabulate_unit("other", &json!({"areaUnit":"ac"})));
+        assert!(!command_uses_tabulate_unit("tabulateIntersection", &json!({"areaUnit":null})));
     }
 
     /// Every saved executable container protects percent slope, while default/explicit degrees
