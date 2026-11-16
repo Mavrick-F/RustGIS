@@ -4,7 +4,7 @@
 use rustgis_map::{Layer, Map, raster::RasterRenderer};
 use serde::{Deserialize, Serialize};
 
-use super::{FORMAT, Project};
+use super::{FORMAT, ModelGraph, ModelNodeKind, ModelStep, Project};
 
 impl Serialize for Project {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -26,11 +26,24 @@ impl<'de> Deserialize<'de> for Project {
 }
 
 impl Project {
-    /// Required features of maps, snapshots and saved commands that can later be replayed.
+    /// Required features of all saved maps, snapshots and replayable commands/scripts.
     pub(crate) fn required_capabilities(&self) -> Vec<&'static str> {
         let mut required = map_capabilities(self.maps.iter().chain(self.offline_areas.iter().map(|a| &a.data)));
         if !self.origin_id.is_empty() || self.field_origin.is_some() || self.offline_areas.iter().any(|area| !area.id.is_empty()) {
             required.push("field-origin");
+        }
+        if self.models.iter().any(|m| model_uses_percent_slope(&m.steps, m.graph.as_ref()))
+            || self.tasks.iter().any(|t| t.steps.iter().any(|s| command_uses_percent_slope(&s.command, &s.params)))
+            || self.gp_history.iter().any(|h| {
+                command_uses_percent_slope(&h.id, &h.params)
+                    || h.command.as_ref().is_some_and(|(id, params)| command_uses_percent_slope(id, params))
+            })
+            || self.notebooks.iter().any(|n| {
+                n.language().is_none()
+                    && n.cells.iter().any(|c| c.kind == crate::cmd::notebook::CellKind::Code && script_uses_percent_slope(&c.source))
+            })
+        {
+            required.push("slope-percent");
         }
         if self.tasks.iter().any(|task| task.steps.iter().any(|step| command_uses_table_export_order(&step.command, &step.params)))
             || self.gp_history.iter().any(|record| {
@@ -51,21 +64,33 @@ impl Project {
     }
 }
 
-/// Only executable export options require the capability, not fields in unrelated data.
-/// Models and web tools run analysis tools, so cannot execute share.exportTable.
-fn command_uses_table_export_order(id: &str, params: &serde_json::Value) -> bool {
+/// Check only the executable payload being saved: graph files omit steps, web tools omit graphs.
+pub(crate) fn model_uses_percent_slope(steps: &[ModelStep], graph: Option<&ModelGraph>) -> bool {
+    steps.iter().any(|s| command_uses_percent_slope(&s.tool, &s.params))
+        || graph.is_some_and(|g| {
+            g.nodes.iter().any(|n| n.kind == ModelNodeKind::Tool && command_uses_percent_slope(n.tool.as_deref().unwrap_or(""), &n.params))
+        })
+}
+
+/// Inspect known command parameters, not arbitrary data that happens to contain unit names.
+fn command_uses_percent_slope(id: &str, params: &serde_json::Value) -> bool {
+    let percent = |p: &serde_json::Value| {
+        p.get("function").and_then(serde_json::Value::as_str) == Some("slope")
+            && p.get("units").and_then(serde_json::Value::as_str) == Some("percent")
+    };
     match id {
-        "share.exportTable" => ["sort", "limit"].iter().any(|key| params.get(key).is_some_and(|value| !value.is_null())),
-        "script.run" => params.get("script").and_then(serde_json::Value::as_str).is_some_and(script_uses_table_export_order),
+        "raster.function" => percent(params),
+        "raster.functionChain" => params.get("steps").and_then(serde_json::Value::as_array).is_some_and(|steps| steps.iter().any(percent)),
+        "script.run" => params.get("script").and_then(serde_json::Value::as_str).is_some_and(script_uses_percent_slope),
         _ => false,
     }
 }
 
-/// Use the executor's bounded line grammar; nested script.run is refused by script_line,
-/// so inspecting script commands cannot recurse through scripts.
-fn script_uses_table_export_order(script: &str) -> bool {
+/// Use the executor's line grammar; comments/invalid lines are not executable commands, and
+/// script_line refuses nested scripts, so this check cannot recurse through script.run.
+fn script_uses_percent_slope(script: &str) -> bool {
     script.lines().take(crate::cmd::workflows::MAX_SCRIPT_LINES).any(|line| {
-        crate::script_line(line).is_some_and(|parsed| parsed.is_ok_and(|(id, params)| command_uses_table_export_order(&id, &params)))
+        crate::script_line(line).is_some_and(|parsed| parsed.is_ok_and(|(id, params)| command_uses_percent_slope(&id, &params)))
     })
 }
 
@@ -114,6 +139,24 @@ pub(crate) fn layer_file_bytes(layer: &Layer) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&Item { format: FORMAT, requires, value: layer }).map_err(|e| e.to_string())
 }
 
+/// Only executable export options require the capability, not fields in unrelated data.
+/// Models and web tools run analysis tools, so cannot execute share.exportTable.
+fn command_uses_table_export_order(id: &str, params: &serde_json::Value) -> bool {
+    match id {
+        "share.exportTable" => ["sort", "limit"].iter().any(|key| params.get(key).is_some_and(|value| !value.is_null())),
+        "script.run" => params.get("script").and_then(serde_json::Value::as_str).is_some_and(script_uses_table_export_order),
+        _ => false,
+    }
+}
+
+/// Use the executor's bounded line grammar; nested script.run is refused by script_line,
+/// so inspecting script commands cannot recurse through scripts.
+fn script_uses_table_export_order(script: &str) -> bool {
+    script.lines().take(crate::cmd::workflows::MAX_SCRIPT_LINES).any(|line| {
+        crate::script_line(line).is_some_and(|parsed| parsed.is_ok_and(|(id, params)| command_uses_table_export_order(&id, &params)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,51 +166,57 @@ mod tests {
         serde_json::from_slice(bytes).unwrap()
     }
 
-    /// Tasks, scripts and command notebook cells need ordered-export support when replayed;
-    /// default exports, unrelated parameters and notebook prose retain legacy compatibility.
+    /// Every saved executable container protects percent slope, while default/explicit degrees
+    /// and non-executable notebook text stay readable without the capability.
     #[test]
-    fn table_export_order_capability_follows_saved_commands() {
-        let mut fixture = Project::from_json(include_str!("../../../schema/fixtures/table_export_order.rgis")).unwrap();
-        assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["table-export-order"]));
-        fixture.tasks.clear();
+    fn slope_percent_capability_follows_saved_executables() {
+        let mut fixture = Project::from_json(include_str!("../../../schema/fixtures/slope_percent.rgis")).unwrap();
+        assert_eq!(fixture.models[0].steps[0].params["steps"][0]["units"], "percent");
+        assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["slope-percent"]));
+        fixture.models.clear();
         let base = serde_json::to_value(&fixture).unwrap();
-        for (params, required) in [
-            (json!({"table":"ranked","path":"top.csv"}), false),
-            (json!({"sort":null,"limit":null}), false),
-            (json!({"sort":[{"field":"score","descending":true}]}), true),
-            (json!({"limit":0}), true),
-        ] {
-            let script = format!("# Export\nshare.exportTable= {params}");
-            for (field, value) in [
-                ("tasks", json!([{"name":"Export","steps":[{"title":"Top","command":"share.exportTable","params":params}]}])),
-                ("tasks", json!([{"name":"Script","steps":[{"title":"Top","command":"script.run","params":{"script":script}}]}])),
-                ("notebooks", json!([{"name":"Commands","cells":[{"kind":"code","source":script}]}])),
-                (
-                    "gp_history",
-                    json!([{"tool":"Export Table","params":{},"command":["share.exportTable",params],"ok":true,"messages":[],"millis":0}]),
-                ),
-            ] {
-                let mut document = base.clone();
-                document[field] = value;
-                let project = Project::from_json(&document.to_string()).unwrap();
-                let saved = serde_json::to_value(&project).unwrap();
-                assert_eq!(saved.get("requires"), required.then(|| json!(["table-export-order"])).as_ref(), "{field} {params}");
-                let reopened = Project::from_json(&saved.to_string()).unwrap();
-                assert_eq!(serde_json::to_value(reopened).unwrap().get("requires"), saved.get("requires"));
+        for units in [None, Some("degrees"), Some("percent")] {
+            let mut slope = json!({"function": "slope", "layer": "DEM"});
+            if let Some(units) = units {
+                slope["units"] = json!(units);
+            }
+            for (id, params) in [("raster.function", slope.clone()), ("raster.functionChain", json!({"layer": "DEM", "steps": [slope]}))] {
+                let script = format!("# Slope\n{id}= {params}");
+                for (field, value) in [
+                    ("models", json!([{"name": "Steps", "steps": [{"tool": id, "params": params}]}])),
+                    ("models", json!([{"name": "Graph", "graph": {"nodes": [{"id": "s", "kind": "tool", "tool": id, "params": params}]}}])),
+                    ("tasks", json!([{"name": "Task", "steps": [{"title": "Slope", "command": id, "params": params}]}])),
+                    (
+                        "tasks",
+                        json!([{"name": "Script", "steps": [{"title": "Slope", "command": "script.run", "params": {"script": script}}]}]),
+                    ),
+                    ("notebooks", json!([{"name": "Notebook", "cells": [{"kind": "code", "source": script}]}])),
+                    (
+                        "gp_history",
+                        json!([{"tool": "Slope", "params": {}, "command": [id, params], "ok": true, "messages": [], "millis": 0}]),
+                    ),
+                ] {
+                    let mut document = base.clone();
+                    document[field] = value;
+                    let project = Project::from_json(&document.to_string()).unwrap();
+                    let saved = serde_json::to_value(&project).unwrap();
+                    if units == Some("percent") {
+                        assert_eq!(saved["requires"], json!(["slope-percent"]), "{id} {field}");
+                    } else {
+                        assert!(saved.get("requires").is_none(), "{id} {field} {units:?}");
+                    }
+                }
             }
         }
-        let script = "share.exportTable {\"limit\":1}";
         let mut document = base;
-        document["tasks"] =
-            json!([{"name":"Unrelated","steps":[{"title":"Other","command":"layer.addDataText","params":{"sort":[],"limit":1}}]}]);
+        let script = "raster.function {\"function\":\"slope\",\"units\":\"percent\"}";
         document["notebooks"] = json!([
-            {"name":"Notes","cells":[{"kind":"markdown","source":script}]},
-            {"name":"Comments","cells":[{"kind":"code","source":format!("# {script}")}]},
-            {"name":"Foreign","cells":[{"kind":"code","source":script}],"jupyter":{"metadata":{"kernelspec":{"language":"python"}}}}
+            {"name": "Notes", "cells": [{"kind": "markdown", "source": script}]},
+            {"name": "Foreign", "cells": [{"kind": "code", "source": script}],
+             "jupyter": {"metadata": {"kernelspec": {"language": "python"}}}}
         ]);
         let project = Project::from_json(&document.to_string()).unwrap();
-        assert!(serde_json::to_value(project).unwrap().get("requires").is_none());
-        assert!(rustgis_analysis::resolve_published("share.exportTable").is_none(), "models and web tools execute analysis tools only");
+        assert!(serde_json::to_value(&project).unwrap().get("requires").is_none());
     }
 
     #[test]
@@ -266,5 +315,52 @@ mod tests {
             }
         }
         assert!(json_bytes(&layer_file_bytes(&clean).unwrap()).get("requires").is_none());
+    }
+
+    /// Tasks, scripts and command notebook cells need ordered-export support when replayed;
+    /// default exports, unrelated parameters and notebook prose retain legacy compatibility.
+    #[test]
+    fn table_export_order_capability_follows_saved_commands() {
+        let mut fixture = Project::from_json(include_str!("../../../schema/fixtures/table_export_order.rgis")).unwrap();
+        assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["table-export-order"]));
+        fixture.tasks.clear();
+        let base = serde_json::to_value(&fixture).unwrap();
+        for (params, required) in [
+            (json!({"table":"ranked","path":"top.csv"}), false),
+            (json!({"sort":null,"limit":null}), false),
+            (json!({"sort":[{"field":"score","descending":true}]}), true),
+            (json!({"limit":0}), true),
+        ] {
+            let script = format!("# Export\nshare.exportTable= {params}");
+            for (field, value) in [
+                ("tasks", json!([{"name":"Export","steps":[{"title":"Top","command":"share.exportTable","params":params}]}])),
+                ("tasks", json!([{"name":"Script","steps":[{"title":"Top","command":"script.run","params":{"script":script}}]}])),
+                ("notebooks", json!([{"name":"Commands","cells":[{"kind":"code","source":script}]}])),
+                (
+                    "gp_history",
+                    json!([{"tool":"Export Table","params":{},"command":["share.exportTable",params],"ok":true,"messages":[],"millis":0}]),
+                ),
+            ] {
+                let mut document = base.clone();
+                document[field] = value;
+                let project = Project::from_json(&document.to_string()).unwrap();
+                let saved = serde_json::to_value(&project).unwrap();
+                assert_eq!(saved.get("requires"), required.then(|| json!(["table-export-order"])).as_ref(), "{field} {params}");
+                let reopened = Project::from_json(&saved.to_string()).unwrap();
+                assert_eq!(serde_json::to_value(reopened).unwrap().get("requires"), saved.get("requires"));
+            }
+        }
+        let script = "share.exportTable {\"limit\":1}";
+        let mut document = base;
+        document["tasks"] =
+            json!([{"name":"Unrelated","steps":[{"title":"Other","command":"layer.addDataText","params":{"sort":[],"limit":1}}]}]);
+        document["notebooks"] = json!([
+            {"name":"Notes","cells":[{"kind":"markdown","source":script}]},
+            {"name":"Comments","cells":[{"kind":"code","source":format!("# {script}")}]},
+            {"name":"Foreign","cells":[{"kind":"code","source":script}],"jupyter":{"metadata":{"kernelspec":{"language":"python"}}}}
+        ]);
+        let project = Project::from_json(&document.to_string()).unwrap();
+        assert!(serde_json::to_value(project).unwrap().get("requires").is_none());
+        assert!(rustgis_analysis::resolve_published("share.exportTable").is_none(), "models and web tools execute analysis tools only");
     }
 }

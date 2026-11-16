@@ -66,11 +66,22 @@ For commands, `format` is optional and defaults to `"iso"`: ISO 8601 (`2026-03-0
 `2026-03-05T14:30:00+02:00`, or with a space for the `T`). An explicit numeric pattern uses
 `%Y` (four-digit year), `%m` (month), `%d` (day), `%H` (24-hour clock), `%M` (minute),
 `%S` (second), `%f` (fractional second digits), `%z` (`Z`, `+0200` or `+02:00`), and `%%` (a
-literal percent). Month, day, hour, minute, second and `%y` take two digits. Other characters
+literal percent). `%m`, `%d`, `%H`, `%M`, `%S` and `%y` take exactly two digits. Other characters
 match literally; surrounding whitespace is ignored. For example:
 
 ```json
 {"layer":"Permits","field":"issued","type":"datetime","format":"%m/%d/%Y %H:%M"}
+```
+
+For a month, day or 24-hour clock written with one or two digits, use `%-m`, `%-d` or `%-H`.
+Each reads up to two digits; separate these fields with punctuation or spaces. The fixed-width
+`%m`, `%d` and `%H` keep their meaning, including in compact patterns such as `%m%d%Y`.
+`%I` reads a one- or two-digit 12-hour clock (1 to 12), paired with `%p` for case-insensitive
+`AM` or `PM`: 12 AM is midnight and 12 PM is noon. Do not combine it with `%H` or `%-H`.
+The dialog offers **M/D/YYYY h:MM:SS AM/PM** for text such as `6/23/2021 5:00:00 AM`:
+
+```json
+{"layer":"Permits","field":"issued","type":"datetime","format":"%-m/%-d/%Y %I:%M:%S %p"}
 ```
 
 `%y` requires `pivotYear`, the first year of a 100-year window (1 to 9900). For example,
@@ -1391,7 +1402,7 @@ click them on the map:
 
 | Workflow | What it does |
 | --- | --- |
-| Raster Functions | Slope in degrees (not percent), aspect, hillshade (8-bit shades from 1 to 255, with 0 for no data), NDVI, band math (`(b4-b3)/(b4+b3)`), remapping, thresholds, resampling |
+| Raster Functions | Slope in degrees or percent, aspect, hillshade (8-bit shades from 1 to 255, with 0 for no data), NDVI, band math (`(b4-b3)/(b4+b3)`), remapping, thresholds, resampling |
 | Function Editor | Chains raster functions, each on the previous output |
 | Suitability Modeler | Scores rasters 1–10 and adds them with weights |
 | Visibility Analysis | A viewshed from a point on an elevation raster, with the Earth's curvature and the refraction of visible light (1/7, as `gdal_viewshed`). The ground along each ray is the cell each point falls in by default; `heights: "bilinear"` (**Ground heights › Between cells (bilinear)** in the Workflows pane) reads it between the cells' centres instead. Both are estimates of the ground between cell centres; between cells is closer on ground that bulges (a hill seen from its top), where the nearest cell can hide cells just inside the horizon. With no radius, or one longer than the raster's diagonal, the viewshed covers the whole raster. The map's **Viewshed N km Here** reads the ground as the Workflows pane's **Ground heights** says. On a raster round the whole Earth the rays don't cross its east–west edge, which the analysis says when the radius reaches it and the way across is shorter: the ground just across the edge is left out, worked out the long way round where the radius reaches the far edge through the raster too (always with no radius), or partly both, near the observer's row and not farther from it. The observer's height must be from 0 to 10,000 m. Ground with no data hides nothing, and next to it bilinear heights take the nearest cell's height; the analysis says how many cells this touched, in a notice. The answer gives both counts (0 when there is nothing to say): `acrossNoData` counts the visible cells whose rays crossed ground with no data (a hidden cell stays hidden whatever that ground is, so it isn't counted, and 0 doesn't mean no ray crossed any); `readNearest` counts every cell, visible or hidden, whose ray took a nearest height next to no data in bilinear mode |
@@ -1405,12 +1416,15 @@ click them on the map:
 | Embeddings | The features most like the selected one, by their numeric attributes |
 | Data Interop | KML, GPX, CSV with WKT, GeoJSON or CSV |
 
-Slope, in Raster Functions and the Function Editor, is in degrees, from 0 (flat) to 90
-(vertical), from Horn's 3 × 3 gradient; there is no percent option. Percent slope is
-`100 × tan(slope × π / 180)` (the angle in radians, as `tan` takes it), so 45° is 100%: convert
-each cell before averaging, since a converted mean angle isn't the mean percent. The result's
-band is named **Slope (degrees)**, which `raster.info` shows and a saved project or GeoTIFF
-export keeps; a later step in a chain names it again.
+Slope, in Raster Functions and the Function Editor, uses Horn's 3 × 3 gradient. Choose
+**Slope units**: **Degrees (0–90)** (the default, from flat to vertical) or **Percent**.
+For `raster.function`, set `"function": "slope", "units": "percent"`; in `raster.functionChain`,
+set `"units": "percent"` on the slope step. Omitting `units`, or setting it to `"degrees"`,
+keeps degree output. Percent slope is `100 × tan(slope × π / 180)` (the angle in radians, as
+`tan` takes it), so 45° is 100%. Percent is computed per cell before any later step or
+statistics; converting a mean angle would not give the mean percent. The result's band is
+named **Slope (degrees)** or **Slope (percent)**, which `raster.info` shows and a saved project
+or GeoTIFF export keeps; a later step in a chain names it again.
 
 Slope, aspect and hillshade need the cell size in the elevation's unit. On a projected DEM the
 cell size is taken as it is, so elevations must be in the same unit as the coordinates (feet
@@ -1425,9 +1439,11 @@ from its low end up to, but not including, its high end: `[21, 22, 1]` maps clas
 ranges that can match nothing, and another says when a remap, or a suitability whose criteria
 score no cell in common, leaves no cells with values.
 
-Network routing rebuilds its graph for each request and solves each edge length on WGS 84.
-Large line networks can therefore take longer to route than with spherical lengths; repeated
-routes do not currently share a cached graph.
+Network routing solves each edge length on WGS 84 and reuses the most recent network graph
+across repeated routes, including command, model and script loops. Editing the network, changing
+its visible rows or choosing a different cost field rebuilds the graph. Route ends and snap
+distance are checked separately for each request. The cache holds at most one graph with up to
+256 MiB of heap storage (including its row list); larger networks are rebuilt for each request.
 
 Rasters these make are kept in the project. **Environments** (`gp.env`) set an extent from the map
 view, full extent, a layer or a longitude/latitude box (or `null` to clear it). For tools that

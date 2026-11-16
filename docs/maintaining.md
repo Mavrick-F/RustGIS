@@ -105,6 +105,10 @@ Earlier format-2 readers refuse unknown required
 capabilities instead of opening and later saving away those settings; legacy format-1 files
 still open.
 
+Projects, model files and web tools that save a percent-slope function require `slope-percent`:
+an older reader must refuse them rather than run the saved function in degrees. Project
+requirements also cover executable task steps, replayable history and notebook command cells.
+
 ## New dependencies
 
 A proposal for a dependency answers:
