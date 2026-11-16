@@ -198,6 +198,47 @@ fn area_units_convert_only_the_area_and_name_its_unit() {
     assert_eq!(out.fields[1].name, "area_ac_2");
 }
 
+/// Null optional units match omission exactly, including the table schema and notices.
+#[test]
+fn null_area_unit_keeps_default_output() {
+    let l = layers(zones(), classes());
+    let mut params = json!({"zones":"zones", "zoneFields":"zone", "classes":"classes", "sumFields":"pop"});
+    let default = rustgis_analysis::run("tabulateIntersection", &l, &params).unwrap();
+    params["areaUnit"] = json!(null);
+    let null = rustgis_analysis::run("tabulateIntersection", &l, &params).unwrap();
+    assert_eq!(null.messages, default.messages);
+    assert_eq!(serde_json::to_value(table(null)).unwrap(), serde_json::to_value(table(default)).unwrap());
+}
+
+/// Geographic notices name the numeric area column after collisions with both grouping fields.
+#[test]
+fn area_notices_use_the_actual_column_name() {
+    let polygon = |points: &[(f64, f64)]| Some(Geometry::Polygon(vec![vec![points.iter().map(|&(x, y)| Coord::new(x, y)).collect()]]));
+    for (zone, class, notice) in [
+        (
+            [(179.0, 0.0), (-179.0, 0.0), (-179.0, 1.0), (179.0, 1.0), (179.0, 0.0)],
+            [(0.0, 0.2), (0.5, 0.2), (0.5, 0.8), (0.0, 0.8), (0.0, 0.2)],
+            "follows the ground",
+        ),
+        (
+            [(0.0, 80.0), (10.0, 80.0), (10.0, 88.0), (0.0, 88.0), (0.0, 80.0)],
+            [(0.0, 84.0), (10.0, 84.0), (10.0, 89.0), (0.0, 89.0), (0.0, 84.0)],
+            "takes the shortest way on the ground",
+        ),
+    ] {
+        let mut z = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("area_ac", FieldType::Text)]);
+        z.push_next(polygon(&zone), vec![Value::Text("A".into())]);
+        let mut c = Dataset::new("classes", GeometryType::Polygon, vec![Field::new("area_ac", FieldType::Text)]);
+        c.push_next(polygon(&class), vec![Value::Text("forest".into())]);
+        let params = json!({"zones":"zones", "zoneFields":"area_ac", "classes":"classes", "classFields":"area_ac", "areaUnit":"ac"});
+        let result = rustgis_analysis::run("tabulateIntersection", &layers(z, c), &params).unwrap();
+        assert!(result.messages.iter().any(|m| m.contains(&format!("while area_ac_3 {notice}"))), "{:?}", result.messages);
+        let out = table(result);
+        assert_eq!(out.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["area_ac", "area_ac_2", "area_ac_3", "percentage"]);
+        assert_eq!(out.fields[2].ty, FieldType::Double);
+    }
+}
+
 /// A fieldless dissolved layer works without a synthetic attribute. Empty lists and strings
 /// behave like omission; a reordered selection retains original row identities and order.
 #[test]

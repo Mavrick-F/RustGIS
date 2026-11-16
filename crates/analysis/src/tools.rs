@@ -6068,9 +6068,8 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         }
     }
     let zone_keys = key_fields(zones, p.get("zoneFields"), "Zone Field")?;
-    let area_unit = s(p, "areaUnit");
+    let area_unit = p.get("areaUnit").and_then(Json::as_str).unwrap_or("km2");
     let area_divisor = Measure::Area.unit(area_unit).ok_or("unknown area unit")?;
-    let area_field = format!("area_{area_unit}");
     let class_keys = key_fields(classes, p.get("classFields"), "Class Field")?;
     let sum_fields = key_fields(classes, p.get("sumFields"), "Sum Field")?;
     for &f in &sum_fields {
@@ -6310,10 +6309,9 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         let name = unique_field(&out, &f.name);
         out.fields.push(Field { name, ..f.clone() });
     }
-    for base in [area_field.as_str(), "percentage"]
-        .into_iter()
-        .chain(sum_fields.iter().filter_map(|&f| classes.fields.get(f).map(|f| f.name.as_str())))
-    {
+    let area_field = unique_field(&out, &format!("area_{area_unit}"));
+    out.fields.push(Field::new(area_field.clone(), FieldType::Double));
+    for base in ["percentage"].into_iter().chain(sum_fields.iter().filter_map(|&f| classes.fields.get(f).map(|f| f.name.as_str()))) {
         let name = unique_field(&out, base);
         out.fields.push(Field::new(name, FieldType::Double));
     }
