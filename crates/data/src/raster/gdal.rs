@@ -1,6 +1,6 @@
 //! GDAL, optionally, for rasters: formats the built-in readers don't know (JPEG 2000, ERDAS
-//! Imagine, SRTM HGT, DTED, NetCDF, HDF, ENVI, SAGA…) read through GDAL's `gdal_translate` when it
-//! is installed.
+//! Imagine, SRTM HGT, DTED, NetCDF, HDF, ENVI, SAGA, GeoPDF…) read through GDAL's `gdal_translate`
+//! when it is installed.
 //!
 //! A file (or one of its subdatasets, such as a NetCDF variable) is converted once into a
 //! cloud-optimised GeoTIFF with overviews in the cache folder, then read as a GeoTIFF, so large
@@ -17,11 +17,12 @@ use crate::{DataError, Result};
 /// machine, nor `.xyz`, more often a point cloud than a grid.)
 pub const EXTENSIONS: &[&str] = &[
     "jp2", "j2k", "img", "hgt", "dem", "dt0", "dt1", "dt2", "nc", "nc4", "hdf", "hdf5", "h5", "he5", "bil", "bsq", "bip", "envi", "grd",
-    "rst", "sdat", "kea", "ers", "ntf", "nitf", "ecw", "sid", "gsb", "bt", "rsw",
+    "rst", "sdat", "kea", "ers", "ntf", "nitf", "ecw", "sid", "gsb", "bt", "rsw", "pdf",
 ];
 
-/// Most subdatasets listed from one file.
-const MAX_SUBDATASETS: usize = 256;
+/// Most subdatasets listed from one file: a PDF's pages among them, up to the 500 a map series
+/// exports.
+const MAX_SUBDATASETS: usize = 512;
 
 /// Whether a file name is a raster read through GDAL.
 pub fn is_gdal_raster_name(name: &str) -> bool {
@@ -60,6 +61,8 @@ fn drivers(src: &Path) -> Result<&'static [&'static str]> {
         "gsb" => &["NTv2"],
         "bt" => &["BT"],
         "rsw" => &["RMF"],
+        // A GeoPDF, its page drawn as a picture where its map frame's coordinates say (#2336).
+        "pdf" => &["PDF"],
         _ => return Err(DataError::Unsupported(format!("{}: not a raster type read through GDAL", src.display()))),
     })
 }
@@ -328,9 +331,20 @@ fn looks_geographic(e: [f64; 4]) -> bool {
     w >= -181.0 && east <= 361.0 && s >= -92.0 && n <= 92.0 && w < east && s < n
 }
 
-/// The short name of a subdataset: the part after its last `:` (a NetCDF variable's name).
+/// The short name of a subdataset: the part after its last `:` (a NetCDF variable's name), or a
+/// PDF page's number (GDAL names page 2 `PDF:2:/d/x.pdf`).
 pub fn short_name(subdataset: &str) -> &str {
+    if let Some((page, _)) = pdf_page(subdataset) {
+        return page;
+    }
     subdataset.rsplit(':').next().unwrap_or(subdataset).trim_matches('"')
+}
+
+/// A PDF page's subdataset name split into its page number and its file (`PDF:2:/d/x.pdf`). The
+/// file comes last and may hold colons of its own (`C:\d\x.pdf`).
+fn pdf_page(subdataset: &str) -> Option<(&str, &str)> {
+    let (page, file) = subdataset.strip_prefix("PDF:")?.split_once(':')?;
+    (!page.is_empty() && page.bytes().all(|b| b.is_ascii_digit())).then_some((page, file))
 }
 
 /// What a conversion made: the GeoTIFF, the subdataset it came from, and the file's other
@@ -433,7 +447,9 @@ fn is_driver_tag(s: &str) -> bool {
 /// The file a GDAL subdataset name points into: its quoted path (`NETCDF:"/d/x.nc":air`,
 /// `HDF4_SDS:UNKNOWN:"/d/x.hdf":0`), else what lies between the driver and the last colon.
 fn subdataset_file(name: &str) -> Option<&str> {
-    let path = if name.contains('"') {
+    let path = if let Some((_, file)) = pdf_page(name) {
+        file.trim_matches('"')
+    } else if name.contains('"') {
         let (prefix, rest) = name.split_once('"')?;
         let tags = prefix.strip_suffix(':')?;
         if tags.is_empty() || !tags.split(':').all(is_driver_tag) {
@@ -543,6 +559,13 @@ fn convert_in(dir: &Path, src: &Path, layer: Option<&str>, crs: Option<&str>, bu
     let mut assumed_lonlat = false;
     let d = describe(&input, drivers, workspace)?;
     let Some(extent) = d.extent else {
+        if drivers == ["PDF"] {
+            let why = match &subdataset {
+                Some(page) => format!("page {page} of the PDF doesn't say where its map lies: another may (pick it with \"layer\")"),
+                None => "the PDF isn't a GeoPDF: its page doesn't say where its map lies".into(),
+            };
+            return Err(DataError::Format(why));
+        }
         return Err(DataError::Format("the raster isn't georeferenced: GDAL finds no coordinates for its cells".into()));
     };
     let crs = match crs {
@@ -691,6 +714,12 @@ mod tests {
         assert_eq!(subdataset_file("HDF4_SDS:UNKNOWN:\"/d/x.hdf\":0"), Some("/d/x.hdf"));
         assert_eq!(subdataset_file("NETCDF:/d/air.nc:air"), Some("/d/air.nc"));
         assert_eq!(subdataset_file("NETCDF:\"/d/x.nc\""), Some("/d/x.nc"));
+        // A PDF's pages: named by number, the file after it, colons and all.
+        assert!(is_gdal_raster_name("/d/Map.PDF"));
+        assert_eq!(short_name("PDF:2:/d/x.pdf"), "2");
+        assert_eq!(subdataset_file("PDF:2:/d/x.pdf"), Some("/d/x.pdf"));
+        assert_eq!(subdataset_file("PDF:12:C:\\d\\a:b.pdf"), Some("C:\\d\\a:b.pdf"));
+        assert_eq!(subdataset_file("PDF:2:/vsicurl/https://example.com/x.pdf"), None);
         assert_ne!(subdataset_file("NETCDF:\"/d/air.nc.evil\":air"), Some("/d/air.nc"), "a longer name isn't the file");
         for bad_sub in [
             "NETCDF:/other/target:foo=\"/d/x.nc\"",

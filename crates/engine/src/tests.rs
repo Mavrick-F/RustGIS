@@ -44573,6 +44573,55 @@ fn a_map_series_pdf_georeferences_each_page_with_its_view() {
     assert_eq!(distinct.len(), gpts.len(), "no page has another's corners");
 }
 
+/// A GeoPDF RustGIS wrote is added back as a raster where its map frame's corners put it (#2336),
+/// through GDAL on the desktop: a map series page by page, the others named, and a PDF without
+/// coordinates refused as not a GeoPDF.
+#[test]
+fn a_geopdf_is_added_back_as_a_raster_through_gdal() {
+    let mut s = world();
+    s.run("map.projection", &json!({"type": "EPSG:3857"})).unwrap();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let pages = s.run("layout.series", &json!({"layer": "Lakes", "nameField": "name"})).unwrap()["pages"].as_u64().unwrap();
+    assert!(pages > 2, "{pages}");
+    let dir = std::env::temp_dir().join(format!("rustgis-geopdf-read-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (series, plain) = (dir.join("series.pdf"), dir.join("plain.pdf"));
+    s.run("layout.export", &json!({"path": series, "dpi": 36})).unwrap();
+    s.run("layout.export", &json!({"path": plain, "dpi": 36, "allPages": false, "georeference": false})).unwrap();
+    if !rustgis_data::raster::gdal::available() {
+        let e = s.run("layer.addData", &json!({"path": series})).unwrap_err();
+        assert!(e.contains("needs GDAL"), "{e}");
+        return;
+    }
+    let gdalinfo = std::env::var_os("RUSTGIS_GDAL_BIN")
+        .map(|d| std::path::PathBuf::from(d).join(if cfg!(windows) { "gdalinfo.exe" } else { "gdalinfo" }))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| "gdalinfo".into());
+    let formats = std::process::Command::new(&gdalinfo).arg("--formats").output().expect("list GDAL drivers");
+    if !String::from_utf8_lossy(&formats.stdout).lines().any(|line| line.split_whitespace().next() == Some("PDF")) {
+        eprintln!("skipping GeoPDF reading: GDAL has no optional PDF driver");
+        return;
+    }
+    let mark = s.notice_mark();
+    let added = |s: &mut Session, p: Value| {
+        let r = s.run("layer.addData", &p).unwrap();
+        let l = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap();
+        let data = l.raster.as_ref().unwrap().data.as_ref().unwrap();
+        assert!(data.georeferenced && data.crs.epsg() == 3857, "{}", l.name);
+        (l.name.clone(), data.extent())
+    };
+    let (name, first) = added(&mut s, json!({"path": series}));
+    assert_eq!(name, "series page 1");
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains(&format!("it has {} more pages (2, 3", pages - 1))), "{said:?}");
+    let (name, second) = added(&mut s, json!({"path": series, "layer": "2"}));
+    assert_eq!(name, "series page 2");
+    assert!((first.min_x - second.min_x).abs() > 1.0 || (first.min_y - second.min_y).abs() > 1.0, "each page its own place");
+    let e = s.run("layer.addData", &json!({"path": plain})).unwrap_err();
+    assert!(e.contains("isn't a GeoPDF"), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A frame drawn over another (an inset on the main map) is cut out of the other's viewport, so
 /// that a reader shows the main map's coordinates around the inset and not in it: none there when
 /// the inset is left out of georeferencing (tilted), the inset's own when it isn't (#1191). No two

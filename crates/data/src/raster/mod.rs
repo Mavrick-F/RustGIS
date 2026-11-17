@@ -1339,8 +1339,10 @@ pub fn read_converted(path: &Path, c: &gdal::Converted) -> Result<Raster> {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
     crate::provenance::path(path);
     let mut r = crate::provenance::without(|| geotiff::read_file(&c.path, stem))?;
+    // A PDF's subdatasets are its pages, named by number.
+    let pdf = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
     if let Some(s) = &c.subdataset {
-        r.name = format!("{stem} {}", gdal::short_name(s));
+        r.name = if pdf { format!("{stem} page {}", gdal::short_name(s)) } else { format!("{stem} {}", gdal::short_name(s)) };
     }
     r.source = Some(path.display().to_string());
     // What converting found that the GeoTIFF it made doesn't say (that file names the system GDAL
@@ -1353,7 +1355,8 @@ pub fn read_converted(path: &Path, c: &gdal::Converted) -> Result<Raster> {
         let shown: Vec<&str> = c.others.iter().take(20).map(String::as_str).collect();
         let more = c.others.len().saturating_sub(shown.len());
         let tail = if more > 0 { format!(", and {more} more") } else { String::new() };
-        r.lost.push(format!("it has {} more variables ({}{tail}): add one with \"layer\"", c.others.len(), shown.join(", ")));
+        let what = if pdf { "pages" } else { "variables" };
+        r.lost.push(format!("it has {} more {what} ({}{tail}): add one with \"layer\"", c.others.len(), shown.join(", ")));
     }
     Ok(r)
 }
