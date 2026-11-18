@@ -85,11 +85,14 @@ pub const CAPABILITIES: &[&str] = &[
     SIZE_BY_CAPABILITY,
     "picture-markers",
     "layout-element-ink",
+    SERIES_HIGHLIGHT_CAPABILITY,
     "field-generation",
     "crs-wkt",
 ];
 /// Independent marker sizes alongside classified point colours (`Layer::size_by`).
 pub(crate) const SIZE_BY_CAPABILITY: &str = "classified-point-size";
+/// A layout that marks the index feature of each map series page.
+pub(crate) const SERIES_HIGHLIGHT_CAPABILITY: &str = "map-series-highlight";
 /// The most entries a document's `requires` may list: past it the document is refused without
 /// the rest being read.
 pub(crate) const MAX_REQUIRES: usize = 256;

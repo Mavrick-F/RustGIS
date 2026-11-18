@@ -11886,6 +11886,61 @@ fn map_series_empty_names_use_row_numbers() {
 }
 
 #[test]
+fn map_series_highlight_follows_the_page_in_its_frame() {
+    use rustgis_data::{Dataset, Geometry, GeometryType};
+    use rustgis_render::layout::{PageInfo, render};
+
+    let mut data = Dataset::new("Index", GeometryType::Polygon, vec![]);
+    for x in [-1.0, 1.0] {
+        let ring =
+            [(-0.1, -0.1), (0.1, -0.1), (0.1, 0.1), (-0.1, 0.1), (-0.1, -0.1)].map(|(dx, y)| rustgis_geom::Coord::new(x + dx, y)).to_vec();
+        data.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+    }
+    data.push(None, vec![]);
+    let mut s = Session::new(Project::default());
+    let index = s.map_mut().add_dataset(data);
+    s.map_mut().layer_mut(index).unwrap().selection = vec![1];
+    s.run("layout.new", &json!({"name": "Atlas", "template": "blank"})).unwrap();
+    let frame = s.run("layout.addFrame", &json!({"x":10, "y":10, "w":120, "h":70})).unwrap()["element"].as_u64().unwrap();
+    let view = json!({"element":frame, "x":10, "y":10, "w":120, "h":70, "center":[0,0], "scale":5_000_000});
+    s.run("layout.addFrame", &json!({"x":140, "y":10, "w":100, "h":70})).unwrap();
+    s.run("layout.series", &json!({"layer":"Index", "frame":frame})).unwrap();
+    let draw = |s: &mut Session| render(&s.project.layouts[0], &mut s.project.maps, 96.0, &PageInfo::default()).unwrap();
+    let fit = |s: &mut Session| s.run("layout.update", &view).unwrap();
+    let toggle = |s: &mut Session, highlight| s.run("layout.series", &json!({"highlight":highlight})).unwrap();
+    fit(&mut s);
+    let baseline = draw(&mut s);
+    toggle(&mut s, true);
+    let left = draw(&mut s);
+    s.run("layout.seriesPage", &json!({"page":"next"})).unwrap();
+    fit(&mut s);
+    let right = draw(&mut s);
+    let scale = rustgis_map::layout::PT_PER_MM;
+    for (image, (lo, hi)) in [(&left, (10.0, 70.0)), (&right, (70.0, 130.0))] {
+        let mut changes = 0;
+        for (i, (a, b)) in image.pixels().iter().zip(baseline.pixels()).enumerate() {
+            if a != b {
+                let x = (i % image.width() as usize) as f64 / scale;
+                assert!(lo < x && x < hi, "only the page row in the series frame is highlighted at x={x}");
+                changes += 1;
+            }
+        }
+        assert!(changes > 100);
+    }
+    assert_eq!(s.map().layer(index).unwrap().selection, [1]);
+    toggle(&mut s, false);
+    assert_eq!(s.project.layouts[0].series.as_ref().unwrap().page, 1);
+    assert_eq!(draw(&mut s).data(), baseline.data());
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(draw(&mut s).data(), right.data());
+    s.run("edit.redo", &Value::Null).unwrap();
+    assert_eq!(draw(&mut s).data(), baseline.data());
+    toggle(&mut s, true);
+    s.run("layout.seriesPage", &json!({"page":"next"})).unwrap();
+    assert_eq!(draw(&mut s).data(), baseline.data(), "a row without geometry has no outline");
+}
+
+#[test]
 fn layouts_compose_export_and_round_trip() {
     use base64::Engine;
     let dir = std::env::temp_dir().join(format!("rustgis-layout-{}", std::process::id()));

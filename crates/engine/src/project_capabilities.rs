@@ -70,6 +70,11 @@ impl Project {
         if !required.contains(&"layout-element-ink") && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.kind.ink().is_some())) {
             required.push("layout-element-ink");
         }
+        if !required.contains(&super::SERIES_HIGHLIGHT_CAPABILITY)
+            && self.layouts.iter().any(|l| l.series.as_ref().is_some_and(|s| s.highlight))
+        {
+            required.push(super::SERIES_HIGHLIGHT_CAPABILITY);
+        }
         // A coordinate system whose PROJ definition, which an older reader reads, doesn't place
         // points as its WKT does (angles in grads, a datum transformation the definition can't
         // hold).
@@ -107,6 +112,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("layout-element-background", command_uses_element_background),
     ("picture-markers", command_uses_picture_marker),
     ("layout-element-ink", command_uses_element_ink),
+    (super::SERIES_HIGHLIGHT_CAPABILITY, command_uses_series_highlight),
 ];
 
 /// A layout command that gives an element a background: an older reader warns that it ignores
@@ -115,7 +121,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
 fn command_uses_element_background(id: &str, params: &Value) -> bool {
     match id {
         "layout.addElement" | "layout.update" => params.get("background").is_some_and(|b| !b.is_null()),
-        "layout.import" => imported_layout_uses(params, "\"background\"", |e| e.background.is_some()),
+        "layout.import" => imported_layout_uses(params, "\"background\"", |l| l.elements.iter().any(|e| e.background.is_some())),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_background)),
         _ => false,
     }
@@ -126,24 +132,38 @@ fn command_uses_element_background(id: &str, params: &Value) -> bool {
 /// and `layout.update`, so such a command fails there instead of losing the ink.
 fn command_uses_element_ink(id: &str, params: &Value) -> bool {
     match id {
-        "layout.import" => imported_layout_uses(params, "\"color\"", |e| e.kind.ink().is_some()),
+        "layout.import" => imported_layout_uses(params, "\"color\"", |l| l.elements.iter().any(|e| e.kind.ink().is_some())),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_ink)),
         _ => false,
     }
 }
 
-/// Whether a `layout.import` carries its layout as `"text"` with an element `uses`: an older
-/// reader reads it without the keys it doesn't know. One read from a `"path"` is a layout file,
-/// which carries no format header yet (#2277). Every save asks, so a text without the feature's
+/// A saved command that starts a highlighted series, toggles one on, or imports its layout.
+fn command_uses_series_highlight(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.series" => {
+            params.get("off").and_then(Value::as_bool) != Some(true) && params.get("highlight").and_then(Value::as_bool) == Some(true)
+        }
+        "layout.import" | "report.existingTemplate" => {
+            imported_layout_uses(params, "\"highlight\"", |l| l.series.as_ref().is_some_and(|s| s.highlight))
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_series_highlight)),
+        _ => false,
+    }
+}
+
+/// Whether a `layout.import` carries its layout as `"text"` with something `uses`:
+/// a legacy reader reads a bare layout without the keys it doesn't know. A path is
+/// checked at import. Every save asks, so a text without the feature's
 /// `key` (a saved layout writes it only when set) isn't read through, unless it has a backslash:
 /// JSON may spell the key with escapes (`"\u0063olor"`).
-fn imported_layout_uses(params: &Value, key: &str, uses: fn(&rustgis_map::layout::Element) -> bool) -> bool {
+fn imported_layout_uses(params: &Value, key: &str, uses: fn(&rustgis_map::layout::Layout) -> bool) -> bool {
     params
         .get("text")
         .and_then(Value::as_str)
         .filter(|t| t.contains(key) || t.contains('\\'))
-        .and_then(|t| serde_json::from_str::<rustgis_map::layout::Layout>(t).ok())
-        .is_some_and(|l| l.elements.iter().any(uses))
+        .and_then(|t| crate::cmd::layout::parse_saved_layout(t).ok())
+        .is_some_and(|l| uses(&l))
 }
 
 /// Require only executable payloads being saved: graph files omit steps, web tools omit graphs.
@@ -539,6 +559,34 @@ mod tests {
         both["tasks"] = json!([{"name": "Task", "steps": [{"title": "Panel", "command": "layout.update", "params": {"element": 2, "background": {}}}]}]);
         let saved = serde_json::to_value(Project::from_json(&both.to_string()).unwrap()).unwrap();
         assert_eq!(saved["requires"], json!(["layout-element-background"]));
+    }
+
+    #[test]
+    fn series_highlight_capability_follows_saved_layouts_and_commands() {
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/map_series_highlight.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["map-series-highlight"]));
+        assert!(Project::from_json(&saved.to_string()).unwrap().layouts[0].series.as_ref().unwrap().highlight);
+        let layout = &fixture.layouts[0];
+        let text = crate::cmd::layout::saved_layout_text(layout).unwrap();
+        // Layout readers before capability headers deserialize the bare Layout directly.
+        assert!(serde_json::from_str::<rustgis_map::layout::Layout>(&text).is_err());
+        assert_eq!(&crate::cmd::layout::parse_saved_layout(&text).unwrap(), layout);
+
+        let mut clean = fixture;
+        clean.layouts[0].series.as_mut().unwrap().highlight = false;
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none());
+        assert!(base["layouts"][0]["series"].get("highlight").is_none());
+        assert!(!Project::from_json(&base.to_string()).unwrap().layouts[0].series.as_ref().unwrap().highlight);
+
+        for highlight in [false, true] {
+            let mut document = base.clone();
+            document["tasks"] = json!([{"name":"Set up atlas","steps":[{"title":"Series","command":"layout.series",
+                "params":{"layer":"Index","highlight":highlight}}]}]);
+            let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+            assert_eq!(saved.get("requires").is_some(), highlight);
+        }
     }
 
     /// A legend's, colorbar's, table's or chart's ink is required where it is saved, so an older

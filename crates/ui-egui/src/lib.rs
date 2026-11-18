@@ -4310,7 +4310,7 @@ impl RustGisApp {
                 let li = self.session.active_layout.ok_or("open a layout first")?;
                 let l = self.session.project.layouts.get(li).cloned().ok_or("open a layout first")?;
                 if self.services.download.is_some() {
-                    let text = serde_json::to_string_pretty(&l).map_err(|e| e.to_string())?;
+                    let text = rustgis_engine::cmd::layout::saved_layout_text(&l)?;
                     self.download(&format!("{}.rgislayout", l.name), text.into_bytes());
                 } else if let Some(path) = dialogs::pick_save(&format!("{}.rgislayout", l.name), &["rgislayout"], tl!("RustGIS layout")) {
                     return self.run("layout.save", json!({"layout": li, "path": path}));
@@ -7048,6 +7048,8 @@ mod record_tests {
             "layout.addElement",
             "layout.update",
             "layout.frameZoom",
+            // An index layer named on setup, or the series' stored index when changing the highlight.
+            "layout.series",
             "report.update",
             "share.replaceWebLayer",
         ];

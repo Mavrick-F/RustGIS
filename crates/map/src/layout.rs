@@ -1367,6 +1367,9 @@ pub struct MapSeries {
     /// The page shown (0-based row of the index layer).
     #[serde(default)]
     pub page: usize,
+    /// Draw a contrasting outline around the page's feature in the series frame.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub highlight: bool,
 }
 
 fn margin() -> f64 {

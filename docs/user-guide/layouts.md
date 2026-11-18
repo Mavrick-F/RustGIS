@@ -530,15 +530,22 @@ Select the main map frame, then **Publish › Map Frames › Map Series** and ch
 (tracts, for example). The series follows the layer's feature order. **Previous Page** and
 **Next Page** step through it; **Refresh** refits the current page after changes to the index layer.
 
-Use `layout.series` to set a page-name field and margin; for example, on the active layout:
+Turn on **Highlight Page Feature** in the **Map Series** menu to mark the current page's
+index feature with a gold outline in the series frame. The outline is visible in the layout
+and in exports, even when the index layer is hidden. Features without geometry have no outline.
+The setting is off by default, is saved with the layout, and can be undone.
+
+Use `layout.series` to set a page-name field, margin and highlight; for example, on the active layout:
 
 ```text
-layout.series={"layer":"Tracts","nameField":"GEOID","margin":0.1}
+layout.series={"layer":"Tracts","nameField":"GEOID","margin":0.1,"highlight":true}
 ```
 
 Without `frame` (the frame's element id), the command uses the layout's first map frame, so
 name the frame when the series is on another one. Running `layout.series` again starts the series
-over at its first page. `nameField` supplies
+over at its first page when you supply an index layer. Use `layout.series={"highlight":true}`
+or `layout.series={"highlight":false}` to toggle the current series without changing pages.
+`nameField` supplies
 `{pageName}` in dynamic text; if omitted, it uses the index layer's label field, or the row number
 (starting at 1) when that field is unavailable or its value is null, empty or whitespace-only.
 Add a text element such as

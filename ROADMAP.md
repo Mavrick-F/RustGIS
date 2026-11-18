@@ -257,8 +257,7 @@ attributes kept.
 ### Lay out and share
 - Layout legends: entries reordered and renamed, several values grouped into one unique-value
   class (a label per layer and a classified raster's classes are done).
-- Map series at a fixed scale, with the current feature highlighted and its attributes in the
-  page's text.
+- Map series at a fixed scale and attributes of the current feature in the page's text.
 
 ### 3D scenes
 - A scene with a free camera and each layer's elevation mode (on the ground, relative, absolute),

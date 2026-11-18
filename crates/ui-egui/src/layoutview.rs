@@ -249,7 +249,8 @@ fn pan_preview(app: &mut RustGisApp, ctx: &egui::Context, layout: &Layout, id: u
     // thin frame could pass the first and not the second).
     let side = (ctx.input(|i| i.max_texture_side) as f64).min(PAN_PREVIEW_SIDE);
     let ppp = screen.min((PAN_PREVIEW_PIXELS / (w * h).max(1.0)).sqrt()).min(side / w.max(h).max(1.0)).max(0.01);
-    let pm = rustgis_engine::render::layout::frame_map_preview(m, cam, w, h, ppp)?;
+    let series = layout.series.as_ref().filter(|series| series.frame == id);
+    let pm = rustgis_engine::render::layout::frame_map_preview_with_series(m, cam, w, h, ppp, series)?;
     let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
     Some(ctx.load_texture("layout_pan_preview", img, egui::TextureOptions::LINEAR))
 }

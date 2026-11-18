@@ -126,8 +126,8 @@ Projects with a background on a layout element, or a saved task step, script, no
 cell or history entry that gives one (`layout.addElement` or `layout.update` with a
 `background` other than `null`), require `layout-element-background`, so an older reader
 refuses them instead of opening the layout and saving it again, or running the command,
-without the background. Layout files (`.rgislayout`) carry no format header yet and are not
-covered (#2277).
+without the background. A background alone does not add a format header to a standalone layout
+file (`.rgislayout`, #2277).
 
 Projects with an ink on a legend, colorbar, table or chart (`color` on those elements) require
 `layout-element-ink`, so an older reader refuses them instead of drawing those elements in dark
@@ -135,8 +135,13 @@ grey and saving them again without it. Saved `layout.addElement` and `layout.upd
 that set one need nothing: an older reader refuses `color` on those elements, so the command
 fails there instead of losing the ink. A saved `layout.import` whose `text` gives an element an
 ink requires `layout-element-ink`, and one whose `text` gives an element a background requires
-`layout-element-background`, since an older reader would read that layout without them. Layout
-files are not covered, as for backgrounds (#2277).
+`layout-element-background`, since an older reader would read that layout without them. An ink
+alone does not add a format header to a standalone layout file, as for backgrounds (#2277).
+
+Projects with a highlighted map series or a replayable command that enables one require
+`map-series-highlight`. A standalone layout with the highlight enabled is saved inside a
+document with the same requirement. Older layout importers refuse that document because
+they expect the layout fields at the root. Layouts with the option off retain their usual form.
 
 A coordinate system read from WKT is saved with its PROJ definition, which older readers read,
 and its WKT beside it (`wkt`), which this release reads first. Projects, map files and layer

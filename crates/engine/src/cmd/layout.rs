@@ -124,7 +124,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layout"?, "element"?: frame id, "frame"?: (as element), "to"?: "view" (the map view's extent, bearing and pitch; the default)|"full"|"selection"|"layer", "layer"?}"#,
         ),
         C::new("layout.series", "Map Series", "Publish › Map Frames", series).inputs(series_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layout"?, "layer": index layer, "nameField"?: string, "frame"?: id, "margin"?: 0..1, "off"?: bool}"#,
+            r#"{"layout"?, "layer"?: index layer (required to set up a series), "nameField"?: string, "frame"?: id, "margin"?: 0..1, "highlight"?: bool (default false on setup; without layer, toggle the current series without changing pages), "off"?: bool}"#,
         ),
         C::new("layout.seriesPage", "Map Series Page", "Publish › Map Frames", series_page).inputs(series_page_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layout"?, "page": number|"next"|"previous"}"#),
         C::new("layout.seriesRefresh", "Refresh Map Series", "Publish › Map Frames", |s, p| series_page(s, &json!({"layout": p.get("layout"), "page": "current"}))).inputs(series_page_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
@@ -134,8 +134,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layout"?, "path": "*.png|*.pdf|*.svg" (PNG/SVG: current page; SVG: each element a group of its own; text and shapes as SVG, map frames and surrounds as vectors, rasters and tiles in them as pictures at dpi), "dpi"?: 72..600, "allPages"?: bool (PDF only; default true: every map series page, up to 500; false: the current page), "georeference"?: bool (PDF only; default true: map frames carry their coordinates, a GeoPDF; false: none), "pdf"?: {"layers"?: bool (default true: each element, and in a map frame each layer and its labels, a PDF layer that vector editors open as a layer; false: none), "text"?: "fonts" (default: text in its faces, embedded as subsets, editable in a vector editor; a face that can't be is set in outlines, and said)|"outlines" (glyphs as outlines, as print shops ask)}}"#),
         C::new("layout.save", "Save Layout File", "Publish › Save As", |s, p| {
             let path = ps(p, "path").ok_or("path is required")?;
-            let l = active(s, p)?.clone();
-            let text = serde_json::to_string_pretty(&l).map_err(|e| e.to_string())?;
+            let text = saved_layout_text(active(s, p)?)?;
             rustgis_data::io::write_atomic(Path::new(path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
             Ok(json!({"path": path}))
         }).inputs(object_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
@@ -4917,12 +4916,21 @@ fn frame_zoom(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"element": frame}))
 }
 
+/// Starts or removes a series. A highlight-only call edits the stored series in place.
 fn series(s: &mut Session, p: &Value) -> CmdResult {
     let li = index(s, p)?;
     if b(p, "off").unwrap_or(false) {
         if let Some(l) = s.project.layouts.get_mut(li) {
             l.series = None;
         }
+        return Ok(Value::Null);
+    }
+    let highlight = p.get("highlight").map(|v| v.as_bool().ok_or("highlight must be true or false")).transpose()?;
+    if p.get("layer").is_none()
+        && let Some(highlight) = highlight
+    {
+        let sr = s.project.layouts.get_mut(li).and_then(|l| l.series.as_mut()).ok_or("the layout has no map series")?;
+        sr.highlight = highlight;
         return Ok(Value::Null);
     }
     let l = s.project.layouts.get(li).ok_or("no layout")?;
@@ -4949,7 +4957,7 @@ fn series(s: &mut Session, p: &Value) -> CmdResult {
     let layer = layer.name.clone();
     let margin = f(p, "margin").unwrap_or(0.1).clamp(0.0, 5.0);
     if let Some(l) = s.project.layouts.get_mut(li) {
-        l.series = Some(MapSeries { frame, layer, name_field, margin, page: 0 });
+        l.series = Some(MapSeries { frame, layer, name_field, margin, page: 0, highlight: highlight.unwrap_or(false) });
     }
     series_page(s, &json!({"layout": li, "page": 0}))
 }
@@ -5412,11 +5420,48 @@ fn layout_svg(s: &mut Session, li: usize, dpi: f64) -> Result<String, String> {
     Ok(text)
 }
 
-pub(crate) fn import(s: &mut Session, text: &str) -> CmdResult {
+/// The standalone layout file, including for browser downloads. A legacy reader requires
+/// layout fields at the root, so it refuses the document used for a highlighted series.
+pub fn saved_layout_text(layout: &Layout) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    struct Document<'a> {
+        format: u32,
+        requires: [&'static str; 1],
+        layout: &'a Layout,
+    }
+    let text = if layout.series.as_ref().is_some_and(|sr| sr.highlight) {
+        serde_json::to_string_pretty(&Document {
+            format: crate::project::FORMAT,
+            requires: [crate::project::SERIES_HIGHLIGHT_CAPABILITY],
+            layout,
+        })
+    } else {
+        serde_json::to_string_pretty(layout)
+    };
+    text.map_err(|e| e.to_string())
+}
+
+/// Reads both a legacy bare layout and a layout inside a capability-checked document.
+pub(crate) fn parse_saved_layout(text: &str) -> Result<Layout, String> {
     if text.len() as u64 > MAX_LAYOUT {
         return Err("the layout file is too large".into());
     }
-    let mut l: Layout = serde_json::from_str(text).map_err(|e| format!("not a RustGIS layout: {e}"))?;
+    crate::project::check_format(text, "layout")?;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum SavedLayout {
+        Document { layout: Layout },
+        Legacy(Layout),
+    }
+    let saved = serde_json::from_str(text).map_err(|e| format!("not a RustGIS layout: {e}"))?;
+    Ok(match saved {
+        SavedLayout::Document { layout } | SavedLayout::Legacy(layout) => layout,
+    })
+}
+
+/// Imports a layout, repairing element settings and rebinding frames whose maps are missing.
+pub(crate) fn import(s: &mut Session, text: &str) -> CmdResult {
+    let mut l = parse_saved_layout(text)?;
     // Refused before anything is said of it.
     if s.project.layouts.len() >= crate::project::MAX_LAYOUTS {
         return Err(format!("a project holds at most {} layouts; remove one first", crate::project::MAX_LAYOUTS));
@@ -5501,11 +5546,14 @@ fn frame_zoom_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super
     inputs.state = json!({"layout":index(input,p)?,"frame":frame});
     Ok(inputs)
 }
-/// Binds a new series to its actual frame map, unless the call only turns it off.
+/// Binds the series' index layer in its actual frame map, unless the call only turns it off.
 fn series_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
     let s = input;
     if b(p, "off") == Some(true) {
         return Ok(super::Inputs::layers(std::iter::empty()));
+    }
+    if p.get("layer").is_none() && p.get("highlight").is_some() {
+        return series_page_inputs(input, p);
     }
     let layout = s.project.layouts.get(index(input, p)?).ok_or("no layout")?;
     let frame = frame_of(layout, p)?;

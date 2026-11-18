@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 
 use crate::Canvas;
-use rustgis_data::GeometryType;
+use rustgis_data::{Geometry, GeometryType};
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
-    ArrowStyle, ColorScale, ElementKind, FrameShape, Grid, GridKind, INK, Layout, LineHead, MAX_LEGEND_COLUMNS, Orientation, PT_PER_MM,
-    ScaleBarStyle, ScaleUnits, TextAlign, TickSide, frame_camera,
+    ArrowStyle, ColorScale, ElementKind, FrameShape, Grid, GridKind, INK, Layout, LineHead, MAX_LEGEND_COLUMNS, MapSeries, Orientation,
+    PT_PER_MM, ScaleBarStyle, ScaleUnits, TextAlign, TickSide, frame_camera,
 };
 use rustgis_map::symbology::LegendEntry;
 use rustgis_map::{Map, Rgba};
@@ -335,6 +335,9 @@ fn draw_page(
         })
         .collect();
     let frame = |id: u32| frames.iter().find(|f| f.0 == id);
+    // Read the page row before rendering any frames or legends can move a streamed layer's window.
+    let series = layout.series.as_ref().filter(|s| s.highlight && layout.element(s.frame).is_some_and(|e| visible(&e)));
+    let highlight = series.and_then(|s| series_feature(maps.get(frame(s.frame)?.1)?, s)).cloned();
     // What each legend's frame draws, worked out before any element is drawn: its map is synced
     // to that frame's view first, so a streamed layer holds that frame's features whichever order
     // the frames and legends come in, and whichever other frame showed the map last.
@@ -382,9 +385,10 @@ fn draw_page(
                 // The grid is drawn with the frame's map, before its attribution, which keeps
                 // clear of the grid's labels.
                 let grid = grid.as_ref().map(|g| (g, layout.decimal_comma));
+                let highlight = series.filter(|s| s.frame == e.id).and(highlight.as_ref());
                 let mut failed_source = None;
                 let Some(mut frame_pm) =
-                    frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), &mut pending.frames, grid, &mut failed_source)
+                    frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), &mut pending.frames, grid, highlight, &mut failed_source)
                 else {
                     if frame_requires_complete(map, &view) {
                         *source_error = failed_source_error(map, failed_source);
@@ -399,7 +403,7 @@ fn draw_page(
                     frame_pm.overflowed() || pm.recorded_cost().saturating_add(frame_pm.recorded_cost()) > crate::vector::max_cost();
                 if frame_pm.is_recording()
                     && too_large
-                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false, &mut pending.frames, grid, &mut None)
+                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false, &mut pending.frames, grid, highlight, &mut None)
                 {
                     frame_pm = pixels;
                     if let Some(list) = record.as_deref_mut() {
@@ -651,13 +655,13 @@ fn draw_page(
 pub fn frame_map(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Result<Pixmap, String> {
     let revisions = crate::archive_revisions([&*map]);
     let mut failed_source = None;
-    let result = frame_canvas(map, camera, w, h, ppp, false, &mut false, None, &mut failed_source).map(Canvas::into_pixmap);
+    let result = frame_canvas(map, camera, w, h, ppp, false, &mut false, None, None, &mut failed_source).map(Canvas::into_pixmap);
     revisions.finish(map, failed_source, result, "could not draw the map frame")
 }
 
 /// [`frame_map`] on a canvas: one that records (see [`crate::canvas`]) when `record` and the
 /// frame can be kept as vectors (flat, north up, without view effects), else its pixels; with
-/// `grid` (and whether the layout writes a decimal comma) drawn on it under the attribution.
+/// the page feature drawn above the map, and its labels, grid and attribution over it.
 /// `pending` is set when some of its tiles, or a read of its streamed layers or rasters, were
 /// still on their way (in the browser, which doesn't wait for them).
 fn frame_canvas(
@@ -669,6 +673,7 @@ fn frame_canvas(
     record: bool,
     pending: &mut bool,
     grid: Option<(&Grid, bool)>,
+    highlight: Option<&Geometry>,
     failed_source: &mut Option<u64>,
 ) -> Option<Canvas> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
@@ -679,27 +684,92 @@ fn frame_canvas(
     });
     let img = img?;
     *pending |= img.tiles_pending || img.data_pending || shadows;
-    Some(finish_frame(img, ppp, grid.map(|(g, comma)| (&*map, &view, g, comma))))
+    Some(finish_frame(img, map, &view, grid, highlight))
 }
 
 /// [`frame_map`] without waiting for tiles still on their way, for a preview drawn while the
 /// interface waits: a pan's preview, whose size is more than the frame's for the overscan slid
 /// under the pointer.
 pub fn frame_map_preview(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Option<Pixmap> {
-    let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    crate::render(map, &view).map(|img| finish_frame(img, ppp, None).into_pixmap())
+    frame_map_preview_with_series(map, camera, w, h, ppp, None)
 }
 
-/// A rendered frame map with its labels, its `grid` (drawn on `map` in `view`, with a decimal
+/// The pan preview, optionally marking the page feature when panning the series frame.
+pub fn frame_map_preview_with_series(
+    map: &mut Map,
+    camera: rustgis_map::Camera,
+    w: f64,
+    h: f64,
+    ppp: f64,
+    series: Option<&MapSeries>,
+) -> Option<Pixmap> {
+    let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
+    let highlight = series.filter(|s| s.highlight).and_then(|s| series_feature(map, s)).cloned();
+    crate::render(map, &view).map(|img| finish_frame(img, map, &view, None, highlight.as_ref()).into_pixmap())
+}
+
+/// The same row that fits the series frame, independent of layer styling or visibility.
+fn series_feature<'a>(map: &'a Map, series: &MapSeries) -> Option<&'a Geometry> {
+    map.layer_by_name(&series.layer)?.dataset.features.get(series.page)?.geometry.as_ref()
+}
+
+/// Marks one index feature, using the map renderer's paths and clipping. A dark casing keeps
+/// the gold line legible over pale and dark maps without covering the feature's interior.
+fn draw_series_highlight(pm: &mut Canvas, map: &Map, view: &View, geometry: &Geometry) {
+    let globe = map.projection.is_globe().then(|| rustgis_map::Globe::new(&view.camera, view.width, view.height));
+    let ppp = view.pixels_per_point as f32;
+    let ctx =
+        crate::Ctx { view, ppp, globe, wireframe: false, cull: Extent::EMPTY, sprites: Default::default(), bursts: Default::default() };
+    let projected;
+    let geometry = if globe.is_some() {
+        geometry
+    } else {
+        projected = map.flat().project(geometry);
+        &projected
+    };
+    let mut path = PathBuilder::new();
+    let mut mark = |c| {
+        let (x, y) = ctx.px(c);
+        if x.is_finite() && y.is_finite() {
+            path.push_circle(x, y, 6.0 * ppp);
+        }
+    };
+    match geometry {
+        Geometry::Point(c) => mark(*c),
+        Geometry::MultiPoint(points) => points.iter().copied().for_each(mark),
+        Geometry::Line(parts) => {
+            for part in parts {
+                ctx.ring_path(&mut path, part, false);
+            }
+        }
+        Geometry::Polygon(polys) => {
+            for ring in polys.iter().flatten() {
+                ctx.ring_path(&mut path, ring, true);
+            }
+        }
+    }
+    if let Some(path) = path.finish() {
+        pm.layer(Some("Page Feature"));
+        ctx.outline(pm, &path, &paint(Rgba::rgb(44, 35, 17), 1.0), 4.5);
+        ctx.outline(pm, &path, &paint(Rgba::rgb(255, 196, 48), 1.0), 2.5);
+        pm.layer(None);
+    }
+}
+
+/// A rendered frame map with its page feature, labels, `grid` (drawn on `map` in `view`, with a decimal
 /// comma or not) and its attribution drawn on it: on its recording when it was recorded, else on
 /// its pixels. The attribution keeps clear of the grid's labels.
-fn finish_frame(img: crate::Rendered, ppp: f64, grid: Option<(&Map, &View, &Grid, bool)>) -> Canvas {
+fn finish_frame(img: crate::Rendered, map: &Map, view: &View, grid: Option<(&Grid, bool)>, highlight: Option<&Geometry>) -> Canvas {
     let crate::Rendered { pixmap, recorded, labels, unplaced, label_layers, attribution, .. } = img;
     let mut pm = recorded.unwrap_or_else(|| Canvas::from_pixmap(pixmap));
+    let ppp = view.pixels_per_point;
+    if let Some(geometry) = highlight {
+        draw_series_highlight(&mut pm, map, view, geometry);
+    }
     crate::draw_labels(&mut pm, (&unplaced, &labels, &label_layers), ppp as f32);
     // The grid is a layer of its own (#1815).
     pm.layer(grid.is_some().then_some("Grid"));
-    let grid_labels = grid.map(|(map, view, g, comma)| draw_grid(&mut pm, map, view, g, comma)).unwrap_or_default();
+    let grid_labels = grid.map(|(g, comma)| draw_grid(&mut pm, map, view, g, comma)).unwrap_or_default();
     pm.layer(None);
     let (w, h) = (pm.width() as f32 / ppp as f32, pm.height() as f32 / ppp as f32);
     let inset = crate::attribution_text(&attribution).map_or((0.0, 0.0), |(_, tw)| attribution_inset((w, h), tw, &grid_labels));
@@ -5926,7 +5996,7 @@ Elaboração: RustGIS",
             recorded: None,
             label_layers: Vec::new(),
         };
-        let framed = finish_frame(img, ppp, Some((&map, &view, &all, false)));
+        let framed = finish_frame(img, &map, &view, Some((&all, false)), None);
         let (a, b) = (labels_pm.pixmap(), framed.pixmap());
         assert_ne!(a.data(), b.data(), "the credit is drawn");
         for (_, [x0, y0, x1, y1]) in &labels {

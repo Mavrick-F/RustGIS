@@ -3298,9 +3298,16 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
                         ui.close();
                     }
                 }
-                if layout.series.is_some() && ui.button(tl!("Turn Off")).clicked() {
-                    let _ = app.run("layout.series", json!({"layout": li, "off": true}));
-                    ui.close();
+                if let Some(series) = &layout.series {
+                    ui.separator();
+                    let mut highlight = series.highlight;
+                    if ui.checkbox(&mut highlight, tl!("Highlight Page Feature")).changed() {
+                        let _ = app.run("layout.series", json!({"layout": li, "highlight": highlight}));
+                    }
+                    if ui.button(tl!("Turn Off")).clicked() {
+                        let _ = app.run("layout.series", json!({"layout": li, "off": true}));
+                        ui.close();
+                    }
                 }
             });
         });
