@@ -11886,6 +11886,20 @@ fn map_series_empty_names_use_row_numbers() {
 }
 
 #[test]
+fn map_series_setup_keeps_highlight_when_omitted() {
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Atlas"})).unwrap();
+    let setup = json!({"layer": "Lakes"});
+    s.run("layout.series", &setup).unwrap();
+    assert!(!s.project.layouts[0].series.as_ref().unwrap().highlight);
+    s.run("layout.series", &json!({"highlight": true})).unwrap();
+    s.run("layout.series", &setup).unwrap();
+    assert!(s.project.layouts[0].series.as_ref().unwrap().highlight);
+    s.run("layout.series", &json!({"layer": "Lakes", "highlight": false})).unwrap();
+    assert!(!s.project.layouts[0].series.as_ref().unwrap().highlight);
+}
+
+#[test]
 fn map_series_highlight_follows_the_page_in_its_frame() {
     use rustgis_data::{Dataset, Geometry, GeometryType};
     use rustgis_render::layout::{PageInfo, render};
@@ -11938,6 +11952,17 @@ fn map_series_highlight_follows_the_page_in_its_frame() {
     toggle(&mut s, true);
     s.run("layout.seriesPage", &json!({"page":"next"})).unwrap();
     assert_eq!(draw(&mut s).data(), baseline.data(), "a row without geometry has no outline");
+}
+
+#[test]
+fn layout_import_reports_missing_fields_in_bare_and_wrapped_layouts() {
+    let mut s = Session::new(Project::default());
+    let bare = json!({"name": "Atlas", "width": 210.0, "height": 297.0});
+    let wrapped = json!({"format": crate::project::FORMAT, "requires": [crate::project::SERIES_HIGHLIGHT_CAPABILITY], "layout": bare});
+    for layout in [bare, wrapped] {
+        let error = s.run("layout.import", &json!({"text": layout.to_string()})).unwrap_err();
+        assert!(error.starts_with("not a RustGIS layout: missing field `elements`"), "{error}");
+    }
 }
 
 #[test]

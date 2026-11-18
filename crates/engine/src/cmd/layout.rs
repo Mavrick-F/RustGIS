@@ -124,7 +124,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layout"?, "element"?: frame id, "frame"?: (as element), "to"?: "view" (the map view's extent, bearing and pitch; the default)|"full"|"selection"|"layer", "layer"?}"#,
         ),
         C::new("layout.series", "Map Series", "Publish › Map Frames", series).inputs(series_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layout"?, "layer"?: index layer (required to set up a series), "nameField"?: string, "frame"?: id, "margin"?: 0..1, "highlight"?: bool (default false on setup; without layer, toggle the current series without changing pages), "off"?: bool}"#,
+            r#"{"layout"?, "layer"?: index layer (required to set up a series), "nameField"?: string, "frame"?: id, "margin"?: 0..1, "highlight"?: bool (keeps the existing setting on setup, or defaults to false for a new series; without layer, toggle the current series without changing pages), "off"?: bool}"#,
         ),
         C::new("layout.seriesPage", "Map Series Page", "Publish › Map Frames", series_page).inputs(series_page_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layout"?, "page": number|"next"|"previous"}"#),
         C::new("layout.seriesRefresh", "Refresh Map Series", "Publish › Map Frames", |s, p| series_page(s, &json!({"layout": p.get("layout"), "page": "current"}))).inputs(series_page_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
@@ -4957,7 +4957,8 @@ fn series(s: &mut Session, p: &Value) -> CmdResult {
     let layer = layer.name.clone();
     let margin = f(p, "margin").unwrap_or(0.1).clamp(0.0, 5.0);
     if let Some(l) = s.project.layouts.get_mut(li) {
-        l.series = Some(MapSeries { frame, layer, name_field, margin, page: 0, highlight: highlight.unwrap_or(false) });
+        let highlight = highlight.unwrap_or_else(|| l.series.as_ref().is_some_and(|series| series.highlight));
+        l.series = Some(MapSeries { frame, layer, name_field, margin, page: 0, highlight });
     }
     series_page(s, &json!({"layout": li, "page": 0}))
 }
@@ -5447,16 +5448,9 @@ pub(crate) fn parse_saved_layout(text: &str) -> Result<Layout, String> {
         return Err("the layout file is too large".into());
     }
     crate::project::check_format(text, "layout")?;
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum SavedLayout {
-        Document { layout: Layout },
-        Legacy(Layout),
-    }
-    let saved = serde_json::from_str(text).map_err(|e| format!("not a RustGIS layout: {e}"))?;
-    Ok(match saved {
-        SavedLayout::Document { layout } | SavedLayout::Legacy(layout) => layout,
-    })
+    let mut saved: Value = serde_json::from_str(text).map_err(|e| format!("not a RustGIS layout: {e}"))?;
+    let layout = saved.as_object_mut().and_then(|object| object.remove("layout")).unwrap_or(saved);
+    serde_json::from_value(layout).map_err(|e| format!("not a RustGIS layout: {e}"))
 }
 
 /// Imports a layout, repairing element settings and rebinding frames whose maps are missing.
