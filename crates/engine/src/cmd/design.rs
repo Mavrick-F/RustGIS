@@ -2170,24 +2170,31 @@ struct TopologyInput {
     data: rustgis_data::Dataset,
     rows: Vec<usize>,
     by: Option<rustgis_data::Dataset>,
+    query_error: Option<String>,
 }
 
 /// The rules as the map has them now, each with what it reads; a rule whose layer is gone is left
-/// out, as it always was.
-fn topology_checks(s: &Session) -> Vec<TopologyInput> {
+/// out, as it always was. Primary rows use Query, ignoring selection; covering rows use All.
+/// The resolver query pass has no internal Cancel checks, as the previous visible-row pass did.
+fn topology_checks(s: &Session) -> Result<Vec<TopologyInput>, String> {
     let mut inputs = Vec::new();
     for rule in s.map().editing.topology.clone() {
         let Some(l) = s.map().layer_by_name(rule.layer()) else { continue };
-        let rows: Vec<usize> = l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
+        let resolved = l.resolve_rows(&l.dataset, rustgis_map::rows::Policy::Query, None)?;
+        let rows = match resolved.rows {
+            rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
+            rustgis_map::rows::Rows::Subset(rows) => rows,
+        };
         // A covering layer that is gone leaves the rule with nothing to check (its layer's
-        // latitudes are still checked).
+        // latitudes are still checked). Its whole resident dataset supplies coverage,
+        // independently of its selection and definition query.
         let by = match &rule {
             TopologyRule::MustBeCoveredBy { by, .. } => s.map().layer_by_name(by).map(|b| b.dataset.clone()),
             _ => None,
         };
-        inputs.push(TopologyInput { rule, layer: l.name.clone(), data: l.dataset.clone(), rows, by });
+        inputs.push(TopologyInput { rule, layer: l.name.clone(), data: l.dataset.clone(), rows, by, query_error: resolved.query_error });
     }
-    inputs
+    Ok(inputs)
 }
 
 /// Whether two layers' data are the same: the same rows (shared, not compared one by one), fields
@@ -2203,6 +2210,7 @@ fn same_topology(was: &[TopologyInput], now: &[TopologyInput]) -> bool {
             a.rule == b.rule
                 && a.layer == b.layer
                 && a.rows == b.rows
+                && a.query_error == b.query_error
                 && same_data(&a.data, &b.data)
                 && match (&a.by, &b.by) {
                     (Some(x), Some(y)) => same_data(x, y),
@@ -2259,7 +2267,7 @@ struct TopologyAhead {
 /// rule on a thread of its own, with progress and Cancel and no work limit. The command takes it
 /// as it lands when the rules and their layers are still the ones checked.
 pub(crate) fn topology_ahead(s: &Session, p: &Json) -> Option<super::reads::ReadWork> {
-    let (inputs, tol) = (topology_checks(s), topology_tolerance(p));
+    let (inputs, tol) = (topology_checks(s).ok()?, topology_tolerance(p));
     if inputs.is_empty() {
         return None;
     }
@@ -2278,7 +2286,7 @@ pub(crate) fn topology_ahead(s: &Session, p: &Json) -> Option<super::reads::Read
 /// so they check where they ask, with the work limit of a run that can't be cancelled.
 fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
     let tol = topology_tolerance(p);
-    let inputs = topology_checks(s);
+    let inputs = topology_checks(s)?;
     let found = match super::reads::take::<TopologyAhead>(s, TOPOLOGY_AHEAD) {
         Some(ahead) if ahead.tol == tol && same_topology(&ahead.inputs, &inputs) => ahead.found?,
         // Checking again here would hold the window: the check made on its thread is dropped.
@@ -2345,6 +2353,32 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
     let out: Vec<Json> =
         errors.iter().take(1000).map(|e| json!({"rule": e.rule, "layer": e.layer, "rows": e.rows, "lon": e.lon, "lat": e.lat})).collect();
     s.topology_errors = errors;
+    // Count layers once even when several rules read the same unreadable query. Bound
+    // NoticeText::list nesting independently of the number of rules or layers.
+    use crate::notice_text::NoticeText;
+    let mut seen = std::collections::HashSet::new();
+    let mut details = Vec::new();
+    for input in &inputs {
+        if let Some(error) = &input.query_error
+            && seen.insert(&input.layer)
+            && details.len() < 5
+        {
+            details.push(NoticeText::format("{layer}: {error}", [("layer", input.layer.clone().into()), ("error", error.clone().into())]));
+        }
+    }
+    if !seen.is_empty() {
+        let more = seen.len() - details.len();
+        let mut layers = NoticeText::list(details);
+        if more > 0 {
+            layers = NoticeText::format("{layers}; {count} more layers", [("layers", layers), ("count", more.to_string().into())]);
+        }
+        let key = if seen.len() == 1 {
+            "{count} layer with an unreadable definition query; reading without that query: {layers}"
+        } else {
+            "{count} layers with unreadable definition queries; reading without those queries: {layers}"
+        };
+        s.notify_text(NoticeText::format(key, [("count", seen.len().to_string().into()), ("layers", layers)]), false);
+    }
     Ok(json!({"errors": n, "first": out, "incomplete": incomplete}))
 }
 

@@ -80,6 +80,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": polygons, "count"?: points per polygon, "seed"?: number, "field"?: numeric field (count per polygon from it, scaled by "rate"), "rate"?: number, "name"?: output}"#,
         ),
         C::new("data.profile", "Data Engineering", "Analyze › Workflows", |s, p| {
+            // All resident rows: completeness profiling is independent of map filters/selection.
             let ds = feature_ds(s, p)?;
             let rows: Vec<Value> = network::profile_fields(ds)
                 .into_iter()
@@ -1881,7 +1882,7 @@ fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
     }
 }
 
-/// Histograms of numeric fields and their correlation matrix.
+/// Histograms and correlations over All resident rows, independent of map filters/selection.
 fn explore(s: &mut Session, p: &Value) -> CmdResult {
     let ds = feature_ds(s, p)?;
     let fields = numeric_fields(ds, p)?;
@@ -1924,6 +1925,8 @@ fn explore(s: &mut Session, p: &Value) -> CmdResult {
     )
 }
 
+/// Compare All resident candidates. Selection supplies only the reference when row is omitted;
+/// filtering candidates would also change the population used to standardize distances.
 fn similar(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;

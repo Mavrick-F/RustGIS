@@ -54295,3 +54295,158 @@ fn row_resolver_buffer_and_both_clip_inputs() {
         }
     }
 }
+
+/// Whole-resident diagnostics retain nulls and hidden candidates. Similar's selection is a
+/// reference, not an input subset, and its returned row positions never become feature IDs.
+#[test]
+fn resident_data_diagnostics_keep_all_rows_despite_map_filters() {
+    let mut ds = rustgis_data::Dataset::new(
+        "values",
+        rustgis_data::GeometryType::None,
+        vec![rustgis_data::Field::new("n", rustgis_data::FieldType::Integer)],
+    );
+    for n in [Some(0), Some(2), Some(10), None] {
+        ds.push(None, vec![n.map_or(rustgis_data::Value::Null, rustgis_data::Value::Int)]);
+    }
+    for (f, id) in ds.features.iter_mut().zip([90, 10, 70, 30]) {
+        f.id = id;
+    }
+    let mut s = Session::new(Project::default());
+    let id = crate::cmd::layer::add_dataset(&mut s, ds);
+    let held = s.map().layer(id).unwrap().dataset.clone();
+    let params = json!({"layer": id, "fields": ["n"]});
+    let profile = s.run("data.profile", &params).unwrap();
+    assert_eq!(profile["features"], 4);
+    assert_eq!(profile["fields"][0]["nulls"], 1);
+    assert_eq!(profile["fields"][0]["distinct"], 3);
+    assert_eq!(profile["fields"][0]["mean"], 4.0);
+    let explore = s.run("data.explore", &params).unwrap();
+    assert_eq!(explore["histograms"][0]["max"], 10.0);
+    assert_eq!(explore["histograms"][0]["counts"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).sum::<u64>(), 3);
+    let expected = s.run("data.similar", &json!({"layer": id, "row": 0, "fields": ["n"], "count": 2, "select": false})).unwrap();
+    assert_eq!(expected["similar"][0]["row"], 1);
+    assert_eq!(expected["similar"][1]["row"], 2);
+    for query in [None, Some("n = 10"), Some("n > 100"), Some("missing = 1")] {
+        let l = s.map_mut().layer_mut(id).unwrap();
+        l.definition_query = query.map(str::to_string);
+        l.selection = vec![0];
+        let mark = s.notice_mark();
+        assert_eq!(s.run("data.profile", &params).unwrap(), profile);
+        assert_eq!(s.run("data.explore", &params).unwrap(), explore);
+        assert_eq!(s.run("data.similar", &json!({"layer": id, "fields": ["n"], "count": 2, "select": false})).unwrap(), expected);
+        assert_eq!(s.map().layer(id).unwrap().selection, vec![0]);
+        assert!(
+            s.notices_since(mark).iter().all(|n| !n.text.contains("unreadable definition quer")),
+            "All policy must not report query fallback: {:?}",
+            s.notices_since(mark).iter().map(|n| &n.text).collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(s.run("data.similar", &json!({"layer": id, "row": 0, "fields": ["n"], "count": 2})).unwrap(), expected);
+    let l = s.map().layer(id).unwrap();
+    assert_eq!(l.selection, vec![0, 1, 2]);
+    assert!(held.features.shares(&l.dataset.features), "readers and selection retain shared rows");
+}
+
+/// Primary Query scope ignores selection; the covering layer deliberately supplies All rows.
+/// Empty primary subsets check nothing, and repeated rules count one literal fallback per layer.
+#[test]
+fn topology_row_contracts_and_unreadable_query_notice() {
+    use rustgis_data::Geometry;
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    use rustgis_geom::Coord;
+    let mut s = Session::new(Project::default());
+    let mut points = Dataset::new("points {layer}", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    points.push(Some(Geometry::Point(Coord::new(0.5, 0.5))), vec![V::Int(1)]);
+    points.push(Some(Geometry::Point(Coord::new(3.0, 3.0))), vec![V::Int(2)]);
+    points.features[0].id = 71;
+    points.features[1].id = 19;
+    let id = crate::cmd::layer::add_dataset(&mut s, points);
+    let cover = json!({"type":"FeatureCollection","features":[{"type":"Feature","properties":{"n":1},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}}]});
+    s.run("layer.addDataText", &json!({"fileName":"cover.geojson","text":cover.to_string()})).unwrap();
+    let cover_id = s.map().layer_by_name("cover").unwrap().id;
+    s.map_mut().layer_mut(cover_id).unwrap().definition_query = Some("n > 100".into());
+    s.run("topology.rules", &json!({"add":{"rule":"mustBeCoveredBy","layer":"points {layer}","by":"cover"}})).unwrap();
+    s.run("topology.rules", &json!({"add":{"rule":"mustNotSelfIntersect","layer":"points {layer}"}})).unwrap();
+    let held = s.map().layer(id).unwrap().dataset.clone();
+    for (query, errors) in [(None, 1), (Some("n = 1"), 0), (Some("n = 2"), 1), (Some("n > 100"), 0)] {
+        let l = s.map_mut().layer_mut(id).unwrap();
+        l.definition_query = query.map(str::to_string);
+        l.selection = vec![0];
+        let mark = s.notice_mark();
+        let out = s.run("topology.validate", &Value::Null).unwrap();
+        assert_eq!(out["errors"], errors, "{query:?}: {out}");
+        if errors == 1 {
+            assert_eq!(out["first"][0]["rows"], json!([1]));
+        }
+        assert!(s.notices_since(mark).is_empty());
+    }
+    s.map_mut().layer_mut(id).unwrap().definition_query = Some("missing = 1".into());
+    let mark = s.notice_mark();
+    assert_eq!(s.run("topology.validate", &Value::Null).unwrap()["errors"], 1);
+    let notices = s.notices_since(mark);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].text.starts_with("1 layer with an unreadable definition query"));
+    let keys = std::cell::RefCell::new(Vec::new());
+    let rendered = notices[0].translated(|key, args| {
+        keys.borrow_mut().push(key.to_string());
+        let mut out = format!("translated:{key}");
+        for (k, v) in args {
+            out = out.replace(&format!("{{{k}}}"), v);
+        }
+        out
+    });
+    let rendered = rendered.unwrap();
+    assert!(rendered.contains("points {layer}"));
+    assert!(keys.borrow().iter().all(|key| !key.contains("points {layer}") && !key.contains("missing")));
+    assert!(held.features.shares(&s.map().layer(id).unwrap().dataset.features));
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::cmd::reads::{read_ahead, read_land};
+        use rustgis_analysis::control::Control;
+        let read = read_ahead(&mut s, "topology.validate", &json!({})).unwrap().run(&Control::stoppable()).unwrap();
+        // Same rows, different fallback state: don't land an obsolete diagnostic.
+        s.map_mut().layer_mut(id).unwrap().definition_query = None;
+        let mark = s.notice_mark();
+        assert!(read_land(&mut s, read).unwrap_err().contains("changed while they were checked"));
+        let notices = s.notices_since(mark);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].error && notices[0].text.contains("changed while they were checked"));
+        assert_eq!(s.topology_errors.len(), 1);
+    }
+}
+
+/// Seven unreadable primary queries produce one bounded notice on successful read-ahead landing.
+#[test]
+fn topology_query_details_are_bounded_and_land_with_ahead_results() {
+    let mut s = Session::new(Project::default());
+    for i in 0..7 {
+        let name = format!("query layer {i}");
+        let mut ds = rustgis_data::Dataset::new(&name, rustgis_data::GeometryType::Point, vec![]);
+        ds.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![]);
+        let id = crate::cmd::layer::add_dataset(&mut s, ds);
+        s.map_mut().layer_mut(id).unwrap().definition_query = Some("missing = 1".into());
+        s.run("topology.rules", &json!({"add":{"rule":"mustNotSelfIntersect","layer":name}})).unwrap();
+    }
+    let mark = s.notice_mark();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::cmd::reads::{read_ahead, read_land};
+        let read =
+            read_ahead(&mut s, "topology.validate", &json!({})).unwrap().run(&rustgis_analysis::control::Control::stoppable()).unwrap();
+        assert!(s.notices_since(mark).is_empty());
+        read_land(&mut s, read).unwrap();
+    }
+    #[cfg(target_arch = "wasm32")]
+    s.run("topology.validate", &Value::Null).unwrap();
+    let notices = s.notices_since(mark);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].text.starts_with("7 layers with unreadable definition queries"));
+    assert!(notices[0].text.contains("2 more layers"));
+    assert!(!notices[0].text.contains("query layer 5"));
+    assert!(
+        notices[0]
+            .translated(|key, args| { args.iter().fold(key.to_string(), |text, (k, v)| text.replace(&format!("{{{k}}}"), v)) })
+            .is_some()
+    );
+}
