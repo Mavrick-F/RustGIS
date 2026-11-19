@@ -1483,6 +1483,14 @@ click them on the map:
 | Embeddings | The features most like the selected one, by their numeric attributes |
 | Data Interop | KML, GPX, CSV with WKT, GeoJSON or CSV |
 
+Data Engineering and Exploratory Analysis use every resident row, independently of the
+layer's selection and map filters. Embeddings also compares and standardizes numeric values
+over every resident row; the selection supplies its reference when no explicit row is given.
+Its returned matches can include hidden rows. With the default `select: true`, only matches
+and the reference that pass the layer's definition query, time window and display filters
+are selected; one notice counts those excluded. `select: false` leaves selection unchanged.
+These workflows use the loaded resident dataset, without reloading a streamed layer's source.
+
 Slope, in Raster Functions and the Function Editor, uses Horn's 3 × 3 gradient. Choose
 **Slope units**: **Degrees (0–90)** (the default, from flat to vertical) or **Percent**.
 For `raster.function`, set `"function": "slope", "units": "percent"`; in `raster.functionChain`,

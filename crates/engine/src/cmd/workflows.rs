@@ -1927,6 +1927,7 @@ fn explore(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Compare All resident candidates. Selection supplies only the reference when row is omitted;
 /// filtering candidates would also change the population used to standardize distances.
+/// Output selection keeps only drawn rows, reporting candidates/reference excluded by map filters.
 fn similar(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
@@ -1947,7 +1948,20 @@ fn similar(s: &mut Session, p: &Value) -> CmdResult {
     if b(p, "select").unwrap_or(true) {
         let mut sel: Vec<usize> = found.iter().map(|x| x.0).collect();
         sel.push(row);
+        let drawn = l.drawn_rows(s.scale());
+        let matched = sel.len();
+        sel.retain(|r| drawn.get(*r) == Some(&true));
+        let excluded = matched - sel.len();
         super::select::set(s, id, sel, super::select::Mode::New);
+        if excluded > 0 {
+            s.notify_text(
+                crate::notice_text::NoticeText::format(
+                    "{n} features aren't drawn (the layer's definition query, time window or display filters hide them), and aren't selected",
+                    [("n", excluded.to_string().into())],
+                ),
+                false,
+            );
+        }
     }
     Ok(json!({"similar": rows}))
 }

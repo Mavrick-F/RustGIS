@@ -54341,10 +54341,38 @@ fn resident_data_diagnostics_keep_all_rows_despite_map_filters() {
             s.notices_since(mark).iter().map(|n| &n.text).collect::<Vec<_>>()
         );
     }
+    // Ranking still includes hidden candidates, but output selection follows the map's
+    // drawn-row contract, including an explicitly supplied reference hidden by the query.
+    for (query, selection, excluded) in [
+        (None, vec![0, 1, 2], 0),
+        (Some("n >= 2"), vec![1, 2], 1),
+        (Some("n = 10"), vec![2], 2),
+        (Some("n > 100"), vec![], 3),
+        (Some("missing = 1"), vec![0, 1, 2], 0),
+    ] {
+        s.map_mut().layer_mut(id).unwrap().definition_query = query.map(str::to_string);
+        let mark = s.notice_mark();
+        assert_eq!(s.run("data.similar", &json!({"layer": id, "row": 0, "fields": ["n"], "count": 2})).unwrap(), expected);
+        assert_eq!(s.map().layer(id).unwrap().selection, selection, "{query:?}");
+        let notices = s.notices_since(mark);
+        assert_eq!(notices.len(), usize::from(excluded > 0));
+        if excluded > 0 {
+            assert!(notices[0].text.starts_with(&format!("{excluded} features aren't drawn")));
+        }
+    }
+    let l = s.map_mut().layer_mut(id).unwrap();
+    l.definition_query = None;
+    l.display_filters.push(rustgis_map::effects::DisplayFilter {
+        name: "only ten".into(),
+        min_scale: None,
+        max_scale: None,
+        where_: "n = 10".into(),
+    });
+    let mark = s.notice_mark();
     assert_eq!(s.run("data.similar", &json!({"layer": id, "row": 0, "fields": ["n"], "count": 2})).unwrap(), expected);
-    let l = s.map().layer(id).unwrap();
-    assert_eq!(l.selection, vec![0, 1, 2]);
-    assert!(held.features.shares(&l.dataset.features), "readers and selection retain shared rows");
+    assert_eq!(s.map().layer(id).unwrap().selection, vec![2]);
+    assert!(s.notices_since(mark)[0].text.starts_with("2 features aren't drawn"));
+    assert!(held.features.shares(&s.map().layer(id).unwrap().dataset.features), "readers and selection retain shared rows");
 }
 
 /// Primary Query scope ignores selection; the covering layer deliberately supplies All rows.
