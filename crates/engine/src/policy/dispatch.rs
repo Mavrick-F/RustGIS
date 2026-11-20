@@ -985,9 +985,10 @@ impl Session {
                     Txn::Shared => run(self),
                 };
                 self.url_completion_landed(spec.id, &params, &result);
-                if result.is_ok() && spec.mutates {
+                if result.is_ok() && spec.mutates && spec.id != "data.similar" {
                     // Some edits replace selections without going through select::set. A pending
                     // read must preserve the later intent, even when this edit touched another layer.
+                    // Similar's own result is derived output, not a new external selection intent.
                     self.selection_generation = self.selection_generation.wrapping_add(1);
                 }
                 result

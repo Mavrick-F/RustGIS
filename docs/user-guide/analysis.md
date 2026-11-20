@@ -1495,7 +1495,7 @@ These workflows use the loaded resident dataset, without reloading a streamed la
 On the desktop, Find Similar computes on the background read queue with progress and Cancel;
 the completed ranking appears in the Workflows pane. A changed layer, reference or active filter
 invalidates the result. Zooming without changing which display filters apply does not invalidate it.
-If selection changes while an explicit-reference request runs, its ranking still returns but it
+If you change selection while an explicit-reference request runs, its ranking still returns but it
 does not replace the newer selection.
 The reference must have a finite numeric value in every compared field; otherwise the command
 refuses without changing selection. Other incomplete candidate rows are skipped with one count,

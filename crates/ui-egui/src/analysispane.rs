@@ -1798,7 +1798,8 @@ fn trend(app: &mut RustGisApp, ui: &mut Ui, rasters: &[String]) {
 
 /// A trend that has finished, its layers added through `cube.trend` (so it's in the History):
 /// called every frame, whatever pane is in view, so a run lands though the Workflows pane
-/// closed. `true` while one is still running.
+/// closed. Output stays with the Trend section; failures elsewhere become notices.
+/// `true` while one is still running.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn land_trend(app: &mut RustGisApp) -> bool {
     use std::sync::atomic::Ordering;
@@ -1815,14 +1816,15 @@ pub fn land_trend(app: &mut RustGisApp) -> bool {
         Ok(_) if cancelled => {}
         // Another project opened meanwhile: nothing added, and said.
         Ok(_) if !current => {
-            app.workflow.error = Some(tl!("The trend finished after another project was opened, so it wasn't added").to_string());
+            show_job(app, "trend", Err(tl!("The trend finished after another project was opened, so it wasn't added").to_string()));
         }
         Ok((rasters, dates)) => {
             p["ran"] = json!(rustgis_engine::cmd::cube::land(&mut app.session, rasters, dates));
-            run(app, "cube.trend", p);
+            let result = app.run("cube.trend", p);
+            show_job(app, "trend", result);
         }
         Err(_) if cancelled => {}
-        Err(e) => app.workflow.error = Some(e),
+        Err(e) => show_job(app, "trend", Err(e)),
     }
     false
 }
@@ -2900,6 +2902,77 @@ mod tests {
             _ => None,
         });
         assert_eq!(copied, Some(pretty(&long)), "Copy keeps the long line whole");
+    }
+
+    /// Ready Trend completions land through the real app frame without replacing another
+    /// section's output; Trend still receives its own result/error and Cancel stays quiet.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn trend_completion_preserves_other_workflow_output() {
+        for section in ["similar", "trend"] {
+            for outcome in ["failure", "project changed", "success", "cancelled"] {
+                let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+                let id = app.session.download_started();
+                if outcome == "project changed" {
+                    app.session.run("project.new", &Value::Null).unwrap();
+                }
+                app.run("ui.pane.workflows", json!({"section":section})).unwrap();
+                let kept = json!({"similar": [{"row":1,"distance":0.5}]});
+                app.workflow.result = Some(kept.clone());
+                let result = match outcome {
+                    "project changed" | "success" => Ok((Vec::new(), 0)),
+                    _ => Err("trend test failure".into()),
+                };
+                app.workflow.trend.running = Some(Trending {
+                    total: 1,
+                    id,
+                    params: Value::Null,
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(outcome == "cancelled")),
+                    done: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                    result: std::sync::Arc::new(std::sync::Mutex::new(Some(result))),
+                });
+                let mark = app.session.notice_mark();
+                let mut fonts = false;
+                let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_ui_state(
+                    move |ui, app: &mut RustGisApp| {
+                        if !fonts {
+                            crate::theme::install_fonts(ui.ctx(), &[], None);
+                            fonts = true;
+                            return;
+                        }
+                        app.logic(ui.ctx());
+                        app.ui(ui);
+                    },
+                    app,
+                );
+                for _ in 0..4 {
+                    h.step();
+                }
+                assert!(h.state().workflow.trend.running.is_none(), "the real frame consumed the worker completion");
+                let notices = h.state().session.notices_since(mark);
+                if outcome == "cancelled" || (section == "similar" && outcome == "success") {
+                    assert!(h.state().workflow.error.is_none());
+                    assert_eq!(h.state().workflow.result, Some(kept));
+                    assert!(notices.is_empty());
+                } else if outcome == "success" {
+                    assert!(h.state().workflow.error.is_none());
+                    assert_eq!(h.state().workflow.result, Some(json!({"layers":[],"dates":0})));
+                    assert!(notices.is_empty());
+                } else {
+                    let needle = if outcome == "project changed" { "after another project" } else { "trend test failure" };
+                    if section == "similar" {
+                        assert!(h.state().workflow.error.is_none(), "Trend's error belongs outside the Similar pane");
+                        assert_eq!(h.state().workflow.result, Some(kept));
+                        assert_eq!(notices.len(), 1);
+                        assert!(notices[0].error && notices[0].text.contains(needle));
+                    } else {
+                        assert!(h.state().workflow.error.as_deref().is_some_and(|e| e.contains(needle)));
+                        assert!(h.state().workflow.result.is_none());
+                        assert!(notices.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     /// Interpolate runs on a thread of its own from the pane (#1291 step 3): the pane goes on while

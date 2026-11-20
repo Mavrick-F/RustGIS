@@ -221,7 +221,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> CmdResult {
     let done = done?;
     if let Some(rows) = done.selection {
         if selection_generation == s.selection_generation {
-            super::select::set(s, input.target.id, rows, super::select::Mode::New);
+            super::select::set_similar_result(s, input.target.id, rows);
         } else {
             s.notify_text(
                 NoticeText::term(

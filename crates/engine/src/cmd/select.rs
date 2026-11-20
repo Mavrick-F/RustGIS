@@ -127,6 +127,17 @@ fn area_mode(p: &Value) -> Result<Mode, String> {
 /// Applies a selection to one layer (New clears the others too, like desktop GIS).
 pub fn set(s: &mut Session, id: u32, rows: Vec<usize>, m: Mode) {
     s.selection_generation = s.selection_generation.wrapping_add(1);
+    apply(s, id, rows, m);
+}
+
+/// A queued Similar result must not invalidate the selection intent of later queued requests.
+/// External selection commands still advance the generation through `set`.
+pub(super) fn set_similar_result(s: &mut Session, id: u32, rows: Vec<usize>) {
+    apply(s, id, rows, Mode::New);
+}
+
+/// Applies either external intent or a validated result with the same row bounds and modes.
+fn apply(s: &mut Session, id: u32, rows: Vec<usize>, m: Mode) {
     if m == Mode::New {
         s.map_mut().clear_selection();
     }

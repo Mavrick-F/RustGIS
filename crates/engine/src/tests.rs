@@ -54778,6 +54778,36 @@ fn prepared_similar_preserves_newer_selection_on_any_layer() {
 }
 
 #[test]
+fn queued_similar_results_preserve_later_requests_and_user_intent() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    for first_selects in [false, true] {
+        for user_changes_selection in [false, true] {
+            let (mut s, id) = similar_lifecycle_session();
+            let first = json!({"layer":id,"row":0,"fields":["n"],"count":1,"select":first_selects});
+            let second = json!({"layer":id,"row":2,"fields":["n"],"count":1});
+            // Both requests capture intent before either completion reaches the live session.
+            let first = read_ahead(&mut s, "data.similar", &first).unwrap();
+            let second = read_ahead(&mut s, "data.similar", &second).unwrap();
+            read_land(&mut s, first.run(&Control::stoppable()).unwrap()).unwrap();
+            if user_changes_selection {
+                s.run("select.rows", &json!({"layer":id,"rows":[0]})).unwrap();
+            }
+            let mark = s.notice_mark();
+            let answer = read_land(&mut s, second.run(&Control::stoppable()).unwrap()).unwrap();
+            assert_eq!(answer["similar"][0]["row"], 1);
+            if user_changes_selection {
+                assert_eq!(s.map().layer(id).unwrap().selection, vec![0]);
+                assert!(s.notices_since(mark).iter().any(|n| n.text.contains("without replacing the current selection")));
+            } else {
+                assert_eq!(s.map().layer(id).unwrap().selection, vec![1, 2], "the latest request owns selection");
+                assert!(s.notices_since(mark).is_empty(), "an earlier result is not a user selection change");
+            }
+        }
+    }
+}
+
+#[test]
 fn queued_similar_and_topology_snapshots_are_charged_until_drop_or_cancel() {
     use crate::cmd::reads::read_ahead;
     use rustgis_analysis::control::Control;
