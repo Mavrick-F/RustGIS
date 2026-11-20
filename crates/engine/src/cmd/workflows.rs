@@ -93,7 +93,7 @@ pub fn commands() -> Vec<C> {
         C::new("data.explore", "Exploratory Analysis", "Analyze › Workflows", explore).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .params(r#"{"layer"?, "fields"?: [numeric fields], "bins"?: number}"#),
-        C::new("data.similar", "Embeddings", "Analyze › Workflows", similar).roles(&[]).effects(crate::policy::Effects::NONE)
+        C::new("data.similar", "Embeddings", "Analyze › Workflows", super::similar::run).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"layer"?, "row"?: number (the selected feature when omitted), "fields"?: [numeric fields], "count"?: number, "select"?: bool}"#),
         C::new("data.convert", "Data Interop", "Analyze › Workflows", convert).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
@@ -1867,7 +1867,8 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"layer": nid, "points": n}))
 }
 
-fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
+/// Numeric fields requested by name, or all numeric fields when omitted; invalid names fail.
+pub(super) fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
     match p.get("fields").and_then(Value::as_array) {
         Some(a) => a
             .iter()
@@ -1923,65 +1924,6 @@ fn explore(s: &mut Session, p: &Value) -> CmdResult {
     Ok(
         json!({"histograms": hist, "fields": fields.iter().filter_map(|fi| ds.fields.get(*fi).map(|f| f.name.clone())).collect::<Vec<_>>(), "correlation": matrix}),
     )
-}
-
-/// Compare All resident candidates. Selection supplies only the reference when row is omitted;
-/// filtering candidates would also change the population used to standardize distances.
-/// Output selection keeps only drawn rows, reporting candidates/reference excluded by map filters.
-fn similar(s: &mut Session, p: &Value) -> CmdResult {
-    let id = s.layer_id(p)?;
-    let l = s.map().layer(id).ok_or("no such layer")?;
-    let row = match p.get("row").and_then(Value::as_u64) {
-        Some(r) => r as usize,
-        None => *l.selection.first().ok_or("select a feature (or give row)")?,
-    };
-    if row >= l.dataset.features.len() {
-        return Err("no such row".into());
-    }
-    let fields = numeric_fields(&l.dataset, p)?;
-    if fields.is_empty() {
-        return Err("the layer has no numeric fields to compare".into());
-    }
-    let n = p.get("count").and_then(Value::as_u64).unwrap_or(10).clamp(1, 1000) as usize;
-    let found = network::similar(&l.dataset, row, &fields, n);
-    let rows: Vec<Value> = found.iter().map(|(r, d)| json!({"row": r, "distance": d})).collect();
-    if b(p, "select").unwrap_or(true) {
-        let mut sel: Vec<usize> = found.iter().map(|x| x.0).collect();
-        sel.push(row);
-        let scale = s.scale();
-        // The shared drawn mask keeps the established fallback. Report the settings it
-        // cannot read, retaining only the first literal diagnostic regardless of filter count.
-        let mut errors = rustgis_data::rows::Query::compile(l.definition_query.as_deref(), &l.dataset).err().into_iter().chain(
-            l.display_filters
-                .iter()
-                .filter(|f| f.applies(scale))
-                .filter_map(|f| rustgis_data::query::parse_fields(&f.where_, &l.dataset).err()),
-        );
-        let unreadable = errors.next().map(|error| {
-            crate::notice_text::NoticeText::format(
-                "{layer}: selecting without unreadable query/filter settings ({count}). First parser error: {error}",
-                [("layer", l.name.clone().into()), ("count", (1 + errors.count()).to_string().into()), ("error", error.into())],
-            )
-        });
-        let drawn = l.drawn_rows(scale);
-        let matched = sel.len();
-        sel.retain(|r| drawn.get(*r) == Some(&true));
-        let excluded = matched - sel.len();
-        super::select::set(s, id, sel, super::select::Mode::New);
-        if let Some(notice) = unreadable {
-            s.notify_text(notice, false);
-        }
-        if excluded > 0 {
-            s.notify_text(
-                crate::notice_text::NoticeText::format(
-                    "{n} features aren't drawn (the layer's definition query, time window or display filters hide them), and aren't selected",
-                    [("n", excluded.to_string().into())],
-                ),
-                false,
-            );
-        }
-    }
-    Ok(json!({"similar": rows}))
 }
 
 /// Converts text on the caller's thread for scripts and browser downloads. A streamed layer

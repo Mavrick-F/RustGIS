@@ -173,6 +173,7 @@ fn run_presented(
             | "labels.convert"
             | "source.syncState"
             | "table.statistics"
+            | "data.similar"
             | "edit.previewShapeConversion"
             | "layer.sizeBy"
     )
@@ -277,7 +278,7 @@ pub fn admitted(app: &mut RustGisApp, ahead: reads::ReadAhead, relay: rustgis_as
     };
     let params = params.clone();
     let archive = matches!(command, "map.reloadTiles" | "map.repairTiles").then(|| reads::archive_target(&app.session, &params)).flatten();
-    let layer = matches!(command, "table.statistics" | "layer.sizeBy")
+    let layer = matches!(command, "table.statistics" | "data.similar" | "layer.sizeBy")
         .then(|| app.session.layer_id(&params).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
         .flatten();
     let what =
@@ -372,6 +373,7 @@ fn called<'a>(command: &str, what: &'a str) -> &'a str {
         (true, "script.run") => tl_raw!("Run Script"),
         (true, "topology.validate") => tl_raw!("Error Inspector"),
         (true, "table.statistics") => tl_raw!("Column Statistics"),
+        (true, "data.similar") => tl_raw!("Find Similar"),
         (true, "layer.sizeBy") => tl_raw!("Size by Field"),
         (true, "service.add") => tl_raw!("Add Service Layer"),
         (true, _) => tl_raw!("Run Model"),
@@ -500,6 +502,7 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
                 | "script.run"
                 | "edit.previewShapeConversion"
                 | "layer.sizeBy"
+                | "data.similar"
         ) || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
         {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
@@ -1807,6 +1810,50 @@ mod tests {
         assert_eq!(answer["result"]["isError"], false, "{answer}");
         assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("\"sum\":6"), "{answer}");
         relay.stop();
+    }
+
+    /// UI and direct relay Similar requests defer selection until the worker lands; a failed
+    /// worker spawn must refuse rather than compute synchronously on the window thread.
+    #[test]
+    fn similarity_uses_the_read_queue_for_ui_and_relay() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+        use std::io::{BufRead, BufReader};
+        for relay_call in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let mut ds = Dataset::new("numbers", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+            for n in [0, 2, 10] {
+                ds.push(None, vec![V::Int(n)]);
+            }
+            let id = rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+            let l = app.session.map_mut().layer_mut(id).unwrap();
+            l.selection = vec![0];
+            l.definition_query = Some("n >= 2".into());
+            app.reads_off_frame = true;
+            let p = json!({"layer":id,"fields":["n"],"count":2});
+            let relay = if relay_call {
+                let (relay, grant, client, ahead) = paused_relay(&mut app, relay_command(1, "data.similar", p.clone()));
+                admitted(&mut app, ahead, relay.clone());
+                Some((relay, grant, client))
+            } else {
+                assert_eq!(app.run("data.similar", p.clone()).unwrap()["started"], "Find Similar");
+                None
+            };
+            assert_eq!(app.session.map().layer(id).unwrap().selection, vec![0]);
+            landed(&mut app, 60);
+            assert_eq!(app.session.map().layer(id).unwrap().selection, vec![1, 2]);
+            if let Some((relay, _grant, client)) = relay {
+                let mut text = String::new();
+                BufReader::new(client).read_line(&mut text).unwrap();
+                let answer: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(answer["result"]["isError"], false, "{answer}");
+                assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("similar"));
+                relay.stop();
+            }
+            app.reads.fail_spawn = true;
+            let before = app.session.map().layer(id).unwrap().selection.clone();
+            assert!(app.run("data.similar", p).unwrap_err().contains("background worker could not start"));
+            assert_eq!(app.session.map().layer(id).unwrap().selection, before);
+        }
     }
 
     /// Statistics… counts the column on a thread of its own and keeps the answer for its window

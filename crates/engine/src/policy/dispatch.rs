@@ -123,15 +123,15 @@ impl Session {
         }
         let CallKind::Command { id, params } = &call.kind else {
             return Err(
-                "only standalone archive, column-statistics, shape-conversion or size-by-field commands can prepare a scoped read".into()
+                "only standalone archive, column-statistics, similarity, shape-conversion or size-by-field commands can prepare a scoped read".into()
             );
         };
         if !matches!(
             id.as_str(),
-            "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "edit.previewShapeConversion" | "layer.sizeBy"
+            "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "data.similar" | "edit.previewShapeConversion" | "layer.sizeBy"
         ) {
             return Err(
-                "only standalone archive, column-statistics, shape-conversion or size-by-field commands can prepare a scoped read".into()
+                "only standalone archive, column-statistics, similarity, shape-conversion or size-by-field commands can prepare a scoped read".into()
             );
         }
         let capture = |s: &mut Session| s.capture_read(id, params);
@@ -163,11 +163,12 @@ impl Session {
                 | "service.add"
                 | "source.syncState"
                 | "table.statistics"
+                | "data.similar"
                 | "edit.previewShapeConversion"
                 | "layer.sizeBy"
         ) && crate::cmd::edit::table_edit_in_background(command).is_none()
         {
-            return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service reads, topology, Source File State, Column Statistics and Size by Field prepare background work".into());
+            return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service reads, topology, Source File State, Column Statistics, Similar and Size by Field prepare background work".into());
         }
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
         // Scoped previews retain the raw invocation that was approved. Their admitted owner
@@ -180,6 +181,7 @@ impl Session {
                 | "labels.convert"
                 | "source.syncState"
                 | "table.statistics"
+                | "data.similar"
                 | "edit.previewShapeConversion"
                 | "layer.sizeBy"
         ) && (command != "edit.previewShapeConversion" || self.policy_user())

@@ -2892,6 +2892,9 @@ impl RustGisApp {
             if id == "table.statistics" {
                 return readjob::run_then(self, "table.statistics", params, Some(table::statistics_landed));
             }
+            if id == "data.similar" {
+                return readjob::run(self, "data.similar", params);
+            }
             if id == "layer.sizeBy" {
                 return readjob::run(self, "layer.sizeBy", params);
             }

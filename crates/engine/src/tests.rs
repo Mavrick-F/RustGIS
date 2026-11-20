@@ -54498,3 +54498,79 @@ fn topology_query_details_are_bounded_and_land_with_ahead_results() {
             .is_some()
     );
 }
+
+/// Prepared Similar work shares data and mutates only on current successful completion.
+/// Query/reference/time/display/schema/row changes refuse a stale answer without re-running it.
+#[test]
+fn similar_prepared_results_require_current_inputs() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    let mut ds = rustgis_data::Dataset::new(
+        "values",
+        rustgis_data::GeometryType::None,
+        vec![rustgis_data::Field::new("n", rustgis_data::FieldType::Integer)],
+    );
+    for n in [0, 2, 10] {
+        ds.push(None, vec![rustgis_data::Value::Int(n)]);
+    }
+    let mut s = Session::new(Project::default());
+    let id = crate::cmd::layer::add_dataset(&mut s, ds);
+    let l = s.map_mut().layer_mut(id).unwrap();
+    l.selection = vec![0];
+    l.definition_query = Some("n >= 2".into());
+    let p = json!({"layer":id,"fields":["n"],"count":2});
+    let expected = s.run("data.similar", &json!({"layer":id,"fields":["n"],"count":2,"select":false})).unwrap();
+    let held = s.map().layer(id).unwrap().dataset.clone();
+    let mark = s.notice_mark();
+    let read = read_ahead(&mut s, "data.similar", &p).unwrap();
+    assert!(read.reads());
+    let control = Control::stoppable();
+    let done = read.run(&control).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().selection, vec![0]);
+    assert!(s.notices_since(mark).is_empty());
+    assert!(control.progress().is_some());
+    assert_eq!(read_land(&mut s, done).unwrap(), expected);
+    assert_eq!(s.map().layer(id).unwrap().selection, vec![1, 2]);
+    assert!(held.features.shares(&s.map().layer(id).unwrap().dataset.features));
+    s.map_mut().layer_mut(id).unwrap().selection = vec![0];
+    let project = s.project.clone();
+    for change in 0..6 {
+        let mut changed = Session::new(project.clone());
+        let done = read_ahead(&mut changed, "data.similar", &p).unwrap().run(&Control::stoppable()).unwrap();
+        let l = changed.map_mut().layer_mut(id).unwrap();
+        match change {
+            0 => l.definition_query = Some("n > 100".into()),
+            1 => l.selection = vec![1],
+            2 => l.dataset.features[0].attrs[0] = rustgis_data::Value::Int(20),
+            3 => l.dataset.fields.push(rustgis_data::Field::new("extra", rustgis_data::FieldType::Text)),
+            4 => l.display_filters.push(rustgis_map::effects::DisplayFilter {
+                name: "hidden".into(),
+                min_scale: None,
+                max_scale: None,
+                where_: "n > 100".into(),
+            }),
+            _ => {
+                let mut time = rustgis_map::time::TimeBinding::new("n");
+                time.window = Some((0.0, 1000.0));
+                l.time = Some(time);
+            }
+        }
+        let selection = changed.map().layer(id).unwrap().selection.clone();
+        let mark = changed.notice_mark();
+        assert!(read_land(&mut changed, done).unwrap_err().contains("changed while"), "change {change}");
+        assert_eq!(changed.map().layer(id).unwrap().selection, selection);
+        assert!(changed.notices_since(mark).iter().all(|n| n.error), "only the refusal, no success diagnostics");
+    }
+    let mark = s.notice_mark();
+    let read = read_ahead(&mut s, "data.similar", &p).unwrap();
+    assert!(read.run(&Control::cancelled_once_started()).err().is_some_and(|e| e.contains("cancelled")));
+    assert_eq!(s.map().layer(id).unwrap().selection, vec![0]);
+    assert!(s.notices_since(mark).is_empty());
+    let retry = read_ahead(&mut s, "data.similar", &p).unwrap().run(&Control::stoppable()).unwrap();
+    assert_eq!(read_land(&mut s, retry).unwrap(), expected);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        s.statistics_need_read_ahead(true);
+        assert!(s.run("data.similar", &p).unwrap_err().contains("background read queue"));
+    }
+}

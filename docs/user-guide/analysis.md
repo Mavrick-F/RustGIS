@@ -1492,6 +1492,8 @@ are selected; one notice counts those excluded. Unreadable definition queries or
 display filters are ignored for selection, with one notice giving the count and first parser
 error. `select: false` leaves selection unchanged and does not apply these filters.
 These workflows use the loaded resident dataset, without reloading a streamed layer's source.
+On the desktop, Find Similar computes on the background read queue with progress and Cancel;
+selection changes only when the completed result still matches its layer, reference and filters.
 
 Slope, in Raster Functions and the Function Editor, uses Horn's 3 × 3 gradient. Choose
 **Slope units**: **Degrees (0–90)** (the default, from flat to vertical) or **Percent**.
