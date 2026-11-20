@@ -1500,6 +1500,8 @@ does not replace the newer selection.
 The reference must have a finite numeric value in every compared field; otherwise the command
 refuses without changing selection. Other incomplete candidate rows are skipped with one count,
 including when `select: false`. Standardization still uses each field's finite resident values.
+If a field's mean or spread overflows the numeric range, the comparison is refused; rescale its
+values before comparing.
 
 Slope, in Raster Functions and the Function Editor, uses Horn's 3 × 3 gradient. Choose
 **Slope units**: **Degrees (0–90)** (the default, from flat to vertical) or **Percent**.

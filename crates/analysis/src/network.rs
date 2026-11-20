@@ -768,6 +768,7 @@ pub struct Similarity {
 /// distance over `fields`), nearest first, excluding the row itself. Counts progress and checks
 /// Cancel between rows and within wide vectors. The stable library sort is one indivisible step,
 /// checked immediately before and after; equal-distance rows keep their original order.
+/// Non-finite standardization statistics are refused before ranking any candidates.
 pub fn similar(ds: &Dataset, row: usize, fields: &[usize], n: usize) -> Result<Similarity, String> {
     use crate::control;
     control::begin(ds.features.len().saturating_mul(fields.len().saturating_mul(3).saturating_add(1)));
@@ -802,6 +803,9 @@ pub fn similar(ds: &Dataset, row: usize, fields: &[usize], n: usize) -> Result<S
             .sum::<Result<f64, control::Cancelled>>()?
             / vals.len().max(1) as f64)
             .sqrt();
+        if !m.is_finite() || !sd.is_finite() {
+            return Err("a compared field's values are too large to standardize (its mean or spread overflows)".into());
+        }
         stats.push((m, if sd > 0.0 { sd } else { 1.0 }));
     }
     let mut vector_pace = control::Pace::default();

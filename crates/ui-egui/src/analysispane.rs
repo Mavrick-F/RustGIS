@@ -153,6 +153,8 @@ pub(crate) fn similar_ran(app: &mut RustGisApp, request: u64, landed: crate::Lan
 pub struct Job {
     /// What it is called, for its progress line.
     name: &'static str,
+    /// Only this section owns the pane output; data and error notices still land elsewhere.
+    section: &'static str,
     /// Stops it, and counts its progress.
     control: std::sync::Arc<rustgis_engine::analysis::control::Control>,
     kind: JobKind,
@@ -334,7 +336,6 @@ fn model_ran(app: &mut RustGisApp, landed: crate::Landed) {
 
 /// Shows how a workflow's command went, and redraws the map it may have changed.
 fn show(app: &mut RustGisApp, r: Result<Value, String>) {
-    forget_similar(&mut app.workflow);
     match r {
         Ok(v) => {
             app.workflow.result = Some(v);
@@ -346,6 +347,20 @@ fn show(app: &mut RustGisApp, r: Result<Value, String>) {
         }
     }
     app.map.invalidate();
+}
+
+/// A background workflow changes only its own section's output. Its applied data redraws the
+/// map either way, and failures remain visible as notices after the user changes sections.
+#[cfg(not(target_arch = "wasm32"))]
+fn show_job(app: &mut RustGisApp, section: &'static str, r: Result<Value, String>) {
+    if app.workflow.section == section {
+        show(app, r);
+    } else {
+        if let Err(error) = r {
+            app.session.notify(error, true);
+        }
+        app.map.invalidate();
+    }
 }
 
 /// The workflows that run on a thread of their own on the desktop, as their command and name:
@@ -391,7 +406,7 @@ fn start(app: &mut RustGisApp, command: &'static str, name: &'static str, p: Val
     };
     match kind {
         Ok(kind) => {
-            app.workflow.job = Some(Job { name, control, kind });
+            app.workflow.job = Some(Job { name, section: app.workflow.section, control, kind });
             (app.workflow.result, app.workflow.error) = (None, None);
         }
         Err(e) => show(app, Err(e)),
@@ -411,7 +426,8 @@ fn fill<T>(slot: &crate::Slot<T>, v: T) {
 
 /// A workflow that has finished on its thread, applied (so it's in the History and can be undone):
 /// called every frame, whatever pane is in view, so a run lands though the pane closed. `true`
-/// while one is still running.
+/// while one is still running. Pane output stays in its originating section; failures still
+/// reach session notices after a section change.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn land_job(app: &mut RustGisApp) -> bool {
     use rustgis_engine::cmd::{gp, workflows};
@@ -422,8 +438,9 @@ pub fn land_job(app: &mut RustGisApp) -> bool {
             if !gp::tool_waiting(&app.session, *id) {
                 job.control.cancel();
                 let name = job.name;
+                let section = job.section;
                 app.workflow.job = None;
-                dropped(app, name);
+                dropped(app, section, name);
                 return false;
             }
             filled(slot)
@@ -433,8 +450,9 @@ pub fn land_job(app: &mut RustGisApp) -> bool {
             if !workflows::raster_waiting(&app.session, *id) {
                 job.control.cancel();
                 let name = job.name;
+                let section = job.section;
                 app.workflow.job = None;
-                dropped(app, name);
+                dropped(app, section, name);
                 return false;
             }
             filled(slot)
@@ -448,21 +466,21 @@ pub fn land_job(app: &mut RustGisApp) -> bool {
         JobKind::Tool { id, slot } => {
             let Some(done) = take(&slot) else { return false };
             let r = gp::tool_complete(&mut app.session, id, done).and_then(|_| app.finish_gp(id));
-            show(app, r);
+            show_job(app, job.section, r);
         }
         JobKind::Raster { id, command, params, slot } => match take(&slot) {
             // Added by its command, as if it had run here.
             Some(Ok(made)) => match workflows::raster_land(&mut app.session, id, made) {
                 Ok(true) => {
                     let result = app.finish_raster(command, id, &params);
-                    show(app, result);
+                    show_job(app, job.section, result);
                 }
-                Ok(false) => dropped(app, job.name),
-                Err(e) => show(app, Err(e)),
+                Ok(false) => dropped(app, job.section, job.name),
+                Err(e) => show_job(app, job.section, Err(e)),
             },
             Some(Err(e)) => {
                 workflows::raster_abandon(&mut app.session, id);
-                show(app, Err(e));
+                show_job(app, job.section, Err(e));
             }
             None => {}
         },
@@ -482,9 +500,9 @@ fn take<T>(slot: &crate::Slot<T>) -> Option<T> {
 
 /// Says that a workflow's run was dropped: its project closed while it ran.
 #[cfg(not(target_arch = "wasm32"))]
-fn dropped(app: &mut RustGisApp, name: &'static str) {
-    app.workflow.error = Some(crate::i18n::fmt("{tool} was stopped: its project was closed while it ran.", &[("tool", tl_raw!(name))]));
-    app.workflow.result = None;
+fn dropped(app: &mut RustGisApp, section: &'static str, name: &'static str) {
+    let error = crate::i18n::fmt("{tool} was stopped: its project was closed while it ran.", &[("tool", tl_raw!(name))]);
+    show_job(app, section, Err(error));
 }
 
 /// A workflow under way: its name, progress and Cancel.

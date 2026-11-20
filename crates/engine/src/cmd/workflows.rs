@@ -912,8 +912,8 @@ fn check_table_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(
 #[cfg(not(target_arch = "wasm32"))]
 /// The commands a script's line may run on a copy of the session ([`runs_on_a_copy`]): those
 /// whose results are taken (a tool, a model, a batch) and those that change only what the taking compares
-/// by value (a selection, a layer's name or query, the environment, the projection). A line that
-/// makes rows of its own (a layer edit, a layer from a selection) isn't one. Table edits are the
+/// by value (a selection, a layer's name or query, topology rules, the environment, the projection).
+/// A line that makes rows of its own (a layer edit, a layer from a selection) isn't one. Table edits are the
 /// exception: their rows are recorded and taken, so later tools retain their shared input.
 pub(crate) const ON_A_COPY: &[&str] = &[
     "edit.enable",
@@ -930,6 +930,7 @@ pub(crate) const ON_A_COPY: &[&str] = &[
     "gp.zonalStats",
     "gp.env",
     "data.similar",
+    "topology.rules",
     "topology.validate",
     "select.all",
     "select.atPoint",

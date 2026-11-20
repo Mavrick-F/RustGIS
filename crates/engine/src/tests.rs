@@ -54695,11 +54695,11 @@ fn native_script_replays_similar_and_topology_before_the_following_line() {
     use crate::cmd::reads::{read_ahead, read_land};
     use rustgis_analysis::control::Control;
     let (mut s, id) = similar_lifecycle_session();
-    s.run("topology.rules", &json!({"add":{"rule":"mustNotSelfIntersect","layer":"values"}})).unwrap();
     s.run("select.rows", &json!({"layer":id,"rows":[0]})).unwrap();
     s.statistics_need_read_ahead(true);
     let depth = s.undo_depth();
     let p = json!({"script": concat!(
+        "topology.rules {\"add\":{\"rule\":\"mustNotSelfIntersect\",\"layer\":\"values\"}}\n",
         "topology.validate {}\n",
         "data.similar {\"layer\":\"values\",\"fields\":[\"n\"],\"count\":1}\n",
         "select.layerFromSelection {\"layer\":\"values\"}"
@@ -54709,9 +54709,9 @@ fn native_script_replays_similar_and_topology_before_the_following_line() {
     let read = read.run(&Control::stoppable()).unwrap();
     assert!(s.map().layer(id).unwrap().selection == vec![0], "the worker cannot change live selection");
     let answer = read_land(&mut s, read).unwrap();
-    assert_eq!(answer["ran"][0]["result"]["errors"], 0);
-    assert_eq!(answer["ran"][1]["result"]["similar"][0]["row"], 1);
-    let made = answer["ran"][2]["result"]["layer"].as_u64().unwrap() as u32;
+    assert_eq!(answer["ran"][1]["result"]["errors"], 0);
+    assert_eq!(answer["ran"][2]["result"]["similar"][0]["row"], 1);
+    let made = answer["ran"][3]["result"]["layer"].as_u64().unwrap() as u32;
     let rows = &s.map().layer(made).unwrap().dataset;
     assert_eq!(rows.features.len(), 2);
     assert_eq!((rows.value(0, 0), rows.value(1, 0)), (&rustgis_data::Value::Int(0), &rustgis_data::Value::Int(2)));
@@ -54719,6 +54719,7 @@ fn native_script_replays_similar_and_topology_before_the_following_line() {
     assert!(s.read_ahead.is_none() && s.tools_ahead.is_none());
     s.run("edit.undo", &Value::Null).unwrap();
     assert!(s.map().layer(made).is_none());
+    assert!(s.map().editing.topology.is_empty(), "Undo also removes the rules created by the script");
     assert_eq!(s.map().layer(id).unwrap().selection, vec![0]);
 }
 
@@ -54808,5 +54809,36 @@ fn queued_similar_and_topology_snapshots_are_charged_until_drop_or_cancel() {
         let queued = read_ahead(&mut s, command, &p).unwrap();
         assert!(queued.run(&Control::cancelled_once_started()).is_err());
         assert_eq!(s.undo_memory.held(&s.project, &[], &[]), current);
+    }
+}
+
+/// Finite sentinels can overflow the spread or mean; neither may select a misleading ranking.
+#[test]
+fn similar_refuses_overflowing_statistics_without_selecting() {
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    for values in [[1.0, 2.0, -f64::MAX], [f64::MAX; 3]] {
+        let mut ds = Dataset::new("extremes", GeometryType::Point, vec![Field::new("n", FieldType::Double)]);
+        for value in values {
+            ds.push(None, vec![V::Float(value)]);
+        }
+        let mut s = Session::new(Project::default());
+        let id = crate::cmd::layer::add_dataset(&mut s, ds);
+        s.map_mut().layer_mut(id).unwrap().selection = vec![2];
+        let p = json!({"layer":id,"row":0,"fields":["n"],"count":2});
+        let mark = s.notice_mark();
+        assert!(s.run("data.similar", &p).unwrap_err().contains("mean or spread overflows"));
+        assert_eq!(s.map().layer(id).unwrap().selection, vec![2]);
+        assert!(!s.notices_since(mark).is_empty());
+        assert!(s.notices_since(mark).iter().all(|n| n.error));
+        for row in 0..3 {
+            s.map_mut().layer_mut(id).unwrap().dataset.features[row].attrs[0] = V::Float((row + 1) as f64);
+        }
+        let mark = s.notice_mark();
+        let answer = s.run("data.similar", &p).unwrap();
+        let matches = answer["similar"].as_array().unwrap();
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|m| m["distance"].as_f64().is_some_and(|d| d.is_finite() && d > 0.0)));
+        assert_eq!(s.map().layer(id).unwrap().selection, vec![0, 1, 2]);
+        assert!(s.notices_since(mark).is_empty());
     }
 }

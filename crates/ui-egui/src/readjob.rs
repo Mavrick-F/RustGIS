@@ -1821,12 +1821,15 @@ mod tests {
     #[test]
     fn similar_pane_receives_success_failure_and_cancellation() {
         use egui_kittest::kittest::Queryable;
-        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
-        for outcome in ["success", "error", "cancel", "spawn", "newer", "layer"] {
+        use rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+        for outcome in ["success", "error", "cancel", "spawn", "newer", "layer", "workflow"] {
             let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
             let mut ds = Dataset::new("numbers", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
             for n in [0, 2, 10] {
-                ds.push(None, vec![if n == 0 && outcome == "error" { V::Null } else { V::Int(n) }]);
+                ds.push(
+                    Some(Geometry::Point(rustgis_engine::geom::Coord::new(n as f64, n as f64))),
+                    vec![if n == 0 && outcome == "error" { V::Null } else { V::Int(n) }],
+                );
             }
             let id = rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds.clone());
             ds.name = "other".into();
@@ -1834,6 +1837,15 @@ mod tests {
             app.session.map_mut().layer_mut(id).unwrap().selection = vec![0];
             app.reads_off_frame = true;
             app.reads.fail_spawn = outcome == "spawn";
+            if outcome == "workflow" {
+                crate::analysispane::run_elsewhere(
+                    &mut app,
+                    "interpolate",
+                    "analysis.interpolate",
+                    json!({"layer":"numbers","field":"n","cellSize":2}),
+                );
+                assert!(app.workflow.job.is_some(), "the raster workflow is pending before Similar starts");
+            }
             app.run("ui.pane.workflows", json!({"section":"similar"})).unwrap();
             app.workflow.layer = "numbers".into();
             // Pause only the frame's completion pass until the button and queue ownership have
@@ -1858,7 +1870,14 @@ mod tests {
                 },
                 app,
             );
-            h.run();
+            if outcome == "workflow" {
+                // This deliberately held background job shows a spinner until we land it.
+                for _ in 0..4 {
+                    h.step();
+                }
+            } else {
+                h.run();
+            }
             h.get_by_role_and_label(egui::accesskit::Role::Button, "Find Similar").click();
             for _ in 0..4 {
                 h.step();
@@ -1866,6 +1885,15 @@ mod tests {
             assert_eq!(showing(h.state()), outcome != "spawn", "{outcome}: worker admission");
             assert!(h.state().workflow.result.is_none(), "a receipt is not a ranking");
             match outcome {
+                "workflow" => {
+                    let end = std::time::Instant::now() + Duration::from_secs(60);
+                    while crate::analysispane::land_job(h.state_mut()) {
+                        assert!(std::time::Instant::now() < end, "the raster workflow never landed");
+                        std::thread::sleep(Duration::from_millis(5)); // test-wait: the real raster completion lands while Similar remains pending
+                    }
+                    assert!(h.state().session.map().layers.iter().any(|l| l.is_raster()));
+                    assert!(h.state().workflow.result.is_none(), "another section cannot show its result in the Similar pane");
+                }
                 "cancel" => h.state().reads.cancel_for_tests(),
                 "layer" => {
                     h.state_mut().workflow.layer = "other".into();
@@ -1903,7 +1931,7 @@ mod tests {
             h.step();
             h.run();
             match outcome {
-                "success" => {
+                "success" | "workflow" => {
                     let answer = h.state().workflow.result.as_ref().expect("the pane shows the completed ranking");
                     assert_eq!(answer["similar"].as_array().unwrap().len(), 2);
                     assert!(answer["similar"][0]["distance"].is_number());
