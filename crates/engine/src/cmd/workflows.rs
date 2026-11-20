@@ -1948,11 +1948,29 @@ fn similar(s: &mut Session, p: &Value) -> CmdResult {
     if b(p, "select").unwrap_or(true) {
         let mut sel: Vec<usize> = found.iter().map(|x| x.0).collect();
         sel.push(row);
-        let drawn = l.drawn_rows(s.scale());
+        let scale = s.scale();
+        // The shared drawn mask keeps the established fallback. Report the settings it
+        // cannot read, retaining only the first literal diagnostic regardless of filter count.
+        let mut errors = rustgis_data::rows::Query::compile(l.definition_query.as_deref(), &l.dataset).err().into_iter().chain(
+            l.display_filters
+                .iter()
+                .filter(|f| f.applies(scale))
+                .filter_map(|f| rustgis_data::query::parse_fields(&f.where_, &l.dataset).err()),
+        );
+        let unreadable = errors.next().map(|error| {
+            crate::notice_text::NoticeText::format(
+                "{layer}: selecting without unreadable query/filter settings ({count}). First parser error: {error}",
+                [("layer", l.name.clone().into()), ("count", (1 + errors.count()).to_string().into()), ("error", error.into())],
+            )
+        });
+        let drawn = l.drawn_rows(scale);
         let matched = sel.len();
         sel.retain(|r| drawn.get(*r) == Some(&true));
         let excluded = matched - sel.len();
         super::select::set(s, id, sel, super::select::Mode::New);
+        if let Some(notice) = unreadable {
+            s.notify_text(notice, false);
+        }
         if excluded > 0 {
             s.notify_text(
                 crate::notice_text::NoticeText::format(

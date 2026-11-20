@@ -54355,9 +54355,14 @@ fn resident_data_diagnostics_keep_all_rows_despite_map_filters() {
         assert_eq!(s.run("data.similar", &json!({"layer": id, "row": 0, "fields": ["n"], "count": 2})).unwrap(), expected);
         assert_eq!(s.map().layer(id).unwrap().selection, selection, "{query:?}");
         let notices = s.notices_since(mark);
-        assert_eq!(notices.len(), usize::from(excluded > 0));
+        let unreadable = query == Some("missing = 1");
+        assert_eq!(notices.len(), usize::from(excluded > 0) + usize::from(unreadable));
         if excluded > 0 {
             assert!(notices[0].text.starts_with(&format!("{excluded} features aren't drawn")));
+        }
+        if unreadable {
+            assert!(notices[0].text.contains("selecting without unreadable query/filter settings (1)"));
+            assert!(notices[0].text.contains("missing"));
         }
     }
     let l = s.map_mut().layer_mut(id).unwrap();
@@ -54372,6 +54377,21 @@ fn resident_data_diagnostics_keep_all_rows_despite_map_filters() {
     assert_eq!(s.run("data.similar", &json!({"layer": id, "row": 0, "fields": ["n"], "count": 2})).unwrap(), expected);
     assert_eq!(s.map().layer(id).unwrap().selection, vec![2]);
     assert!(s.notices_since(mark)[0].text.starts_with("2 features aren't drawn"));
+    let l = s.map_mut().layer_mut(id).unwrap();
+    l.display_filters[0].where_ = "missing = 1".into();
+    l.display_filters.push(rustgis_map::effects::DisplayFilter {
+        name: "second unreadable".into(),
+        min_scale: None,
+        max_scale: None,
+        where_: "another_missing = 1".into(),
+    });
+    let mark = s.notice_mark();
+    assert_eq!(s.run("data.similar", &json!({"layer": id, "row": 0, "fields": ["n"], "count": 2})).unwrap(), expected);
+    assert_eq!(s.map().layer(id).unwrap().selection, vec![0, 1, 2]);
+    let notices = s.notices_since(mark);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].text.contains("selecting without unreadable query/filter settings (2)"));
+    assert!(notices[0].text.contains("missing"));
     assert!(held.features.shares(&s.map().layer(id).unwrap().dataset.features), "readers and selection retain shared rows");
 }
 

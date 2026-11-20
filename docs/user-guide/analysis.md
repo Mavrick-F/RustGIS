@@ -1488,7 +1488,9 @@ layer's selection and map filters. Embeddings also compares and standardizes num
 over every resident row; the selection supplies its reference when no explicit row is given.
 Its returned matches can include hidden rows. With the default `select: true`, only matches
 and the reference that pass the layer's definition query, time window and display filters
-are selected; one notice counts those excluded. `select: false` leaves selection unchanged.
+are selected; one notice counts those excluded. Unreadable definition queries or active
+display filters are ignored for selection, with one notice giving the count and first parser
+error. `select: false` leaves selection unchanged and does not apply these filters.
 These workflows use the loaded resident dataset, without reloading a streamed layer's source.
 
 Slope, in Raster Functions and the Function Editor, uses Horn's 3 × 3 gradient. Choose
