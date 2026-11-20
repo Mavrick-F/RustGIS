@@ -809,6 +809,35 @@ pub(crate) struct ToolAhead {
 pub(crate) enum RanAhead {
     Tool(Box<ToolAhead>),
     Table(Box<super::edit::ScriptTableEdit>),
+    Read(ScriptRead),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A read-only command's prepared result, replayed by its ordinary admitted handler.
+pub(crate) struct ScriptRead {
+    command: &'static str,
+    params: Value,
+    value: Box<dyn std::any::Any + Send>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Keeps a typed worker result in prefix order for the live command's authorized replay.
+pub(crate) fn record_read<T: Send + 'static>(s: &mut Session, command: &'static str, params: &Value, value: T) {
+    if let Some(Ahead::Recording(ran)) = &mut s.tools_ahead {
+        ran.push(RanAhead::Read(ScriptRead { command, params: params.clone(), value: Box::new(value) }));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A replayed read must consume its recorded result, never recompute after an earlier mismatch.
+pub(crate) fn take_read<T: 'static>(s: &mut Session, command: &str, params: &Value) -> Result<Option<T>, String> {
+    let Some(Ahead::Taking(ran)) = &mut s.tools_ahead else { return Ok(None) };
+    let mismatch = || "the script's prepared read changed: run the script again".to_string();
+    let Some(RanAhead::Read(next)) = ran.pop_front() else { return Err(mismatch()) };
+    if next.command != command || next.params != *params {
+        return Err(mismatch());
+    }
+    next.value.downcast::<T>().map(|value| Some(*value)).map_err(|_| mismatch())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -862,6 +891,8 @@ pub(crate) struct RanAheads {
     tools: Vec<RanAhead>,
     files: Vec<FileAhead>,
     zones: Vec<super::imagery::ZoneMeans>,
+    // The copy's initial project can outlive history while queued or waiting to replay.
+    pub(crate) retained: Option<crate::undo_memory::ReadRows>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -870,6 +901,7 @@ pub(crate) struct RanAheads {
 /// files read ahead the same way. Restored on every path, a panic included (raised again), so no
 /// later run takes them.
 pub(crate) fn taking<T>(s: &mut Session, ran: RanAheads, run: impl FnOnce(&mut Session) -> T) -> T {
+    let _retained = ran.retained;
     s.tools_ahead = Some(Ahead::Taking(ran.tools.into()));
     s.files_ahead = Some(FilesAhead::Taking(ran.files.into()));
     s.zones_ahead = Some(super::imagery::ZonesAhead::Taking(ran.zones.into()));
@@ -895,7 +927,7 @@ pub(crate) fn ran_ahead(s: &mut Session) -> RanAheads {
         Some(super::imagery::ZonesAhead::Recording(read)) => read,
         _ => Vec::new(),
     };
-    RanAheads { tools, files, zones }
+    RanAheads { tools, files, zones, retained: None }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

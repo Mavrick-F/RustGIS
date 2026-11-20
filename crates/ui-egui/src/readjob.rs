@@ -76,12 +76,14 @@ pub type Then = fn(&mut RustGisApp, Landed);
 enum Completion {
     Command(Then),
     ShapeConversion(Option<u64>),
+    WorkflowSimilar(u64),
 }
 impl Completion {
     fn deliver(self, app: &mut RustGisApp, result: Landed) {
         match self {
             Self::Command(then) => then(app, result),
             Self::ShapeConversion(request) => crate::shapeconvert::landed(app, request, result),
+            Self::WorkflowSimilar(request) => crate::analysispane::similar_ran(app, request, result),
         }
     }
 }
@@ -121,6 +123,11 @@ pub fn run_then(app: &mut RustGisApp, command: &'static str, p: Value, then: Opt
 pub(crate) fn run_shape_conversion(app: &mut RustGisApp, p: Value) -> Result<Value, String> {
     let request = p.get("request").and_then(Value::as_u64);
     run_presented(app, "edit.previewShapeConversion", p, Some(Completion::ShapeConversion(request)), None, None)
+}
+
+/// Gives the final ranking to the pane request that asked for it, rather than its queue receipt.
+pub(crate) fn run_workflow_similar(app: &mut RustGisApp, p: Value, request: u64) -> Result<Value, String> {
+    run_presented(app, "data.similar", p, Some(Completion::WorkflowSimilar(request)), None, None)
 }
 
 /// Keeps a service layer's title and connection display name outside recorded parameters
@@ -503,6 +510,7 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
                 | "edit.previewShapeConversion"
                 | "layer.sizeBy"
                 | "data.similar"
+                | "topology.validate"
         ) || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
         {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
@@ -514,9 +522,6 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
         if reload {
             crate::diskwatch::reading(app, asked.command, &p);
         }
-        // Here, where its Cancel can't be clicked, the topology check takes the work limit of a
-        // run that can't be cancelled; it has none on its thread.
-        let control = if asked.command == "topology.validate" { Control::new() } else { control };
         let read = held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1812,6 +1817,129 @@ mod tests {
         relay.stop();
     }
 
+    /// The real pane button owns the final ranking, not the read queue's admission receipt.
+    #[test]
+    fn similar_pane_receives_success_failure_and_cancellation() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+        for outcome in ["success", "error", "cancel", "spawn", "newer", "layer"] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let mut ds = Dataset::new("numbers", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+            for n in [0, 2, 10] {
+                ds.push(None, vec![if n == 0 && outcome == "error" { V::Null } else { V::Int(n) }]);
+            }
+            let id = rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds.clone());
+            ds.name = "other".into();
+            rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+            app.session.map_mut().layer_mut(id).unwrap().selection = vec![0];
+            app.reads_off_frame = true;
+            app.reads.fail_spawn = outcome == "spawn";
+            app.run("ui.pane.workflows", json!({"section":"similar"})).unwrap();
+            app.workflow.layer = "numbers".into();
+            // Pause only the frame's completion pass until the button and queue ownership have
+            // been inspected; draw the owning pane first, then use the real app frame's
+            // completion hook below.
+            let allow_landing = std::rc::Rc::new(std::cell::Cell::new(false));
+            let allow = allow_landing.clone();
+            let mut fonts = false;
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_max_steps(1000).build_ui_state(
+                move |ui, app: &mut RustGisApp| {
+                    if !fonts {
+                        crate::theme::install_fonts(ui.ctx(), &[], None);
+                        fonts = true;
+                        return;
+                    }
+                    if allow.get() {
+                        app.logic(ui.ctx());
+                        app.ui(ui);
+                    } else {
+                        crate::analysispane::workflows(app, ui, &Tokens::light());
+                    }
+                },
+                app,
+            );
+            h.run();
+            h.get_by_role_and_label(egui::accesskit::Role::Button, "Find Similar").click();
+            for _ in 0..4 {
+                h.step();
+            }
+            assert_eq!(showing(h.state()), outcome != "spawn", "{outcome}: worker admission");
+            assert!(h.state().workflow.result.is_none(), "a receipt is not a ranking");
+            match outcome {
+                "cancel" => h.state().reads.cancel_for_tests(),
+                "layer" => {
+                    h.state_mut().workflow.layer = "other".into();
+                    h.state_mut().workflow.result = Some(json!({"kept":"other layer"}));
+                }
+                "newer" => {
+                    // The older completion cannot erase the newer pending state or show its
+                    // ranking. Keep the worker slots deterministic without timing the scan.
+                    let end = std::time::Instant::now() + Duration::from_secs(60);
+                    while !h.state().reads.read_finished_for_tests() {
+                        assert!(std::time::Instant::now() < end);
+                        std::thread::sleep(Duration::from_millis(5)); // test-wait: completion slot before testing queued pane ownership
+                    }
+                    h.get_by_role_and_label(egui::accesskit::Role::Button, "Find Similar").click();
+                    for _ in 0..4 {
+                        h.step();
+                    }
+                    assert_eq!(h.state().reads.waiting.len(), 1);
+                    land(h.state_mut());
+                    assert!(h.state().workflow.result.is_none(), "older ranking cannot replace the newer pending request");
+                    h.state().reads.cancel_for_tests();
+                }
+                _ => {}
+            }
+            allow_landing.set(true);
+            let end = std::time::Instant::now() + Duration::from_secs(60);
+            while showing(h.state()) || !h.state().reads.waiting.is_empty() {
+                assert!(std::time::Instant::now() < end, "{outcome}: pane read never landed");
+                h.step();
+                std::thread::sleep(Duration::from_millis(5)); // test-wait: worker completion delivered by the real app frame
+            }
+            // Completion used the full app frame above. Inspect the actual pane alone so its
+            // diagnostic cannot be confused with the same text in another app surface.
+            allow_landing.set(false);
+            h.step();
+            h.run();
+            match outcome {
+                "success" => {
+                    let answer = h.state().workflow.result.as_ref().expect("the pane shows the completed ranking");
+                    assert_eq!(answer["similar"].as_array().unwrap().len(), 2);
+                    assert!(answer["similar"][0]["distance"].is_number());
+                    assert!(h.query_by_label_contains("distance").is_some(), "the ranking is drawn in the pane");
+                    assert!(h.state().workflow.error.is_none());
+                }
+                "error" => {
+                    assert!(h.state().workflow.result.is_none());
+                    assert!(h.state().workflow.error.as_deref().is_some_and(|e| e.contains("reference row")));
+                    assert!(
+                        h.query_by_role_and_label(egui::accesskit::Role::Label, h.state().workflow.error.as_deref().unwrap()).is_some()
+                    );
+                }
+                "spawn" => {
+                    assert!(h.state().workflow.result.is_none());
+                    assert!(h.state().workflow.error.as_deref().is_some_and(|e| e.contains("background worker could not start")));
+                    assert!(
+                        h.query_by_role_and_label(egui::accesskit::Role::Label, h.state().workflow.error.as_deref().unwrap()).is_some()
+                    );
+                }
+                "cancel" | "newer" => {
+                    assert!(h.state().workflow.result.is_none());
+                    assert!(h.state().workflow.error.as_deref().is_some_and(|e| e.contains("cancelled")));
+                    assert!(
+                        h.query_by_role_and_label(egui::accesskit::Role::Label, h.state().workflow.error.as_deref().unwrap()).is_some()
+                    );
+                }
+                "layer" => {
+                    assert_eq!(h.state().workflow.result, Some(json!({"kept":"other layer"})));
+                    assert!(h.state().workflow.error.is_none());
+                }
+                _ => panic!("unexpected Similar pane scenario"),
+            }
+        }
+    }
+
     /// UI and direct relay Similar requests defer selection until the worker lands; a failed
     /// worker spawn must refuse rather than compute synchronously on the window thread.
     #[test]
@@ -1853,6 +1981,40 @@ mod tests {
             let before = app.session.map().layer(id).unwrap().selection.clone();
             assert!(app.run("data.similar", p).unwrap_err().contains("background worker could not start"));
             assert_eq!(app.session.map().layer(id).unwrap().selection, before);
+        }
+    }
+
+    /// Topology's worker is used by both UI and scoped relay paths, with no inline spawn fallback.
+    #[test]
+    fn topology_uses_the_read_queue_for_ui_and_relay() {
+        use std::io::{BufRead, BufReader};
+        for relay_call in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let mut ds = rustgis_engine::data::Dataset::new("points", rustgis_engine::data::GeometryType::Point, vec![]);
+            ds.push(Some(rustgis_engine::data::Geometry::Point(rustgis_engine::geom::Coord::new(1.0, 2.0))), vec![]);
+            rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+            app.run("topology.rules", json!({"add":{"rule":"mustNotSelfIntersect","layer":"points"}})).unwrap();
+            app.reads_off_frame = true;
+            let p = json!({});
+            let relay = if relay_call {
+                let (relay, grant, client, ahead) = paused_relay(&mut app, relay_command(1, "topology.validate", p.clone()));
+                admitted(&mut app, ahead, relay.clone());
+                Some((relay, grant, client))
+            } else {
+                assert_eq!(app.run("topology.validate", p.clone()).unwrap()["started"], "Error Inspector");
+                None
+            };
+            landed(&mut app, 60);
+            if let Some((relay, _grant, client)) = relay {
+                let mut text = String::new();
+                BufReader::new(client).read_line(&mut text).unwrap();
+                let answer: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(answer["result"]["isError"], false, "{answer}");
+                assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("errors"));
+                relay.stop();
+            }
+            app.reads.fail_spawn = true;
+            assert!(app.run("topology.validate", p).unwrap_err().contains("background worker could not start"));
         }
     }
 

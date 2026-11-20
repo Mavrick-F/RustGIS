@@ -1493,7 +1493,13 @@ display filters are ignored for selection, with one notice giving the count and 
 error. `select: false` leaves selection unchanged and does not apply these filters.
 These workflows use the loaded resident dataset, without reloading a streamed layer's source.
 On the desktop, Find Similar computes on the background read queue with progress and Cancel;
-selection changes only when the completed result still matches its layer, reference and filters.
+the completed ranking appears in the Workflows pane. A changed layer, reference or active filter
+invalidates the result. Zooming without changing which display filters apply does not invalidate it.
+If selection changes while an explicit-reference request runs, its ranking still returns but it
+does not replace the newer selection.
+The reference must have a finite numeric value in every compared field; otherwise the command
+refuses without changing selection. Other incomplete candidate rows are skipped with one count,
+including when `select: false`. Standardization still uses each field's finite resident values.
 
 Slope, in Raster Functions and the Function Editor, uses Horn's 3 × 3 gradient. Choose
 **Slope units**: **Degrees (0–90)** (the default, from flat to vertical) or **Percent**.

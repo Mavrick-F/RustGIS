@@ -35,6 +35,11 @@ pub struct Workflow {
     pub pick: Option<Pick>,
     pub result: Option<Value>,
     pub error: Option<String>,
+    /// Only this request may replace the Similar section's pending result.
+    #[cfg(not(target_arch = "wasm32"))]
+    similar_request: Option<SimilarRequest>,
+    #[cfg(not(target_arch = "wasm32"))]
+    similar_next: u64,
     pub script: String,
     pub script_out: Vec<(String, bool)>,
     /// The Script pane's last run, shown above its results.
@@ -82,6 +87,65 @@ pub struct Workflow {
     /// lands through [`land_job`].
     #[cfg(not(target_arch = "wasm32"))]
     pub job: Option<Job>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct SimilarRequest {
+    id: u64,
+    opened: u64,
+    map: u64,
+    layer: String,
+    instance: Option<u64>,
+}
+
+/// A pane/input change relinquishes ownership of a pending ranking. The read still completes
+/// through its ordinary command, but cannot overwrite another section or a newer request.
+pub(crate) fn forget_similar(workflow: &mut Workflow) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        workflow.similar_request = None;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = workflow;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn start_similar(app: &mut RustGisApp) {
+    app.workflow.similar_next = app.workflow.similar_next.wrapping_add(1);
+    let id = app.workflow.similar_next;
+    app.workflow.similar_request = Some(SimilarRequest {
+        id,
+        opened: app.session.opened,
+        map: app.session.map().instance_id(),
+        layer: app.workflow.layer.clone(),
+        instance: app.session.map().layer_by_name(&app.workflow.layer).map(|l| l.instance_id()),
+    });
+    (app.workflow.result, app.workflow.error) = (None, None);
+    let params = json!({"layer": app.workflow.layer, "count": 10});
+    // Success here is only an admission receipt. Completion owns success and every failure.
+    let _ = crate::readjob::run_workflow_similar(app, params, id);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Delivers only to the still-current pane request; the admission receipt never becomes output.
+pub(crate) fn similar_ran(app: &mut RustGisApp, request: u64, landed: crate::Landed) {
+    if !app.workflow.similar_request.as_ref().is_some_and(|r| r.id == request) {
+        return;
+    }
+    let Some(asked) = app.workflow.similar_request.take() else { return };
+    if app.ui.right != Some(crate::RightPane::Workflows)
+        || app.workflow.section != "similar"
+        || app.workflow.layer != asked.layer
+        || app.session.opened != asked.opened
+        || app.session.map().instance_id() != asked.map
+        || app.session.map().layer_by_name(&asked.layer).map(|l| l.instance_id()) != asked.instance
+    {
+        return;
+    }
+    match landed {
+        crate::Landed::Ran(r) => show(app, r),
+        crate::Landed::NotRun(why) => show(app, Err(why)),
+    }
 }
 
 /// A workflow running on a thread of its own, so the window goes on while it works (#1291 step 3).
@@ -270,6 +334,7 @@ fn model_ran(app: &mut RustGisApp, landed: crate::Landed) {
 
 /// Shows how a workflow's command went, and redraws the map it may have changed.
 fn show(app: &mut RustGisApp, r: Result<Value, String>) {
+    forget_similar(&mut app.workflow);
     match r {
         Ok(v) => {
             app.workflow.result = Some(v);
@@ -552,6 +617,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         if !app.workflow.section.is_empty() {
             app.workflow.pick = None;
         }
+        forget_similar(&mut app.workflow);
         app.workflow.section = "rasterFunctions";
     }
     egui::ComboBox::from_id_salt("wf_section")
@@ -560,6 +626,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         .show_ui(ui, |ui| {
             for (id, title) in SECTIONS.iter().filter(|s| section_shown(&app.session, s.0)) {
                 if ui.selectable_label(app.workflow.section == *id, tl!(*title)).clicked() {
+                    forget_similar(&mut app.workflow);
                     app.workflow.section = id;
                     app.workflow.result = None;
                     app.workflow.error = None;
@@ -922,9 +989,24 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         "similar" => {
             heading(ui, "Features most like the selected one");
+            let before = app.workflow.layer.clone();
             combo(ui, "wf_e", "Layer", &mut app.workflow.layer, &features);
+            if app.workflow.layer != before {
+                forget_similar(&mut app.workflow);
+                (app.workflow.result, app.workflow.error) = (None, None);
+            }
             if ui.button(tl!("Find Similar")).clicked() {
+                #[cfg(not(target_arch = "wasm32"))]
+                start_similar(app);
+                #[cfg(target_arch = "wasm32")]
                 run(app, "data.similar", json!({"layer": app.workflow.layer, "count": 10}));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if app.workflow.similar_request.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(tl!("Running…"));
+                });
             }
         }
         "interop" => {

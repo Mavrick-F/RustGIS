@@ -169,6 +169,7 @@ impl ArchiveBatch {
                                 | "map.repairTiles"
                                 | "table.statistics"
                                 | "data.similar"
+                                | "topology.validate"
                                 | "edit.previewShapeConversion"
                                 | "layer.sizeBy"
                         )

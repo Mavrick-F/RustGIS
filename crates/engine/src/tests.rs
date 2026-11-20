@@ -54356,13 +54356,17 @@ fn resident_data_diagnostics_keep_all_rows_despite_map_filters() {
         assert_eq!(s.map().layer(id).unwrap().selection, selection, "{query:?}");
         let notices = s.notices_since(mark);
         let unreadable = query == Some("missing = 1");
-        assert_eq!(notices.len(), usize::from(excluded > 0) + usize::from(unreadable));
+        assert_eq!(notices.len(), 1 + usize::from(excluded > 0) + usize::from(unreadable));
+        assert!(notices.iter().any(|n| n.text.starts_with("Candidate features skipped: 1")));
         if excluded > 0 {
-            assert!(notices[0].text.starts_with(&format!("{excluded} features aren't drawn")));
+            assert!(notices.iter().any(|n| n.text.starts_with(&format!("{excluded} features aren't drawn"))));
         }
         if unreadable {
-            assert!(notices[0].text.contains("selecting without unreadable query/filter settings (1)"));
-            assert!(notices[0].text.contains("missing"));
+            assert!(
+                notices
+                    .iter()
+                    .any(|n| n.text.contains("selecting without unreadable query/filter settings (1)") && n.text.contains("missing"))
+            );
         }
     }
     let l = s.map_mut().layer_mut(id).unwrap();
@@ -54376,7 +54380,7 @@ fn resident_data_diagnostics_keep_all_rows_despite_map_filters() {
     let mark = s.notice_mark();
     assert_eq!(s.run("data.similar", &json!({"layer": id, "row": 0, "fields": ["n"], "count": 2})).unwrap(), expected);
     assert_eq!(s.map().layer(id).unwrap().selection, vec![2]);
-    assert!(s.notices_since(mark)[0].text.starts_with("2 features aren't drawn"));
+    assert!(s.notices_since(mark).iter().any(|n| n.text.starts_with("2 features aren't drawn")));
     let l = s.map_mut().layer_mut(id).unwrap();
     l.display_filters[0].where_ = "missing = 1".into();
     l.display_filters.push(rustgis_map::effects::DisplayFilter {
@@ -54389,9 +54393,11 @@ fn resident_data_diagnostics_keep_all_rows_despite_map_filters() {
     assert_eq!(s.run("data.similar", &json!({"layer": id, "row": 0, "fields": ["n"], "count": 2})).unwrap(), expected);
     assert_eq!(s.map().layer(id).unwrap().selection, vec![0, 1, 2]);
     let notices = s.notices_since(mark);
-    assert_eq!(notices.len(), 1);
-    assert!(notices[0].text.contains("selecting without unreadable query/filter settings (2)"));
-    assert!(notices[0].text.contains("missing"));
+    assert_eq!(notices.len(), 2);
+    assert!(notices.iter().any(|n| n.text.starts_with("Candidate features skipped: 1")));
+    assert!(
+        notices.iter().any(|n| n.text.contains("selecting without unreadable query/filter settings (2)") && n.text.contains("missing"))
+    );
     assert!(held.features.shares(&s.map().layer(id).unwrap().dataset.features), "readers and selection retain shared rows");
 }
 
@@ -54572,5 +54578,235 @@ fn similar_prepared_results_require_current_inputs() {
     {
         s.statistics_need_read_ahead(true);
         assert!(s.run("data.similar", &p).unwrap_err().contains("background read queue"));
+    }
+}
+
+/// An unusable reference is an error before selection or success notices are applied.
+#[test]
+fn similar_invalid_reference_is_refused_without_selecting() {
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    let mut ds = Dataset::new("values", GeometryType::None, vec![Field::new("n", FieldType::Double)]);
+    for n in [0.0, 2.0, 10.0] {
+        ds.push(None, vec![V::Float(n)]);
+    }
+    let mut s = Session::new(Project::default());
+    let id = crate::cmd::layer::add_dataset(&mut s, ds);
+    let p = json!({"layer":id,"row":0,"fields":["n"],"count":2});
+    for value in [V::Null, V::Float(f64::NAN), V::Float(f64::INFINITY)] {
+        let l = s.map_mut().layer_mut(id).unwrap();
+        l.dataset.features[0].attrs[0] = value;
+        l.selection = vec![2];
+        let mark = s.notice_mark();
+        assert!(s.run("data.similar", &p).unwrap_err().contains("reference row needs a finite numeric value"));
+        assert_eq!(s.map().layer(id).unwrap().selection, vec![2]);
+        assert!(s.notices_since(mark).iter().all(|n| n.error));
+    }
+    s.map_mut().layer_mut(id).unwrap().dataset.features[0].attrs[0] = V::Float(0.0);
+    let mark = s.notice_mark();
+    assert_eq!(s.run("data.similar", &p).unwrap()["similar"].as_array().unwrap().len(), 2);
+    assert!(s.notices_since(mark).is_empty());
+}
+
+/// Incomplete candidates are counted even without output selection; clean inputs stay quiet.
+#[test]
+fn similar_reports_skipped_candidates() {
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    let mut ds = Dataset::new("values", GeometryType::None, vec![Field::new("n", FieldType::Double)]);
+    for value in [V::Float(0.0), V::Float(2.0), V::Null, V::Float(f64::NAN), V::Float(f64::INFINITY)] {
+        ds.push(None, vec![value]);
+    }
+    let mut s = Session::new(Project::default());
+    let id = crate::cmd::layer::add_dataset(&mut s, ds);
+    s.map_mut().layer_mut(id).unwrap().selection = vec![4];
+    let p = json!({"layer":id,"row":0,"fields":["n"],"count":4,"select":false});
+    let mark = s.notice_mark();
+    let result = s.run("data.similar", &p).unwrap();
+    assert_eq!(result["similar"].as_array().unwrap().len(), 1);
+    assert_eq!(result["similar"][0]["row"], 1);
+    assert_eq!(s.map().layer(id).unwrap().selection, vec![4]);
+    let notices = s.notices_since(mark);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].text.starts_with("Candidate features skipped: 3"));
+    for row in 2..5 {
+        s.map_mut().layer_mut(id).unwrap().dataset.features[row].attrs[0] = V::Float((row * 2) as f64);
+    }
+    let mark = s.notice_mark();
+    assert_eq!(s.run("data.similar", &p).unwrap()["similar"].as_array().unwrap().len(), 4);
+    assert!(s.notices_since(mark).is_empty());
+    assert_eq!(s.map().layer(id).unwrap().selection, vec![4]);
+}
+
+/// Query changes are checked by metadata, even if they would match identical rows; replacing
+/// the map with shared source rows also invalidates its worker. No heavy check runs inline.
+#[test]
+fn topology_prepared_queries_require_current_map_and_metadata() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Cell};
+    let mut s = Session::new(Project::default());
+    let mut ds = Dataset::new("points", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    ds.push(Some(Geometry::Point(rustgis_geom::Coord::new(1.0, 2.0))), vec![Cell::Int(1)]);
+    let id = crate::cmd::layer::add_dataset(&mut s, ds);
+    s.map_mut().layer_mut(id).unwrap().definition_query = Some("n >= 0".into());
+    s.run("topology.rules", &json!({"add":{"rule":"mustNotSelfIntersect","layer":"points"}})).unwrap();
+    let p = json!({});
+    let read = read_ahead(&mut s, "topology.validate", &p).unwrap().run(&Control::stoppable()).unwrap();
+    s.map_mut().layer_mut(id).unwrap().definition_query = Some("n >= -1".into());
+    assert!(read_land(&mut s, read).unwrap_err().contains("changed while"));
+    assert!(s.topology_errors.is_empty());
+    let read = read_ahead(&mut s, "topology.validate", &p).unwrap().run(&Control::stoppable()).unwrap();
+    let original = s.map().layer(id).unwrap().dataset.clone();
+    let rules = s.map().editing.topology.clone();
+    let mut replacement = Project::default();
+    let next = replacement.map_mut().add_dataset(original);
+    replacement.map_mut().layer_mut(next).unwrap().definition_query = Some("n >= -1".into());
+    replacement.map_mut().editing.topology = rules;
+    s.project = replacement;
+    assert!(read_land(&mut s, read).is_err(), "a replacement map must not take the original map's result");
+    assert!(s.topology_errors.is_empty());
+    assert_eq!(s.run("topology.validate", &p).unwrap()["errors"], 0, "an immediate retry succeeds");
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        s.statistics_need_read_ahead(true);
+        assert!(s.run("topology.validate", &p).unwrap_err().contains("background read queue"));
+        let read = read_ahead(&mut s, "topology.validate", &p).unwrap().run(&Control::stoppable()).unwrap();
+        assert_eq!(read_land(&mut s, read).unwrap()["errors"], 0);
+        let mut empty = Session::new(Project::default());
+        empty.statistics_need_read_ahead(true);
+        assert_eq!(empty.run("topology.validate", &p).unwrap()["errors"], 0, "no rules needs no worker");
+    }
+}
+
+/// Small shared fixture for queued ranking, script replay and retained-reader regressions.
+fn similar_lifecycle_session() -> (Session, u32) {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let mut ds = Dataset::new("values", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    for n in [0, 2, 10] {
+        ds.push(Some(Geometry::Point(rustgis_geom::Coord::new(n as f64, 0.0))), vec![V::Int(n)]);
+    }
+    let mut s = Session::new(Project::default());
+    let id = crate::cmd::layer::add_dataset(&mut s, ds);
+    (s, id)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_script_replays_similar_and_topology_before_the_following_line() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    let (mut s, id) = similar_lifecycle_session();
+    s.run("topology.rules", &json!({"add":{"rule":"mustNotSelfIntersect","layer":"values"}})).unwrap();
+    s.run("select.rows", &json!({"layer":id,"rows":[0]})).unwrap();
+    s.statistics_need_read_ahead(true);
+    let depth = s.undo_depth();
+    let p = json!({"script": concat!(
+        "topology.validate {}\n",
+        "data.similar {\"layer\":\"values\",\"fields\":[\"n\"],\"count\":1}\n",
+        "select.layerFromSelection {\"layer\":\"values\"}"
+    )});
+    let read = read_ahead(&mut s, "script.run", &p).unwrap();
+    assert!(read.reads());
+    let read = read.run(&Control::stoppable()).unwrap();
+    assert!(s.map().layer(id).unwrap().selection == vec![0], "the worker cannot change live selection");
+    let answer = read_land(&mut s, read).unwrap();
+    assert_eq!(answer["ran"][0]["result"]["errors"], 0);
+    assert_eq!(answer["ran"][1]["result"]["similar"][0]["row"], 1);
+    let made = answer["ran"][2]["result"]["layer"].as_u64().unwrap() as u32;
+    let rows = &s.map().layer(made).unwrap().dataset;
+    assert_eq!(rows.features.len(), 2);
+    assert_eq!((rows.value(0, 0), rows.value(1, 0)), (&rustgis_data::Value::Int(0), &rustgis_data::Value::Int(2)));
+    assert_eq!(s.undo_depth(), depth + 1);
+    assert!(s.read_ahead.is_none() && s.tools_ahead.is_none());
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert!(s.map().layer(made).is_none());
+    assert_eq!(s.map().layer(id).unwrap().selection, vec![0]);
+}
+
+#[test]
+fn similar_zoom_keeps_results_until_the_active_filter_set_changes() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    for case in 0..3 {
+        let (mut s, id) = similar_lifecycle_session();
+        s.run("map.setScale", &json!({"scale":1_000_000})).unwrap();
+        if case > 0 {
+            s.map_mut().layer_mut(id).unwrap().display_filters.push(rustgis_map::effects::DisplayFilter {
+                name: "active".into(),
+                min_scale: None,
+                max_scale: Some(if case == 1 { 200_000.0 } else { 750_000.0 }),
+                where_: "n >= 2".into(),
+            });
+        }
+        let p = json!({"layer":id,"row":0,"fields":["n"],"count":2});
+        let read = read_ahead(&mut s, "data.similar", &p).unwrap().run(&Control::stoppable()).unwrap();
+        s.run("map.setScale", &json!({"scale":500_000})).unwrap();
+        let answer = read_land(&mut s, read);
+        if case == 2 {
+            assert!(answer.unwrap_err().contains("changed while"));
+            assert!(s.map().layer(id).unwrap().selection.is_empty());
+        } else {
+            assert_eq!(answer.unwrap()["similar"].as_array().unwrap().len(), 2);
+            assert_eq!(s.map().layer(id).unwrap().selection, if case == 0 { vec![0, 1, 2] } else { vec![1, 2] });
+            assert!(!s.notices.iter().any(|n| n.text.contains("without replacing the current selection")));
+        }
+    }
+}
+
+#[test]
+fn prepared_similar_preserves_newer_selection_on_any_layer() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    for elsewhere in [false, true] {
+        let (mut s, id) = similar_lifecycle_session();
+        let another = s.map().layer(id).unwrap().dataset.clone();
+        let other = crate::cmd::layer::add_dataset(&mut s, another);
+        s.run("select.rows", &json!({"layer":id,"rows":[0]})).unwrap();
+        // Explicit reference means a later selection changes output intent, not the ranking.
+        let p = json!({"layer":id,"row":0,"fields":["n"],"count":1});
+        let read = read_ahead(&mut s, "data.similar", &p).unwrap().run(&Control::stoppable()).unwrap();
+        let changed = if elsewhere { other } else { id };
+        s.run("select.rows", &json!({"layer":changed,"rows":[2],"mode":"add"})).unwrap();
+        // Add/Remove exercise the in-place selection mutation that pointer/length snapshots miss.
+        s.run("select.rows", &json!({"layer":changed,"rows":[2],"mode":"remove"})).unwrap();
+        let selections: Vec<_> = s.map().layers.iter().map(|l| (l.id, l.selection.clone())).collect();
+        let mark = s.notice_mark();
+        assert_eq!(read_land(&mut s, read).unwrap()["similar"][0]["row"], 1);
+        assert_eq!(s.map().layers.iter().map(|l| (l.id, l.selection.clone())).collect::<Vec<_>>(), selections);
+        assert!(s.notices_since(mark).iter().any(|n| n.text.contains("without replacing the current selection")));
+    }
+}
+
+#[test]
+fn queued_similar_and_topology_snapshots_are_charged_until_drop_or_cancel() {
+    use crate::cmd::reads::read_ahead;
+    use rustgis_analysis::control::Control;
+    for topology in [false, true] {
+        let (mut s, id) = similar_lifecycle_session();
+        if topology {
+            s.run("topology.rules", &json!({"add":{"rule":"mustNotSelfIntersect","layer":"values"}})).unwrap();
+        }
+        s.undo_memory.memory = None;
+        let old = s.map().layer(id).unwrap().dataset.features.clone();
+        let old_size = s.undo_memory.rows_bytes(&old);
+        let (command, p) = if topology {
+            ("topology.validate", json!({}))
+        } else {
+            ("data.similar", json!({"layer":id,"row":0,"fields":["n"],"select":false}))
+        };
+        let first = read_ahead(&mut s, command, &p).unwrap();
+        let second = read_ahead(&mut s, command, &p).unwrap();
+        drop(old);
+        s.run("edit.setValue", &json!({"layer":id,"row":0,"field":"n","value":42})).unwrap();
+        s.clear_history();
+        let mut live_only = crate::undo_memory::Budget::default();
+        let current = live_only.held(&s.project, &[], &[]);
+        assert_eq!(s.undo_memory.held(&s.project, &[], &[]), current + old_size);
+        drop(first);
+        assert_eq!(s.undo_memory.held(&s.project, &[], &[]), current + old_size);
+        drop(second);
+        assert_eq!(s.undo_memory.held(&s.project, &[], &[]), current);
+        let queued = read_ahead(&mut s, command, &p).unwrap();
+        assert!(queued.run(&Control::cancelled_once_started()).is_err());
+        assert_eq!(s.undo_memory.held(&s.project, &[], &[]), current);
     }
 }

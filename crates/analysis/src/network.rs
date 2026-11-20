@@ -756,11 +756,19 @@ pub fn profile_fields(ds: &Dataset) -> Vec<FieldProfile> {
         .collect()
 }
 
+/// Ranked rows and the count of other resident rows lacking a finite value in every
+/// compared field. Per-field standardization still uses every finite value in that field.
+#[derive(Debug)]
+pub struct Similarity {
+    pub matches: Vec<(usize, f64)>,
+    pub skipped: usize,
+}
+
 /// Rows ranked by how close their numeric attributes are to a row's (z-scored Euclidean
 /// distance over `fields`), nearest first, excluding the row itself. Counts progress and checks
 /// Cancel between rows and within wide vectors. The stable library sort is one indivisible step,
 /// checked immediately before and after; equal-distance rows keep their original order.
-pub fn similar(ds: &Dataset, row: usize, fields: &[usize], n: usize) -> Result<Vec<(usize, f64)>, String> {
+pub fn similar(ds: &Dataset, row: usize, fields: &[usize], n: usize) -> Result<Similarity, String> {
     use crate::control;
     control::begin(ds.features.len().saturating_mul(fields.len().saturating_mul(3).saturating_add(1)));
     let mut stats = Vec::with_capacity(fields.len());
@@ -810,17 +818,19 @@ pub fn similar(ds: &Dataset, row: usize, fields: &[usize], n: usize) -> Result<V
             .collect()
     };
     let Some(target) = vec_of(row)? else {
-        control::finish();
-        return Ok(Vec::new());
+        return Err("the reference row needs a finite numeric value in every compared field".into());
     };
     let mut distance_pace = control::Pace::default();
     let mut out = Vec::new();
+    let mut skipped = 0;
     for r in 0..ds.features.len() {
         control::check()?;
         control::advance(1);
-        if r != row
-            && let Some(v) = vec_of(r)?
-        {
+        if r != row {
+            let Some(v) = vec_of(r)? else {
+                skipped += 1;
+                continue;
+            };
             let distance = v
                 .iter()
                 .zip(&target)
@@ -840,7 +850,7 @@ pub fn similar(ds: &Dataset, row: usize, fields: &[usize], n: usize) -> Result<V
     control::check()?;
     out.truncate(n);
     control::finish();
-    Ok(out)
+    Ok(Similarity { matches: out, skipped })
 }
 
 fn radius_scale(at: Coord) -> f64 {
@@ -1552,7 +1562,7 @@ mod tests {
         let p = profile_fields(&ds);
         assert_eq!((p[0].min, p[0].max, p[0].distinct), (Some(1.0), Some(5.0), 2));
         let sim = similar(&ds, 0, &[0], 2).unwrap();
-        assert_eq!(sim[0].0, 1);
+        assert_eq!(sim.matches[0].0, 1);
         let near = within(&ds, &rows, Coord::new(0.5, 0.001), 500.0);
         assert_eq!(near.first().map(|x| x.0), Some(0));
     }

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::notice_text::NoticeText;
 use crate::{CmdResult, Session};
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Target {
     id: u32,
     row: usize,
@@ -18,15 +18,15 @@ struct Target {
 }
 
 /// The map filters affecting output selection, independently of the ranking population.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Visibility {
     query: Option<String>,
     filters: Vec<DisplayFilter>,
     time: Option<(String, Option<(f64, f64)>)>,
-    scale: f64,
 }
 
 /// Captures only this layer's metadata and shared row storage, never a project/session copy.
+#[derive(Clone)]
 struct Input {
     target: Target,
     opened: u64,
@@ -35,6 +35,8 @@ struct Input {
     name: String,
     data: Dataset,
     visibility: Option<Visibility>,
+    selection_generation: u64,
+    _retained: crate::undo_memory::ReadRows,
 }
 
 impl Input {
@@ -58,9 +60,8 @@ impl Input {
         let select = super::b(p, "select").unwrap_or(true);
         let visibility = select.then(|| Visibility {
             query: l.definition_query.clone(),
-            filters: l.display_filters.clone(),
+            filters: l.display_filters.iter().filter(|filter| filter.applies(s.scale())).cloned().collect(),
             time: l.time.as_ref().map(|t| (t.field.clone(), t.window)),
-            scale: s.scale(),
         });
         Ok(Self {
             target: Target { id, row, fields, count, select },
@@ -70,6 +71,8 @@ impl Input {
             name: l.name.clone(),
             data: l.dataset.clone(),
             visibility,
+            selection_generation: s.selection_generation,
+            _retained: s.undo_memory.readers().retain(vec![l.dataset.features.allocation_key()]),
         })
     }
 
@@ -88,12 +91,14 @@ impl Input {
     }
 }
 
+#[derive(Clone)]
 struct Done {
     answer: Value,
     selection: Option<Vec<usize>>,
     notices: Vec<NoticeText>,
 }
 
+#[derive(Clone)]
 struct Ahead {
     input: Input,
     done: Result<Done, String>,
@@ -101,11 +106,16 @@ struct Ahead {
 
 /// Filters the bounded result/reference rows with cancellation, without a layer-wide mask.
 fn keep(rows: Vec<usize>, mut matches: impl FnMut(usize) -> bool) -> Result<Vec<usize>, String> {
+    try_keep(rows, |row| Ok(matches(row)))
+}
+
+/// Filters bounded result rows while preserving predicate errors, including cancellation.
+fn try_keep(rows: Vec<usize>, mut matches: impl FnMut(usize) -> Result<bool, String>) -> Result<Vec<usize>, String> {
     rustgis_data::progress::begin(rows.len());
     let mut kept = Vec::with_capacity(rows.len());
     for row in rows {
         rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
-        if matches(row) {
+        if matches(row)? {
             kept.push(row);
         }
     }
@@ -113,14 +123,22 @@ fn keep(rows: Vec<usize>, mut matches: impl FnMut(usize) -> bool) -> Result<Vec<
 }
 
 /// Computes rankings and output intent without mutating the session. Ranking checks Cancel in
-/// its loops; expression evaluation of one candidate and a time binding's initial mask fill are
-/// indivisible library steps, checked before/after. A detached time cache cannot lock the live
-/// window's cache. Only the at-most-1,001 result/reference rows need query/filter evaluation.
+/// its loops; expression evaluation of one candidate is indivisible, checked before/after.
+/// Time detection checks Cancel and keeps no layer-wide timestamp or visibility cache. Only
+/// the at-most-1,001 result/reference rows need query/filter/time evaluation.
 fn gather(input: &Input) -> Result<Done, String> {
     let t = &input.target;
-    let found = rustgis_analysis::network::similar(&input.data, t.row, &t.fields, t.count)?;
+    let ranked = rustgis_analysis::network::similar(&input.data, t.row, &t.fields, t.count)?;
+    let mut notices = Vec::new();
+    if ranked.skipped > 0 {
+        notices.push(NoticeText::format(
+            "Candidate features skipped: {count} on {layer} (missing or non-finite compared values)",
+            [("count", ranked.skipped.to_string().into()), ("layer", input.name.clone().into())],
+        ));
+    }
+    let found = ranked.matches;
     let answer = json!({"similar": found.iter().map(|(r, d)| json!({"row": r, "distance": d})).collect::<Vec<_>>()});
-    let Some(v) = &input.visibility else { return Ok(Done { answer, selection: None, notices: Vec::new() }) };
+    let Some(v) = &input.visibility else { return Ok(Done { answer, selection: None, notices }) };
     let mut rows: Vec<usize> = found.iter().map(|(r, _)| *r).collect();
     rows.push(t.row);
     let matched = rows.len();
@@ -138,22 +156,16 @@ fn gather(input: &Input) -> Result<Done, String> {
         Err(e) => error(e),
     }
     if let Some((field, Some(window))) = &v.time {
-        let mut time = rustgis_map::time::TimeBinding::new(field);
-        time.window = Some(*window);
-        let mask = time.keeps(&input.data);
-        rustgis_data::progress::check().map_err(|e| e.to_string())?;
-        if let Some(mask) = mask {
-            rows = keep(rows, |r| mask.get(r) == Some(&true))?;
-        }
+        let time = rustgis_map::time::candidate_window(&input.data, field, *window).map_err(|e| e.to_string())?;
+        rows = try_keep(rows, |row| time.keeps(row).map_err(|e| e.to_string()))?;
     }
-    for filter in v.filters.iter().filter(|f| f.applies(v.scale)) {
+    for filter in &v.filters {
         rustgis_data::progress::check().map_err(|e| e.to_string())?;
         match query::parse_fields(&filter.where_, &input.data) {
             Ok(q) => rows = keep(rows, |r| query::matches(&q, &input.data, r, &query::Env::default()))?,
             Err(e) => error(e),
         }
     }
-    let mut notices = Vec::new();
     if let Some(error) = first {
         notices.push(NoticeText::format(
             "{layer}: selecting without unreadable query/filter settings ({count}). First parser error: {error}",
@@ -189,16 +201,35 @@ pub(super) fn run(s: &mut Session, p: &Value) -> CmdResult {
     let input = Input::resolve(s, p)?;
     let ahead = super::reads::take::<Ahead>(s, "data.similar");
     #[cfg(not(target_arch = "wasm32"))]
+    let ahead = match ahead {
+        Some(ahead) => Some(ahead),
+        None => super::gp::take_read::<Ahead>(s, "data.similar", p)?,
+    };
+    #[cfg(not(target_arch = "wasm32"))]
     if ahead.is_none() && s.statistics_window_thread == Some(std::thread::current().id()) {
         return Err("Similarity needs the desktop background read queue; run Find Similar or a direct MCP data.similar request".into());
     }
-    let done = match ahead {
-        Some(a) if a.input.same(&input) => a.done?,
+    let (done, selection_generation) = match ahead {
+        Some(a) if a.input.same(&input) => (a.done, a.input.selection_generation),
         Some(_) => return Err("the layer, reference or map filters changed while similarity was computed: ask again".into()),
-        None => gather(&input)?,
+        None => (gather(&input), input.selection_generation),
     };
+    #[cfg(not(target_arch = "wasm32"))]
+    if matches!(s.tools_ahead, Some(super::gp::Ahead::Recording(_))) {
+        super::gp::record_read(s, "data.similar", p, Ahead { input: input.clone(), done: done.clone() });
+    }
+    let done = done?;
     if let Some(rows) = done.selection {
-        super::select::set(s, input.target.id, rows, super::select::Mode::New);
+        if selection_generation == s.selection_generation {
+            super::select::set(s, input.target.id, rows, super::select::Mode::New);
+        } else {
+            s.notify_text(
+                NoticeText::term(
+                    "Selection changed while similarity was computed; its ranking is returned without replacing the current selection",
+                ),
+                false,
+            );
+        }
     }
     for notice in done.notices {
         s.notify_text(notice, false);

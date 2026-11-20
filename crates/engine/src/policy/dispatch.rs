@@ -123,15 +123,21 @@ impl Session {
         }
         let CallKind::Command { id, params } = &call.kind else {
             return Err(
-                "only standalone archive, column-statistics, similarity, shape-conversion or size-by-field commands can prepare a scoped read".into()
+                "only standalone archive, column-statistics, similarity, topology, shape-conversion or size-by-field commands can prepare a scoped read".into()
             );
         };
         if !matches!(
             id.as_str(),
-            "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "data.similar" | "edit.previewShapeConversion" | "layer.sizeBy"
+            "map.reloadTiles"
+                | "map.repairTiles"
+                | "table.statistics"
+                | "data.similar"
+                | "topology.validate"
+                | "edit.previewShapeConversion"
+                | "layer.sizeBy"
         ) {
             return Err(
-                "only standalone archive, column-statistics, similarity, shape-conversion or size-by-field commands can prepare a scoped read".into()
+                "only standalone archive, column-statistics, similarity, topology, shape-conversion or size-by-field commands can prepare a scoped read".into()
             );
         }
         let capture = |s: &mut Session| s.capture_read(id, params);
@@ -979,6 +985,11 @@ impl Session {
                     Txn::Shared => run(self),
                 };
                 self.url_completion_landed(spec.id, &params, &result);
+                if result.is_ok() && spec.mutates {
+                    // Some edits replace selections without going through select::set. A pending
+                    // read must preserve the later intent, even when this edit touched another layer.
+                    self.selection_generation = self.selection_generation.wrapping_add(1);
+                }
                 result
             }
         }

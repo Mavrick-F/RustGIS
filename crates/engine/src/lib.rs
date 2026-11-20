@@ -787,6 +787,9 @@ pub struct Session {
     pub registry: Registry,
     /// Bumped on every change so views can cache.
     pub revision: u64,
+    /// Runtime selection intent, including changes on other layers that a new selection clears.
+    /// Mutation dispatch conservatively advances it too; view-only commands leave it alone.
+    pub(crate) selection_generation: u64,
     /// Bumped each time another project replaces this one (new, open, sample, template), however
     /// the command came (the app, an agent, a script): the interface drops what it kept for the
     /// old one.
@@ -1307,6 +1310,7 @@ impl Session {
             layout_arrangements: serde_json::Map::new(),
             registry: Registry { commands: cmd::all() },
             revision: 1,
+            selection_generation: 0,
             opened: 0,
             exchange: None,
             tool: Tool::Explore,
