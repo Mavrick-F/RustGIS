@@ -39,8 +39,7 @@ pub fn commands() -> Vec<C> {
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"layer"?, "rows": [number], "mode"?}"#),
         C::new("select.clear", "Clear", "Home › Selection", |s, _| {
-            s.map_mut().clear_selection();
-            s.selection_generation = s.selection_generation.wrapping_add(1);
+            clear(s);
             Ok(Value::Null)
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_selection),
@@ -122,6 +121,12 @@ fn area_mode(p: &Value) -> Result<Mode, String> {
         Some(Value::String(m)) if m.eq_ignore_ascii_case("remove") => Ok(Mode::Remove),
         _ => Err("mode must be new, add or remove".into()),
     }
+}
+
+/// Records an external clear without a command/Undo step, as pop-up browsing requires.
+pub fn clear(s: &mut Session) {
+    s.map_mut().clear_selection();
+    s.selection_generation = s.selection_generation.wrapping_add(1);
 }
 
 /// Applies a selection to one layer (New clears the others too, like desktop GIS).

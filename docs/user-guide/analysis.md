@@ -1497,6 +1497,8 @@ the completed ranking appears in the Workflows pane. A changed layer, reference 
 invalidates the result. Zooming without changing which display filters apply does not invalidate it.
 If you change selection while an explicit-reference request runs, its ranking still returns but it
 does not replace the newer selection.
+An older result also preserves selection applied by a newer Similar request. Earlier completions
+do not prevent later queued requests from selecting their own results.
 The reference must have a finite numeric value in every compared field; otherwise the command
 refuses without changing selection. Other incomplete candidate rows are skipped with one count,
 including when `select: false`. Standardization still uses each field's finite resident values.

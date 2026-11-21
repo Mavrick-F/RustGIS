@@ -826,6 +826,7 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
     let extensions = s.extensions().clone();
     let (view_size, active_layer, opened, p) = (s.view_size, s.active_layer, s.opened, p.clone());
     let selection_generation = s.selection_generation;
+    let (similar_sequence, similar_selected) = (s.similar_sequence.clone(), s.similar_selected);
     // What its tools ask of servers and files goes in this session's Diagnostics, as when they
     // run here: the run here takes their results and asks nothing.
     let requests = s.diagnostics.capture();
@@ -838,6 +839,8 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
         copy.active_layer = active_layer;
         copy.opened = opened;
         copy.selection_generation = selection_generation;
+        copy.similar_sequence = similar_sequence;
+        copy.similar_selected = similar_selected;
         // The copy shares this session's rows, which this session already counts in what the
         // process holds (#2431): it neither measures nor adds them again.
         copy.undo_memory.memory = None;
