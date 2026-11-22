@@ -29,7 +29,7 @@ const BASEMAPS: &str = "basemaps";
 /// The folder of a field package that holds its features' photos.
 const PHOTOS: &str = "photos";
 /// What an offline area's map is called after: `<area> (offline)`.
-pub(crate) const OFFLINE: &str = " (offline)";
+pub const OFFLINE: &str = " (offline)";
 /// The most bytes read from one field package's entries when it is opened.
 const MOST_UNPACKED: usize = rustgis_data::zip::MAX_TOTAL;
 /// Optional information for the crew. Older readers extract it like any other companion file.
@@ -328,6 +328,8 @@ fn build_package(s: &mut Session, p: &Value, notes: &mut Vec<String>) -> Result<
     }
     let mut project = crate::project::Project::new(area.clone());
     project.field_origin = origin;
+    // New layers made in the field are held in the home project's system, as at home.
+    (project.coordinate_system, project.crs_from_first_layer) = (s.project.coordinate_system, s.project.crs_from_first_layer);
     // The package has no home offline areas and carries its association in field_origin.
     map.offline_area_id = None;
     let mut copied = Vec::new();

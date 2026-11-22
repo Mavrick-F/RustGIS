@@ -107,10 +107,15 @@ pub const CAPABILITIES: &[&str] = &[
     NATIVE_COORDINATES,
     "layout-legend-text",
     "label-guide",
+    PROJECT_CRS,
 ];
 /// A layer or table saved in a coordinate system of its own, not longitude/latitude
 /// (`Dataset::held_in`, #2032 C2d): an older reader would read its coordinates as degrees.
 pub(crate) const NATIVE_COORDINATES: &str = "native-coordinates";
+/// A project with a coordinate system of its own, or taking one from its first layer
+/// (`Project::coordinate_system`, `Project::crs_from_first_layer`, #2032 C3a): an older reader
+/// would save it again without them.
+pub(crate) const PROJECT_CRS: &str = "project-crs";
 /// Independent marker sizes alongside classified point colours (`Layer::size_by`).
 pub(crate) const SIZE_BY_CAPABILITY: &str = "classified-point-size";
 /// The most entries a document's `requires` may list: past it the document is refused without
@@ -386,6 +391,11 @@ pub(crate) fn public_login_params(value: &serde_json::Value) -> Option<serde_jso
 #[serde(remote = "Self")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Project {
+    /// Which layers have been looked at for the project's coordinate system, and which wait for
+    /// their pixels (`crate::cmd::project::take_first_layer_system`): never saved, and kept with
+    /// the project so that Undo and a rolled-back command restore it with the layers.
+    #[serde(skip)]
+    pub(crate) first_layer: FirstLayerSeen,
     /// Read-time adjustments (labels, diagrams, layouts), consumed by the session and never saved.
     #[serde(skip)]
     pub(crate) read_notices: Vec<(ReadPart, NoticeText)>,
@@ -471,6 +481,33 @@ pub struct Project {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(with = "Vec<crate::schema::Open>"))]
     pub data_stores: Vec<crate::cmd::sharing::DataStore>,
+    /// The project's coordinate system (#2032 C3a): new maps are drawn in it, when a map can be,
+    /// and new empty layers hold their coordinates in it. Maps and layers already in the project
+    /// keep theirs. `None`: new maps in Web Mercator and new layers in longitude/latitude, as
+    /// before there was one. Saved with [`PROJECT_CRS`], which an older reader refuses rather
+    /// than saving the project again without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinate_system: Option<rustgis_data::raster::Crs>,
+    /// While the project has no coordinate system, the first layer added with one of its own
+    /// gives it its system ([`Project::coordinate_system`]). Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub crs_from_first_layer: bool,
+}
+
+/// The layers a project taking its system from the first layer added has looked at, by instance
+/// id: those looked at (each once, by the innermost step that added it), and rasters added whose
+/// pixels were still to come.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FirstLayerSeen {
+    pub(crate) considered: std::collections::HashSet<u64>,
+    pub(crate) pending: Vec<u64>,
+}
+
+impl FirstLayerSeen {
+    /// The project has a system, or doesn't take one: the rasters waiting count as looked at.
+    pub(crate) fn settle(&mut self) {
+        self.considered.extend(self.pending.drain(..));
+    }
 }
 
 /// A standalone table: a dataset without geometry, under an id that stays with it. Names can
@@ -1126,6 +1163,7 @@ impl Project {
 
     pub fn new(name: impl Into<String>) -> Self {
         Project {
+            first_layer: FirstLayerSeen::default(),
             read_notices: Vec::new(),
             format: FORMAT,
             name: name.into(),
@@ -1154,6 +1192,8 @@ impl Project {
             dl_models: Vec::new(),
             shared: Vec::new(),
             data_stores: Vec::new(),
+            coordinate_system: None,
+            crs_from_first_layer: false,
         }
     }
 
@@ -1724,14 +1764,20 @@ impl Project {
     /// peer input stays unnormalized until its slot census has rejected ambiguous identities.
     fn read_json(text: &str, restore: bool, dir: Option<&Path>, normalize: bool, map_limit: Option<usize>) -> Result<Project, String> {
         check_format(text, "project")?;
-        let mut p: Project = serde_json::from_str(text).map_err(|e| {
+        let refused = |e: serde_json::Error| {
             let msg = e.to_string();
             if msg.contains("unknown variant") {
                 format!("this project may have been saved by a newer RustGIS: {msg}. Update RustGIS to open it.")
             } else {
                 format!("not a RustGIS project: {msg}")
             }
-        })?;
+        };
+        // Keys this version doesn't read (a hand-edited file, or one another program wrote) are
+        // left out, as before, and now said: counted, a few named (#2639).
+        let mut unknown = UnknownKeys::default();
+        let mut de = serde_json::Deserializer::from_str(text);
+        let mut p: Project = serde_ignored::deserialize(&mut de, |path| unknown.add(&path.to_string())).map_err(refused)?;
+        de.end().map_err(refused)?;
         let mut area_ids = std::collections::HashSet::new();
         let mut offline_map_ids = std::collections::HashSet::new();
         if (!p.origin_id.is_empty() && !valid_field_id(&p.origin_id))
@@ -1838,6 +1884,7 @@ impl Project {
                 NoticeText::format("{n} map(s) beyond the import limit left out", [("n", excluded_maps.to_string().into())]),
             ));
         }
+        p.read_notices.extend(unknown.notices(map_limit));
         Ok(p)
     }
 
@@ -2047,7 +2094,7 @@ fn picture_names(names: &[&str]) -> NoticeText {
 }
 
 /// The part of a project a read notice is about, so an import says only what it takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ReadPart {
     AreaExpressions,
     Labels,
@@ -2059,6 +2106,79 @@ pub(crate) enum ReadPart {
     Maps,
     /// The project's other lists: reports, presentations, notebooks, models, ramps and the like.
     Items,
+}
+
+/// The most keys an unknown-keys notice names for each part; the rest are counted.
+const MAX_UNKNOWN_NAMED: usize = 3;
+
+/// The keys a project file has that this version doesn't read, by the part of the project each
+/// is in: counted, and the first few kept by their place in the file (`maps.0.layers.2.glow`).
+#[derive(Default)]
+struct UnknownKeys {
+    /// (part, map index for a key inside a map, place in the file), the first few of each part and
+    /// map.
+    named: Vec<(ReadPart, Option<usize>, String)>,
+    /// How many keys each part (and each map) has.
+    counted: std::collections::HashMap<(ReadPart, Option<usize>), usize>,
+}
+
+impl UnknownKeys {
+    /// Notes the key at `place` (serde_ignored's path, segments joined by dots).
+    fn add(&mut self, place: &str) {
+        // The header's `requires`, which `check_format` reads.
+        if place == "requires" {
+            return;
+        }
+        let mut parts = place.split('.');
+        let (part, map) = match parts.next() {
+            Some("maps") => (ReadPart::Maps, parts.next().and_then(|i| i.parse().ok())),
+            Some("layouts") => (ReadPart::Layouts, None),
+            _ => (ReadPart::Items, None),
+        };
+        // The first few of each part and map, so an import that leaves some maps out still names
+        // those of the maps it takes.
+        let seen = self.counted.entry((part, map)).or_default();
+        if *seen < MAX_UNKNOWN_NAMED {
+            // A key from the file is shown on one line of plain text: controls and directional
+            // marks flattened, as field names are.
+            let shown: String = place.chars().map(rustgis_data::io::dbf_notice_char).collect();
+            self.named.push((part, map, crate::project::short_name(&shown)));
+        }
+        *seen += 1;
+    }
+
+    /// One notice for each part with keys left out, leaving out keys in maps past `map_limit`
+    /// (an import that doesn't take those maps says nothing of them).
+    fn notices(self, map_limit: Option<usize>) -> Vec<(ReadPart, NoticeText)> {
+        let kept = |map: &Option<usize>| map_limit.is_none_or(|limit| map.is_none_or(|i| i < limit));
+        [ReadPart::Maps, ReadPart::Layouts, ReadPart::Items]
+            .into_iter()
+            .filter_map(|part| {
+                let n: usize = self.counted.iter().filter(|((p, m), _)| *p == part && kept(m)).map(|(_, n)| n).sum();
+                if n == 0 {
+                    return None;
+                }
+                let named: Vec<&str> = self
+                    .named
+                    .iter()
+                    .filter(|(p, m, _)| *p == part && kept(m))
+                    .map(|(.., place)| place.as_str())
+                    .take(MAX_UNKNOWN_NAMED)
+                    .collect();
+                let mut which = named.join(", ");
+                if n > named.len() {
+                    which = format!("{which} and {} more", n - named.len());
+                }
+                Some((
+                    part,
+                    NoticeText::format(
+                        "{n} key(s) this version doesn't read were left out (from a newer RustGIS, another program or a hand edit): {which}",
+                        [("n", n.to_string().into()), ("which", which.into())],
+                    ),
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Every part: a whole project opened.
@@ -2458,6 +2578,7 @@ impl Durable for Project {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>) {
         let Self {
+            first_layer: _,
             read_notices: _,
             format: _,
             name: _,
@@ -2486,6 +2607,8 @@ impl Durable for Project {
             dl_models: _,
             shared: _,
             data_stores: _,
+            coordinate_system: _,
+            crs_from_first_layer: _,
         } = self;
         for (i, v) in maps.iter().enumerate() {
             p.child(Owner::Map(i), v);

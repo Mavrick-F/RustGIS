@@ -7,6 +7,10 @@ use crate::{Project, Session, sample};
 mod scene_losses;
 
 #[cfg(not(target_arch = "wasm32"))]
+#[path = "tests/said_not_silent.rs"]
+mod said_not_silent;
+
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "tests/cancellation.rs"]
 mod cancellation;
 
@@ -33,6 +37,8 @@ mod write_notices;
 
 #[path = "tests/held_layers.rs"]
 mod held_layers;
+#[path = "tests/project_crs.rs"]
+mod project_crs;
 
 #[path = "tests/task_reentry.rs"]
 mod task_reentry;
@@ -1801,6 +1807,48 @@ fn a_streamed_shapefile_says_text_that_isnt_utf8_once_and_in_its_exports() {
     }
 }
 
+/// A window read twice before the notice pass (after a reset) counts its non-UTF-8 text once, not
+/// twice: the notice's "so far" count is what the layer holds.
+#[test]
+fn a_window_read_twice_before_the_notice_pass_counts_once() {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-streamed-twice-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let mut ds = Dataset::new("big5", GeometryType::Point, vec![Field::new("NAME", FieldType::Text)]);
+    for (i, text) in ["Taipei", "AAAAAAA"].into_iter().enumerate() {
+        ds.push(Some(Geometry::Point(rustgis_geom::Coord::new(i as f64, 1.0))), vec![V::Text(text.into())]);
+    }
+    let shp = dir.0.join("big5.shp");
+    rustgis_data::io::write_path(&ds, &shp).unwrap();
+    std::fs::remove_file(shp.with_extension("cpg")).unwrap();
+    let dbf = shp.with_extension("dbf");
+    let mut table = std::fs::read(&dbf).unwrap();
+    table[29] = 0;
+    let at = table.windows(7).position(|w| w == b"AAAAAAA").unwrap();
+    table[at..at + 7].copy_from_slice(b"\xbb\x4f\xa5\x5f101");
+    std::fs::write(&dbf, table).unwrap();
+    let mut s = Session::new(Project::default());
+    let added = s.run("layer.addData", &json!({"path": shp.display().to_string(), "stream": true})).unwrap();
+    let id = added["layer"].as_u64().unwrap() as u32;
+    let mark = s.notice_mark();
+    let view = rustgis_geom::Extent::new(-180.0, -90.0, 180.0, 90.0);
+    s.map_mut().sync_sources(&view, 1000.0, true);
+    // The same window again, with no notice pass between the two reads.
+    s.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap().reset();
+    s.map_mut().sync_sources(&view, 1000.0, true);
+    s.notice_landed_rasters();
+    let notes: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("valid UTF-8")).collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("1 text value isn't valid UTF-8"), "{}", notes[0]);
+}
+
 /// What the map's reads of a layer read in place lost (`Batch::notes`, here a Shapefile line left
 /// out for a NaN point under a stored box that frames the layer) is said once for its opening, not
 /// on each read of the view, and again once after the source is opened anew; a clean file says
@@ -3526,6 +3574,109 @@ fn qgis_raster_image_markers_read_their_files_from_the_style_folder() {
             eprintln!("skipped the unopenable file: it opens as this user");
         }
     }
+}
+
+/// A QGIS style's file and its raster image markers' images are read on a thread before the
+/// command lands (#2620): the landing needs neither file, says what the inline import says, can be
+/// undone, and a style read for a layer that was renamed meanwhile is refused. A cancelled read
+/// changes nothing.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn qgis_style_import_reads_its_files_ahead() {
+    use cancellation::contents;
+    use rustgis_analysis::control::Control;
+    use rustgis_map::Marker;
+    // Removed however the test ends.
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let guard = Dir(std::env::temp_dir().join(format!("rustgis-qgis-style-ahead-{}", std::process::id())));
+    let dir = guard.0.clone();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("pins")).unwrap();
+    image::RgbImage::from_pixel(8, 4, image::Rgb([200, 30, 30])).save(dir.join("pins/pin.png")).unwrap();
+    std::fs::write(dir.join("pins/pin.gif"), b"GIF89a").unwrap();
+    let qml = |files: &[&str]| {
+        let layers: String = files
+            .iter()
+            .map(|f| {
+                format!(
+                    r#"<layer class="RasterMarker" enabled="1"><Option type="Map"><Option name="imageFile" value="{f}"/><Option name="size" value="6"/></Option></layer>"#
+                )
+            })
+            .collect();
+        format!(
+            r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="1">{layers}</symbol></symbols></renderer-v2></qgis>"#
+        )
+    };
+    let notes = |r: &Value| r["notes"].as_array().unwrap().iter().map(|n| n["text"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let marker = |s: &Session| s.map().layer_by_name("Cities").unwrap().symbol(0).marker;
+    let path = dir.join("pins.qml");
+    let p = json!({"layer": "Cities", "path": path.to_string_lossy()});
+    // A clean style says nothing; a lossy one says what the inline import says, as the same notes.
+    for (files, said) in [(&["pins/pin.png"][..], 0), (&["pins/pin.gif"][..], 1)] {
+        std::fs::write(&path, qml(files)).unwrap();
+        let mut inline = world();
+        let inline_notes = notes(&inline.run("style.importQgis", &p).unwrap());
+        assert_eq!(inline_notes.len(), said, "{files:?}: {inline_notes:?}");
+        let mut s = world();
+        let before = marker(&s);
+        let ahead = crate::cmd::reads::read_ahead(&mut s, "style.importQgis", &p).unwrap();
+        assert!(ahead.reads(), "{files:?}: the style is read ahead");
+        let read = ahead.run(&Control::stoppable()).unwrap();
+        // Neither file is needed once read.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(dir.join("pins/pin.png")).unwrap();
+        let r = crate::cmd::reads::read_land(&mut s, read).unwrap();
+        assert_eq!(notes(&r), inline_notes, "{files:?}");
+        assert_eq!(marker(&s), marker(&inline), "{files:?}");
+        s.run("edit.undo", &Value::Null).unwrap();
+        assert_eq!(marker(&s), before, "{files:?}: undone");
+        image::RgbImage::from_pixel(8, 4, image::Rgb([200, 30, 30])).save(dir.join("pins/pin.png")).unwrap();
+    }
+    assert!(matches!(marker(&world()), Marker::Circle));
+    // Cancel: no change, and the read looked at Cancel.
+    std::fs::write(&path, qml(&["pins/pin.png"])).unwrap();
+    let mut s = world();
+    let before = contents(&s.project);
+    let control = Control::cancelled_once_started();
+    let e = crate::cmd::reads::read_ahead(&mut s, "style.importQgis", &p).unwrap().run(&control).err().unwrap();
+    assert!(e.contains("cancelled"), "{e}");
+    assert!(control.looked() > 0, "never looks at Cancel");
+    assert!(contents(&s.project) == before);
+    // A Cancel that comes at any check (the file's, each image's, after the parse) is the cancelled
+    // error, not a style with its image noted as skipped; read here under the same probe as well.
+    let count = Control::cancelled_at_look(u64::MAX);
+    crate::cmd::reads::read_ahead(&mut s, "style.importQgis", &p).unwrap().run(&count).unwrap();
+    assert!(count.looked() >= 3, "the file, the image and the parse's end look: {}", count.looked());
+    for n in 1..=count.looked() {
+        let e = crate::cmd::reads::read_ahead(&mut s, "style.importQgis", &p).unwrap().run(&Control::cancelled_at_look(n)).err().unwrap();
+        assert!(e.contains("cancelled"), "check {n}: {e}");
+    }
+    let here = Control::cancelled_at_look(u64::MAX);
+    {
+        let _probe = rustgis_analysis::control::install_progress(Some(here.clone()));
+        s.run("style.importQgis", &p).unwrap();
+    }
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert!(here.looked() >= 3, "read here: {}", here.looked());
+    for n in 1..=here.looked() {
+        let _probe = rustgis_analysis::control::install_progress(Some(Control::cancelled_at_look(n)));
+        let e = s.run("style.importQgis", &p).unwrap_err();
+        assert!(e.contains("cancelled"), "check {n}, read here: {e}");
+        assert!(contents(&s.project) == before, "check {n}");
+    }
+    // Renamed while it was read: refused, the layer as it was.
+    let read = crate::cmd::reads::read_ahead(&mut s, "style.importQgis", &p).unwrap().run(&Control::stoppable()).unwrap();
+    let id = s.layer_id(&p).unwrap();
+    s.run("layer.rename", &json!({"layer": id, "name": "Towns"})).unwrap();
+    let before = contents(&s.project);
+    let e = crate::cmd::reads::read_land(&mut s, read).unwrap_err();
+    assert!(e.contains("renamed while its style was read"), "{e}");
+    assert!(contents(&s.project) == before);
 }
 
 /// Pictures are charged to an import's budget (1 KiB in tests) only once placed: pictures that
@@ -7983,7 +8134,11 @@ fn labels_take_a_distance_from_the_line() {
     s.run("labels.placement", &json!({"layer": "Rivers", "lineOffset": "-2.5"})).unwrap();
     assert_eq!(class(&s).0, -2.5, "below the line");
     s.run("labels.placement", &json!({"layer": "Rivers", "lineOffset": 200})).unwrap();
-    assert!(s.notices_since(mark).is_empty(), "a distance within its range says nothing: {:?}", s.notices_since(mark));
+    // Kept on a class not placed along its line, which each call says (#2639), and nothing of its
+    // range.
+    let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert_eq!(said.len(), 3, "{said:?}");
+    assert!(said.iter().all(|t| t.starts_with("Rivers: lineOffset kept, but")), "{said:?}");
     let mark = s.notice_mark();
     s.run("labels.placement", &json!({"layer": "Rivers", "lineOffset": 1e9})).unwrap();
     assert_eq!(class(&s).0, 200.0, "within its range");
@@ -10178,10 +10333,10 @@ fn terrain_block_is_checked_kept_and_taken_off() {
     assert_eq!(v["block"]["radius_capped"], false);
     // One larger than the circle in the DEM's box (about 4453 m across) is drawn as that circle,
     // and the result says so; with none, that circle's too.
-    let v = s.run("map.terrain", &json!({"block": {"shape": "circle", "radius": 5000}})).unwrap();
+    let v = s.run("map.terrain", &json!({"block": {"extent": null, "shape": "circle", "radius": 5000}})).unwrap();
     assert_eq!(v["block"]["radius_capped"], true);
     assert!(v["block"]["radius"].as_f64().is_some_and(|r| (r - 2226.5).abs() < 2.0), "{v}");
-    let v = s.run("map.terrain", &json!({"block": {"shape": "circle"}})).unwrap();
+    let v = s.run("map.terrain", &json!({"block": {"shape": "circle", "radius": null}})).unwrap();
     assert!(v["block"]["radius"].as_f64().is_some_and(|r| (r - 2226.5).abs() < 2.0), "{v}");
     let v = s.run("map.terrain", &json!({"block": {"shape": "box"}})).unwrap();
     assert_eq!(v["block"]["shape"].as_str(), Some("box"));
@@ -10219,12 +10374,120 @@ fn terrain_block_is_checked_kept_and_taken_off() {
     assert!(e.contains("degrees"), "{e}");
     s.run("map.terrain", &json!({"tiles": "https://e.com/{z}/{x}/{y}.png", "block": {"extent": [0, 0, 1000, 1000]}})).unwrap();
     // A block on the DEM's extent left behind on a switch to tiles; one with a box kept.
-    s.run("map.terrain", &json!({"layer": dem, "block": {}})).unwrap();
+    s.run("map.terrain", &json!({"layer": dem, "block": {"extent": null}})).unwrap();
     let v = s.run("map.terrain", &json!({"tiles": "https://e.com/{z}/{x}/{y}.png"})).unwrap();
     assert!(v["block"].is_null(), "{v}");
     s.run("map.terrain", &json!({"layer": dem, "block": {"extent": inside}})).unwrap();
     let v = s.run("map.terrain", &json!({"tiles": "https://e.com/{z}/{x}/{y}.png"})).unwrap();
     assert_eq!(v["block"]["extent"], json!([1114000.0, 5622000.0, 1116000.0, 5625000.0]));
+}
+
+/// #2447: a `"block"` object changes only the keys it gives. A key left out stays as the block had
+/// it, `null` puts one back to its default, `true` keeps the block as it is, `false` takes it off.
+#[test]
+fn a_terrain_block_object_changes_only_the_keys_it_gives() {
+    use base64::Engine;
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
+    let dem = s.map().layers.iter().find(|l| l.is_raster()).map(|l| l.name.clone()).unwrap();
+    let add = |s: &mut Session, file: &str, gj: Value| {
+        let data = base64::engine::general_purpose::STANDARD.encode(gj.to_string().as_bytes());
+        s.run("layer.addDataBytes", &json!({"fileName": file, "data": data})).unwrap();
+        s.map().layers.iter().rev().find(|l| !l.is_raster()).map(|l| l.name.clone()).unwrap()
+    };
+    let ring = |x0: f64, x1: f64| json!([[[x0, 45.0], [x1, 45.0], [x1, 45.04], [x0, 45.04], [x0, 45.0]]]);
+    let one = |props: Value, ring: Value| {
+        json!({"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": props, "geometry": {"type": "Polygon", "coordinates": ring}}]})
+    };
+    let geo = add(&mut s, "geologia.geojson", one(json!({"unidade": "granito"}), ring(10.0, 10.02)));
+    let lagos = add(&mut s, "lagos.geojson", one(json!({"prof": 12.0}), ring(10.02, 10.03)));
+    let inside = json!([1114000.0, 5622000.0, 1116000.0, 5625000.0]);
+    let block = |v: Value| v["block"].clone();
+    let v = s
+        .run(
+            "map.terrain",
+            &json!({"layer": dem, "water": {"layer": lagos},
+                "block": {"extent": inside, "depth": 300, "walls": {"color": "#E0D0B0", "layer": geo}}}),
+        )
+        .unwrap();
+    let walls = json!({"color": "#E0D0B0", "layer": geo});
+    assert_eq!(block(v)["water"], json!(null));
+    let first = s.map().view.terrain.clone();
+    // The water set alone leaves the box, the depth and the walls as they were.
+    let v = s.run("map.terrain", &json!({"block": {"water": {"depth": 5}}})).unwrap();
+    let b = block(v);
+    assert_eq!((&b["extent"], b["extent_from"].as_str(), &b["depth"], &b["walls"]), (&inside, Some("box"), &json!(300.0), &walls), "{b}");
+    assert_eq!(b["water"], json!({"depth": 5.0}));
+    // Undo puts the whole old block back.
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.map().view.terrain, first, "the whole old block (box, depth, walls, water) comes back");
+    let back = s.map().view.terrain.as_ref().and_then(|t| t.block.clone()).unwrap();
+    assert!(back.water.is_none() && back.depth == Some(300.0) && back.extent.is_some(), "{back:?}");
+    s.run("edit.redo", &Value::Null).unwrap();
+    // The terrain's water can't go under the block's water, and the refusal says how to take that off.
+    let before = s.map().view.terrain.clone();
+    let e = s.run("map.terrain", &json!({"water": false})).unwrap_err();
+    assert!(e.contains(r#"take the block's water off with "block": {"water": false}"#), "{e}");
+    assert_eq!(s.map().view.terrain, before);
+    // null puts a key back to its default, the rest stays.
+    let b = block(s.run("map.terrain", &json!({"block": {"depth": null}})).unwrap());
+    assert_eq!((&b["depth"], &b["extent"], &b["walls"], &b["water"]), (&json!(null), &inside, &walls, &json!({"depth": 5.0})), "{b}");
+    let b = block(s.run("map.terrain", &json!({"block": {"water": false}})).unwrap());
+    assert_eq!((&b["water"], &b["extent"]), (&json!(null), &inside));
+    // Inside the walls: a layer given keeps the colour, a colour given keeps the layer.
+    let b = block(s.run("map.terrain", &json!({"block": {"walls": {"layer": null}}})).unwrap());
+    assert_eq!(b["walls"], json!("#E0D0B0"));
+    let b = block(s.run("map.terrain", &json!({"block": {"walls": {"layer": geo}}})).unwrap());
+    assert_eq!(b["walls"], walls);
+    let b = block(s.run("map.terrain", &json!({"block": {"walls": {"color": "#806040"}}})).unwrap());
+    assert_eq!(b["walls"], json!({"color": "#806040", "layer": geo}));
+    let b = block(s.run("map.terrain", &json!({"block": {"walls": "#806040"}})).unwrap());
+    assert_eq!(b["walls"], json!("#806040"), "a plain colour takes the layer off");
+    let b = block(s.run("map.terrain", &json!({"block": {"walls": null}})).unwrap());
+    assert_eq!(b["walls"], json!("#C8B89A"));
+    // true and {} keep the block as it is.
+    let before = s.map().view.terrain.clone();
+    for keep in [json!(true), json!({})] {
+        s.run("map.terrain", &json!({"block": keep})).unwrap();
+        assert_eq!(s.map().view.terrain, before, "{keep}");
+    }
+    // A round block stays round, with its radius, while other keys change; a box drops the radius.
+    let b = block(s.run("map.terrain", &json!({"block": {"shape": "circle", "radius": 400}})).unwrap());
+    assert_eq!((b["shape"].as_str(), b["radius"].as_f64()), (Some("circle"), Some(400.0)));
+    let b = block(s.run("map.terrain", &json!({"block": {"depth": 200}})).unwrap());
+    assert_eq!((b["shape"].as_str(), b["radius"].as_f64(), b["depth"].as_f64()), (Some("circle"), Some(400.0), Some(200.0)));
+    let b = block(s.run("map.terrain", &json!({"block": {"radius": 300}})).unwrap());
+    assert_eq!(b["radius"].as_f64(), Some(300.0));
+    let b = block(s.run("map.terrain", &json!({"block": {"shape": "box"}})).unwrap());
+    assert_eq!((b["shape"].as_str(), b["radius"].is_null()), (Some("box"), true));
+    let e = s.run("map.terrain", &json!({"block": {"radius": 300}})).unwrap_err();
+    assert!(e.contains("radius is a circle's"), "{e}");
+    // The DEM's box again.
+    let b = block(s.run("map.terrain", &json!({"block": {"extent": null}})).unwrap());
+    assert_eq!(b["extent_from"].as_str(), Some("layer"));
+    // Cut to polygons: the box kept from before is dropped, the polygons kept by the keys that follow.
+    s.run("map.terrain", &json!({"block": {"extent": inside}})).unwrap();
+    let b = block(s.run("map.terrain", &json!({"block": {"shape": {"layer": geo}}})).unwrap());
+    assert_eq!(b["extent_from"].as_str(), Some("shape"), "{b}");
+    let b = block(s.run("map.terrain", &json!({"block": {"depth": 250}})).unwrap());
+    assert_eq!((&b["shape"], b["extent_from"].as_str()), (&json!({"layer": geo, "where": null}), Some("shape")), "{b}");
+    let e = s.run("map.terrain", &json!({"block": {"extent": inside}})).unwrap_err();
+    assert!(e.contains("give no extent") && e.contains("the block's shape is the one kept from before"), "{e}");
+    // A box kept from before that the DEM can't take is refused, and the refusal says it was kept.
+    s.run("map.terrain", &json!({"block": {"shape": "box"}})).unwrap();
+    if let Some(b) = s.map_mut().view.terrain.as_mut().and_then(|t| t.block.as_mut()) {
+        b.extent = Some([0.0, 0.0, 1000.0, 1000.0]);
+    }
+    let before = s.map().view.terrain.clone();
+    let e = s.run("map.terrain", &json!({"block": {"depth": 200}})).unwrap_err();
+    assert!(e.contains("the block's extent is the one kept from before"), "{e}");
+    assert_eq!(s.map().view.terrain, before);
+    s.run("map.terrain", &json!({"block": {"depth": 200, "extent": null}})).unwrap();
+    // Taken off, a block object is a new block with the defaults.
+    s.run("map.terrain", &json!({"block": false})).unwrap();
+    let b = block(s.run("map.terrain", &json!({"block": {"depth": 200}})).unwrap());
+    assert_eq!((b["extent_from"].as_str(), &b["walls"], b["depth"].as_f64()), (Some("layer"), &json!("#C8B89A"), Some(200.0)));
 }
 
 #[test]
@@ -14015,11 +14278,23 @@ fn layouts_compose_export_and_round_trip() {
     assert_eq!(indicator(&s), (Some(frame), "#D01C1C".to_string(), 2.0));
     let saved = serde_json::to_string(&s.project.layouts[0]).unwrap();
     assert!(!saved.contains("extent_color") && !saved.contains("extent_width"), "defaults aren't written");
+    let mark = s.notice_mark();
     s.run("layout.addElement", &json!({"kind": "extentIndicator", "frame": inset, "of": frame, "color": "#1F4E9A", "width": 0.75}))
         .unwrap();
     assert_eq!(indicator(&s), (Some(frame), "#1F4E9A".to_string(), 0.75));
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("held to")), "a width within range says nothing");
+    let mark = s.notice_mark();
     s.run("layout.update", &json!({"element": inset, "extentIndicator": {"width": 99}})).unwrap();
     assert_eq!(indicator(&s).2, rustgis_map::layout::MAX_INDICATOR_WIDTH, "clamped, and the colour kept");
+    // Held to its limit, and said (#2639).
+    assert!(
+        s.notices_since(mark).iter().any(|n| n.text.starts_with("Element Properties: extent indicator width 99 held to")),
+        "{:?}",
+        s.notices_since(mark)
+    );
+    let mark = s.notice_mark();
+    s.run("layout.addElement", &json!({"kind": "extentIndicator", "frame": inset, "of": frame, "width": 99})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.starts_with("Add Element: extent indicator width 99 held to")));
     assert_eq!(indicator(&s).1, "#1F4E9A");
     let saved: rustgis_map::layout::Layout = serde_json::from_str(&serde_json::to_string(&s.project.layouts[0]).unwrap()).unwrap();
     assert!(saved.element(inset as u32).is_some_and(
@@ -14055,8 +14330,10 @@ fn layouts_compose_export_and_round_trip() {
     assert_eq!(border(&s), ("#C8B89A".to_string(), 0.8), "the width kept");
     s.run("layout.update", &json!({"element": inset, "border": {"width": 0}})).unwrap();
     assert_eq!(border(&s), ("#C8B89A".to_string(), 0.0), "the colour kept");
+    let mark = s.notice_mark();
     s.run("layout.update", &json!({"element": inset, "border": {"width": 99}})).unwrap();
     assert_eq!(border(&s).1, rustgis_map::layout::MAX_FRAME_BORDER_WIDTH);
+    assert!(s.notices_since(mark).iter().any(|n| n.text.starts_with("Element Properties: border width 99 held to")));
     let saved: rustgis_map::layout::Layout = serde_json::from_str(&serde_json::to_string(&s.project.layouts[0]).unwrap()).unwrap();
     assert_eq!(saved.element(inset as u32).map(|e| &e.kind), s.project.layouts[0].element(inset as u32).map(|e| &e.kind));
     for bad in [json!({"width": "thin"}), json!({"color": 123}), json!(3), json!(false)] {
