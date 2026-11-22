@@ -1229,11 +1229,12 @@ fn finite(ps: &[P3]) -> bool {
 
 /// Whether retained, placed vertices have heights the single elevation attribute cannot hold.
 /// Compare after all object/block transforms: a placement may flatten previously varying Z.
-fn has_varying_z<'a>(mut points: impl Iterator<Item = &'a P3>, first: Option<P3>) -> bool {
+fn has_varying_z<'a>(mut points: impl Iterator<Item = &'a P3>, first: Option<P3>, placement_z: f64) -> bool {
     let Some(first) = first else { return false };
-    // Spline evaluation and placement can round equal heights differently. Allow a few ulps,
-    // relative to the heights, without imposing an absolute drawing-unit tolerance.
-    points.any(|p| (p[2] - first[2]).abs() > (64.0 * f64::EPSILON) * p[2].abs().max(first[2].abs()))
+    // Equal source heights can round differently during spline evaluation. Include the placement's
+    // Z offset so cancellation cannot collapse the comparison scale near zero.
+    let scale = first[2].abs().max(placement_z.abs());
+    points.any(|p| (p[2] - first[2]).abs() > (64.0 * f64::EPSILON) * p[2].abs().max(scale))
 }
 
 /// Draws entities through `xf` (a block's placement), into `out`.
@@ -1396,7 +1397,7 @@ fn emit(
                     ok.then(|| Geometry::Line(vec![ps.iter().map(|p| xy(*p)).collect()])),
                     ps.first().copied(),
                     1,
-                    has_varying_z(ps.iter(), ps.first().copied()),
+                    has_varying_z(ps.iter(), ps.first().copied(), xf.0[2][3]),
                 )
             }
             Shape::Polygon(ps) => {
@@ -1406,7 +1407,7 @@ fn emit(
                     ok.then(|| Geometry::Polygon(vec![vec![ps.iter().map(|p| xy(*p)).collect()]])),
                     ps.first().copied(),
                     2,
-                    has_varying_z(ps.iter(), ps.first().copied()),
+                    has_varying_z(ps.iter(), ps.first().copied(), xf.0[2][3]),
                 )
             }
             Shape::Rings(rings) => {
@@ -1426,7 +1427,7 @@ fn emit(
                 let kept = rings.iter().filter(|r| {
                     r.len() >= 4 || (e.kind != "POLYLINE" && r.len() == 3 && r.first().map(|p| xy(*p)) != r.last().map(|p| xy(*p)))
                 });
-                let varying = has_varying_z(kept.flatten(), first);
+                let varying = has_varying_z(kept.flatten(), first, xf.0[2][3]);
                 (g, first, 2, varying)
             }
             Shape::Insert(_) => continue,
@@ -2494,56 +2495,74 @@ mod tests {
         assert!(no_blocks.iter().all(|(ds, r)| !ds.zm_dropped && r.messages.iter().all(|m| !m.contains("varying Z"))));
     }
 
-    /// Rational spline evaluation rounds even when all control heights are equal.
+    /// Rational spline noise stays quiet even when a block's offsets cancel its height.
     #[test]
     fn constant_spline_height_stays_quiet() {
-        for varying in [false, true] {
-            let end = if varying { "0.1000000001" } else { "0.1" };
-            let bytes = dxf(&[
-                (0, "SECTION"),
-                (2, "ENTITIES"),
-                (0, "SPLINE"),
-                (71, "3"),
-                (40, "0"),
-                (40, "0"),
-                (40, "0"),
-                (40, "0"),
-                (40, "1"),
-                (40, "1"),
-                (40, "1"),
-                (40, "1"),
-                (41, "1"),
-                (41, "0.5"),
-                (41, "2"),
-                (41, "1"),
-                (10, "0"),
-                (20, "0"),
-                (30, "0.1"),
-                (10, "1"),
-                (20, "1"),
-                (30, "0.1"),
-                (10, "2"),
-                (20, "1"),
-                (30, "0.1"),
-                (10, "3"),
-                (20, "0"),
-                (30, end),
-                (0, "ENDSEC"),
-                (0, "EOF"),
-            ]);
-            let layers = read("spline.dxf", &bytes, &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
-            assert_eq!(layers.len(), 1);
-            let (ds, report) = &layers[0];
-            assert_eq!(ds.features.len(), 1);
-            assert_eq!(ds.value(0, 8), &Value::Float(0.1));
-            assert_eq!(ds.zm_dropped, varying, "{:?}", report.messages);
-            assert_eq!(report.skipped, 0);
-            let expected =
-                if varying { vec!["1 feature lost varying Z coordinates; only the elevation attribute is kept"] } else { vec![] };
-            assert_eq!(report.messages, expected);
-            let Some(Geometry::Line(parts)) = &ds.features[0].geometry else { panic!("spline line") };
-            assert_eq!(parts[0].first(), Some(&Coord::new(0.0, 0.0)));
-            assert_eq!(parts[0].last(), Some(&Coord::new(3.0, 0.0)));
+        for (height, changed, base, offset, elevation) in
+            [("0.1", "0.1000000001", "0", "0", 0.1), ("500.1", "500.1000000001", "500", "-0.1", 0.0)]
+        {
+            for varying in [false, true] {
+                let end = if varying { changed } else { height };
+                let bytes = dxf(&[
+                    (0, "SECTION"),
+                    (2, "BLOCKS"),
+                    (0, "BLOCK"),
+                    (2, "B"),
+                    (10, "0"),
+                    (20, "0"),
+                    (30, base),
+                    (0, "SPLINE"),
+                    (71, "3"),
+                    (40, "0"),
+                    (40, "0"),
+                    (40, "0"),
+                    (40, "0"),
+                    (40, "1"),
+                    (40, "1"),
+                    (40, "1"),
+                    (40, "1"),
+                    (41, "1"),
+                    (41, "0.5"),
+                    (41, "2"),
+                    (41, "1"),
+                    (10, "0"),
+                    (20, "0"),
+                    (30, height),
+                    (10, "1"),
+                    (20, "1"),
+                    (30, height),
+                    (10, "2"),
+                    (20, "1"),
+                    (30, height),
+                    (10, "3"),
+                    (20, "0"),
+                    (30, end),
+                    (0, "ENDBLK"),
+                    (0, "ENDSEC"),
+                    (0, "SECTION"),
+                    (2, "ENTITIES"),
+                    (0, "INSERT"),
+                    (2, "B"),
+                    (10, "0"),
+                    (20, "0"),
+                    (30, offset),
+                    (0, "ENDSEC"),
+                    (0, "EOF"),
+                ]);
+                let layers = read("spline.dxf", &bytes, &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+                assert_eq!(layers.len(), 1);
+                let (ds, report) = &layers[0];
+                assert_eq!(ds.features.len(), 1);
+                assert_eq!(ds.value(0, 8), &Value::Float(elevation));
+                assert_eq!(ds.zm_dropped, varying, "height={height}, offset={offset}: {:?}", report.messages);
+                assert_eq!(report.skipped, 0);
+                let expected =
+                    if varying { vec!["1 feature lost varying Z coordinates; only the elevation attribute is kept"] } else { vec![] };
+                assert_eq!(report.messages, expected);
+                let Some(Geometry::Line(parts)) = &ds.features[0].geometry else { panic!("spline line") };
+                assert_eq!(parts[0].first(), Some(&Coord::new(0.0, 0.0)));
+                assert_eq!(parts[0].last(), Some(&Coord::new(3.0, 0.0)));
+            }
         }
     }
 
