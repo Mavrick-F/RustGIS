@@ -926,7 +926,7 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64, linked: &mut rustgis_dat
     crate::project::ensure_map_imports_complete(&m)?;
     // After mobile_map: a hidden layer it drops isn't in the package.
     linked.extend(left_linked("Package Map", [&m]));
-    crate::project::mark_internet_only(&mut m);
+    crate::project::mark_internet_only(&mut m, false);
     let name = m.name.clone();
     // With the map file's header, so an older reader refuses what it can't draw.
     let (bytes, report) = crate::durable::output_owned(m, crate::project::map_file_bytes)?;
@@ -1834,7 +1834,7 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             crate::project::ensure_map_imports_complete(map)?;
             let mut map = embedded_map(map, &mut MAX_EMBED.clone());
             // What documents read from the internet named stays held there when the file is read.
-            crate::project::mark_internet_only(&mut map);
+            crate::project::mark_internet_only(&mut map, false);
             let name = map.name.clone();
             (name, durable_bytes_with(s, map, crate::project::map_file_bytes)?)
         }

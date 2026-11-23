@@ -4571,7 +4571,11 @@ pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     // A layer whose addresses a document read from the internet named is held there again before
     // it is read (the repair below reads it).
     if layer.internet_only {
+        let full = crate::render::rustgis_tiles::cache::public_restrictions_full();
         crate::project::apply_layer_internet_only(&layer);
+        if !full && crate::render::rustgis_tiles::cache::public_restrictions_full() {
+            s.notify(crate::project::held_full_notice(&format!("the layer '{}'", layer.name)), false);
+        }
     }
     // A fresh id and a unique name in this map; the rest goes through project repair.
     let base = layer.name.clone();

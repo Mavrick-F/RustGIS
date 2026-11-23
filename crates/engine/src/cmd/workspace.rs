@@ -388,7 +388,10 @@ pub fn commands() -> Vec<C> {
                 let mut m = a.data.clone();
                 // Its layers that documents read from the internet named are held there again
                 // before anything of the map is read.
+                let full = crate::render::rustgis_tiles::cache::public_restrictions_full();
                 crate::project::apply_internet_only(&m);
+                let filled = !full && crate::render::rustgis_tiles::cache::public_restrictions_full();
+                let area_name = a.name.clone();
                 let map_name = offline_map_name(&a.name);
                 let taken = |n: &str| s.project.maps.iter().any(|m| m.name.eq_ignore_ascii_case(n));
                 m.name = if taken(&map_name) { super::numbered(&map_name, taken) } else { map_name.clone() };
@@ -410,6 +413,9 @@ pub fn commands() -> Vec<C> {
                 }
                 s.project.maps.push(m);
                 s.project.active_map = s.project.maps.len() - 1;
+                if filled {
+                    s.notify(crate::project::held_full_notice(&format!("the offline map '{area_name}'")), false);
+                }
             }
             s.active_layer = s.map().layers.first().map(|l| l.id);
             s.zoom_to(&extent);

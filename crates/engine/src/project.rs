@@ -1744,7 +1744,11 @@ impl Project {
             // layers kept, and only as they are read from a file: a later repair (another layer
             // added) leaves an address the user has named since as theirs.
             if opened {
+                let full = crate::render::rustgis_tiles::cache::public_restrictions_full();
                 apply_internet_only(m);
+                if !full && crate::render::rustgis_tiles::cache::public_restrictions_full() {
+                    done.held_full.add(1, &m.name);
+                }
             }
             #[cfg(not(target_arch = "wasm32"))]
             for t in &mut m.tiles {
@@ -1868,8 +1872,11 @@ impl Project {
 
     /// Marks every map's layers held to the internet ([`mark_internet_only`]), before writing.
     pub(crate) fn mark_internet_only(&mut self) {
-        for map in self.maps.iter_mut().chain(self.offline_areas.iter_mut().map(|area| &mut area.data)) {
-            mark_internet_only(map);
+        for map in &mut self.maps {
+            mark_internet_only(map, false);
+        }
+        for area in &mut self.offline_areas {
+            mark_internet_only(&mut area.data, true);
         }
     }
 
@@ -2521,6 +2528,8 @@ struct Repaired {
     tile_settings: Tally,
     tiles_removed: Tally,
     tiles_over_limit: Tally,
+    /// Holding a map's layers to the internet filled the record of held addresses.
+    held_full: Tally,
     values_cut: Tally,
 }
 
@@ -2674,6 +2683,8 @@ impl Repaired {
                 vec![("limit", rustgis_map::tiles::MAX_TILE_LAYERS.to_string().into())],
             ),
         );
+        let t = &self.held_full;
+        say(ReadPart::Maps, t, message(HELD_FULL, t, vec![]));
         let t = &self.values_cut;
         say(
             ReadPart::Maps,
@@ -2961,32 +2972,50 @@ impl Durable for ModelGraph {
     }
 }
 
-/// Enforces the opening bound inside the formatter, before any destination is replaced.
+/// What is said when holding `place`'s layers to the internet fills the record of held addresses,
+/// outside a file's read (an offline area opened, a layer file added).
+pub(crate) fn held_full_notice(place: &str) -> String {
+    format!(
+        "holding {place} to the internet filled the record of addresses held there: until RustGIS is restarted, every address is held to the internet, and services on this computer or the local network can't be reached"
+    )
+}
+
+/// What is said when holding layers to the internet fills the record of held addresses: from then
+/// on every address is held there.
+pub(crate) const HELD_FULL: &str = "holding the layers whose addresses came from documents read from the internet filled the record of such addresses {when} (in {places}): until RustGIS is restarted, every address is held to the internet, and services on this computer or the local network can't be reached";
+
 /// Marks, before a map is written, each layer whose addresses this session recorded as named by a
 /// document read from the internet ([`cache::recorded_public`]), so the restriction is saved with
-/// it (`internetOnly`) and [`apply_internet_only`] puts it back when the map is read again. Only
-/// ever sets the mark: a layer marked once stays held to the internet. A layer is held or not as a
+/// it (`internetOnly`) and [`apply_internet_only`] puts it back when the map is read again. The
+/// mark follows the record: a layer the user has since pointed elsewhere, or named themselves,
+/// loses it (a map read from a file has its held layers recorded again as it is read, so they
+/// keep it). An offline area's snapshot (`sticky`), which isn't read until it is opened, keeps the
+/// mark it has. A layer is held or not as a
 /// whole, since its addresses come from one document (a tile layer's template, legends and dated
 /// steps from its capabilities or tile set; a map layer's sources from the one add): a tile layer
 /// is marked by its template's record, a map layer by any of its sources'.
 ///
 /// [`cache::recorded_public`]: crate::render::rustgis_tiles::cache::recorded_public
-pub(crate) fn mark_internet_only(map: &mut Map) {
+pub(crate) fn mark_internet_only(map: &mut Map, sticky: bool) {
     use crate::render::rustgis_tiles::cache;
     for tile in &mut map.tiles {
-        tile.internet_only |= cache::recorded_public(&tile.url);
+        tile.internet_only = (sticky && tile.internet_only) || cache::recorded_public(&tile.url);
     }
     for layer in &mut map.layers {
-        mark_layer_internet_only(layer);
+        layer.internet_only = (sticky && layer.internet_only) || layer_recorded(layer);
     }
 }
 
 /// [`mark_internet_only`] for one layer: marked when an address its source is read again from was
 /// recorded as named by a document read from the internet.
 pub(crate) fn mark_layer_internet_only(layer: &mut rustgis_map::Layer) {
-    use crate::render::rustgis_tiles::cache;
-    let recorded = layer_web_addresses(layer).any(cache::recorded_public);
-    layer.internet_only |= recorded;
+    layer.internet_only = layer_recorded(layer);
+}
+
+/// Whether any address a layer's source is read again from is recorded as named by a document read
+/// from the internet.
+fn layer_recorded(layer: &rustgis_map::Layer) -> bool {
+    layer_web_addresses(layer).any(crate::render::rustgis_tiles::cache::recorded_public)
 }
 
 /// The web addresses a layer's source is read again from (local paths left out).
@@ -3026,6 +3055,7 @@ pub(crate) fn apply_layer_internet_only(layer: &rustgis_map::Layer) {
     }
 }
 
+/// Enforces the opening bound inside the formatter, before any destination is replaced.
 fn project_text(p: &Project) -> Result<String, String> {
     let max = max_bytes();
     json_within(p, max)?.ok_or_else(|| format!("the project is too large to save (maximum {})", limit_said(max)))
@@ -3155,6 +3185,22 @@ mod internet_only_tests {
         }
         assert_eq!(dropped, 3);
         assert_eq!(ceilings(&older.to_string()), ([Reach::Local; 4], 0), "a project without the mark");
+        // The mark follows the record: an address the user names afterwards (which clears its
+        // record) is saved unmarked, and reads as theirs.
+        for a in addresses {
+            cache::restrict_to_public(a);
+        }
+        cache::allow_named(&template);
+        let (again, _) = s.project.saved_text(None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&again).unwrap();
+        let marked = |name: &str| v["maps"][0]["tiles"].as_array().unwrap().iter().any(|t| t["name"] == name && t["internetOnly"] == true);
+        assert!(!marked("Roads"), "named by the user since");
+        assert!(marked("Roads style"), "the rest stay marked");
+        forget(&addresses);
+        let reopened = Session::new(Project::from_json(&again).unwrap());
+        assert_eq!(cache::ceiling_for(&template), Reach::Local);
+        assert_eq!(cache::ceiling_for(&style), Reach::Public);
+        drop(reopened);
         // The mark only narrows: an address held to the internet stays held in a project without it.
         cache::restrict_to_public(&template);
         let s = Session::new(Project::from_json(&older.to_string()).unwrap());
