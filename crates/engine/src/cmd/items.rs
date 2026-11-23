@@ -847,8 +847,7 @@ fn package_project(s: &mut Session, notes: &mut rustgis_data::loss::Notes) -> Re
     // Offline areas are maps too, and their copies keep a streamed layer's source and the tiles.
     let linked = left_linked("Package Project", p.maps.iter().chain(p.offline_areas.iter().map(|a| &a.data)));
     // What documents read from the internet named stays held there when the package is read.
-    let held = p.mark_internet_only();
-    say_held_unmarked(s, held);
+    p.mark_internet_only().say(s);
     let name = p.name.clone();
     let readme = format!("{} — a RustGIS project package.\nOpen it with RustGIS (Project › Open), or unzip it for {}.rgis.\n", name, name);
     // The package as unzipped, the README with it, within what a zip and a project may hold.
@@ -931,7 +930,7 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64, linked: &mut rustgis_dat
     let name = m.name.clone();
     // With the map file's header, so an older reader refuses what it can't draw.
     let (bytes, mut report) = crate::durable::output_owned(m, crate::project::map_file_bytes)?;
-    report.held_unmarked = u32::try_from(held).unwrap_or(u32::MAX);
+    held.report(&mut report);
     crate::durable::notify(s, &report);
     let kind = if mobile { "mobile map package" } else { "map package" };
     let readme = format!("{} — a RustGIS {kind}.\nAdd it to a project with Data › Import.\n", name);
@@ -1836,8 +1835,7 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             crate::project::ensure_map_imports_complete(map)?;
             let mut map = embedded_map(map, &mut MAX_EMBED.clone());
             // What documents read from the internet named stays held there when the file is read.
-            let held = crate::project::mark_internet_only(&mut map);
-            say_held_unmarked(s, held);
+            crate::project::mark_internet_only(&mut map).say(s);
             let name = map.name.clone();
             (name, durable_bytes_with(s, map, crate::project::map_file_bytes)?)
         }
@@ -1848,8 +1846,7 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
                 return Err("this layer is still downloading; wait for it to finish before saving".into());
             }
             let mut layer = embed_layer(l, &mut MAX_EMBED.clone());
-            let held = crate::project::mark_layer_internet_only(&mut layer);
-            say_held_unmarked(s, usize::from(held));
+            crate::project::mark_layer_internet_only(&mut layer).say(s);
             let name = layer.name.clone();
             (name, durable_bytes_with(s, layer, crate::project::layer_file_bytes)?)
         }
@@ -1872,8 +1869,7 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
                 t.name = super::within("name", "a template's name", n, 200)?;
             }
             // What documents read from the internet named stays held there when it is used.
-            let held = t.mark_internet_only();
-            say_held_unmarked(s, held);
+            t.mark_internet_only().say(s);
             let name = t.name.clone();
             let bytes = durable_bytes(s, t)?;
             if source_references > 0 {
@@ -1976,13 +1972,6 @@ pub(crate) fn save_item(s: &mut Session, kind: &str, p: &Value) -> CmdResult {
 }
 
 /// Consumes the existing item draft, emitting losses after serialization has completed.
-/// Says how many layers held to the internet only by a full record were written without the hold.
-fn say_held_unmarked(s: &mut Session, held: usize) {
-    if held > 0 {
-        s.notify(format!("{held} {}", crate::project::HELD_UNMARKED), false);
-    }
-}
-
 fn durable_bytes<T: crate::durable::Durable + serde::Serialize>(s: &mut Session, value: T) -> Result<Vec<u8>, String> {
     durable_bytes_with(s, value, to_json)
 }

@@ -1871,10 +1871,10 @@ impl Project {
     }
 
     /// Marks every map's layers held to the internet ([`mark_internet_only`]), before writing;
-    /// returns how many are held only by a full record, and written without the hold.
-    pub(crate) fn mark_internet_only(&mut self) -> usize {
+    /// returns what that leaves to say.
+    pub(crate) fn mark_internet_only(&mut self) -> Marked {
         let maps = self.maps.iter_mut().chain(self.offline_areas.iter_mut().map(|a| &mut a.data));
-        maps.map(mark_internet_only).sum()
+        maps.map(mark_internet_only).fold(Marked::default(), Marked::add)
     }
 
     /// Writes controlled durable fields and relative paths in one guarded transaction. Live
@@ -1887,7 +1887,7 @@ impl Project {
         let unrecorded = self.bound_address_losses(false);
         let (text, mut report) = crate::durable::output_remembered(self, dir.and_then(Path::to_str), project_text)?;
         report.addresses = report.addresses.saturating_add(u32::try_from(unrecorded).unwrap_or(u32::MAX));
-        report.held_unmarked = u32::try_from(held).unwrap_or(u32::MAX);
+        held.report(&mut report);
         Ok((text, report))
     }
 
@@ -1915,7 +1915,7 @@ impl Project {
             json_within(p, max)?.ok_or_else(|| format!("the project is too large to keep a recovery copy (maximum {})", limit_said(max)))
         })?;
         report.addresses = report.addresses.saturating_add(u32::try_from(unrecorded).unwrap_or(u32::MAX));
-        report.held_unmarked = u32::try_from(held).unwrap_or(u32::MAX);
+        held.report(&mut report);
         Ok((text, report))
     }
 
@@ -2985,6 +2985,40 @@ pub(crate) fn held_full_notice(place: &str) -> String {
 /// on every address is held there.
 pub(crate) const HELD_FULL: &str = "holding the layers whose addresses came from documents read from the internet filled the record of such addresses {when} (in {places}): until RustGIS is restarted, every address is held to the internet, and services on this computer or the local network can't be reached";
 
+/// What is said when layers held to the internet as a whole are written though the user named some
+/// of their addresses, after their count.
+pub(crate) const NAMED_HELD: &str = "layer(s) were written held to the internet as a whole, though you named some of their addresses yourself: opened again, those addresses are held there too; add them again to reach them on this computer or the local network";
+
+/// What marking layers before they are written leaves to say ([`mark_internet_only`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Marked {
+    /// Held to the internet only by a full record, written unmarked ([`HELD_UNMARKED`]).
+    unmarked: usize,
+    /// Written marked though the user named some of their addresses ([`NAMED_HELD`]).
+    named: usize,
+}
+
+impl Marked {
+    fn add(self, other: Marked) -> Marked {
+        Marked { unmarked: self.unmarked.saturating_add(other.unmarked), named: self.named.saturating_add(other.named) }
+    }
+
+    /// Counts it in the output's report, which says it.
+    pub(crate) fn report(self, report: &mut crate::durable::Report) {
+        report.held_unmarked = u32::try_from(self.unmarked).unwrap_or(u32::MAX);
+        report.named_held = u32::try_from(self.named).unwrap_or(u32::MAX);
+    }
+
+    /// Says it, one notice for each kind.
+    pub(crate) fn say(self, s: &mut crate::Session) {
+        for (n, text) in [(self.unmarked, HELD_UNMARKED), (self.named, NAMED_HELD)] {
+            if n > 0 {
+                s.notify(format!("{n} {text}"), false);
+            }
+        }
+    }
+}
+
 /// What is said when layers held to the internet only by a full record are written without the
 /// hold, after their count.
 pub(crate) const HELD_UNMARKED: &str = "layer(s) held to the internet only because this session's record of such addresses is full were written without the hold: opened again, their addresses are read as your own";
@@ -2998,34 +3032,42 @@ pub(crate) const HELD_UNMARKED: &str = "layer(s) held to the internet only becau
 /// addresses come from one document (a tile layer's template, legends and dated steps from its
 /// capabilities or tile set; a map layer's sources from the one add): it is marked while any of
 /// them is recorded, so a legend a document named stays held though the user has named the
-/// template since, and the rest narrow with it.
+/// template since, and the rest narrow with it: that is said ([`NAMED_HELD`]), since the addresses
+/// the user named are held to the internet again when the map is read.
 ///
-/// Returns how many layers are held to the internet now only because the record is full (added
-/// after it filled, so nothing recorded them) and are written unmarked, for the caller to say.
+/// Returns, for the caller to say, how many layers are held to the internet now only because the
+/// record is full (added after it filled, so nothing recorded them) and are written unmarked, and
+/// how many are written marked though the user named some of their addresses.
 ///
 /// [`cache::recorded_public`]: crate::render::rustgis_tiles::cache::recorded_public
 /// [`cache::named_by_user`]: crate::render::rustgis_tiles::cache::named_by_user
-pub(crate) fn mark_internet_only(map: &mut Map) -> usize {
+pub(crate) fn mark_internet_only(map: &mut Map) -> Marked {
     use crate::render::rustgis_tiles::cache;
     let web = |a: &&str| rustgis_map::tiles::is_web(a);
-    let mut held = 0;
+    let mut marked = Marked::default();
     for tile in &mut map.tiles {
-        tile.internet_only =
-            tile.addresses().any(cache::recorded_public) || (tile.internet_only && !tile.addresses().filter(web).any(cache::named_by_user));
-        held += usize::from(held_by_full_record(tile.internet_only, tile.addresses().filter(web)));
+        let named = tile.addresses().filter(web).any(cache::named_by_user);
+        tile.internet_only = tile.addresses().any(cache::recorded_public) || (tile.internet_only && !named);
+        marked = marked.add(Marked {
+            unmarked: usize::from(held_by_full_record(tile.internet_only, tile.addresses().filter(web))),
+            named: usize::from(tile.internet_only && named),
+        });
     }
     for layer in &mut map.layers {
-        held += usize::from(mark_layer_internet_only(layer));
+        marked = marked.add(mark_layer_internet_only(layer));
     }
-    held
+    marked
 }
 
-/// [`mark_internet_only`] for one layer; true when it is held only by a full record and is written
-/// unmarked.
-pub(crate) fn mark_layer_internet_only(layer: &mut rustgis_map::Layer) -> bool {
+/// [`mark_internet_only`] for one layer.
+pub(crate) fn mark_layer_internet_only(layer: &mut rustgis_map::Layer) -> Marked {
     use crate::render::rustgis_tiles::cache;
-    layer.internet_only = layer_recorded(layer) || (layer.internet_only && !layer_web_addresses(layer).any(cache::named_by_user));
-    held_by_full_record(layer.internet_only, layer_web_addresses(layer))
+    let named = layer_web_addresses(layer).any(cache::named_by_user);
+    layer.internet_only = layer_recorded(layer) || (layer.internet_only && !named);
+    Marked {
+        unmarked: usize::from(held_by_full_record(layer.internet_only, layer_web_addresses(layer))),
+        named: usize::from(layer.internet_only && named),
+    }
 }
 
 /// Whether an unmarked layer with these web addresses is held to the internet now only because the
@@ -3218,12 +3260,16 @@ mod internet_only_tests {
             v["maps"][0]["tiles"].as_array().unwrap().iter().any(|t| t["name"] == name && t["internetOnly"] == true)
         };
         // The template named, its legend still came from the document: held whole.
+        // The template it names is held there again when reopened, and that is said.
         cache::allow_named(&template);
-        let (named_template, _) = s.project.saved_text(None).unwrap();
+        let (named_template, report) = s.project.saved_text(None).unwrap();
         assert!(marked(&named_template, "Roads"), "its legend is still the document's");
+        let said = report.notices().into_iter().filter(|n| n.contains("though you named some of their addresses")).collect::<Vec<_>>();
+        assert!(said.len() == 1 && said[0].starts_with("1 layer(s)"), "{said:?}");
         forget(&addresses);
         let reopened = Session::new(Project::from_json(&named_template).unwrap());
         assert_eq!(cache::ceiling_for(&legend), Reach::Public);
+        assert_eq!(cache::ceiling_for(&template), Reach::Public, "held as a whole");
         drop(reopened);
         // Every address of it named: saved unmarked.
         cache::restrict_to_public(&style);

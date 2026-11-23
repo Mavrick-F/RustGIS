@@ -30,6 +30,9 @@ pub struct Report {
     /// Layers held to the internet only because the session's record of such addresses is full,
     /// written without the hold ([`crate::project::HELD_UNMARKED`]).
     pub(crate) held_unmarked: u32,
+    /// Layers written held to the internet as a whole though the user named some of their
+    /// addresses ([`crate::project::NAMED_HELD`]).
+    pub(crate) named_held: u32,
 }
 
 impl Report {
@@ -76,6 +79,7 @@ impl Report {
             (self.lost, "address(es) lost their keys when a peer sent back its project; add them again in the receiving session"),
             (self.reconnect, "database source(s) from a peer require an explicit reconnect before reading"),
             (self.held_unmarked, crate::project::HELD_UNMARKED),
+            (self.named_held, crate::project::NAMED_HELD),
             (
                 self.executable_changes,
                 "credential-bearing executable field(s) changed when a peer sent back its project; supply missing values before replay",
@@ -124,6 +128,7 @@ impl Report {
         self.reconnect = self.reconnect.saturating_add(other.reconnect);
         self.numbers = self.numbers.saturating_add(other.numbers);
         self.held_unmarked = self.held_unmarked.saturating_add(other.held_unmarked);
+        self.named_held = self.named_held.saturating_add(other.named_held);
         for place in &other.number_places {
             if self.number_places.len() < 3 && !self.number_places.contains(place) {
                 self.number_places.push(place.clone());

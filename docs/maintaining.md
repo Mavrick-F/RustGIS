@@ -160,7 +160,14 @@ with both needs nothing: an older RustGIS refuses it when it runs.
 Projects, map files and layer files with a layer held to the internet (one whose addresses a
 document read from the internet named: `internetOnly` on a tile layer, `internet_only` on a map
 layer) require `internet-only`, so an older reader refuses them instead of reading the layer's
-addresses wherever their names resolve and saving the project again without the hold.
+addresses wherever their names resolve and saving the project again without the hold. The one
+exception is a layer held only because the session's record of such addresses is full (one added
+after it filled): it is written unmarked, so its file needs nothing new and opening it again
+doesn't hold it, and writing it says so.
+
+A layer is held or not as a whole: one marked because some of its addresses came from such a
+document holds every address it has when it is read, including any the user named since, and
+writing it says so.
 
 Projects, map files and layer files with a label class curved along a guide line layer
 (`labels.placement` with a `guide`) require `label-guide`, so an older reader refuses them instead
