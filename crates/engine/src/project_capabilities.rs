@@ -528,6 +528,7 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
         (layer.has_picture_markers(), "picture-markers"),
         (zarr_window(layer), "zarr-window"),
         (label_guide(layer), "label-guide"),
+        (layer.internet_only, super::INTERNET_ONLY),
         (held_natively(&layer.dataset), super::NATIVE_COORDINATES),
     ]
     .into_iter()
@@ -555,6 +556,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
     ) = (false, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
     let mut polygon = false;
     let (mut offline_area_id, mut paper, mut native, mut guided) = (false, false, false, false);
+    let mut internet_only = false;
     for map in maps {
         offline_area_id |= map.offline_area_id.is_some();
         // A blank basemap's paper colour (#2532), which an older reader would draw and save white.
@@ -580,6 +582,9 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
             // The layer a block's walls are coloured by (#2173), which an older reader would save away.
             walls_layer |= t.block.as_ref().is_some_and(|b| b.walls_layer.is_some());
         }
+        // A layer held to the internet (its addresses came from a document read from there), which
+        // an older reader would save again without the hold.
+        internet_only |= map.tiles.iter().any(|t| t.internet_only) || map.layers.iter().any(|l| l.internet_only);
         relief |= map.layers.iter().any(relief_effects);
         light |= map.layers.iter().any(relief_light);
         sized |= map.layers.iter().any(|layer| layer.size_by.is_some());
@@ -611,6 +616,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (mgrs, "graticule-mgrs"),
         (on_top, "graticule-on-top"),
         (grid_color, "graticule-color"),
+        (internet_only, super::INTERNET_ONLY),
     ]
     .into_iter()
     .filter_map(|(used, name)| used.then_some(name))

@@ -1,5 +1,8 @@
 {
   "format": 2,
+  "requires": [
+    "internet-only"
+  ],
   "name": "Internet only",
   "maps": [
     {

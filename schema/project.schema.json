@@ -1275,7 +1275,8 @@
           "layout-text-size",
           "label-guide",
           "project-crs",
-          "dggs-system"
+          "dggs-system",
+          "internet-only"
         ],
         "type": "string"
       },
@@ -1379,7 +1380,8 @@
     "layout-text-size",
     "label-guide",
     "project-crs",
-    "dggs-system"
+    "dggs-system",
+    "internet-only"
   ],
   "x-rustgis-reads-format": 2,
   "x-rustgis-writes-format": 2

@@ -846,6 +846,8 @@ fn package_project(s: &mut Session, notes: &mut rustgis_data::loss::Notes) -> Re
     }
     // Offline areas are maps too, and their copies keep a streamed layer's source and the tiles.
     let linked = left_linked("Package Project", p.maps.iter().chain(p.offline_areas.iter().map(|a| &a.data)));
+    // What documents read from the internet named stays held there when the package is read.
+    p.mark_internet_only();
     let name = p.name.clone();
     let readme = format!("{} — a RustGIS project package.\nOpen it with RustGIS (Project › Open), or unzip it for {}.rgis.\n", name, name);
     // The package as unzipped, the README with it, within what a zip and a project may hold.
@@ -924,6 +926,7 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64, linked: &mut rustgis_dat
     crate::project::ensure_map_imports_complete(&m)?;
     // After mobile_map: a hidden layer it drops isn't in the package.
     linked.extend(left_linked("Package Map", [&m]));
+    crate::project::mark_internet_only(&mut m);
     let name = m.name.clone();
     // With the map file's header, so an older reader refuses what it can't draw.
     let (bytes, report) = crate::durable::output_owned(m, crate::project::map_file_bytes)?;

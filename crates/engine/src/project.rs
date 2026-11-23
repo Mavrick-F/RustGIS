@@ -69,6 +69,9 @@ pub const FORMAT: u32 = 2;
 /// so what a later RustGIS adds to format 2, and an older one would lose, is listed there and
 /// refused by name instead.
 pub const READ_FORMAT: u32 = 2;
+/// Layers held to the internet (`internetOnly` on a tile layer, `internet_only` on a map layer): an
+/// older reader would save the project again without the hold, so it refuses the project by name.
+pub const INTERNET_ONLY: &str = "internet-only";
 /// The saved additions this RustGIS understands. Writers require only capabilities used by
 /// their payload, so a format-2 reader without them refuses instead of discarding their fields.
 pub const CAPABILITIES: &[&str] = &[
@@ -112,6 +115,7 @@ pub const CAPABILITIES: &[&str] = &[
     "label-guide",
     PROJECT_CRS,
     "dggs-system",
+    INTERNET_ONLY,
 ];
 /// An offline area keeping the versions that lost a sync or a Bring Back
 /// (`OfflineArea::conflicts`, #2468): an older reader would save it again without them.
@@ -1711,9 +1715,6 @@ impl Project {
                     false
                 }
             });
-            // Layers whose addresses a document read from the internet named are held there again,
-            // before anything below is read (a raster in place, a streamed source).
-            apply_internet_only(m);
             // GeoTIFFs read in place are raster layers (a project from before saved tile layers),
             // so they don't count toward the tile layers kept. As the project opens only: a tile
             // layer added this session stays one until the project is opened again.
@@ -1738,6 +1739,10 @@ impl Project {
             }
             done.tiles_over_limit.add(m.tiles.len().saturating_sub(rustgis_map::tiles::MAX_TILE_LAYERS), &m.name);
             m.tiles.truncate(rustgis_map::tiles::MAX_TILE_LAYERS);
+            // Layers whose addresses a document read from the internet named are held there again,
+            // before anything below is read (a raster in place, a streamed source); only the tile
+            // layers kept.
+            apply_internet_only(m);
             #[cfg(not(target_arch = "wasm32"))]
             for t in &mut m.tiles {
                 if t.error.is_none()
@@ -2957,7 +2962,10 @@ impl Durable for ModelGraph {
 /// Marks, before a map is written, each layer whose addresses this session recorded as named by a
 /// document read from the internet ([`cache::recorded_public`]), so the restriction is saved with
 /// it (`internetOnly`) and [`apply_internet_only`] puts it back when the map is read again. Only
-/// ever sets the mark: a layer marked once stays held to the internet.
+/// ever sets the mark: a layer marked once stays held to the internet. A layer is held or not as a
+/// whole, since its addresses come from one document (a tile layer's template, legends and dated
+/// steps from its capabilities or tile set; a map layer's sources from the one add): a tile layer
+/// is marked by its template's record, a map layer by any of its sources'.
 ///
 /// [`cache::recorded_public`]: crate::render::rustgis_tiles::cache::recorded_public
 pub(crate) fn mark_internet_only(map: &mut Map) {
@@ -3007,9 +3015,6 @@ pub(crate) fn apply_internet_only(map: &Map) {
 /// [`apply_internet_only`] for one layer.
 fn apply_layer_internet_only(layer: &rustgis_map::Layer) {
     use crate::render::rustgis_tiles::cache;
-    if !layer.internet_only {
-        return;
-    }
     for address in layer_web_addresses(layer) {
         cache::restrict_to_public(address);
         for (_, part) in rustgis_data::io::shapefile_part_urls(address).unwrap_or_default() {
@@ -3054,8 +3059,9 @@ mod internet_only_tests {
     use crate::{Project, Session};
     use serde_json::json;
 
-    /// The session's record of what each address may reach, as a new process has it: nothing
-    /// recorded. ([`cache::clear_public_restrictions`] would clear other tests' records too.)
+    /// The session's record of these addresses as a new process has it, as far as their reach goes
+    /// (`Local`: they are recorded as named by the user, which a hold replaces).
+    /// ([`cache::clear_public_restrictions`] would clear other tests' records too.)
     fn forget(addresses: &[&str]) {
         for a in addresses {
             cache::allow_named(a);
@@ -3099,6 +3105,18 @@ mod internet_only_tests {
             assert_eq!(cache::ceiling_for(a), Reach::Public, "{a}, as added");
         }
         let (saved, _) = s.project.saved_text(None).unwrap();
+        // Required by name: an older RustGIS refuses the project rather than saving it again
+        // without the hold; a map file and a layer file the same.
+        let requires = |v: &serde_json::Value| v["requires"].as_array().is_some_and(|r| r.iter().any(|c| c == super::INTERNET_ONLY));
+        assert!(requires(&serde_json::from_str(&saved).unwrap()), "{saved}");
+        let file = |bytes: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        assert!(requires(&file(super::map_file_bytes(s.map()).unwrap())));
+        let marked = s.map().layer(id).unwrap();
+        assert!(requires(&file(super::layer_file_bytes(marked).unwrap())));
+        // Saved with nothing held, nothing is required.
+        let mut plain = Session::new(Project::default());
+        plain.run("layer.addDataText", &json!({"fileName": "plain.geojson", "text": roads})).unwrap();
+        assert!(!requires(&serde_json::from_str(&plain.project.saved_text(None).unwrap().0).unwrap()));
         let ceilings = |text: &str| {
             forget(&addresses);
             let s = Session::new(Project::from_json(text).unwrap());
@@ -3125,6 +3143,82 @@ mod internet_only_tests {
         let s = Session::new(Project::from_json(&older.to_string()).unwrap());
         assert_eq!(cache::ceiling_for(&template), Reach::Public);
         drop(s);
+    }
+
+    /// An offline area's snapshot keeps the hold: marked when the project is written and held
+    /// again when the area is opened as a map. A project package and a map package carry the mark
+    /// too.
+    #[test]
+    fn offline_maps_and_packages_keep_the_hold() {
+        let template = "https://saved-reach-offline.example/tiles/{z}/{x}/{y}.png";
+        let mut s = Session::new(Project::default());
+        s.run("map.addTiles", &json!({"url": template, "name": "Held", "overlay": true})).unwrap();
+        cache::restrict_to_public(template);
+        let data = s.map().clone();
+        s.project.offline_areas.push(super::OfflineArea {
+            id: String::new(),
+            name: "Field".into(),
+            map: "Map".into(),
+            extent: rustgis_geom::Extent::new(0.0, 0.0, 1.0, 1.0),
+            created: 0.0,
+            synced: 0.0,
+            generation: String::new(),
+            returned: Vec::new(),
+            ids: Default::default(),
+            conflicts: Default::default(),
+            data,
+        });
+        s.map_mut().tiles.clear();
+        // Packages: the project's (its offline area's snapshot) and the map's (a held layer on it).
+        let mut packaged = Session::new(Project::from_json(&s.project.saved_text(None).unwrap().0).unwrap());
+        packaged.run("map.addTiles", &json!({"url": template, "name": "Held", "overlay": true})).unwrap();
+        cache::restrict_to_public(template);
+        for kind in ["projectPackage", "mapPackage"] {
+            let (_, bytes, _) = crate::cmd::items::item_output(&mut packaged, kind, &json!({})).unwrap();
+            let entries = rustgis_data::zip::read(&bytes).unwrap();
+            // The map's own tiles (a project's first map, or a map file's), not the snapshot's.
+            let marked = entries.iter().filter(|(name, _)| name.ends_with(".rgis") || name.ends_with(".rgismap")).any(|(_, text)| {
+                let v: serde_json::Value = serde_json::from_slice(text).unwrap_or_default();
+                let tiles = v.get("maps").and_then(|m| m.get(0)).unwrap_or(&v)["tiles"].as_array().cloned().unwrap_or_default();
+                tiles.iter().any(|t| t["name"] == "Held" && t["internetOnly"] == true)
+            });
+            assert!(marked, "{kind}: {:?}", entries.iter().map(|(n, _)| n).collect::<Vec<_>>());
+        }
+        let (saved, _) = s.project.saved_text(None).unwrap();
+        assert!(s.project.offline_areas[0].data.tiles[0].internet_only, "the snapshot is marked");
+        forget(&[template]);
+        let mut reopened = Session::new(Project::from_json(&saved).unwrap());
+        assert_eq!(cache::ceiling_for(template), Reach::Local, "a snapshot isn't read until its area is opened");
+        reopened.run("offline.open", &json!({"name": "Field"})).unwrap();
+        assert_eq!(cache::ceiling_for(template), Reach::Public, "opened as a map, it is held again");
+    }
+
+    /// Only the tile layers a project keeps are held: those past the limit, left out (and said),
+    /// record nothing.
+    #[test]
+    fn tile_layers_past_the_limit_record_nothing() {
+        let template = |i: usize| format!("https://saved-reach-limit-{i}.example/tiles/{{z}}/{{x}}/{{y}}.png");
+        let mut s = Session::new(Project::default());
+        let first = template(0);
+        s.run("map.addTiles", &json!({"url": first, "name": "Held", "overlay": true})).unwrap();
+        cache::restrict_to_public(&first);
+        let (saved, _) = s.project.saved_text(None).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        let tile = v["maps"][0]["tiles"][0].clone();
+        let mut tiles = Vec::new();
+        for i in 0..=rustgis_map::tiles::MAX_TILE_LAYERS {
+            let mut t = tile.clone();
+            t["url"] = json!(template(i));
+            t["name"] = json!(format!("Held {i}"));
+            tiles.push(t);
+        }
+        v["maps"][0]["tiles"] = json!(tiles);
+        let last = template(rustgis_map::tiles::MAX_TILE_LAYERS);
+        forget(&[first.as_str(), last.as_str()]);
+        let reopened = Session::new(Project::from_json(&v.to_string()).unwrap());
+        assert_eq!(reopened.map().tiles.len(), rustgis_map::tiles::MAX_TILE_LAYERS);
+        assert_eq!(cache::ceiling_for(&first), Reach::Public, "a kept layer is held");
+        assert_eq!(cache::ceiling_for(&last), Reach::Local, "the one left out records nothing");
     }
 
     /// The fixture project's marked WMS layer opens with its template and legend held to the

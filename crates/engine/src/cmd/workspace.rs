@@ -386,6 +386,9 @@ pub fn commands() -> Vec<C> {
                 s.project.active_map = i;
             } else {
                 let mut m = a.data.clone();
+                // Its layers that documents read from the internet named are held there again
+                // before anything of the map is read.
+                crate::project::apply_internet_only(&m);
                 let map_name = offline_map_name(&a.name);
                 let taken = |n: &str| s.project.maps.iter().any(|m| m.name.eq_ignore_ascii_case(n));
                 m.name = if taken(&map_name) { super::numbered(&map_name, taken) } else { map_name.clone() };
