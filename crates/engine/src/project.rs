@@ -2990,16 +2990,17 @@ pub(crate) const HELD_FULL: &str = "holding the layers whose addresses came from
 /// mark follows the record: a layer the user has since pointed elsewhere, or named themselves,
 /// loses it (a map read from a file has its held layers recorded again as it is read, so they
 /// keep it). An offline area's snapshot (`sticky`), which isn't read until it is opened, keeps the
-/// mark it has. A layer is held or not as a
-/// whole, since its addresses come from one document (a tile layer's template, legends and dated
-/// steps from its capabilities or tile set; a map layer's sources from the one add): a tile layer
-/// is marked by its template's record, a map layer by any of its sources'.
+/// mark it has. A layer is held or not as a whole, since its addresses come from one document (a
+/// tile layer's template, legends and dated steps from its capabilities or tile set; a map layer's
+/// sources from the one add): it is marked while any of them is recorded, so a legend a document
+/// named stays held though the user has named the template since, and the rest narrow with it.
 ///
 /// [`cache::recorded_public`]: crate::render::rustgis_tiles::cache::recorded_public
 pub(crate) fn mark_internet_only(map: &mut Map, sticky: bool) {
     use crate::render::rustgis_tiles::cache;
     for tile in &mut map.tiles {
-        tile.internet_only = (sticky && tile.internet_only) || cache::recorded_public(&tile.url);
+        tile.internet_only =
+            (sticky && tile.internet_only) || cache::recorded_public(&tile.url) || tile.addresses().any(cache::recorded_public);
     }
     for layer in &mut map.layers {
         layer.internet_only = (sticky && layer.internet_only) || layer_recorded(layer);
@@ -3190,12 +3191,25 @@ mod internet_only_tests {
         for a in addresses {
             cache::restrict_to_public(a);
         }
+        let marked = |text: &str, name: &str| {
+            let v: serde_json::Value = serde_json::from_str(text).unwrap();
+            v["maps"][0]["tiles"].as_array().unwrap().iter().any(|t| t["name"] == name && t["internetOnly"] == true)
+        };
+        // The template named, its legend still came from the document: held whole.
         cache::allow_named(&template);
+        let (named_template, _) = s.project.saved_text(None).unwrap();
+        assert!(marked(&named_template, "Roads"), "its legend is still the document's");
+        forget(&addresses);
+        let reopened = Session::new(Project::from_json(&named_template).unwrap());
+        assert_eq!(cache::ceiling_for(&legend), Reach::Public);
+        drop(reopened);
+        // Every address of it named: saved unmarked.
+        cache::restrict_to_public(&style);
+        cache::allow_named(&template);
+        cache::allow_named(&legend);
         let (again, _) = s.project.saved_text(None).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&again).unwrap();
-        let marked = |name: &str| v["maps"][0]["tiles"].as_array().unwrap().iter().any(|t| t["name"] == name && t["internetOnly"] == true);
-        assert!(!marked("Roads"), "named by the user since");
-        assert!(marked("Roads style"), "the rest stay marked");
+        assert!(!marked(&again, "Roads"), "named by the user since");
+        assert!(marked(&again, "Roads style"), "the rest stay marked");
         forget(&addresses);
         let reopened = Session::new(Project::from_json(&again).unwrap());
         assert_eq!(cache::ceiling_for(&template), Reach::Local);
