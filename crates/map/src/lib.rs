@@ -316,6 +316,12 @@ pub struct Layer {
     /// after saving and reopening the project.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub anonymous: bool,
+    /// Its source's addresses came from a document read from the internet, so they are read only
+    /// from there, including after the project is saved and opened again (the session's record of
+    /// where documents were read isn't saved). It only ever narrows what the layer reaches;
+    /// without it, a layer is read as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub internet_only: bool,
     /// Process-local identity, preserved by snapshots but never stored in a project.
     #[serde(skip, default = "next_layer_instance")]
     instance_id: u64,
@@ -572,6 +578,7 @@ impl Layer {
             synced: None,
             connection: String::new(),
             anonymous: false,
+            internet_only: false,
             projected: Default::default(),
             display: None,
             display_rejected: Vec::new(),
@@ -3741,6 +3748,7 @@ impl Layer {
             synced: _,
             connection: _,
             anonymous: _,
+            internet_only: _,
             instance_id: _,
             projected: _,
             display: _,

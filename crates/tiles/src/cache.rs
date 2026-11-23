@@ -605,6 +605,18 @@ pub fn ceiling_for(url: &str) -> crate::address::Reach {
     }
 }
 
+/// Whether [`restrict_to_public`] recorded `url` itself (or a template it matches), so a document
+/// read from the internet named it. Unlike [`ceiling_for`], a full table doesn't make this true:
+/// what is saved with a project must say what was recorded, not that the table filled up.
+pub fn recorded_public(url: &str) -> bool {
+    let base = canonical_resource(url);
+    if base.is_empty() {
+        return false;
+    }
+    let p = public_only().lock().unwrap_or_else(|e| e.into_inner());
+    p.exact.contains(base) || (!p.named_local.contains(base) && p.templates.iter().any(|tpl| tpl.matches(base)))
+}
+
 /// Resets document-origin public restrictions recorded by [`restrict_to_public`] and [`allow_named`].
 pub fn clear_public_restrictions() {
     let mut p = public_only().lock().unwrap_or_else(|e| e.into_inner());

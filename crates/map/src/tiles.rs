@@ -188,6 +188,12 @@ pub struct TileLayer {
     /// web-service login, including after saving and reopening the project.
     #[serde(default, skip_serializing_if = "is_false")]
     pub anonymous: bool,
+    /// Its addresses (template, legends, dated steps) came from a document read from the internet,
+    /// so they are fetched only from there, including after the project is saved and opened again
+    /// (the session's record of where documents were read isn't saved). It only ever narrows what
+    /// the layer reaches; without it, a layer is read as before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub internet_only: bool,
     /// Picked in the Layers pane (`map.selectTiles`), for the session only: it holds while no
     /// map layer is active (the engine's `Session::selected_tile`).
     #[serde(skip)]
@@ -416,6 +422,7 @@ impl TileLayer {
             legends: Vec::new(),
             connection: String::new(),
             anonymous: false,
+            internet_only: false,
             expanded: false,
             selected: false,
             single_image: false,
@@ -710,6 +717,7 @@ impl TileLayer {
             legends,
             connection: _,
             anonymous: _,
+            internet_only: _,
             expanded: _,
             selected: _,
             single_image: _,
@@ -727,6 +735,11 @@ impl TileLayer {
             (R::Legend(i), url.as_str(), false)
         }));
         out
+    }
+
+    /// Every address the layer keeps and fetches from: its template, dated steps and legends.
+    pub fn addresses(&self) -> impl Iterator<Item = &str> {
+        self.output_slots().into_iter().map(|(_, address, _)| address)
     }
 
     /// Resolves a fixed location, independent of the address's current spelling.

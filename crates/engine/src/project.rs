@@ -1711,6 +1711,9 @@ impl Project {
                     false
                 }
             });
+            // Layers whose addresses a document read from the internet named are held there again,
+            // before anything below is read (a raster in place, a streamed source).
+            apply_internet_only(m);
             // GeoTIFFs read in place are raster layers (a project from before saved tile layers),
             // so they don't count toward the tile layers kept. As the project opens only: a tile
             // layer added this session stays one until the project is opened again.
@@ -1855,10 +1858,18 @@ impl Project {
         }
     }
 
+    /// Marks every map's layers held to the internet ([`mark_internet_only`]), before writing.
+    pub(crate) fn mark_internet_only(&mut self) {
+        for map in self.maps.iter_mut().chain(self.offline_areas.iter_mut().map(|area| &mut area.data)) {
+            mark_internet_only(map);
+        }
+    }
+
     /// Writes controlled durable fields and relative paths in one guarded transaction. Live
     /// fields are restored on every return and native unwind; only explicit saves are remembered.
     pub fn saved_text(&mut self, dir: Option<&Path>) -> Result<(String, crate::durable::Report), String> {
         self.ensure_imports_complete()?;
+        self.mark_internet_only();
         let unrecorded = self.bound_address_losses(false);
         let (text, mut report) = crate::durable::output_remembered(self, dir.and_then(Path::to_str), project_text)?;
         report.addresses = report.addresses.saturating_add(u32::try_from(unrecorded).unwrap_or(u32::MAX));
@@ -1881,6 +1892,7 @@ impl Project {
     /// Text too large to open again is refused. Returns the text and its counted output notices.
     pub fn recovery_text_with_report(mut self) -> Result<(String, crate::durable::Report), String> {
         self.omit_pending_imports();
+        self.mark_internet_only();
         let unrecorded = self.bound_address_losses(false);
         // Refused as a recovery copy, not as a save, and never built past the limit.
         let (text, mut report) = crate::durable::output_owned(self, |p| {
@@ -2942,6 +2954,70 @@ impl Durable for ModelGraph {
 }
 
 /// Enforces the opening bound inside the formatter, before any destination is replaced.
+/// Marks, before a map is written, each layer whose addresses this session recorded as named by a
+/// document read from the internet ([`cache::recorded_public`]), so the restriction is saved with
+/// it (`internetOnly`) and [`apply_internet_only`] puts it back when the map is read again. Only
+/// ever sets the mark: a layer marked once stays held to the internet.
+///
+/// [`cache::recorded_public`]: crate::render::rustgis_tiles::cache::recorded_public
+pub(crate) fn mark_internet_only(map: &mut Map) {
+    use crate::render::rustgis_tiles::cache;
+    for tile in &mut map.tiles {
+        tile.internet_only |= cache::recorded_public(&tile.url);
+    }
+    for layer in &mut map.layers {
+        mark_layer_internet_only(layer);
+    }
+}
+
+/// [`mark_internet_only`] for one layer: marked when an address its source is read again from was
+/// recorded as named by a document read from the internet.
+pub(crate) fn mark_layer_internet_only(layer: &mut rustgis_map::Layer) {
+    use crate::render::rustgis_tiles::cache;
+    let recorded = layer_web_addresses(layer).any(cache::recorded_public);
+    layer.internet_only |= recorded;
+}
+
+/// The web addresses a layer's source is read again from (local paths left out).
+fn layer_web_addresses(layer: &rustgis_map::Layer) -> impl Iterator<Item = &str> {
+    layer.output_slots().into_iter().filter(|(_, v, _, local)| !local && rustgis_map::tiles::is_web(v)).map(|(_, v, _, _)| v)
+}
+
+/// Holds the addresses of every layer of `map` marked `internetOnly` to the internet
+/// ([`cache::restrict_to_public`]), as when they were added: a project or map file read again keeps
+/// what its documents named on the internet, however their names resolve now. The mark comes from
+/// the file, which is untrusted input, and can only narrow what a layer reaches; a layer without
+/// it is read as before. Per layer it records its template, dated steps and legends (a tile layer:
+/// at most 1 + [`MAX_TIME_URLS`](rustgis_map::tiles::MAX_TIME_URLS) + 16), or its source addresses
+/// and a Shapefile's parts (a map layer: at most 3 + 4).
+///
+/// [`cache::restrict_to_public`]: crate::render::rustgis_tiles::cache::restrict_to_public
+pub(crate) fn apply_internet_only(map: &Map) {
+    use crate::render::rustgis_tiles::cache;
+    for tile in map.tiles.iter().filter(|t| t.internet_only) {
+        for address in tile.addresses().filter(|a| rustgis_map::tiles::is_web(a)) {
+            cache::restrict_to_public(address);
+        }
+    }
+    for layer in map.layers.iter().filter(|l| l.internet_only) {
+        apply_layer_internet_only(layer);
+    }
+}
+
+/// [`apply_internet_only`] for one layer.
+fn apply_layer_internet_only(layer: &rustgis_map::Layer) {
+    use crate::render::rustgis_tiles::cache;
+    if !layer.internet_only {
+        return;
+    }
+    for address in layer_web_addresses(layer) {
+        cache::restrict_to_public(address);
+        for (_, part) in rustgis_data::io::shapefile_part_urls(address).unwrap_or_default() {
+            cache::restrict_to_public(&part);
+        }
+    }
+}
+
 fn project_text(p: &Project) -> Result<String, String> {
     let max = max_bytes();
     json_within(p, max)?.ok_or_else(|| format!("the project is too large to save (maximum {})", limit_said(max)))
@@ -2969,6 +3045,108 @@ mod requires_tests {
         assert_eq!(n[2], "名".repeat(42));
         // The first entry that isn't a name ends the reading.
         assert!(matches!(requires(serde_json::json!(["a", 1, "b"])), Requires::NotNames));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod internet_only_tests {
+    use crate::render::rustgis_tiles::{address::Reach, cache};
+    use crate::{Project, Session};
+    use serde_json::json;
+
+    /// The session's record of what each address may reach, as a new process has it: nothing
+    /// recorded. ([`cache::clear_public_restrictions`] would clear other tests' records too.)
+    fn forget(addresses: &[&str]) {
+        for a in addresses {
+            cache::allow_named(a);
+        }
+    }
+
+    /// A layer added from a document read from the internet keeps that after the project is saved
+    /// and opened again in a new session: its tiles, legend, style and features are fetched only
+    /// from the internet. The same project without the mark (one an older RustGIS saved) opens as
+    /// before, and a mark can't widen what an address already reaches.
+    #[test]
+    fn what_documents_from_the_internet_named_stays_there_when_the_project_is_opened_again() {
+        let host = "saved-reach.example";
+        let wms = format!("https://{host}/wms");
+        let legend = format!("https://{host}/legend.png");
+        let style = format!("https://{host}/styles/roads.json");
+        let features = format!("https://{host}/collections/roads/items.fgb");
+        // The capabilities were read from the internet (the app's record of them).
+        cache::restrict_to_public(&rustgis_data::ogc::capabilities_url(&wms, Some("wms")));
+        let caps = format!(
+            r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://{host}/wms?"/></Get></HTTP></DCPType></GetMap></Request>
+<Layer><Title>Root</Title><CRS>EPSG:3857</CRS><Layer><Name>roads</Name><Title>Roads</Title>
+<Style><Name>default</Name><Title>Default</Title><LegendURL width="20" height="20"><Format>image/png</Format><OnlineResource xlink:type="simple" xlink:href="{legend}"/></LegendURL></Style>
+</Layer></Layer></Capability></WMS_Capabilities>"#
+        );
+        let mut s = Session::new(Project::default());
+        s.run("service.add", &json!({"url": wms, "type": "wms", "layer": "roads", "text": caps})).unwrap();
+        // A style and a features source a document read from the internet named.
+        s.run("map.addTiles", &json!({"url": style, "name": "Roads style", "kind": "style"})).unwrap();
+        cache::restrict_to_public(&style);
+        let roads = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"n":1},"geometry":{"type":"Point","coordinates":[8.5,47.4]}}]}"#;
+        s.run("layer.addDataText", &json!({"fileName": "roads.geojson", "text": roads})).unwrap();
+        let id = s.map().layers.last().map(|l| l.id).unwrap();
+        s.map_mut().layer_mut(id).unwrap().dataset.source = Some(features.clone());
+        cache::restrict_to_public(&features);
+        let template = s.map().tiles.iter().find(|t| t.name == "Roads").map(|t| t.url.clone()).unwrap();
+        let addresses = [template.as_str(), legend.as_str(), style.as_str(), features.as_str()];
+        for a in addresses {
+            assert_eq!(cache::ceiling_for(a), Reach::Public, "{a}, as added");
+        }
+        let (saved, _) = s.project.saved_text(None).unwrap();
+        let ceilings = |text: &str| {
+            forget(&addresses);
+            let s = Session::new(Project::from_json(text).unwrap());
+            let marked =
+                s.map().tiles.iter().filter(|t| t.internet_only).count() + s.map().layers.iter().filter(|l| l.internet_only).count();
+            (addresses.map(cache::ceiling_for), marked)
+        };
+        assert_eq!(ceilings(&saved), ([Reach::Public; 4], 3), "opened again in a new session");
+        // An older RustGIS's project, without the mark: as before, the user's own.
+        let mut older: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        let mut dropped = 0;
+        for map in older["maps"].as_array_mut().unwrap() {
+            // (A tile layer's keys are camel case, a map layer's snake case.)
+            for (part, key) in [("tiles", "internetOnly"), ("layers", "internet_only")] {
+                for item in map[part].as_array_mut().into_iter().flatten() {
+                    dropped += usize::from(item.as_object_mut().unwrap().remove(key).is_some());
+                }
+            }
+        }
+        assert_eq!(dropped, 3);
+        assert_eq!(ceilings(&older.to_string()), ([Reach::Local; 4], 0), "a project without the mark");
+        // The mark only narrows: an address held to the internet stays held in a project without it.
+        cache::restrict_to_public(&template);
+        let s = Session::new(Project::from_json(&older.to_string()).unwrap());
+        assert_eq!(cache::ceiling_for(&template), Reach::Public);
+        drop(s);
+    }
+
+    /// The fixture project's marked WMS layer opens with its template and legend held to the
+    /// internet; without the mark, they are the user's own.
+    #[test]
+    fn the_fixture_projects_marked_layer_opens_held_to_the_internet() {
+        let text = include_str!("../../../schema/fixtures/internet_only.rgis");
+        let project = Project::from_json(text).unwrap();
+        let tile = &project.maps[0].tiles[0];
+        assert!(tile.internet_only);
+        let addresses: Vec<String> = tile.addresses().map(str::to_string).collect();
+        let addresses: Vec<&str> = addresses.iter().map(String::as_str).collect();
+        assert_eq!(addresses.len(), 2, "{addresses:?}");
+        for (text, want) in
+            [(text.replace("\"internetOnly\": true", "\"internetOnly\": false"), Reach::Local), (text.to_string(), Reach::Public)]
+        {
+            forget(&addresses);
+            let _s = Session::new(Project::from_json(&text).unwrap());
+            for a in &addresses {
+                assert_eq!(cache::ceiling_for(a), want, "{a}");
+            }
+        }
     }
 }
 

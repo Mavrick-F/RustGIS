@@ -83,6 +83,7 @@ fn bare(layer: &Layer) -> Layer {
         synced: _,
         connection,
         anonymous,
+        internet_only,
         instance_id,
         replacement_rev,
         // Caches, emptied below.
@@ -160,6 +161,7 @@ fn bare(layer: &Layer) -> Layer {
         synced: None,
         connection: connection.clone(),
         anonymous: *anonymous,
+        internet_only: *internet_only,
         instance_id: *instance_id,
         replacement_rev: *replacement_rev,
         projected: projected.clone(),
@@ -256,6 +258,7 @@ impl LayerLook {
             synced: _,
             connection: _,
             anonymous: _,
+            internet_only: _,
             instance_id,
             replacement_rev,
             // Caches worked out from the rows, which are compared themselves.

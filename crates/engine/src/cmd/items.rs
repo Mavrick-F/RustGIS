@@ -1829,7 +1829,9 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
         "map" => {
             let map = saved_map(s, p)?;
             crate::project::ensure_map_imports_complete(map)?;
-            let map = embedded_map(map, &mut MAX_EMBED.clone());
+            let mut map = embedded_map(map, &mut MAX_EMBED.clone());
+            // What documents read from the internet named stays held there when the file is read.
+            crate::project::mark_internet_only(&mut map);
             let name = map.name.clone();
             (name, durable_bytes_with(s, map, crate::project::map_file_bytes)?)
         }
@@ -1839,7 +1841,8 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             if l.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")) {
                 return Err("this layer is still downloading; wait for it to finish before saving".into());
             }
-            let layer = embed_layer(l, &mut MAX_EMBED.clone());
+            let mut layer = embed_layer(l, &mut MAX_EMBED.clone());
+            crate::project::mark_layer_internet_only(&mut layer);
             let name = layer.name.clone();
             (name, durable_bytes_with(s, layer, crate::project::layer_file_bytes)?)
         }
