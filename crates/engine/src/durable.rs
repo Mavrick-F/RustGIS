@@ -27,6 +27,9 @@ pub struct Report {
     pub(crate) numbers: u32,
     /// First affected dataset names; the total count still covers every dataset.
     pub(crate) number_places: Vec<crate::notice_text::NoticeText>,
+    /// Layers held to the internet only because the session's record of such addresses is full,
+    /// written without the hold ([`crate::project::HELD_UNMARKED`]).
+    pub(crate) held_unmarked: u32,
 }
 
 impl Report {
@@ -72,6 +75,7 @@ impl Report {
             (self.not_retained, "address(es) exceeded the bridge retention limit; their keys will not survive a round trip"),
             (self.lost, "address(es) lost their keys when a peer sent back its project; add them again in the receiving session"),
             (self.reconnect, "database source(s) from a peer require an explicit reconnect before reading"),
+            (self.held_unmarked, crate::project::HELD_UNMARKED),
             (
                 self.executable_changes,
                 "credential-bearing executable field(s) changed when a peer sent back its project; supply missing values before replay",
@@ -119,6 +123,7 @@ impl Report {
         self.executable_changes = self.executable_changes.saturating_add(other.executable_changes);
         self.reconnect = self.reconnect.saturating_add(other.reconnect);
         self.numbers = self.numbers.saturating_add(other.numbers);
+        self.held_unmarked = self.held_unmarked.saturating_add(other.held_unmarked);
         for place in &other.number_places {
             if self.number_places.len() < 3 && !self.number_places.contains(place) {
                 self.number_places.push(place.clone());

@@ -565,6 +565,12 @@ fn direct_base_origin(url: &str, from: Option<&crate::address::Origin>) -> Optio
     Some(crate::address::Origin { url: origin, reach: crate::address::Reach::Public })
 }
 
+/// Whether the user has named `url` directly since a document did ([`allow_named`]).
+pub fn named_by_user(url: &str) -> bool {
+    let base = canonical_resource(url);
+    !base.is_empty() && public_only().lock().unwrap_or_else(|e| e.into_inner()).named_local.contains(base)
+}
+
 /// Clears any document-origin restriction on `url` when the user explicitly names it directly.
 pub fn allow_named(url: &str) {
     let base = canonical_resource(url);
