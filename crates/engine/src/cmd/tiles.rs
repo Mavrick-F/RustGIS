@@ -760,6 +760,8 @@ pub(crate) fn cog_tiles_to_rasters(m: &mut rustgis_map::Map) {
             // anonymous plugin command added takes no saved login, as before.
             l.connection = t.connection.clone();
             l.anonymous = t.anonymous;
+            // Held to the internet, as the tile layer was.
+            l.internet_only = t.internet_only;
         }
         // Just over the layer it was drawn over, in its group; under them all without one.
         let group = t.over.and_then(|o| m.group_of(o).map(|g| g.id));

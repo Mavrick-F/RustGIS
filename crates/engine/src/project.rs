@@ -1741,8 +1741,11 @@ impl Project {
             m.tiles.truncate(rustgis_map::tiles::MAX_TILE_LAYERS);
             // Layers whose addresses a document read from the internet named are held there again,
             // before anything below is read (a raster in place, a streamed source); only the tile
-            // layers kept.
-            apply_internet_only(m);
+            // layers kept, and only as they are read from a file: a later repair (another layer
+            // added) leaves an address the user has named since as theirs.
+            if opened {
+                apply_internet_only(m);
+            }
             #[cfg(not(target_arch = "wasm32"))]
             for t in &mut m.tiles {
                 if t.error.is_none()
@@ -3012,8 +3015,8 @@ pub(crate) fn apply_internet_only(map: &Map) {
     }
 }
 
-/// [`apply_internet_only`] for one layer.
-fn apply_layer_internet_only(layer: &rustgis_map::Layer) {
+/// [`apply_internet_only`] for one marked layer (a layer file's, before it is added).
+pub(crate) fn apply_layer_internet_only(layer: &rustgis_map::Layer) {
     use crate::render::rustgis_tiles::cache;
     for address in layer_web_addresses(layer) {
         cache::restrict_to_public(address);
@@ -3125,6 +3128,20 @@ mod internet_only_tests {
             (addresses.map(cache::ceiling_for), marked)
         };
         assert_eq!(ceilings(&saved), ([Reach::Public; 4], 3), "opened again in a new session");
+        // A map file and a layer file of the held layers hold them too.
+        forget(&addresses);
+        let mut imported = Session::new(Project::default());
+        imported.run("map.import", &json!({"text": saved})).unwrap();
+        assert_eq!(cache::ceiling_for(&template), Reach::Public, "map.import");
+        forget(&addresses);
+        let layer_file = String::from_utf8(super::layer_file_bytes(s.map().layer(id).unwrap()).unwrap()).unwrap();
+        imported.run("layer.addLayerFile", &json!({"text": layer_file})).unwrap();
+        assert_eq!(cache::ceiling_for(&features), Reach::Public, "layer.addLayerFile");
+        // Held as the file is read, not again later: an address the user names afterwards stays
+        // theirs when another layer is added (a layer file, which repairs the project again).
+        cache::allow_named(&template);
+        imported.run("layer.addLayerFile", &json!({"text": layer_file})).unwrap();
+        assert_eq!(cache::ceiling_for(&template), Reach::Local, "named by the user since");
         // An older RustGIS's project, without the mark: as before, the user's own.
         let mut older: serde_json::Value = serde_json::from_str(&saved).unwrap();
         let mut dropped = 0;
@@ -3191,6 +3208,27 @@ mod internet_only_tests {
         assert_eq!(cache::ceiling_for(template), Reach::Local, "a snapshot isn't read until its area is opened");
         reopened.run("offline.open", &json!({"name": "Field"})).unwrap();
         assert_eq!(cache::ceiling_for(template), Reach::Public, "opened as a map, it is held again");
+    }
+
+    /// A marked cloud-optimised GeoTIFF tile layer, read in place as a raster layer when its
+    /// project opens, keeps the mark and is held.
+    #[test]
+    fn a_marked_cog_tile_stays_held_as_a_raster_layer() {
+        let tif = "https://saved-reach-cog.example/scene.tif";
+        let mut s = Session::new(Project::default());
+        s.run("map.addTiles", &json!({"url": "https://saved-reach-cog.example/{z}/{x}/{y}.png", "name": "Scene", "overlay": true}))
+            .unwrap();
+        cache::restrict_to_public("https://saved-reach-cog.example/{z}/{x}/{y}.png");
+        let (saved, _) = s.project.saved_text(None).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        v["maps"][0]["tiles"][0]["kind"] = json!("cog");
+        v["maps"][0]["tiles"][0]["url"] = json!(tif);
+        assert_eq!(v["maps"][0]["tiles"][0]["internetOnly"], true);
+        forget(&[tif]);
+        let reopened = Session::new(Project::from_json(&v.to_string()).unwrap());
+        let layer = reopened.map().layers.iter().find(|l| l.raster.is_some()).expect("read in place as a raster layer");
+        assert!(layer.internet_only);
+        assert_eq!(cache::ceiling_for(tif), Reach::Public);
     }
 
     /// Only the tile layers a project keeps are held: those past the limit, left out (and said),

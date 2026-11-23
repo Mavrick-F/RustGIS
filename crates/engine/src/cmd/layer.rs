@@ -4568,6 +4568,11 @@ pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     // A binding in a file is no authority to use a login here.
     crate::s3_connections::clear_bindings(layer.addresses_mut());
     crate::project::clear_login_bindings(layer.addresses_mut());
+    // A layer whose addresses a document read from the internet named is held there again before
+    // it is read (the repair below reads it).
+    if layer.internet_only {
+        crate::project::apply_layer_internet_only(&layer);
+    }
     // A fresh id and a unique name in this map; the rest goes through project repair.
     let base = layer.name.clone();
     let mut i = 1;
