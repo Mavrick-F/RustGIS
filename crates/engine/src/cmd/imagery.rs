@@ -518,10 +518,15 @@ fn project_raster(s: &mut Session, p: &Value) -> CmdResult {
         None | Some(Value::Null) => warp::Method::Sample(warp::Resampling::Nearest),
         Some(v) => v.as_str().and_then(warp::Method::parse).ok_or("resampling is nearest, bilinear, cubic, average or mode")?,
     };
-    let grid = grid_param(s, p, r.crs, |crs| warp::projected_footprint(&r, crs).map(|(bounds, pixel)| (bounds, Some(pixel))))?;
     let path = tif_path(p)?;
     let out_name = name(p, format!("{} projected", r.name))?;
-    let out = warp::project(&r, &grid, method, out_name.clone())?;
+    // Sized and sampled for the same datum grids: refused, before anything is kept, when one
+    // arrives between.
+    let (grid, out) = warp::on_unchanged_grids("Project Raster", || {
+        let grid = grid_param(s, p, r.crs, |crs| warp::projected_footprint(&r, crs).map(|(bounds, pixel)| (bounds, Some(pixel))))?;
+        let out = warp::project(&r, &grid, method, out_name.clone())?;
+        Ok((grid, out))
+    })?;
     let used = method.used_on(&r);
     report_resampled_classes(s, &r, &out, used.id());
     let mut info = json!({

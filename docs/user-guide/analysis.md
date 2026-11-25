@@ -2023,7 +2023,10 @@ commands described here aren't on the tab or part of the extension, and run whet
   "pointsCrs": "EPSG:4326", "crs": 32613, "resampling": "bilinear", "cellSize": 5, "name": "warped",
   "path": "warped.tif"}`. `pointsCrs` is the coordinate system the points' x and y are in (default
   EPSG:4326) and `crs` the output's (default `pointsCrs`, so nothing is reprojected unless asked).
-  Each output cell is taken back through the fit, after reprojection, to the image and sampled there
+  Between two datums, positions go between `pointsCrs` and `crs` by the transformation PROJ picks
+  for the pair, and through WGS 84 where the datums have none or it can't place a point; on one
+  datum, through WGS 84 as before. A warp refuses, asking to run it again, when a datum grid arrives
+  while it runs. Each output cell is taken back through the fit, after reprojection, to the image and sampled there
   with `nearest`, `bilinear` (the default) or `cubic`; cells that fall outside the image are no
   data, or see-through for a colour image, which gains an alpha band for it (a grey byte image
   becomes grey with alpha; alpha is 0–255 in every pixel type). An image warped into a geographic
@@ -2072,8 +2075,10 @@ commands described here aren't on the tab or part of the extension, and run whet
   "extent": "Study area", "resampling": "average", "path": "ndvi_100m.tif"}`. It has no pane yet:
   run it from the Script pane, the AI Assistant, the command line or Python. The result is a new
   layer (`name`, by default the layer's name with "projected"), and with `path` a cloud-optimised
-  GeoTIFF too. Between two datums, cells are placed by the transformation PROJ picks for the pair,
-  not one through WGS 84 (half a metre apart for DHDN and ETRS89).
+  GeoTIFF too. Between two datums, cells are placed and the grid sized by the transformation PROJ
+  picks for the pair rather than through WGS 84 (half a metre apart for DHDN and ETRS89), and
+  through WGS 84 where the datums have none or it can't place a point; on one datum, through WGS 84
+  as before. It refuses, asking to run it again, when a datum grid arrives while it runs.
   - **The grid:** `crs` (by default the layer's), `cellSize` in its units (one number, or
     `[x, y]`; by default about the layer's pixel there), `origin`, a point a cell corner falls on
     (`[0, 0]` by default, so cell corners are whole multiples of the cell size and any two rasters

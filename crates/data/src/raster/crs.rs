@@ -1092,6 +1092,9 @@ pub(crate) struct DirectOperation {
     missing: Vec<MissingGrid>,
     /// Its pair's key ([`pair_key`]), what its notes are kept under.
     key: String,
+    /// Whether it changes datum: false between two systems on one datum, where it runs no
+    /// transformation (at the middle of the source's area of use, which no grid changes).
+    shifts: bool,
 }
 
 // What it noted and the session hasn't asked for yet is the pair's as it goes (built again when
@@ -1169,6 +1172,12 @@ impl DirectPair {
         note_used(&key, || format!("{} to {}", source.label(), target.label()));
         let again = std::sync::RwLock::new(None);
         Some(DirectPair { source, target, from: from.clone(), to: to.clone(), first, built_for, again })
+    }
+
+    /// Whether it changes datum ([`DirectOperation`]'s `shifts`), as first built: grids change
+    /// which transformation it takes, not whether it takes one.
+    pub(crate) fn shifts_datum(&self) -> bool {
+        self.first.shifts
     }
 
     /// [`DirectOperation::point`], by the operation built for the grids there are now: as first
@@ -1267,6 +1276,9 @@ fn build_direct(
     };
     let at = [source, target].into_iter().find_map(|crs| area_of_use(crs).and_then(|c| from.from_lonlat(c)));
     let grids = at.and_then(|c| op.best_operation_grids_at(c.x, c.y, 0.0).ok()).unwrap_or_default();
+    // No operation there only between two systems on one datum; a place it can't convert, or none
+    // known, counts as a shift.
+    let shifts = at.is_none_or(|c| !matches!(op.operation_at(c.x, c.y, 0.0), Ok(None)));
     if grids.iter().any(|g| !g.available && !g.optional) {
         let mut needs = needs_grid().lock().unwrap_or_else(|e| e.into_inner());
         if !needs.iter().any(|d| d == key) {
@@ -1274,7 +1286,7 @@ fn build_direct(
         }
     }
     let missing = grids.into_iter().filter(downloadable).filter_map(|g| Some(MissingGrid { url: g.url?, name: g.name })).collect();
-    Some(std::sync::Arc::new(DirectOperation { op, turn, slack, missing, key: key.to_string() }))
+    Some(std::sync::Arc::new(DirectOperation { op, turn, slack, missing, key: key.to_string(), shifts }))
 }
 
 /// The datum grids the direct operation from `source` to `target` needs where the source's data

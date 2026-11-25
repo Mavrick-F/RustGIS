@@ -101,6 +101,16 @@ impl Reprojection {
         self.direct.is_some()
     }
 
+    /// Whether it takes a transformation between two datums where it can: the direct operation,
+    /// between systems on different datums. Between two systems on one datum it converts as the
+    /// way through WGS 84 does, but for rounding.
+    pub fn shifts_datum(&self) -> bool {
+        match &self.through {
+            Some(through) => through.0.shifts_datum() || through.1.shifts_datum(),
+            None => self.direct.as_ref().is_some_and(|d| d.shifts_datum()),
+        }
+    }
+
     /// A place in the target system, or `None` where the source system has no such place or the
     /// target can't hold it. Each system's transformer judges what it is given, as a call of its
     /// own did: Web Mercator takes a latitude past 85.05° (an infinite one too) as 85.05°, where
