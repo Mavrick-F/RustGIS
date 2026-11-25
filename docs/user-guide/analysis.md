@@ -2072,7 +2072,8 @@ commands described here aren't on the tab or part of the extension, and run whet
   "extent": "Study area", "resampling": "average", "path": "ndvi_100m.tif"}`. It has no pane yet:
   run it from the Script pane, the AI Assistant, the command line or Python. The result is a new
   layer (`name`, by default the layer's name with "projected"), and with `path` a cloud-optimised
-  GeoTIFF too.
+  GeoTIFF too. Between two datums, cells are placed by the transformation PROJ picks for the pair,
+  not one through WGS 84 (half a metre apart for DHDN and ETRS89).
   - **The grid:** `crs` (by default the layer's), `cellSize` in its units (one number, or
     `[x, y]`; by default about the layer's pixel there), `origin`, a point a cell corner falls on
     (`[0, 0]` by default, so cell corners are whole multiples of the cell size and any two rasters

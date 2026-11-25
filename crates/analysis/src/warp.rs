@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, Transformer, max_samples};
+use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, Reprojection, Transformer, max_samples};
 use rustgis_geom::Coord;
 
 use crate::georef::Fit;
@@ -78,7 +78,8 @@ pub struct Options {
     pub name: String,
 }
 
-/// Map coordinates of the fit, to and from the output's coordinate system.
+/// Map coordinates in one coordinate system to another's through longitude/latitude, for the
+/// footprints and bounds other commands size a grid by ([`footprint_in`], [`bounds_in`]).
 struct Reproject {
     from: Transformer,
     to: Transformer,
@@ -90,7 +91,7 @@ impl Reproject {
         Ok(Reproject { from: points.transformer()?, to: out.transformer()?, same: points == out })
     }
 
-    /// Fit coordinates to output coordinates.
+    /// Coordinates in the first system to the second's.
     fn forward(&self, x: f64, y: f64) -> Option<(f64, f64)> {
         if self.same {
             return (x.is_finite() && y.is_finite()).then_some((x, y));
@@ -98,15 +99,12 @@ impl Reproject {
         let c = self.to.from_lonlat(self.from.to_lonlat(Coord::new(x, y))?)?;
         Some((c.x, c.y))
     }
+}
 
-    /// Output coordinates to fit coordinates.
-    fn back(&self, x: f64, y: f64) -> Option<(f64, f64)> {
-        if self.same {
-            return (x.is_finite() && y.is_finite()).then_some((x, y));
-        }
-        let c = self.from.from_lonlat(self.to.to_lonlat(Coord::new(x, y))?)?;
-        Some((c.x, c.y))
-    }
+/// `c` converted by `re` ([`Crs::to`]: between two datums, the registry's transformation rather
+/// than each datum's shift to WGS 84 and back), as an `(x, y)` pair.
+fn convert(re: &Reprojection, x: f64, y: f64) -> Option<(f64, f64)> {
+    re.point(Coord::new(x, y)).map(|c| (c.x, c.y))
 }
 
 /// Reads pixels at fractional image positions.
@@ -218,15 +216,16 @@ impl Sampler<'_> {
 /// `r` (in the full image's pixels, when `r` is an overview of it) and whose map coordinates are
 /// in `o.points_crs`. The grid covers the warped image's footprint. A colour or grey byte raster
 /// with neither alpha nor no-data gets an alpha band (0–255), so the cells outside the image are
-/// see-through. Geographic output cells are square in degrees.
+/// see-through. Geographic output cells are square in degrees. Map coordinates go between
+/// `o.points_crs` and `o.crs` by the direct operation between them ([`Crs::to`]).
 pub fn warp(r: &Raster, fit: &Fit, o: &Options) -> Result<Raster, String> {
-    let re = Reproject::new(o.points_crs, o.crs)?;
+    let (forward, back) = (o.points_crs.to(o.crs)?, o.crs.to(o.points_crs)?);
     let (w, h) = (f64::from(r.width), f64::from(r.height));
     // An overview's pixels are bigger than the full image's, which the fit is in; a grid of
     // posts read at a step also starts before the file's corner (each cell centered on its post).
     let (sx, sy) = r.file_pixels();
     let (ox, oy) = r.file_origin();
-    let place = |c: f64, row: f64| fit.to_map(c * sx + ox, row * sy + oy).and_then(|(x, y)| re.forward(x, y));
+    let place = |c: f64, row: f64| fit.to_map(c * sx + ox, row * sy + oy).and_then(|(x, y)| convert(&forward, x, y));
 
     let [min_x, min_y, max_x, max_y] = footprint(w, h, &place).ok_or("the image's edge can't be placed in the output coordinate system")?;
     if o.crs.is_geographic() && max_x - min_x > 180.0 {
@@ -275,7 +274,7 @@ pub fn warp(r: &Raster, fit: &Fit, o: &Options) -> Result<Raster, String> {
     let g = Grid { crs: o.crs, min_x, max_y, cell_x: cell, cell_y: cell, width: ow as usize, height: oh as usize };
     // The image position of an output coordinate.
     let source = |x: f64, y: f64| -> Option<(f64, f64)> {
-        let (px, py) = re.back(x, y)?;
+        let (px, py) = convert(&back, x, y)?;
         let (c, row) = fit.to_pixel(px, py)?;
         let (c, row) = ((c - ox) / sx, (row - oy) / sy);
         (c.is_finite() && row.is_finite()).then_some((c, row))
@@ -387,14 +386,29 @@ impl Grid {
     }
 }
 
-/// The bounds in `crs` of `r`'s footprint, and about the size of its pixel there.
+/// The bounds in `crs` of `r`'s footprint, and about the size of its pixel there, through
+/// longitude/latitude.
 pub fn footprint_in(r: &Raster, crs: Crs) -> Result<([f64; 4], f64), String> {
     r.require_coordinates()?;
     let re = Reproject::new(r.crs, crs)?;
+    footprint_by(r, crs, &|x, y| re.forward(x, y))
+}
+
+/// [`footprint_in`] placed as [`project`] places `r`'s pixels ([`Crs::to`]), so a grid sized by
+/// it holds what `project` samples.
+pub fn projected_footprint(r: &Raster, crs: Crs) -> Result<([f64; 4], f64), String> {
+    r.require_coordinates()?;
+    let re = r.crs.to(crs)?;
+    footprint_by(r, crs, &|x, y| convert(&re, x, y))
+}
+
+/// The bounds and pixel size of [`footprint_in`], `r`'s map coordinates converted to `crs` by
+/// `to`.
+fn footprint_by(r: &Raster, crs: Crs, to: &dyn Fn(f64, f64) -> Option<(f64, f64)>) -> Result<([f64; 4], f64), String> {
     let t = r.transform;
     let place = |c: f64, row: f64| {
         let p = t.to_world(c, row);
-        re.forward(p.x, p.y)
+        to(p.x, p.y)
     };
     let (w, h) = (f64::from(r.width), f64::from(r.height));
     let bounds = footprint(w, h, &place).ok_or_else(|| format!("{} can't be placed in {}", r.name, crs.label()))?;
@@ -452,8 +466,8 @@ impl Method {
     }
 }
 
-/// Projects `r` onto the grid `g`, through longitude/latitude when their coordinate systems
-/// differ: each cell sampled at its centre, or (average, mode) taken from every pixel of `r`
+/// Projects `r` onto the grid `g`, through the direct operation between their coordinate systems
+/// when they differ ([`Crs::to`]; size the grid with [`projected_footprint`]): each cell sampled at its centre, or (average, mode) taken from every pixel of `r`
 /// whose centre falls in it. A cell no pixel centre falls in (a grid finer than the raster) takes
 /// the pixel under its centre. Outside cells use 0 in every band when alpha is present or
 /// added; otherwise they use explicit no-data. Without either, they use NaN for floating-point
@@ -478,10 +492,10 @@ fn project_on(threads: Option<usize>, r: &Raster, g: &Grid, method: Method, name
             g.width, g.height, out_bands
         ));
     }
-    let re = Reproject::new(r.crs, g.crs)?;
+    let back = g.crs.to(r.crs)?;
     let t = r.transform;
     let source = |x: f64, y: f64| -> Option<(f64, f64)> {
-        let (px, py) = re.back(x, y)?;
+        let (px, py) = convert(&back, x, y)?;
         let (c, row) = t.to_pixel(Coord::new(px, py));
         (c.is_finite() && row.is_finite()).then_some((c, row))
     };
@@ -1627,6 +1641,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Between two datums each cell is sampled where the direct operation puts it (DHDN to ETRS89's
+    /// transformation), not where each datum's shift to WGS 84 and back does, about 0.44 m away
+    /// here; on one thread and on several alike.
+    #[test]
+    fn a_projection_between_datums_takes_their_transformation() {
+        // 40 × 40 pixels of 1 m in Gauss-Krüger zone 3 on DHDN, its bands the column and row of a
+        // place, so bilinear sampling gives back where a cell was sampled.
+        let (gk3, utm32) = (Crs::from_epsg(31467).unwrap(), Crs::from_epsg(25832).unwrap());
+        let gt = GeoTransform { origin_x: 3_500_000.0, origin_y: 5_400_040.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let (col, row): (Vec<f32>, Vec<f32>) = (0..1600).map(|i| ((i % 40) as f32 + 0.5, (i / 40) as f32 + 0.5)).unzip();
+        let r = Raster::new("t", 40, 40, vec![col, row], gt, gk3, None, ColorHint::Gray, "Float32").unwrap();
+        let (bounds, _) = projected_footprint(&r, utm32).unwrap();
+        let g = Grid::snapped(utm32, bounds, (1.0, 1.0), (0.0, 0.0)).unwrap();
+        let out = project_on(Some(1), &r, &g, Method::Sample(Resampling::Bilinear), "p".into()).unwrap();
+        let many = project_on(Some(4), &r, &g, Method::Sample(Resampling::Bilinear), "p".into()).unwrap();
+        let bits = |r: &Raster| r.bands.iter().map(|b| b.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(bits(&out), bits(&many));
+        let (direct, back) = (utm32.to(gk3).unwrap(), (utm32.transformer().unwrap(), gk3.transformer().unwrap()));
+        let pixel = |p: Coord| (p.x - gt.origin_x, gt.origin_y - p.y);
+        let mut checked = 0;
+        for j in 0..g.height {
+            for i in 0..g.width {
+                let at = Coord::new(g.min_x + (i as f64 + 0.5) * g.cell_x, g.max_y - (j as f64 + 0.5) * g.cell_y);
+                let want = pixel(direct.point(at).unwrap());
+                // Away from the edge, where bilinear sampling is linear.
+                if !(1.0..39.0).contains(&want.0) || !(1.0..39.0).contains(&want.1) {
+                    continue;
+                }
+                let got = (f64::from(out.bands[0].data[j * g.width + i]), f64::from(out.bands[1].data[j * g.width + i]));
+                assert!((got.0 - want.0).abs().max((got.1 - want.1).abs()) < 1e-3, "cell {i}, {j}: {got:?} against {want:?}");
+                let via = pixel(back.1.from_lonlat(back.0.to_lonlat(at).unwrap()).unwrap());
+                assert!((via.0 - want.0).hypot(via.1 - want.1) > 0.4, "cell {i}, {j}: {via:?} through WGS 84");
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000, "{checked} cells checked");
     }
 
     /// A raster projected to another system and back keeps its values in place, within a cell.
