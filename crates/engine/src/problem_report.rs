@@ -11,6 +11,7 @@ use std::fmt::Write;
 use rustgis_data::diagnostics::Filter;
 
 use crate::Session;
+use crate::project_log::LogEntry;
 
 /// The most commands the report gives, the newest.
 pub const COMMANDS: usize = 50;
@@ -108,11 +109,12 @@ impl Session {
             };
             let mut said = vec![format!("{} UTC, {} ms, {ended}", e.time_utc(), e.millis)];
             // Its parameters as the log kept them, secrets out, with addresses and logins in use
-            // scrubbed now; a redaction made for prose would take the JSON out with them. A
-            // scrub that changed it changed what it runs.
-            let kept = e.script_line();
-            let line = crate::durable::generated_text(&kept);
-            if e.partial || line != kept {
+            // scrubbed now, value by value before they are written as JSON (whose escapes would
+            // hide a login with a quote in it); a redaction made for prose would take the JSON
+            // out with them. A scrub that changed them changed what it runs.
+            let scrubbed = LogEntry { params: scrubbed_values(&e.params), ..e.clone() };
+            let line = scrubbed.script_line();
+            if e.partial || scrubbed.params != e.params {
                 said.push("its parameters were cut or had secrets taken out, so it may not run as it ran".into());
             }
             let scriptable = self.registry.get(&e.command).is_some() && !crate::cmd::workflows::refused_in_script(&e.command);
@@ -128,6 +130,17 @@ impl Session {
             }
         }
         out
+    }
+}
+
+/// `params` with each text in it, keys too, scrubbed of addresses' logins and the logins in use.
+fn scrubbed_values(params: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match params {
+        Value::String(s) => Value::String(crate::durable::generated_text(s)),
+        Value::Array(items) => Value::Array(items.iter().map(scrubbed_values).collect()),
+        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (crate::durable::generated_text(k), scrubbed_values(v))).collect()),
+        other => other.clone(),
     }
 }
 
@@ -167,7 +180,6 @@ mod tests {
 
     use super::*;
     use crate::Project;
-    use crate::project_log::LogEntry;
 
     fn entry(command: &str, params: serde_json::Value) -> LogEntry {
         LogEntry { command: command.into(), params, ok: true, ..Default::default() }
