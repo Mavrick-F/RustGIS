@@ -107,7 +107,12 @@ impl Session {
                 None => "failed".to_string(),
             };
             let mut said = vec![format!("{} UTC, {} ms, {ended}", e.time_utc(), e.millis)];
-            if e.partial {
+            // Its parameters as the log kept them, secrets out, with addresses and logins in use
+            // scrubbed now; a redaction made for prose would take the JSON out with them. A
+            // scrub that changed it changed what it runs.
+            let kept = e.script_line();
+            let line = crate::durable::generated_text(&kept);
+            if e.partial || line != kept {
                 said.push("its parameters were cut or had secrets taken out, so it may not run as it ran".into());
             }
             let scriptable = self.registry.get(&e.command).is_some() && !crate::cmd::workflows::refused_in_script(&e.command);
@@ -116,9 +121,6 @@ impl Session {
             }
             let said = Self::redacted(&said.join("; ")).into_string();
             let _ = writeln!(out, "# {}", said.replace('\n', " "));
-            // Its parameters as the log kept them, secrets out; a redaction made for prose would
-            // take the JSON out with them.
-            let line = crate::durable::generated_text(&e.script_line());
             if scriptable {
                 let _ = writeln!(out, "{line}");
             } else {
@@ -131,14 +133,11 @@ impl Session {
 
 /// Where a new bug report starts: the repository's bug report form.
 pub const NEW_ISSUE: &str = "https://github.com/opengeos/RustGIS/issues/new";
-/// The longest address the report is put into whole: GitHub refuses much longer ones.
-pub const ADDRESS_MOST: usize = 7000;
 
-/// A new bug report on GitHub, its form filled in from `report`: the version, the system and
-/// graphics in their fields, and the whole report in its logs field when the address holds it.
-/// Nothing is sent until the user submits the form. Whether the report is in it: when it isn't,
-/// the field asks for it to be pasted.
-pub fn issue_address(about: &About, report: &str) -> (String, bool) {
+/// A new bug report on GitHub, its form filled in with the version and the system and graphics
+/// (`about`), which go to GitHub as the form opens; its logs field asks for the report to be
+/// pasted, so the report itself goes only once the user pastes it and submits.
+pub fn issue_address(about: &About) -> String {
     let mut system = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
     if !about.front_end.is_empty() {
         let _ = write!(system, ", {}", about.front_end);
@@ -146,25 +145,20 @@ pub fn issue_address(about: &About, report: &str) -> (String, bool) {
     if let Some(graphics) = &about.graphics {
         let _ = write!(system, ", {graphics}");
     }
-    let address = |logs: &str| {
-        let fields =
-            [("template", "bug_report.yml"), ("version", env!("CARGO_PKG_VERSION")), ("os", system.as_str()), ("screenshots", logs)];
-        let query: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={}", crate::cmd::webdata::percent_encode(v))).collect();
-        format!("{NEW_ISSUE}?{}", query.join("&"))
-    };
-    // A fence longer than any run of backticks in the report, so none of it ends the fence and
-    // reads as the form's Markdown.
+    let logs = "Paste the diagnostics from Help › Report a Problem here: Report on GitHub put them on the clipboard.";
+    let fields = [("template", "bug_report.yml"), ("version", env!("CARGO_PKG_VERSION")), ("os", system.as_str()), ("screenshots", logs)];
+    let query: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={}", crate::cmd::webdata::percent_encode(v))).collect();
+    format!("{NEW_ISSUE}?{}", query.join("&"))
+}
+
+/// `report` as it is pasted into the form: in a fence longer than any run of backticks in it, so
+/// none of it ends the fence and reads as the form's Markdown.
+pub fn fenced(report: &str) -> String {
     let mut fence = "```".to_string();
     while report.contains(fence.as_str()) {
         fence.push('`');
     }
-    let whole = format!("RustGIS diagnostics, from Help › Report a Problem:\n\n{fence}text\n{report}\n{fence}");
-    let full = address(&whole);
-    if full.len() <= ADDRESS_MOST {
-        (full, true)
-    } else {
-        (address("Paste the diagnostics here: Report a Problem copied them when it opened this page."), false)
-    }
+    format!("{fence}text\n{report}\n{fence}")
 }
 
 #[cfg(test)]
@@ -206,21 +200,20 @@ mod tests {
         assert!(report.contains("Read 3 features") && report.contains("example.org"), "{report}");
         // A login in an address is taken out of a command's parameters and of a message alike.
         assert!(report.contains("layer.addData {\"path\":\"https://example.org/"), "{report}");
+        // Scrubbed now, it no longer runs as it ran, and says so.
+        assert!(report.contains("may not run as it ran\nlayer.addData {\"path\":\"https://example.org/"), "{report}");
         assert!(!report.contains("user:secret") && !report.contains("token=private"), "{report}");
     }
 
     #[test]
-    fn the_issue_address_holds_a_short_report_and_asks_for_a_long_one() {
-        let about = About { front_end: "desktop".into(), graphics: Some("Vulkan".into()), last_run: LastRun::NotReported };
-        let (short, whole) = issue_address(&about, "RustGIS diagnostics\nVersion: x & y");
-        assert!(whole && short.starts_with(NEW_ISSUE) && short.contains("template=bug_report.yml"), "{short}");
-        // Values are escaped: an `&` in the report doesn't start another field.
-        assert!(short.contains("x%20%26%20y") && short.contains("desktop%2C%20Vulkan"), "{short}");
+    fn the_issue_address_fills_the_form_but_leaves_the_report_out() {
+        let about = About { front_end: "desktop".into(), graphics: Some("Vulkan & co".into()), last_run: LastRun::NotReported };
+        let address = issue_address(&about);
+        assert!(address.starts_with(NEW_ISSUE) && address.contains("template=bug_report.yml"), "{address}");
+        // Values are escaped: an `&` doesn't start another field.
+        assert!(address.contains("desktop%2C%20Vulkan%20%26%20co") && address.contains("Paste%20the%20diagnostics"), "{address}");
         // Backticks in the report don't end its fence.
-        let (fenced, _) = issue_address(&about, "a ``` b");
-        assert!(fenced.contains("%60%60%60%60text"), "{fenced}");
-        let (long, whole) = issue_address(&about, &"x".repeat(ADDRESS_MOST));
-        assert!(!whole && long.len() <= ADDRESS_MOST && long.contains("Paste%20the%20diagnostics"), "{long}");
+        assert_eq!(fenced("a ``` b"), "````text\na ``` b\n````");
     }
 
     /// Incidents past the redaction's bound together are each kept whole, and the lines above

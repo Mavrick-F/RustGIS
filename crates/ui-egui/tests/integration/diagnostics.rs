@@ -116,5 +116,8 @@ fn report_a_problem_shows_copies_and_opens_the_bug_report_form() {
         opened.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url.starts_with(rustgis_engine::problem_report::NEW_ISSUE))),
         "{opened:?}"
     );
+    // The report stays on the clipboard, out of the address.
+    assert!(!opened.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url.contains("report-missing"))), "{opened:?}");
+    assert!(opened.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t.contains("report-missing"))), "{opened:?}");
     h.get_by_label_contains("Opened the bug report form");
 }

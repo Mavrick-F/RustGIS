@@ -172,10 +172,10 @@ failed says its error; one whose parameters were cut or had a secret taken out, 
 can't run, says so in a comment. Logins and secrets are removed as in Messages, with the same
 limits; file paths and layer names stay.
 
-**Copy** copies it. **Report on GitHub…** copies it too and opens a new bug report with the
-version, system and diagnostics filled in; a report too long for the address asks you to paste
-it. Nothing is sent until you submit the form, so read it first and remove what you don't want
-to share.
+You can edit the text: **Copy** copies it as you leave it, so delete anything you don't want to
+share. **Report on GitHub…** copies it too and opens a new bug report with the version and system
+filled in; paste the diagnostics into its logs field. Opening the form sends GitHub only the
+version and system; the diagnostics go when you paste them and submit.
 
 ## The ribbon
 

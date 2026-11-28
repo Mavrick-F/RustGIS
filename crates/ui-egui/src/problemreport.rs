@@ -1,17 +1,18 @@
-//! Help › Report a Problem: the session's diagnostics ([`Session::problem_report`]) shown in full
-//! before anything leaves the app, with Copy, and Report on GitHub, which copies them too and opens
-//! the bug report form filled in. Nothing is sent: the user reads the form and submits it.
+//! Help › Report a Problem: the session's diagnostics ([`Session::problem_report`]) shown in full,
+//! for the user to read and edit before anything leaves the app, with Copy, and Report on GitHub,
+//! which copies them and opens the bug report form with the version and system filled in. The
+//! diagnostics stay on the clipboard: they reach GitHub only when the user pastes and submits.
 //!
 //! [`Session::problem_report`]: rustgis_engine::Session::problem_report
 
 use egui::{Align2, RichText};
-use rustgis_engine::problem_report::{About, issue_address};
+use rustgis_engine::problem_report::{About, fenced, issue_address};
 
 use crate::RustGisApp;
 use crate::theme::Tokens;
 
-/// The open window: the report as it was when opened (so it doesn't change while read), and
-/// what its last button did.
+/// The open window: the report as it was when opened (so it doesn't change while read), as the
+/// user edited it, and what its last button did.
 pub struct Window {
     pub text: String,
     about: About,
@@ -63,7 +64,7 @@ pub(crate) fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             crate::i18n::paragraph(
                 ui,
-                "These diagnostics help someone find what went wrong: this RustGIS and computer, the bugs met, the last commands as a script that runs them again, and Messages. Logins and secrets RustGIS recognises are taken out, but not every password can be told from other text, and file paths and layer names stay. Read them first, and remove anything you don't want to share.",
+                "These diagnostics help someone find what went wrong: this RustGIS and computer, the bugs met, the last commands as a script that runs them again, and Messages. Logins and secrets RustGIS recognises are taken out, but not every password can be told from other text, and file paths and layer names stay. Read them first, and delete anything you don't want to share: Copy and Report on GitHub use the text as you leave it.",
                 crate::theme::regular(12.0),
                 t.text,
             );
@@ -75,25 +76,21 @@ pub(crate) fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 }
                 let report = ui
                     .button(tl!("Report on GitHub…"))
-                    .on_hover_text(tl!("Copy the diagnostics and open a new bug report on GitHub, filled in. Nothing is sent until you submit it."));
+                    .on_hover_text(tl!("Copy the diagnostics and open a new bug report on GitHub with the version and system filled in. Paste the diagnostics into it; nothing is posted until you submit it."));
                 if report.clicked() {
-                    let (address, whole) = issue_address(&window.about, &window.text);
-                    copy = Some(window.text.clone());
-                    visit = Some(address);
-                    window.said = Some(if whole {
-                        tl!("Opened the bug report form with the diagnostics filled in. They're on the clipboard too.").to_string()
-                    } else {
-                        tl!("Opened the bug report form. The diagnostics are too long for its address: paste them from the clipboard into its logs field.").to_string()
-                    });
+                    copy = Some(fenced(&window.text));
+                    visit = Some(issue_address(&window.about));
+                    window.said = Some(tl!("Opened the bug report form. Paste the diagnostics from the clipboard into its logs field.").to_string());
                 }
                 if let Some(said) = &window.said {
                     ui.label(RichText::new(said.as_str()).small().color(t.text_dim));
                 }
             });
             ui.separator();
+            let label = ui.label(RichText::new(tl!("Diagnostics")).small().color(t.text_dim));
             egui::ScrollArea::vertical().id_salt("problem_report_text").auto_shrink([false, false]).show(ui, |ui| {
-                let mut text = window.text.as_str();
-                ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+                // Editable: what the user takes out isn't copied.
+                ui.add(egui::TextEdit::multiline(&mut window.text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY)).labelled_by(label.id);
             });
         });
     if let Some(text) = copy {
