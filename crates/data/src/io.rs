@@ -3581,11 +3581,29 @@ impl TextColumn {
 /// exactly) are; `12345678901234567891` and `0.12345678901234567891` aren't. No Double's exact
 /// value has more than 767 significant digits, so longer text isn't one, and isn't formatted.
 pub fn double_holds(v: &str) -> bool {
-    /// The digits of a number's mantissa without leading or trailing zeros.
-    fn digits(s: &str) -> String {
+    /// Where a number's significant digits run among its mantissa's digits: from the first to
+    /// the last that isn't zero. Found in place, so a long mantissa isn't copied.
+    fn span(s: &str) -> Option<(usize, usize)> {
         let mantissa = s.split(['e', 'E']).next().unwrap_or_default();
-        let all: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-        all.trim_start_matches('0').trim_end_matches('0').to_string()
+        let (mut first, mut last) = (None, 0);
+        for (i, b) in mantissa.bytes().filter(u8::is_ascii_digit).enumerate() {
+            if b != b'0' {
+                first.get_or_insert(i);
+                last = i;
+            }
+        }
+        first.map(|first| (first, last))
+    }
+    /// How many significant digits a number has.
+    fn significant(s: &str) -> usize {
+        span(s).map_or(0, |(first, last)| last - first + 1)
+    }
+    /// The digits of a number's mantissa without leading or trailing zeros: only those are
+    /// copied.
+    fn digits(s: &str) -> String {
+        let Some((first, last)) = span(s) else { return String::new() };
+        let mantissa = s.split(['e', 'E']).next().unwrap_or_default();
+        mantissa.chars().filter(char::is_ascii_digit).skip(first).take(last - first + 1).collect()
     }
     // A whole number written as one is held only exactly: `12345678901234567000` is a Double's
     // 17 digits and zeros, but that Double is 12345678901234567168.
@@ -3599,8 +3617,13 @@ pub fn double_holds(v: &str) -> bool {
     // Parsed first, so the digits of text that is no number aren't copied.
     v.parse::<f64>().is_ok_and(|x| {
         x.is_finite() && {
-            let want = digits(v);
-            want.is_empty() || want.len() <= 767 && digits(&format!("{x:.*e}", want.len() - 1)) == want
+            // Past what any Double holds, refused before its digits are copied.
+            let n = significant(v);
+            n == 0
+                || n <= 767 && {
+                    let want = digits(v);
+                    digits(&format!("{x:.*e}", want.len() - 1)) == want
+                }
         }
     })
 }
@@ -3645,10 +3668,8 @@ fn is_long_number(v: &str) -> bool {
     let mantissa = v.split(['e', 'E']).next().unwrap_or_default();
     let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let frac = frac.trim_end_matches('0');
-    let mut digits = String::new();
-    digits.extend(whole.chars().filter(char::is_ascii_digit));
-    digits.extend(frac.chars().filter(char::is_ascii_digit));
-    digits.trim_start_matches('0').len() > 15
+    // Counted in place, stopping at the sixteenth: a long number isn't copied.
+    whole.bytes().chain(frac.bytes()).filter(u8::is_ascii_digit).skip_while(|b| *b == b'0').nth(15).is_some()
 }
 
 /// Undoes the export formula guard: `'=x` reads back as `=x`.

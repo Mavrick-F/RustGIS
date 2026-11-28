@@ -44,6 +44,8 @@ fn a_large_value_or_shape_is_not_copied_for_a_download() {
     let formula = || format!("={}", "\"x".repeat(ITEM / 2));
     // Text holding numbers, as a JSON document in a cell does.
     let digits = || "{\"a\": 1.5} ".repeat(ITEM / 11);
+    // One enormous finite number, whose digits the guard and precision checks count.
+    let number = || format!("+0.{}1", "0".repeat(ITEM));
     let vertices = || (0..ITEM / 16).map(|i| Coord::new((i % 360) as f64 - 180.0, 1.5)).collect::<Vec<_>>();
     let mut over = Vec::new();
     let mut check = |name: &str, grew: u64| {
@@ -61,6 +63,7 @@ fn a_large_value_or_shape_is_not_copied_for_a_download() {
         ("WKT guarded cell", "wkt", None, "note", formula()),
         ("CSV cell", "csv", None, "note", plain()),
         ("CSV guarded cell", "csv", None, "note", formula()),
+        ("CSV number cell", "csv", None, "note", number()),
     ] {
         let ds = layer(point(), field, value);
         let limit = Limit::new(ROOM);
@@ -70,9 +73,12 @@ fn a_large_value_or_shape_is_not_copied_for_a_download() {
     }
 
     // The counting of what a file loses runs before it is written.
-    for (name, ext, value) in
-        [("CSV notices", "csv", digits()), ("CSV guarded notices", "csv", formula()), ("KML notices", "kml", digits())]
-    {
+    for (name, ext, value) in [
+        ("CSV notices", "csv", digits()),
+        ("CSV guarded notices", "csv", formula()),
+        ("CSV number notices", "csv", number()),
+        ("KML notices", "kml", digits()),
+    ] {
         let ds = layer(point(), "note", value);
         let grew = growth(|| {
             rustgis_data::io::export_losses_notes_in(&ds, ext, None, "t", Crs::LonLat).unwrap();
