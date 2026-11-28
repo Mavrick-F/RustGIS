@@ -169,8 +169,8 @@ graphics the map is drawn with, whether the last run closed normally, each bug m
 with its incident reference and where in RustGIS it happened, the last 50 commands from the
 [session log](workspace.md#session-log) as Script pane lines that run them again, and the whole Messages history. A command that
 failed says its error; one whose parameters were cut or had a secret taken out, or that a script
-can't run, says so in a comment. Logins and passwords are removed, as in Messages; file paths
-and layer names stay.
+can't run, says so in a comment. Logins and secrets are removed as in Messages, with the same
+limits; file paths and layer names stay.
 
 **Copy** copies it. **Report on GitHub…** copies it too and opens a new bug report with the
 version, system and diagnostics filled in; a report too long for the address asks you to paste

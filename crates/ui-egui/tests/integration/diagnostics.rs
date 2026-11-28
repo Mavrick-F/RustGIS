@@ -90,7 +90,7 @@ fn report_a_problem_shows_copies_and_opens_the_bug_report_form() {
     let mut app = RustGisApp::new(Session::new(Project::default()));
     app.session.map_mut().tiles.clear();
     app.session.diagnostics.clear();
-    app.last_run = Some("RustGIS didn't close normally last time, between commands.".into());
+    app.last_run = rustgis_engine::problem_report::LastRun::Left("RustGIS didn't close normally last time, between commands.".into());
     assert!(app.run("layer.addData", json!({"path":"/report-missing/absent.geojson"})).is_err());
     app.run("ui.reportProblem", json!({})).unwrap();
     let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1366.0, 900.0)).with_step_dt(0.1).with_max_steps(64).build_ui_state(

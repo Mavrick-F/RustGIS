@@ -1513,10 +1513,9 @@ pub struct RustGisApp {
     /// The touch interface a phone's shell offers (`rustgis-ui-touch`), kept while the desktop
     /// interface is in its place so `ui.touchInterface` can bring it back. `None` elsewhere.
     pub touch: Option<Chrome>,
-    /// What the app's last run left, as its shell said it at start (it didn't close normally, and
-    /// what it was running), for Report a Problem. `None` after a clean close, or where the shell
-    /// can't tell.
-    pub last_run: Option<String>,
+    /// How the app's last run ended, as its shell said at start, for Report a Problem: not
+    /// reported where the shell doesn't keep track.
+    pub last_run: rustgis_engine::problem_report::LastRun,
     /// Whether the user wants the device's position shown: a shell that can report one (a
     /// phone's) starts and stops its positioning by this, and fills in [`RustGisApp::position`].
     pub locate: bool,
@@ -1900,7 +1899,7 @@ impl RustGisApp {
             reads_off_frame: false,
             chrome: None,
             touch: None,
-            last_run: None,
+            last_run: rustgis_engine::problem_report::LastRun::NotReported,
             locate: false,
             position: None,
             fixes: std::collections::VecDeque::new(),

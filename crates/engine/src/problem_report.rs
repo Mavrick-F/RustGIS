@@ -22,15 +22,27 @@ pub struct About {
     pub front_end: String,
     /// The graphics the map is drawn with (backend, adapter, driver), when it says.
     pub graphics: Option<String>,
-    /// What the last run of the app left: that it didn't close, and what it was running.
-    pub last_run: Option<String>,
+    /// What the last run of the app left.
+    pub last_run: LastRun,
+}
+
+/// How the app's last run ended, as its shell knows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LastRun {
+    /// The shell doesn't keep track (the browser, the phone), or couldn't this time.
+    #[default]
+    NotReported,
+    Closed,
+    /// It didn't close normally, or met an internal error: the shell's notice, which says what
+    /// it was running.
+    Left(String),
 }
 
 impl Session {
     /// The report, logins and secrets taken out. Each section says when it is empty, so a reader
     /// tells "none" from "left out".
     pub fn problem_report(&self, about: &About) -> String {
-        let mut out = Self::redacted(&self.report_head(about)).into_string();
+        let mut out = self.report_head(about);
         out.push_str(&self.commands_section());
         let messages = self.diagnostics.report(Filter::All);
         // The history's own heading, under this one.
@@ -40,17 +52,26 @@ impl Session {
         out
     }
 
-    /// The app, the computer, the last run and the incidents, before they are redacted.
+    /// The app, the computer, the last run and the incidents. Each part is redacted on its own:
+    /// the redaction bounds what it is given, and the whole of them could pass that bound, cutting
+    /// the newest incidents or putting all of it out.
     fn report_head(&self, about: &About) -> String {
+        let redacted = |text: &str| Self::redacted(text).into_string();
         let mut out = String::from("RustGIS diagnostics\n");
         let _ = writeln!(out, "Version: {}", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(out, "System: {} {}", std::env::consts::OS, std::env::consts::ARCH);
         if !about.front_end.is_empty() {
             let _ = writeln!(out, "Front end: {}", about.front_end);
         }
-        let _ = writeln!(out, "Graphics: {}", about.graphics.as_deref().unwrap_or("not reported"));
+        let graphics = about.graphics.as_deref().map_or_else(|| "not reported".to_string(), redacted);
+        let _ = writeln!(out, "Graphics: {graphics}");
         let _ = writeln!(out, "Threads: {} of {} cores", rustgis_data::threads::max(), rustgis_data::threads::cores());
-        let _ = writeln!(out, "Last run: {}", about.last_run.as_deref().unwrap_or("closed normally"));
+        let last_run = match &about.last_run {
+            LastRun::NotReported => "not reported".to_string(),
+            LastRun::Closed => "closed normally".to_string(),
+            LastRun::Left(notice) => redacted(notice),
+        };
+        let _ = writeln!(out, "Last run: {last_run}");
 
         let incidents = rustgis_data::incident::kept();
         let _ = writeln!(out, "\n## Incidents ({})", incidents.len());
@@ -58,7 +79,7 @@ impl Session {
             out.push_str("None this session.\n");
         }
         for incident in &incidents {
-            let _ = writeln!(out, "\n{}", incident.details());
+            let _ = writeln!(out, "\n{}", redacted(&incident.details()));
         }
         out
     }
@@ -131,7 +152,13 @@ pub fn issue_address(about: &About, report: &str) -> (String, bool) {
         let query: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={}", crate::cmd::webdata::percent_encode(v))).collect();
         format!("{NEW_ISSUE}?{}", query.join("&"))
     };
-    let whole = format!("RustGIS diagnostics, from Help › Report a Problem:\n\n```text\n{report}\n```");
+    // A fence longer than any run of backticks in the report, so none of it ends the fence and
+    // reads as the form's Markdown.
+    let mut fence = "```".to_string();
+    while report.contains(fence.as_str()) {
+        fence.push('`');
+    }
+    let whole = format!("RustGIS diagnostics, from Help › Report a Problem:\n\n{fence}text\n{report}\n{fence}");
     let full = address(&whole);
     if full.len() <= ADDRESS_MOST {
         (full, true)
@@ -166,7 +193,7 @@ mod tests {
         s.log.push(entry("script.run", json!({"script": "map.new"})));
         s.log.push(entry("layer.addData", json!({"path": "https://user:secret@example.org/a.geojson?token=private"})));
         s.notify("Read 3 features https://user:secret@example.org/?token=private", false);
-        let about = About { front_end: "desktop".into(), graphics: Some("Vulkan, Test GPU".into()), last_run: None };
+        let about = About { front_end: "desktop".into(), graphics: Some("Vulkan, Test GPU".into()), last_run: LastRun::Closed };
         let report = s.problem_report(&about);
         assert!(report.contains(&format!("Version: {}", env!("CARGO_PKG_VERSION"))), "{report}");
         assert!(report.contains("Graphics: Vulkan, Test GPU") && report.contains("Last run: closed normally"), "{report}");
@@ -184,13 +211,35 @@ mod tests {
 
     #[test]
     fn the_issue_address_holds_a_short_report_and_asks_for_a_long_one() {
-        let about = About { front_end: "desktop".into(), graphics: Some("Vulkan".into()), last_run: None };
+        let about = About { front_end: "desktop".into(), graphics: Some("Vulkan".into()), last_run: LastRun::NotReported };
         let (short, whole) = issue_address(&about, "RustGIS diagnostics\nVersion: x & y");
         assert!(whole && short.starts_with(NEW_ISSUE) && short.contains("template=bug_report.yml"), "{short}");
         // Values are escaped: an `&` in the report doesn't start another field.
         assert!(short.contains("x%20%26%20y") && short.contains("desktop%2C%20Vulkan"), "{short}");
+        // Backticks in the report don't end its fence.
+        let (fenced, _) = issue_address(&about, "a ``` b");
+        assert!(fenced.contains("%60%60%60%60text"), "{fenced}");
         let (long, whole) = issue_address(&about, &"x".repeat(ADDRESS_MOST));
         assert!(!whole && long.len() <= ADDRESS_MOST && long.contains("Paste%20the%20diagnostics"), "{long}");
+    }
+
+    /// Incidents past the redaction's bound together are each kept whole, and the lines above
+    /// them too.
+    #[test]
+    fn many_long_incidents_keep_the_head_and_each_other() {
+        rustgis_data::incident::install();
+        let s = Session::new(Project::default());
+        let ids: Vec<String> = (0..6)
+            .map(|i| {
+                let payload = std::panic::catch_unwind(move || panic!("long bug {i} {}", "x".repeat(4000))).unwrap_err();
+                rustgis_data::incident::caught(payload.as_ref()).id
+            })
+            .collect();
+        let report = s.problem_report(&About::default());
+        assert!(report.starts_with("RustGIS diagnostics\nVersion: "), "{report}");
+        for id in &ids {
+            assert!(report.contains(&format!("Incident {id}")), "{id}");
+        }
     }
 
     #[test]
@@ -198,7 +247,9 @@ mod tests {
         let mut s = Session::new(Project::default());
         s.log.clear();
         s.diagnostics.clear();
-        let report = s.problem_report(&About { last_run: Some("didn't close".into()), ..Default::default() });
+        let report = s.problem_report(&About::default());
+        assert!(report.contains("Last run: not reported"), "{report}");
+        let report = s.problem_report(&About { last_run: LastRun::Left("didn't close".into()), ..Default::default() });
         assert!(report.contains("## Last commands (0 of 0), as a script\nNone this session."), "{report}");
         assert!(report.contains("Graphics: not reported") && report.contains("Last run: didn't close"), "{report}");
         assert!(report.contains("## Messages (0)"), "{report}");

@@ -63,7 +63,7 @@ pub(crate) fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             crate::i18n::paragraph(
                 ui,
-                "These diagnostics help someone find what went wrong: this RustGIS and computer, the bugs met, the last commands as a script that runs them again, and Messages. Logins and passwords are taken out; file paths and layer names stay. Read them first, and remove anything you don't want to share.",
+                "These diagnostics help someone find what went wrong: this RustGIS and computer, the bugs met, the last commands as a script that runs them again, and Messages. Logins and secrets RustGIS recognises are taken out, but not every password can be told from other text, and file paths and layer names stay. Read them first, and remove anything you don't want to share.",
                 crate::theme::regular(12.0),
                 t.text,
             );
