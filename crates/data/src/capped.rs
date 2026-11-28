@@ -211,18 +211,20 @@ mod tests {
     /// isn't reallocated; one held to a limit gives its spare room back.
     #[test]
     fn only_a_limited_file_is_trimmed_when_finished() {
+        // Five bytes, then one more: the allocation doubles to ten for six.
         let unlimited = Limit::none();
         let mut b = unlimited.buffer();
         b.write_all(&[1; 5]).unwrap();
-        let room = b.file.capacity();
-        assert!(room > 5, "{room}");
-        assert_eq!(b.into_inner().capacity(), room);
+        b.write_all(&[1]).unwrap();
+        assert_eq!(b.file.capacity(), 10);
+        assert_eq!(b.into_inner().capacity(), 10);
         let limit = Limit::new(1000);
         let mut b = limit.buffer();
         b.write_all(&[1; 5]).unwrap();
-        b.write_all(&[1; 5]).unwrap();
+        b.write_all(&[1]).unwrap();
+        assert_eq!(b.file.capacity(), 10);
         let file = b.into_inner();
-        assert_eq!(file.capacity(), file.len());
+        assert_eq!((file.len(), file.capacity()), (6, 6));
     }
 
     /// A request past the limit, however large, is refused without changing what is counted.
