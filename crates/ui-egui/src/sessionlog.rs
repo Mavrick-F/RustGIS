@@ -206,23 +206,12 @@ pub fn pane(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
 
 /// An entry's parameters as one line of JSON: none for no parameters.
 fn params_text(e: &LogEntry) -> String {
-    match &e.params {
-        Value::Null => String::new(),
-        Value::Object(m) if m.is_empty() => String::new(),
-        p => p.to_string(),
-    }
+    e.params_text()
 }
 
-/// A Script pane line for entry `e`: its command and parameters, as History's Copy as Command
-/// writes one. Undo and redo alone: what the log keeps of them is the step's label, not a
-/// parameter.
+/// A Script pane line for entry `e` ([`LogEntry::script_line`]).
 fn command_line(e: &LogEntry) -> String {
-    let params = params_text(e);
-    if params.is_empty() || matches!(e.command.as_str(), "edit.undo" | "edit.redo") {
-        e.command.clone()
-    } else {
-        format!("{} {params}", e.command)
-    }
+    e.script_line()
 }
 
 /// The script a `script.run` entry ran, as the log kept it.

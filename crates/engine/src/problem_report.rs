@@ -1,0 +1,206 @@
+//! What a bug report needs from this session, as one text the user reads before sharing it: the
+//! RustGIS and computer it ran on, the bugs it met ([`rustgis_data::incident`]), the last commands
+//! as Script pane lines to run again, and the Messages history. Logins and secrets are taken out:
+//! the free text by [`Session::redacted`], a command's parameters as the session log kept them
+//! (secrets already out) with addresses and active logins scrubbed, and Messages as the history
+//! kept them (redacted as they were said). File paths and layer names stay, as the report needs
+//! them, and the user sees them before anything is copied.
+
+use std::fmt::Write;
+
+use rustgis_data::diagnostics::Filter;
+
+use crate::Session;
+
+/// The most commands the report gives, the newest.
+pub const COMMANDS: usize = 50;
+
+/// What only the front end knows.
+#[derive(Clone, Debug, Default)]
+pub struct About {
+    /// The front end: `desktop`, `browser`, `phone`.
+    pub front_end: String,
+    /// The graphics the map is drawn with (backend, adapter, driver), when it says.
+    pub graphics: Option<String>,
+    /// What the last run of the app left: that it didn't close, and what it was running.
+    pub last_run: Option<String>,
+}
+
+impl Session {
+    /// The report, logins and secrets taken out. Each section says when it is empty, so a reader
+    /// tells "none" from "left out".
+    pub fn problem_report(&self, about: &About) -> String {
+        let mut out = Self::redacted(&self.report_head(about)).into_string();
+        out.push_str(&self.commands_section());
+        let messages = self.diagnostics.report(Filter::All);
+        // The history's own heading, under this one.
+        let messages = messages.split_once('\n').map_or(messages.as_str(), |(_, rest)| rest);
+        let _ = writeln!(out, "\n## Messages ({})", self.diagnostics.records().len());
+        out.push_str(messages);
+        out
+    }
+
+    /// The app, the computer, the last run and the incidents, before they are redacted.
+    fn report_head(&self, about: &About) -> String {
+        let mut out = String::from("RustGIS diagnostics\n");
+        let _ = writeln!(out, "Version: {}", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(out, "System: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+        if !about.front_end.is_empty() {
+            let _ = writeln!(out, "Front end: {}", about.front_end);
+        }
+        let _ = writeln!(out, "Graphics: {}", about.graphics.as_deref().unwrap_or("not reported"));
+        let _ = writeln!(out, "Threads: {} of {} cores", rustgis_data::threads::max(), rustgis_data::threads::cores());
+        let _ = writeln!(out, "Last run: {}", about.last_run.as_deref().unwrap_or("closed normally"));
+
+        let incidents = rustgis_data::incident::kept();
+        let _ = writeln!(out, "\n## Incidents ({})", incidents.len());
+        if incidents.is_empty() {
+            out.push_str("None this session.\n");
+        }
+        for incident in &incidents {
+            let _ = writeln!(out, "\n{}", incident.details());
+        }
+        out
+    }
+
+    /// The last [`COMMANDS`] commands as Script pane lines, oldest first, each after a comment
+    /// saying when it ran and how it ended: one that failed says its error, and one the log kept
+    /// less of (cut to fit, secrets taken out) or that a script can't run says so, as it
+    /// wouldn't run again as it ran.
+    fn commands_section(&self) -> String {
+        let (entries, _, total) = self.log.select(|_| true, COMMANDS);
+        let mut out = format!("\n## Last commands ({} of {total}), as a script\n", entries.len());
+        if !self.log.on() {
+            out.push_str("# The session log is turned off: commands since then aren't listed.\n");
+        }
+        if let Some(dropped) = self.log.dropped_said() {
+            let _ = writeln!(out, "# {dropped}.");
+        }
+        if entries.is_empty() {
+            out.push_str("None this session.\n");
+        }
+        for e in &entries {
+            let ended = match &e.error {
+                Some(error) => format!("failed: {}", error.replace('\n', " ")),
+                None if e.ok => "ok".to_string(),
+                None => "failed".to_string(),
+            };
+            let mut said = vec![format!("{} UTC, {} ms, {ended}", e.time_utc(), e.millis)];
+            if e.partial {
+                said.push("its parameters were cut or had secrets taken out, so it may not run as it ran".into());
+            }
+            let scriptable = self.registry.get(&e.command).is_some() && !crate::cmd::workflows::refused_in_script(&e.command);
+            if !scriptable {
+                said.push("a script can't run it".into());
+            }
+            let said = Self::redacted(&said.join("; ")).into_string();
+            let _ = writeln!(out, "# {}", said.replace('\n', " "));
+            // Its parameters as the log kept them, secrets out; a redaction made for prose would
+            // take the JSON out with them.
+            let line = crate::durable::generated_text(&e.script_line());
+            if scriptable {
+                let _ = writeln!(out, "{line}");
+            } else {
+                let _ = writeln!(out, "# {line}");
+            }
+        }
+        out
+    }
+}
+
+/// Where a new bug report starts: the repository's bug report form.
+pub const NEW_ISSUE: &str = "https://github.com/opengeos/RustGIS/issues/new";
+/// The longest address the report is put into whole: GitHub refuses much longer ones.
+pub const ADDRESS_MOST: usize = 7000;
+
+/// A new bug report on GitHub, its form filled in from `report`: the version, the system and
+/// graphics in their fields, and the whole report in its logs field when the address holds it.
+/// Nothing is sent until the user submits the form. Whether the report is in it: when it isn't,
+/// the field asks for it to be pasted.
+pub fn issue_address(about: &About, report: &str) -> (String, bool) {
+    let mut system = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+    if !about.front_end.is_empty() {
+        let _ = write!(system, ", {}", about.front_end);
+    }
+    if let Some(graphics) = &about.graphics {
+        let _ = write!(system, ", {graphics}");
+    }
+    let address = |logs: &str| {
+        let fields =
+            [("template", "bug_report.yml"), ("version", env!("CARGO_PKG_VERSION")), ("os", system.as_str()), ("screenshots", logs)];
+        let query: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={}", crate::cmd::webdata::percent_encode(v))).collect();
+        format!("{NEW_ISSUE}?{}", query.join("&"))
+    };
+    let whole = format!("RustGIS diagnostics, from Help › Report a Problem:\n\n```text\n{report}\n```");
+    let full = address(&whole);
+    if full.len() <= ADDRESS_MOST {
+        (full, true)
+    } else {
+        (address("Paste the diagnostics here: Report a Problem copied them when it opened this page."), false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::Project;
+    use crate::project_log::LogEntry;
+
+    fn entry(command: &str, params: serde_json::Value) -> LogEntry {
+        LogEntry { command: command.into(), params, ok: true, ..Default::default() }
+    }
+
+    #[test]
+    fn the_report_names_the_app_the_bugs_the_commands_and_the_messages() {
+        rustgis_data::incident::install();
+        let mut s = Session::new(Project::default());
+        s.log.clear();
+        s.diagnostics.clear();
+        let payload = std::panic::catch_unwind(|| panic!("a report's own bug")).unwrap_err();
+        let incident = rustgis_data::incident::caught(payload.as_ref());
+        s.log.push(entry("map.new", json!({"name": "Parcels"})));
+        s.log.push(LogEntry { error: Some("no such file".into()), ok: false, ..entry("layer.addData", json!({"path": "/x/a.shp"})) });
+        s.log.push(LogEntry { partial: true, ..entry("map.new", json!({"name": "S…"})) });
+        s.log.push(entry("script.run", json!({"script": "map.new"})));
+        s.log.push(entry("layer.addData", json!({"path": "https://user:secret@example.org/a.geojson?token=private"})));
+        s.notify("Read 3 features https://user:secret@example.org/?token=private", false);
+        let about = About { front_end: "desktop".into(), graphics: Some("Vulkan, Test GPU".into()), last_run: None };
+        let report = s.problem_report(&about);
+        assert!(report.contains(&format!("Version: {}", env!("CARGO_PKG_VERSION"))), "{report}");
+        assert!(report.contains("Graphics: Vulkan, Test GPU") && report.contains("Last run: closed normally"), "{report}");
+        assert!(report.contains(&format!("Incident {}", incident.id)) && report.contains("a report's own bug"), "{report}");
+        // The commands run again as a script; the failed one says why, the cut one says so.
+        assert!(report.contains("\nmap.new {\"name\":\"Parcels\"}\n"), "{report}");
+        assert!(report.contains("failed: no such file\nlayer.addData {\"path\":\"/x/a.shp\"}\n"), "{report}");
+        assert!(report.contains("may not run as it ran\nmap.new {\"name\":\"S…\"}\n"), "{report}");
+        assert!(report.contains("a script can't run it\n# script.run"), "{report}");
+        assert!(report.contains("Read 3 features") && report.contains("example.org"), "{report}");
+        // A login in an address is taken out of a command's parameters and of a message alike.
+        assert!(report.contains("layer.addData {\"path\":\"https://example.org/"), "{report}");
+        assert!(!report.contains("user:secret") && !report.contains("token=private"), "{report}");
+    }
+
+    #[test]
+    fn the_issue_address_holds_a_short_report_and_asks_for_a_long_one() {
+        let about = About { front_end: "desktop".into(), graphics: Some("Vulkan".into()), last_run: None };
+        let (short, whole) = issue_address(&about, "RustGIS diagnostics\nVersion: x & y");
+        assert!(whole && short.starts_with(NEW_ISSUE) && short.contains("template=bug_report.yml"), "{short}");
+        // Values are escaped: an `&` in the report doesn't start another field.
+        assert!(short.contains("x%20%26%20y") && short.contains("desktop%2C%20Vulkan"), "{short}");
+        let (long, whole) = issue_address(&about, &"x".repeat(ADDRESS_MOST));
+        assert!(!whole && long.len() <= ADDRESS_MOST && long.contains("Paste%20the%20diagnostics"), "{long}");
+    }
+
+    #[test]
+    fn an_empty_session_says_each_section_is_empty() {
+        let mut s = Session::new(Project::default());
+        s.log.clear();
+        s.diagnostics.clear();
+        let report = s.problem_report(&About { last_run: Some("didn't close".into()), ..Default::default() });
+        assert!(report.contains("## Last commands (0 of 0), as a script\nNone this session."), "{report}");
+        assert!(report.contains("Graphics: not reported") && report.contains("Last run: didn't close"), "{report}");
+        assert!(report.contains("## Messages (0)"), "{report}");
+    }
+}
