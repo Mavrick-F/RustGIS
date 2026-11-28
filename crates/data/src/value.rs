@@ -1,5 +1,7 @@
 //! Attribute values and field definitions.
 
+use std::borrow::Cow;
+
 use crate::date::{Date, DateTime};
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +129,22 @@ impl Value {
             Value::Null => String::new(),
             Value::Float(f) => f.to_string(),
             other => other.to_string(),
+        }
+    }
+    /// [`to_file_text`](Value::to_file_text), a text value's own text borrowed rather than
+    /// copied.
+    pub(crate) fn file_text(&self) -> Cow<'_, str> {
+        match self {
+            Value::Text(t) => Cow::Borrowed(t),
+            other => Cow::Owned(other.to_file_text()),
+        }
+    }
+    /// The value as it is shown ([`Display`](std::fmt::Display)), a text value's own text
+    /// borrowed rather than copied.
+    pub(crate) fn shown_text(&self) -> Cow<'_, str> {
+        match self {
+            Value::Text(t) => Cow::Borrowed(t),
+            other => Cow::Owned(other.to_string()),
         }
     }
     /// How a date or date-time compares: microseconds since 1970, a date at its midnight and a

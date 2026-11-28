@@ -1,5 +1,9 @@
 //! Zip archives (Deflate or stored): packages bundle a project or map with its data files.
 
+use std::io::{Seek, SeekFrom, Write};
+
+use crate::capped::{PIECE, write_pieces};
+
 /// Most entries read from an archive (plain zip holds at most 65,535; ZIP64 isn't read).
 const MAX_ENTRIES: usize = 65_535;
 /// Largest entry inflated (1 GiB).
@@ -36,14 +40,15 @@ fn crc32(data: &[u8]) -> u32 {
 /// holds at most 65,535 entries and 4 GiB, and names of up to 65,535 bytes; beyond that it's an
 /// error rather than a damaged archive.
 pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
+    let mut out = std::io::Cursor::new(Vec::new());
     write_to(entries, &mut out)?;
-    Ok(out)
+    Ok(out.into_inner())
 }
 
-/// [`write`]'s archive, written to `out` as it is made (a buffer held to a limit stops it there).
-/// Besides `out`, it holds the central directory and one entry's compressed bytes at a time.
-pub(crate) fn write_to(entries: &[(String, Vec<u8>)], out: &mut impl std::io::Write) -> Result<(), String> {
+/// [`write`]'s archive, written to `out`, empty as it starts, as it is made (a buffer held to a
+/// limit stops it there). Each entry is deflated into `out` a piece at a time, so besides `out`
+/// it holds the central directory, a piece and the compressor.
+pub(crate) fn write_to(entries: &[(String, Vec<u8>)], out: &mut (impl Write + Seek)) -> Result<(), String> {
     let too_big = || "the archive is too large for a zip file".to_string();
     let failed = |e: std::io::Error| e.to_string();
     let count = u16::try_from(entries.len()).map_err(|_| too_big())?;
@@ -55,11 +60,8 @@ pub(crate) fn write_to(entries: &[(String, Vec<u8>)], out: &mut impl std::io::Wr
         let name_len = u16::try_from(n.len()).map_err(|_| too_big())?;
         let data_len = u32::try_from(data.len()).map_err(|_| too_big())?;
         let crc = crc32(data);
-        let z = miniz_oxide::deflate::compress_to_vec(data, 6);
-        let (method, body): (u16, &[u8]) = if z.len() < data.len() { (8, &z) } else { (0, data) };
         let offset = u32::try_from(written).map_err(|_| too_big())?;
-        let body_len = u32::try_from(body.len()).map_err(|_| too_big())?;
-        let header = |sig: u32, central: bool| {
+        let header = |sig: u32, central: bool, method: u16, body_len: u32| {
             let mut h = Vec::new();
             h.extend_from_slice(&sig.to_le_bytes());
             if central {
@@ -85,11 +87,27 @@ pub(crate) fn write_to(entries: &[(String, Vec<u8>)], out: &mut impl std::io::Wr
             h.extend_from_slice(n);
             h
         };
-        let local = header(0x0403_4B50, false);
+        // The header goes before the body, whose method and length are known only after it: its
+        // place is taken, then it is written again.
+        let local = header(0x0403_4B50, false, 0, 0);
         out.write_all(&local).map_err(failed)?;
-        out.write_all(body).map_err(failed)?;
-        written = written.saturating_add(local.len()).saturating_add(body.len());
-        central.extend_from_slice(&header(0x0201_4B50, true));
+        let body_at = written.saturating_add(local.len()) as u64;
+        let (method, body_len) = match deflate_to(data, out).map_err(failed)? {
+            Some(len) => (8, len),
+            None => {
+                // Over what was deflated, which is shorter.
+                out.seek(SeekFrom::Start(body_at)).map_err(failed)?;
+                write_pieces(out, data).map_err(failed)?;
+                (0, data.len())
+            }
+        };
+        let body_len_32 = u32::try_from(body_len).map_err(|_| too_big())?;
+        let end = body_at.saturating_add(body_len as u64);
+        out.seek(SeekFrom::Start(written as u64)).map_err(failed)?;
+        out.write_all(&header(0x0403_4B50, false, method, body_len_32)).map_err(failed)?;
+        out.seek(SeekFrom::Start(end)).map_err(failed)?;
+        written = written.saturating_add(local.len()).saturating_add(body_len);
+        central.extend_from_slice(&header(0x0201_4B50, true, method, body_len_32));
     }
     let cd_offset = u32::try_from(written).map_err(|_| too_big())?;
     let cd_len = u32::try_from(central.len()).map_err(|_| too_big())?;
@@ -102,6 +120,28 @@ pub(crate) fn write_to(entries: &[(String, Vec<u8>)], out: &mut impl std::io::Wr
     end.extend_from_slice(&cd_offset.to_le_bytes());
     end.extend_from_slice(&0u16.to_le_bytes());
     out.write_all(&end).map_err(failed)
+}
+
+/// `data` deflated into `out` at level 6, the bytes `compress_to_vec` makes: its length when that
+/// is less than `data`'s, else `None` once it would come to as much, with less than that written.
+fn deflate_to(data: &[u8], out: &mut impl Write) -> std::io::Result<Option<usize>> {
+    use miniz_oxide::deflate::core::{CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params};
+    let mut compressor = CompressorOxide::new(create_comp_flags_from_zip_params(6, 0, 0));
+    let mut piece = [0; PIECE];
+    let (mut input, mut len) = (data, 0usize);
+    loop {
+        let (status, taken, made) = compress(&mut compressor, input, &mut piece, TDEFLFlush::Finish);
+        len = len.saturating_add(made);
+        if len >= data.len() {
+            return Ok(None);
+        }
+        out.write_all(piece.get(..made).unwrap_or_default())?;
+        match status {
+            TDEFLStatus::Done => return Ok(Some(len)),
+            TDEFLStatus::Okay if taken > 0 || made > 0 => input = input.get(taken..).unwrap_or_default(),
+            _ => return Err(std::io::Error::other("the entry couldn't be compressed")),
+        }
+    }
 }
 
 fn u16_at(b: &[u8], i: usize) -> Option<usize> {
@@ -352,6 +392,35 @@ fn read_within(bytes: &[u8], want: impl Fn(&str) -> bool, budget: usize, spreads
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry's body is what deflating it in one call at level 6 gives when that is smaller,
+    /// else the entry as it is, with the next record straight after: for entries shorter and
+    /// longer than a piece, that deflate or not.
+    #[test]
+    fn entries_are_deflated_as_in_one_call_or_stored() {
+        let mut state = 7u32;
+        let noise: Vec<u8> = std::iter::repeat_with(|| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .take(200_000)
+        .collect();
+        let halves: Vec<u8> = noise.iter().map(|b| b & 0x0f).collect();
+        let text: Vec<u8> = b"the same words again. ".repeat(9_000);
+        let whole = [Vec::new(), vec![7], b"abc".repeat(3), vec![0; 100_000], text, noise, halves];
+        for data in &whole {
+            let archive = write(&[("e".into(), data.clone())]).unwrap();
+            let deflated = miniz_oxide::deflate::compress_to_vec(data, 6);
+            let (method, body) = if deflated.len() < data.len() { (8, &deflated) } else { (0, data) };
+            let end = 31 + body.len();
+            assert_eq!(u16_at(&archive, 8), Some(method), "{} bytes", data.len());
+            assert_eq!(u32_at(&archive, 18), Some(body.len()));
+            assert_eq!(archive.get(31..end), Some(body.as_slice()));
+            assert_eq!(u32_at(&archive, end), Some(0x0201_4B50));
+        }
+        let entries: Vec<(String, Vec<u8>)> = whole.into_iter().enumerate().map(|(i, d)| (i.to_string(), d)).collect();
+        assert_eq!(read(&write(&entries).unwrap()).unwrap(), entries);
+    }
 
     #[test]
     fn spreadsheet_members_use_unicode_path_names() {

@@ -1,5 +1,6 @@
 //! Vector readers and writers: GeoJSON, CSV (with longitude/latitude columns) and Shapefile.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -1136,7 +1137,7 @@ fn projected_bytes_within(ds: &Dataset, ext: &str, crs: Crs, limit: &Limit) -> R
 
 /// A zip of `entries`, which were held to `limit` as they were made: they stay counted against it
 /// while the archive is made, and the archive is written within what they leave, so the two
-/// together never pass it (besides one entry's compressed bytes at a time).
+/// together never pass it.
 fn zipped(entries: &[(String, Vec<u8>)], limit: &Limit) -> Result<Vec<u8>> {
     let parts: usize = entries.iter().map(|(_, bytes)| bytes.capacity()).sum();
     let _parts = limit.hold(parts)?;
@@ -3595,9 +3596,13 @@ pub fn double_holds(v: &str) -> bool {
         let digits = if digits.is_empty() { "0" } else { digits };
         return digits.len() <= 309 && v.parse::<f64>().is_ok_and(|x| x.is_finite() && format!("{:.0}", x.abs()) == digits);
     }
-    let want = digits(v);
-    v.parse::<f64>()
-        .is_ok_and(|x| x.is_finite() && (want.is_empty() || want.len() <= 767 && digits(&format!("{x:.*e}", want.len() - 1)) == want))
+    // Parsed first, so the digits of text that is no number aren't copied.
+    v.parse::<f64>().is_ok_and(|x| {
+        x.is_finite() && {
+            let want = digits(v);
+            want.is_empty() || want.len() <= 767 && digits(&format!("{x:.*e}", want.len() - 1)) == want
+        }
+    })
 }
 
 /// Types a dataset's Text columns from their values (see [`text_type`]), for readers whose
@@ -3671,12 +3676,14 @@ fn csv_needs_guard(text: &str) -> bool {
         && double_holds(text))
 }
 
-/// A cell's file text, with an apostrophe when the spreadsheet guard applies.
-fn csv_cell(v: &Value) -> String {
-    match v {
-        Value::Text(t) if csv_needs_guard(t) => format!("'{t}"),
-        other => other.to_file_text(),
-    }
+/// What goes before a cell's file text, an apostrophe when the spreadsheet guard applies, and
+/// that text.
+fn csv_cell(v: &Value) -> (&'static str, Cow<'_, str>) {
+    let guard = match v {
+        Value::Text(t) if csv_needs_guard(t) => "'",
+        _ => "",
+    };
+    (guard, v.file_text())
 }
 
 /// The names of a point layer's longitude and latitude columns in CSV: the first of the names
@@ -3735,8 +3742,12 @@ fn write_csv(ds: &Dataset, crs: Crs, out: &mut impl std::io::Write) -> Result<()
 /// Writes CSV a run of features at a time: a header of the fields, and for a point layer
 /// longitude and latitude columns before them.
 pub(crate) struct CsvWriter<W: std::io::Write> {
-    w: csv::Writer<W>,
+    /// Absent only while a row is written past it ([`CsvWriter::write_past`]), or after that
+    /// failed.
+    w: Option<csv::Writer<W>>,
     point: bool,
+    /// The cells of each row: the header's.
+    columns: usize,
 }
 
 impl<W: std::io::Write> CsvWriter<W> {
@@ -3752,29 +3763,65 @@ impl<W: std::io::Write> CsvWriter<W> {
         }
         head.extend(fields.iter().map(|f| f.name.clone()));
         w.write_record(&head).map_err(|e| DataError::Format(e.to_string()))?;
-        Ok(CsvWriter { w, point })
+        Ok(CsvWriter { w: Some(w), point, columns: head.len() })
     }
 
     /// Writes the next features, a row each.
     pub(crate) fn write(&mut self, features: &[crate::Feature]) -> Result<()> {
         for f in features {
             crate::progress::step(1)?;
-            let mut row = Vec::with_capacity(f.attrs.len() + 2);
+            let mut row: Vec<(&str, Cow<'_, str>)> = Vec::with_capacity(f.attrs.len() + 2);
             if self.point {
                 let c = f.geometry.as_ref().and_then(|g| g.label_point());
-                row.push(c.map(|c| c.x.to_string()).unwrap_or_default());
-                row.push(c.map(|c| c.y.to_string()).unwrap_or_default());
+                row.push(("", c.map(|c| c.x.to_string()).unwrap_or_default().into()));
+                row.push(("", c.map(|c| c.y.to_string()).unwrap_or_default().into()));
             }
             row.extend(f.attrs.iter().map(csv_cell));
-            self.w.write_record(&row).map_err(|e| DataError::Format(e.to_string()))?;
+            if row.len() != self.columns {
+                return Err(DataError::Format(format!("CSV: a row of {} cells under {} columns", row.len(), self.columns)));
+            }
+            // The `csv` crate takes a cell whole, so a guarded one is first joined to its
+            // apostrophe: a row with a long one is written without it.
+            if row.iter().any(|(guard, text)| !guard.is_empty() && text.len() > crate::capped::PIECE) {
+                self.write_past(&row)?;
+                continue;
+            }
+            let w = self.w.as_mut().ok_or_else(csv_stopped)?;
+            for (guard, text) in &row {
+                let written = if guard.is_empty() { w.write_field(text.as_bytes()) } else { w.write_field(format!("{guard}{text}")) };
+                written.map_err(|e| DataError::Format(e.to_string()))?;
+            }
+            // Ends the row.
+            w.write_record(None::<&[u8]>).map_err(|e| DataError::Format(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    /// Writes `row` straight to the output, a long cell a piece at a time, once the rows before
+    /// it are out of the `csv` writer.
+    fn write_past(&mut self, row: &[(&str, Cow<'_, str>)]) -> Result<()> {
+        let w = self.w.take().ok_or_else(csv_stopped)?;
+        let mut out = w.into_inner().map_err(|e| DataError::Format(e.to_string()))?;
+        for (i, (guard, text)) in row.iter().enumerate() {
+            if i > 0 {
+                out.write_all(b",")?;
+            }
+            crate::interop::write_csv_cell(&mut out, guard, text)?;
+        }
+        out.write_all(b"\n")?;
+        self.w = Some(csv::Writer::from_writer(out));
         Ok(())
     }
 
     /// Flushes the rows and gives the writer back.
     pub(crate) fn finish(self) -> Result<W> {
-        self.w.into_inner().map_err(|e| DataError::Format(e.to_string()))
+        self.w.ok_or_else(csv_stopped)?.into_inner().map_err(|e| DataError::Format(e.to_string()))
     }
+}
+
+/// The error of a CSV writer used after a write of its failed.
+fn csv_stopped() -> DataError {
+    DataError::Format("CSV: writing stopped at an earlier error".into())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5264,7 +5311,7 @@ pub fn shapefile_values_notes(ds: &Dataset, target: &str) -> Vec<crate::loss::No
             let Some(loss) = counts.get_mut(k) else { continue };
             match field.ty {
                 // A date-time field is written as its text too, so text held in one is cut the same way.
-                FieldType::Text | FieldType::DateTime if value.to_string().len() > 254 => loss.text += 1,
+                FieldType::Text | FieldType::DateTime if value.shown_text().len() > 254 => loss.text += 1,
                 FieldType::Date if !value.asks_null() && dbf_date(value).is_none() => loss.empty += 1,
                 FieldType::Integer | FieldType::Double => {
                     let d = decimals.get(k).copied().unwrap_or(0);
@@ -5748,14 +5795,17 @@ impl TextLosses {
                 if let Some(column) = &mut loss.column
                     && !column.is_text()
                 {
-                    let text = match ext {
-                        "csv" => csv_cell(v),
-                        "wkt" => crate::interop::wkt_csv_text(&v.to_file_text()),
-                        _ => v.to_file_text(),
+                    let (guard, cell) = if ext == "csv" {
+                        csv_cell(v)
+                    } else {
+                        let cell = v.file_text();
+                        (if ext == "wkt" { crate::interop::wkt_csv_guard(&cell) } else { "" }, cell)
                     };
+                    // Guarded text types its column as text, as its apostrophe alone does.
+                    let text = if guard.is_empty() { cell.as_ref() } else { guard };
                     // CSV's `<Null>` reads as null, so it types a column no more than an empty cell.
-                    if !(csv && Value::is_null_marker(&text)) {
-                        column.add(&text);
+                    if !(csv && Value::is_null_marker(text)) {
+                        column.add(text);
                     }
                 }
                 let Value::Text(s) = v else { continue };
@@ -6288,7 +6338,7 @@ fn new_column(ds: &Dataset, k: usize) -> Spec {
         FieldType::Date => Spec { ty: b'D', len: 8, decimals: 0 },
         // A `.dbf` has no date-time field that other programs read, so they're ISO text.
         FieldType::Text | FieldType::DateTime => {
-            let longest = ds.features.iter().filter_map(|r| r.attrs.get(k)).map(|v| v.to_string().len()).max().unwrap_or(0);
+            let longest = ds.features.iter().filter_map(|r| r.attrs.get(k)).map(|v| v.shown_text().len()).max().unwrap_or(0);
             Spec { ty: b'C', len: u8::try_from(longest.clamp(1, 254)).unwrap_or(254), decimals: 0 }
         }
     }
@@ -6415,8 +6465,8 @@ fn shapefile_parts_within(
                     shapefile::dbase::Date::new(u32::try_from(d).ok()?, u32::try_from(m).ok()?, u32::try_from(y).ok()?).ok()
                 })),
                 FieldType::Text | FieldType::DateTime => FieldValue::Character((!v.is_null()).then(|| match style {
-                    Some(style) => cut_encoded(&v.to_string(), 254, &style.encoding).to_string(),
-                    None => cut(&v.to_string(), 254).to_string(),
+                    Some(style) => cut_encoded(&v.shown_text(), 254, &style.encoding).to_string(),
+                    None => cut(&v.shown_text(), 254).to_string(),
                 })),
             };
             rec.insert(n.clone(), value);
@@ -6433,8 +6483,18 @@ fn shapefile_parts_within(
         let shapes = shapefile::ShapeWriter::with_shx(&mut shp, &mut shx);
         let mut w = shapefile::Writer::new(shapes, table.build_with_dest(&mut dbf));
         let multi_points = ds.features.iter().any(|f| matches!(f.geometry, Some(Geometry::MultiPoint(_))));
+        // What the `.shp` and `.shx` come to with each shape: their headers, then the records.
+        let mut shape_bytes = 2 * SHAPEFILE_HEADER;
         for f in &ds.features {
             crate::progress::step(1)?;
+            // A shape is copied to be written: one whose record can't fit is refused first.
+            if limit.bounded()
+                && let Some(g) = &f.geometry
+                && let Some(bytes) = shapefile_record_bytes(g, ds.geometry_type, multi_points)
+            {
+                shape_bytes = shape_bytes.saturating_add(bytes);
+                limit.fits(shape_bytes)?;
+            }
             let ok = match (&f.geometry, ds.geometry_type) {
                 (Some(Geometry::Point(c)), GeometryType::Point) if !multi_points && finite(&c) => {
                     w.write_shape_and_record(&pt(c), &record(f)).map_err(fmt)?;
@@ -6514,6 +6574,51 @@ fn shapefile_parts_within(
     Ok((parts, left_out, widened))
 }
 
+/// The bytes of a `.shp` file's header, and of a `.shx` file's.
+const SHAPEFILE_HEADER: usize = 100;
+
+/// The bytes `g`'s record adds to a `.shp` and its `.shx` in a layer of type `gt`, counted from
+/// the vertices [`shapefile_parts_within`] keeps, without copying them; `None` for one it leaves
+/// out. `multi_points` says the layer's points are written as multipoints.
+fn shapefile_record_bytes(g: &Geometry, gt: GeometryType, multi_points: bool) -> Option<usize> {
+    if !shapefile_keeps(Some(g), gt) {
+        return None;
+    }
+    let finite = |c: &&Coord| c.x.is_finite() && c.y.is_finite();
+    // A box, the part and point counts, where each part starts, and the points.
+    let parts = |parts: usize, points: usize| 32 + 8 + 4 * parts + 16 * points;
+    let content = match g {
+        Geometry::Point(_) if !multi_points => 16,
+        Geometry::Point(_) | Geometry::MultiPoint(_) => {
+            let mut points = 0usize;
+            g.for_each_coord(|c| points += usize::from(finite(&&c)));
+            // A box, the count and the points.
+            32 + 4 + 16 * points
+        }
+        Geometry::Line(lines) => {
+            let (n, points) =
+                lines.iter().map(|p| p.iter().filter(finite).count()).filter(|n| *n >= 2).fold((0, 0), |(p, v), n| (p + 1, v + n));
+            parts(n, points)
+        }
+        Geometry::Polygon(polys) => {
+            let (mut rings, mut points) = (0, 0);
+            for poly in polys.iter().filter(|p| p.first().is_some_and(|r| r.iter().filter(finite).count() >= 3)) {
+                for ring in poly {
+                    let n = ring.iter().filter(finite).count();
+                    if n >= 3 {
+                        rings += 1;
+                        // A ring left open is closed with its first point.
+                        points += n + usize::from(ring.iter().find(finite) != ring.iter().rev().find(finite));
+                    }
+                }
+            }
+            parts(rings, points)
+        }
+    };
+    // The record's header and shape type in the `.shp`, and its entry in the `.shx`.
+    Some(8 + 4 + content + 8)
+}
+
 fn is_outer<P>(r: &shapefile::PolygonRing<P>) -> bool {
     matches!(r, shapefile::PolygonRing::Outer(_))
 }
@@ -6571,6 +6676,75 @@ mod tests {
             wasm.lines().any(|l| l.starts_with("time ") && l.contains("\"wasm-bindgen\"")),
             "time's wasm-bindgen feature is on for wasm32, or a Shapefile export panics in the browser:\n{wasm}"
         );
+    }
+
+    /// The bytes counted for each shape before it is built are the bytes its record takes: with
+    /// the two headers they come to the `.shp` and `.shx` written, whatever is filtered out,
+    /// closed or left out, so no shape that fits is refused.
+    #[test]
+    fn shapefile_record_bytes_are_what_is_written() {
+        let c = Coord::new;
+        let nan = c(f64::NAN, 1.0);
+        let closed = vec![c(0.0, 0.0), c(4.0, 0.0), c(4.0, 4.0), c(0.0, 0.0)];
+        let open = vec![c(0.0, 0.0), nan, c(0.0, 4.0), c(4.0, 4.0), nan];
+        let short = vec![c(1.0, 1.0), c(2.0, 2.0), nan];
+        let layers = [
+            (GeometryType::Point, vec![Geometry::Point(c(1.0, 2.0)), Geometry::Point(nan), Geometry::Line(vec![closed.clone()])]),
+            (GeometryType::Point, vec![Geometry::Point(c(1.0, 2.0)), Geometry::MultiPoint(open.clone()), Geometry::MultiPoint(vec![nan])]),
+            (
+                GeometryType::Polyline,
+                vec![
+                    Geometry::Line(vec![short.clone(), vec![c(1.0, 1.0), nan], open.clone()]),
+                    Geometry::Line(vec![vec![c(1.0, 1.0)]]),
+                    Geometry::Line(vec![closed.clone()]),
+                ],
+            ),
+            (
+                GeometryType::Polygon,
+                vec![
+                    Geometry::Polygon(vec![vec![closed.clone(), open.clone(), short.clone()]]),
+                    Geometry::Polygon(vec![vec![short.clone(), closed.clone()], vec![open.clone()], vec![]]),
+                    Geometry::Polygon(vec![vec![vec![nan, nan, c(1.0, 1.0)]]]),
+                ],
+            ),
+        ];
+        for (kind, shapes) in layers {
+            let mut ds = Dataset::new("t", kind, vec![]);
+            let multi_points = shapes.iter().any(|g| matches!(g, Geometry::MultiPoint(_)));
+            let counted: usize = shapes.iter().filter_map(|g| shapefile_record_bytes(g, kind, multi_points)).sum();
+            for g in shapes {
+                ds.push(Some(g), vec![]);
+            }
+            let (parts, _) = shapefile_parts_in(&ds, Crs::LonLat).unwrap();
+            let written: usize = parts.iter().filter(|(e, _)| matches!(*e, "shp" | "shx")).map(|(_, b)| b.len()).sum();
+            assert_eq!(2 * SHAPEFILE_HEADER + counted, written, "{kind:?}");
+        }
+    }
+
+    /// A CSV row holding a long cell the formula guard applies to reads as every other row: the
+    /// same text the `csv` crate makes of the whole cells, with the rows either side of it.
+    #[test]
+    fn csv_rows_around_a_long_guarded_cell_are_written_as_whole_cells() {
+        let long = format!("={}", "a \"b\", c\r\n".repeat(3_000));
+        // Guarded, with nothing to quote.
+        let bare = format!("@{}", "x".repeat(20_000));
+        let fields = vec![Field::new("a", FieldType::Text), Field::new("b", FieldType::Text)];
+        let rows = [["x", ""], [long.as_str(), "y,z"], ["", ""], [bare.as_str(), long.as_str()], ["=1+1", bare.as_str()], ["end", "q\""]];
+        for kind in [GeometryType::Point, GeometryType::None] {
+            let mut ds = Dataset::new("t", kind, fields.clone());
+            let mut whole = csv::Writer::from_writer(Vec::new());
+            let point = kind == GeometryType::Point;
+            let coordinates = |x: &str, y: &str| if point { vec![x.to_string(), y.to_string()] } else { Vec::new() };
+            let header = coordinates("longitude", "latitude").into_iter().chain(["a".to_string(), "b".to_string()]);
+            whole.write_record(header).unwrap();
+            for row in rows {
+                let geometry = point.then(|| Geometry::Point(Coord::new(1.5, 2.0)));
+                ds.push(geometry, row.iter().map(|s| Value::Text(s.to_string())).collect());
+                let guarded = row.iter().map(|s| if s.starts_with(['=', '@']) { format!("'{s}") } else { s.to_string() });
+                whole.write_record(coordinates("1.5", "2").into_iter().chain(guarded)).unwrap();
+            }
+            assert_eq!(to_csv(&ds).unwrap().into_bytes(), whole.into_inner().unwrap());
+        }
     }
 
     /// A write to a name nothing holds reserves it first: a second write to it is refused before

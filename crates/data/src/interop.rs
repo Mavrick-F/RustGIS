@@ -1,17 +1,19 @@
 //! Writers for exchange formats: KML, GPX and CSV with WKT geometry. Geometry text goes to the
-//! output a coordinate at a time, so a large feature's is never held whole.
+//! output a coordinate at a time and values a piece at a time, escaped as they go, so a large
+//! feature's text is never held a second time.
 
 use std::io::Write;
 
 use rustgis_geom::Coord;
 
+use crate::capped::write_pieces;
 use crate::{Dataset, Geometry};
 
-/// Text for XML, special characters escaped: kept exactly or refused, never cleaned without
-/// reporting its loss. `place` says where in the file of `format` the text goes, for the refusal.
+/// Refuses text XML can't hold: it is kept exactly or refused, never cleaned without reporting its
+/// loss. `place` says where in the file of `format` the text goes, for the refusal.
 ///
 /// XML 1.0 Char production: https://www.w3.org/TR/xml/#charsets.
-fn xml(text: &str, format: &str, place: impl FnOnce() -> String) -> crate::Result<String> {
+fn check_xml(text: &str, format: &str, place: impl FnOnce() -> String) -> crate::Result<()> {
     let mut invalid = text.chars().filter(|c| {
         !matches!(*c,
             '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}'
@@ -25,14 +27,34 @@ fn xml(text: &str, format: &str, place: impl FnOnce() -> String) -> crate::Resul
             first as u32
         )));
     }
-    Ok(escaped_xml(text))
+    Ok(())
 }
 
-fn escaped_xml(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\r', "&#13;")
+/// Text [`check_xml`] has passed, written with its special characters escaped. In an `attribute`,
+/// where a reader turns tabs and line breaks into spaces, they are written as references too.
+fn write_xml(out: &mut impl Write, text: &str, attribute: bool) -> std::io::Result<()> {
+    let bytes = text.as_bytes();
+    // Where the run not yet written, with nothing to escape, starts.
+    let mut plain = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        let reference: &[u8] = match b {
+            b'&' => b"&amp;",
+            b'<' => b"&lt;",
+            b'>' => b"&gt;",
+            b'"' => b"&quot;",
+            b'\r' => b"&#13;",
+            b'\t' if attribute => b"&#9;",
+            b'\n' if attribute => b"&#10;",
+            _ => continue,
+        };
+        write_pieces(out, bytes.get(plain..i).unwrap_or_default())?;
+        out.write_all(reference)?;
+        plain = i + 1;
+    }
+    write_pieces(out, bytes.get(plain..).unwrap_or_default())
 }
 
-/// Where in a layer's file a feature's text goes, for [`xml`]'s refusal.
+/// Where in a layer's file a feature's text goes, for [`check_xml`]'s refusal.
 fn feature_place(layer: &str, feature: u64, what: &str) -> String {
     format!("{layer}, feature id {feature}, {what}")
 }
@@ -112,49 +134,57 @@ fn text(out: Vec<u8>) -> crate::Result<String> {
 
 /// [`to_kml`]'s document, written to `out` as it is made.
 pub(crate) fn write_kml(ds: &Dataset, name_field: Option<usize>, out: &mut impl Write) -> crate::Result<()> {
-    write!(
-        out,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document><name>{}</name>\n",
-        xml(&ds.name, "KML", || "layer name".to_string())?
-    )?;
+    check_xml(&ds.name, "KML", || "layer name".to_string())?;
+    out.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document><name>")?;
+    write_xml(out, &ds.name, false)?;
+    out.write_all(b"</name>\n")?;
     // KML's description is text. Other types and differently-cased columns stay in
     // ExtendedData, where the reader preserves their values and reports name collisions.
     let description = ds.fields.iter().position(|f| f.name == "description" && f.ty == crate::FieldType::Text);
     for (r, f) in ds.features.iter().enumerate() {
         crate::progress::step(1)?;
         let Some(g) = &f.geometry else { continue };
-        let name = name_field.map(|fi| ds.value(r, fi).to_file_text()).unwrap_or_else(|| f.id.to_string());
+        let name = name_field.map_or_else(|| f.id.to_string().into(), |fi| ds.value(r, fi).file_text());
         let description = match description.map(|fi| ds.value(r, fi)) {
-            Some(crate::Value::Text(text)) => {
-                format!("<description>{}</description>", xml(text, "KML", || feature_place(&ds.name, f.id, "description"))?)
-            }
-            _ => String::new(),
+            Some(crate::Value::Text(text)) => Some(text),
+            _ => None,
         };
-        let data: String = ds
-            .fields
-            .iter()
-            .zip(&f.attrs)
-            .filter(|(_, v)| !v.is_null())
-            .map(|(fd, v)| {
-                let value = match v {
-                    crate::Value::Text(text) if fd.name == "description" && fd.ty == crate::FieldType::Text => {
-                        xml(text, "KML", || feature_place(&ds.name, f.id, "description"))?
+        let data = || ds.fields.iter().zip(&f.attrs).filter(|(_, v)| !v.is_null());
+        // All the placemark's text is checked before any of it is written.
+        if let Some(text) = description {
+            check_xml(text, "KML", || feature_place(&ds.name, f.id, "description"))?;
+        }
+        for (fd, v) in data() {
+            // Only text can hold what XML can't.
+            if let crate::Value::Text(text) = v {
+                check_xml(text, "KML", || {
+                    if fd.name == "description" && fd.ty == crate::FieldType::Text {
+                        feature_place(&ds.name, f.id, "description")
+                    } else {
+                        feature_place(&ds.name, f.id, &format!("field '{}'", fd.name.escape_debug()))
                     }
-                    _ => xml(&v.to_file_text(), "KML", || feature_place(&ds.name, f.id, &format!("field '{}'", fd.name.escape_debug())))?,
-                };
-                // In an attribute, where a reader turns tabs and line breaks into spaces unless
-                // they are written as references.
-                let name = xml(&fd.name, "KML", || format!("{}, field name '{}'", ds.name, fd.name.escape_debug()))?
-                    .replace('\t', "&#9;")
-                    .replace('\n', "&#10;");
-                Ok(format!("<Data name=\"{name}\"><value>{value}</value></Data>"))
-            })
-            .collect::<crate::Result<String>>()?;
-        write!(
-            out,
-            "<Placemark><name>{}</name>{description}<ExtendedData>{data}</ExtendedData>",
-            xml(&name, "KML", || feature_place(&ds.name, f.id, "name"))?
-        )?;
+                })?;
+            }
+            check_xml(&fd.name, "KML", || format!("{}, field name '{}'", ds.name, fd.name.escape_debug()))?;
+        }
+        check_xml(&name, "KML", || feature_place(&ds.name, f.id, "name"))?;
+        out.write_all(b"<Placemark><name>")?;
+        write_xml(out, &name, false)?;
+        out.write_all(b"</name>")?;
+        if let Some(text) = description {
+            out.write_all(b"<description>")?;
+            write_xml(out, text, false)?;
+            out.write_all(b"</description>")?;
+        }
+        out.write_all(b"<ExtendedData>")?;
+        for (fd, v) in data() {
+            out.write_all(b"<Data name=\"")?;
+            write_xml(out, &fd.name, true)?;
+            out.write_all(b"\"><value>")?;
+            write_xml(out, &v.file_text(), false)?;
+            out.write_all(b"</value></Data>")?;
+        }
+        out.write_all(b"</ExtendedData>")?;
         write_kml_geometry(out, g)?;
         out.write_all(b"</Placemark>\n")?;
     }
@@ -171,6 +201,20 @@ fn write_gpx_segment(out: &mut impl Write, pts: &[Coord]) -> std::io::Result<()>
     out.write_all(b"</trkseg>")
 }
 
+/// A GPX waypoint named `name`, which [`check_xml`] has passed.
+fn write_gpx_waypoint(out: &mut impl Write, c: &Coord, name: &str) -> std::io::Result<()> {
+    write!(out, "<wpt lat=\"{}\" lon=\"{}\"><name>", c.y, c.x)?;
+    write_xml(out, name, false)?;
+    out.write_all(b"</name></wpt>\n")
+}
+
+/// The start of a GPX track named `name`, which [`check_xml`] has passed.
+fn write_gpx_track_start(out: &mut impl Write, name: &str) -> std::io::Result<()> {
+    out.write_all(b"<trk><name>")?;
+    write_xml(out, name, false)?;
+    out.write_all(b"</name>")
+}
+
 /// A GPX file: points become waypoints, lines tracks (polygon outlines too).
 /// A cancelled run ([`crate::progress`]) stops it with [`crate::DataError::Cancelled`].
 pub fn to_gpx(ds: &Dataset, name_field: Option<usize>) -> crate::Result<String> {
@@ -185,7 +229,6 @@ pub(crate) fn write_gpx(ds: &Dataset, name_field: Option<usize>, out: &mut impl 
     out.write_all(
         b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"RustGIS\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n",
     )?;
-    let pt = |c: &Coord| format!("lat=\"{}\" lon=\"{}\"", c.y, c.x);
     for tracks in [false, true] {
         for (r, f) in ds.features.iter().enumerate() {
             // Each feature counts once, in the first pass.
@@ -204,24 +247,24 @@ pub(crate) fn write_gpx(ds: &Dataset, name_field: Option<usize>, out: &mut impl 
             if !written {
                 continue;
             }
-            let name = name_field.map(|fi| ds.value(r, fi).to_file_text()).unwrap_or_else(|| f.id.to_string());
-            let name = xml(&name, "GPX", || feature_place(&ds.name, f.id, "name"))?;
+            let name = name_field.map_or_else(|| f.id.to_string().into(), |fi| ds.value(r, fi).file_text());
+            check_xml(&name, "GPX", || feature_place(&ds.name, f.id, "name"))?;
             match g {
-                Geometry::Point(c) if !tracks => writeln!(out, "<wpt {}><name>{name}</name></wpt>", pt(c))?,
+                Geometry::Point(c) if !tracks => write_gpx_waypoint(out, c, &name)?,
                 Geometry::MultiPoint(v) if !tracks => {
                     for c in v {
-                        writeln!(out, "<wpt {}><name>{name}</name></wpt>", pt(c))?;
+                        write_gpx_waypoint(out, c, &name)?;
                     }
                 }
                 Geometry::Line(parts) if tracks => {
-                    write!(out, "<trk><name>{name}</name>")?;
+                    write_gpx_track_start(out, &name)?;
                     for p in parts {
                         write_gpx_segment(out, p)?;
                     }
                     out.write_all(b"</trk>\n")?;
                 }
                 Geometry::Polygon(polys) if tracks => {
-                    write!(out, "<trk><name>{name}</name>")?;
+                    write_gpx_track_start(out, &name)?;
                     for ring in polys.iter().filter_map(|r| r.first()) {
                         write_gpx_segment(out, ring)?;
                     }
@@ -606,10 +649,29 @@ impl WktParser {
     }
 }
 
-/// A [`to_wkt_csv`] cell's text before quoting: text starting like a formula is prefixed with `'`
-/// so spreadsheets show it rather than run it.
-pub(crate) fn wkt_csv_text(s: &str) -> String {
-    if s.starts_with(['=', '+', '-', '@']) && s.parse::<f64>().is_err() { format!("'{s}") } else { s.to_string() }
+/// What goes before a [`to_wkt_csv`] cell's text: `'` before text starting like a formula, so
+/// spreadsheets show it rather than run it, else nothing.
+pub(crate) fn wkt_csv_guard(s: &str) -> &'static str {
+    if s.starts_with(['=', '+', '-', '@']) && s.parse::<f64>().is_err() { "'" } else { "" }
+}
+
+/// One CSV cell of `text`, `guard` before it: quoted when the text holds a comma, a quote or a
+/// line break, its quotes doubled, as the `csv` crate writes a field of a record with others.
+pub(crate) fn write_csv_cell(out: &mut (impl Write + ?Sized), guard: &str, text: &str) -> std::io::Result<()> {
+    let quote: &[u8] = if text.contains([',', '"', '\n', '\r']) { b"\"" } else { b"" };
+    out.write_all(quote)?;
+    out.write_all(guard.as_bytes())?;
+    if quote.is_empty() {
+        write_pieces(out, text.as_bytes())?;
+    } else {
+        for (i, part) in text.split('"').enumerate() {
+            if i > 0 {
+                out.write_all(b"\"\"")?;
+            }
+            write_pieces(out, part.as_bytes())?;
+        }
+    }
+    out.write_all(quote)
 }
 
 /// CSV with a `wkt` geometry column and every attribute; cancellable between features.
@@ -621,27 +683,28 @@ pub fn to_wkt_csv(ds: &Dataset) -> crate::Result<String> {
 
 /// [`to_wkt_csv`]'s text, written to `out` as it is made.
 pub(crate) fn write_wkt_csv(ds: &Dataset, out: &mut impl Write) -> crate::Result<()> {
-    let q = |s: &str| {
-        let s = wkt_csv_text(s);
-        if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s }
-    };
+    /// A comma, then `text` as a CSV cell with its formula guard.
+    fn cell(out: &mut impl Write, text: &str) -> std::io::Result<()> {
+        out.write_all(b",")?;
+        write_csv_cell(out, wkt_csv_guard(text), text)
+    }
     out.write_all(b"wkt")?;
     for f in &ds.fields {
-        write!(out, ",{}", q(&f.name))?;
+        cell(out, &f.name)?;
     }
     out.write_all(b"\n")?;
     for f in &ds.features {
         crate::progress::step(1)?;
         if let Some(g) = &f.geometry {
-            // As `q` would: WKT holds no quote or line break and starts like no formula, so its
-            // cell is quoted for a comma alone, with nothing in it to escape.
+            // As `write_csv_cell` would: WKT holds no quote or line break and starts like no
+            // formula, so its cell is quoted for a comma alone, with nothing in it to escape.
             let quote: &[u8] = if write_wkt(&mut NoComma, g).is_err() { b"\"" } else { b"" };
             out.write_all(quote)?;
             write_wkt(out, g)?;
             out.write_all(quote)?;
         }
         for v in &f.attrs {
-            write!(out, ",{}", q(&v.to_file_text()))?;
+            cell(out, &v.file_text())?;
         }
         out.write_all(b"\n")?;
     }
@@ -706,6 +769,40 @@ mod tests {
         assert!(to_gpx(&numbered, Some(0)).unwrap().contains("<name>0.1234567891</name>"));
         let c = to_wkt_csv(&ds).unwrap();
         assert!(c.contains("POINT (1 2),,0.1234567891\n") && c.contains(",B,0.000000001\n"), "{c}");
+    }
+
+    /// Values longer than a piece, with every character that is escaped, a quote or the formula
+    /// guard, are written whole in KML, GPX and a WKT cell.
+    #[test]
+    fn long_values_are_escaped_whole_in_kml_gpx_and_wkt_csv() {
+        let long = "é & <b> \"q\"\r\n\t', ".repeat(2_000);
+        let formula = format!("={long}");
+        let escaped =
+            |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\r', "&#13;");
+        let quoted = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let odd = "a\tb\nc\"d";
+        let fields =
+            vec![Field::new("name", FieldType::Text), Field::new("description", FieldType::Text), Field::new(odd, FieldType::Text)];
+        let mut ds = Dataset::new("t & u", GeometryType::Point, fields);
+        let values = [&formula, &long, &long].map(|s| Value::Text(s.to_string()));
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), values.to_vec());
+        let (name, text) = (escaped(&formula), escaped(&long));
+        let k = to_kml(&ds, Some(0)).unwrap();
+        let field = escaped(odd).replace('\t', "&#9;").replace('\n', "&#10;");
+        let data = |field: &str, value: &str| format!("<Data name=\"{field}\"><value>{value}</value></Data>");
+        let placemark = format!(
+            "<Placemark><name>{name}</name><description>{text}</description><ExtendedData>{}{}{}</ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>\n",
+            data("name", &name),
+            data("description", &text),
+            data(&field, &text),
+        );
+        assert!(k.contains("<name>t &amp; u</name>\n") && k.contains(&placemark));
+        let x = to_gpx(&ds, Some(0)).unwrap();
+        assert!(x.contains(&format!("<wpt lat=\"2\" lon=\"1\"><name>{name}</name></wpt>\n</gpx>\n")));
+        let c = to_wkt_csv(&ds).unwrap();
+        let guarded = quoted(&format!("'{formula}"));
+        let row = format!("POINT (1 2),{guarded},{},{}\n", quoted(&long), quoted(&long));
+        assert_eq!(c, format!("wkt,name,description,{}\n{row}", quoted(odd)));
     }
 
     /// Each geometry shape's text in KML, GPX and a WKT cell, the empty and one-coordinate ones

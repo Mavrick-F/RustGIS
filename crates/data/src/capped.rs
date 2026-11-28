@@ -6,6 +6,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::{DataError, Result};
 
+/// The most bytes of one value or zip entry a writer hands its output at once, so a capped one
+/// refuses a large value without being offered it whole.
+pub(crate) const PIECE: usize = 8 << 10;
+
+/// `bytes` written to `out`, [`PIECE`] at a time.
+pub(crate) fn write_pieces(out: &mut (impl Write + ?Sized), bytes: &[u8]) -> std::io::Result<()> {
+    bytes.chunks(PIECE).try_for_each(|piece| out.write_all(piece))
+}
+
 /// The most bytes the buffers a file is made in may hold in all (a Shapefile's parts share one).
 #[derive(Debug)]
 pub struct Limit {
@@ -28,6 +37,21 @@ impl Limit {
     /// Whether a write was refused for passing the limit.
     pub fn passed(&self) -> bool {
         self.passed.load(Ordering::Relaxed)
+    }
+
+    /// Whether there is a limit to pass: false for [`Limit::none`].
+    pub(crate) fn bounded(&self) -> bool {
+        self.max != usize::MAX
+    }
+
+    /// Refuses, and notes the limit passed, when files that come to `bytes` can't be held: for a
+    /// writer to ask before it builds a large piece of them that would then be refused.
+    pub(crate) fn fits(&self, bytes: usize) -> Result<()> {
+        if bytes <= self.max {
+            return Ok(());
+        }
+        self.passed.store(true, Ordering::Relaxed);
+        self.whole(Ok(()))
     }
 
     /// An empty buffer counted against this limit.
@@ -318,6 +342,86 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    impl Seek for Pieces<'_> {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.to.seek(to)
+        }
+    }
+
+    /// One value or zip entry that alone passes the limit is handed over a piece at a time: KML
+    /// and GPX text, a CSV or WKT cell, guarded or not, and an entry deflated or stored.
+    #[test]
+    fn one_large_value_stops_at_the_limit_without_it_offered_whole() {
+        const MAX: usize = 40_000;
+        let long = "a long \"value\" & more, ".repeat(20_000);
+        let formula = format!("={long}");
+        let at = crate::Coord::new(1.0, 2.0);
+        let layer = |geometry: Geometry, field: &str, value: &str| {
+            let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new(field, FieldType::Text)]);
+            ds.push(Some(geometry), vec![Value::Text(value.to_string())]);
+            ds
+        };
+        // Bytes with no pattern to deflate, which are stored as they are.
+        let mut state = 7u32;
+        let noise: Vec<u8> = std::iter::repeat_with(|| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .take(500_000)
+        .collect();
+        // Deflated to well past a piece, yet smaller than they are.
+        let halves: Vec<u8> = noise.iter().map(|b| b & 0x0f).collect();
+        type Make<'a> = Box<dyn Fn(&mut Pieces<'_>) -> Result<()> + 'a>;
+        let zipped = |data: &[u8]| -> Make<'_> {
+            let entries = vec![("e".to_string(), data.to_vec())];
+            Box::new(move |out| crate::zip::write_to(&entries, out).map_err(crate::DataError::Format))
+        };
+        let point = || Geometry::Point(at);
+        let mut cases: Vec<(&str, Make<'_>)> = Vec::new();
+        for (name, field, value) in [("KML description", "description", &long), ("KML attribute", "note", &long)] {
+            let ds = layer(point(), field, value);
+            cases.push((name, Box::new(move |out| crate::interop::write_kml(&ds, None, out))));
+        }
+        for (name, geometry) in [
+            ("GPX waypoint name", point()),
+            ("GPX multipoint name", Geometry::MultiPoint(vec![at, at])),
+            ("GPX track name", Geometry::Line(vec![vec![at, at]])),
+        ] {
+            let ds = layer(geometry, "note", &long);
+            cases.push((name, Box::new(move |out| crate::interop::write_gpx(&ds, Some(0), out))));
+        }
+        for (name, value) in [("WKT cell", &long), ("WKT guarded cell", &formula)] {
+            let ds = layer(point(), "note", value);
+            cases.push((name, Box::new(move |out| crate::interop::write_wkt_csv(&ds, out))));
+        }
+        for (name, value) in [("CSV cell", &long), ("CSV guarded cell", &formula)] {
+            let ds = layer(point(), "note", value);
+            cases.push((
+                name,
+                Box::new(move |out| {
+                    let mut w = crate::io::CsvWriter::new(out, &ds.fields, ds.geometry_type, Crs::LonLat)?;
+                    w.write(&ds.features)?;
+                    w.finish().map(drop)
+                }),
+            ));
+        }
+        cases.push(("deflated entry", zipped(&halves)));
+        cases.push(("stored entry", zipped(&noise)));
+        let mut failed = Vec::new();
+        for (name, make) in cases {
+            let limit = Limit::new(MAX);
+            let mut out = Pieces { to: limit.buffer(), largest: 0 };
+            let made = make(&mut out);
+            let (largest, held) = (out.largest, out.to.file.capacity());
+            if largest > PIECE || held > MAX {
+                failed.push(format!("{name}: a piece of {largest} bytes, {held} held"));
+            }
+            let e = limit.whole(made).unwrap_err().to_string();
+            assert!(limit.passed() && e.contains("passes the 40000 bytes"), "{name}: {e}");
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
     }
 
     /// A buffer dropped without being handed over, as a refused write or a writer's error leaves
