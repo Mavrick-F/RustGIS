@@ -118,7 +118,11 @@ impl Buffer<'_> {
     /// The file made, its spare room given back, no longer counted against the limit.
     pub(crate) fn into_inner(mut self) -> Vec<u8> {
         let mut file = std::mem::take(&mut self.file);
-        file.shrink_to_fit();
+        // Only a file held to a limit (a download, which waits counted by what it holds) gives
+        // back its spare room: a file to be written isn't reallocated for it.
+        if self.limit.max != usize::MAX {
+            file.shrink_to_fit();
+        }
         self.release();
         file
     }
@@ -202,6 +206,24 @@ mod tests {
     use super::*;
     use crate::raster::{ColorHint, Crs, GeoTransform, Raster, cogwrite, geotiff};
     use crate::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+
+    /// A file made under no limit (one to be written) keeps its allocation when finished, so it
+    /// isn't reallocated; one held to a limit gives its spare room back.
+    #[test]
+    fn only_a_limited_file_is_trimmed_when_finished() {
+        let unlimited = Limit::none();
+        let mut b = unlimited.buffer();
+        b.write_all(&[1; 5]).unwrap();
+        let room = b.file.capacity();
+        assert!(room > 5, "{room}");
+        assert_eq!(b.into_inner().capacity(), room);
+        let limit = Limit::new(1000);
+        let mut b = limit.buffer();
+        b.write_all(&[1; 5]).unwrap();
+        b.write_all(&[1; 5]).unwrap();
+        let file = b.into_inner();
+        assert_eq!(file.capacity(), file.len());
+    }
 
     /// A request past the limit, however large, is refused without changing what is counted.
     #[test]
